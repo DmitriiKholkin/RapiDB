@@ -46,7 +46,13 @@ export function inferDynamoDbNativeOperationName(
     return inferBatchOperation(value.RequestItems);
   }
 
-  if (typeof value.UpdateExpression === "string") {
+  // Legacy AWS UpdateItem requests use AttributeUpdates instead of an
+  // expression. Classify even malformed update fields as updates: falling
+  // through to Key + Expected/ReturnValues would execute a DELETE instead.
+  if (
+    value.UpdateExpression !== undefined ||
+    value.AttributeUpdates !== undefined
+  ) {
     return "UpdateItem";
   }
 

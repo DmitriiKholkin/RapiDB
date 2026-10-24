@@ -169,4 +169,42 @@ describe("Elasticsearch REST request boundaries (real SDK + HTTP)", () => {
       await f.close();
     }
   });
+
+  it.each([
+    "DELETE /records",
+    "DELETE /records/_doc/selected",
+    "GET /records/_doc/selected",
+    "GET /records/_mapping",
+    "GET /records/_settings",
+  ])("rejects an ignored body instead of executing %s with different semantics", async (path) => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await expect(
+        f.driver.query(`${path}\n{"query":{"term":{"expired":true}}}`),
+      ).rejects.toThrow(/does not accept.*body/i);
+      expect(f.requests.filter((entry) => entry.method !== "HEAD")).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    ["GET /records/_unsupported", /unsupported/i],
+    ["POST /records/_update/selected\n[]", /JSON object body/i],
+    ["PUT /other", /JSON object body/i],
+    ["DELETE /other\n{}", /does not accept.*body/i],
+    ["GET /records/_search?source=%7B%7D", /source query parameter/i],
+  ])("validates the entire script before the first mutation: %s", async (invalid, reason) => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await expect(
+        f.driver.query(`DELETE /records/_doc/selected\n${invalid}`),
+      ).rejects.toThrow(reason);
+      expect(f.requests.filter((entry) => entry.method !== "HEAD")).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
 });

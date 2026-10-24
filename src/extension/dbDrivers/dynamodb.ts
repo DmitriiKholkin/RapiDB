@@ -869,13 +869,17 @@ export class DynamoDBDriver implements IDBDriver {
     throwIfQueryCancelled(options);
     const inputs = parseDynamoDbNativeQueryInputs(queryText);
     const operation = this.resolveNativeOperation(inputs);
+    // Decode and validate the whole script before submitting its first write.
+    const preparedInputs = inputs.map((input) =>
+      this.requireInputRecord(input),
+    );
     const startedAt = Date.now();
     const rawRows: Record<string, unknown>[] = [];
     const responseMetadata: Record<string, unknown>[] = [];
     let affectedRows = 0;
     let sawMutation = false;
 
-    for (const input of inputs) {
+    for (const input of preparedInputs) {
       throwIfQueryCancelled(options);
       const result = await this.dispatchNativeCommand(
         operation,
@@ -2825,10 +2829,9 @@ export class DynamoDBDriver implements IDBDriver {
 
   private async dispatchNativeCommand(
     operation: DynamoDbNativeOperationName,
-    rawInput: Record<string, unknown>,
+    input: Record<string, unknown>,
     options?: QueryExecutionOptions,
   ): Promise<QueryDispatchResult> {
-    const input = this.requireInputRecord(rawInput);
     const spec = DYNAMO_NATIVE_DISPATCH_MAP[operation];
     const output = await this.requireClient().send(
       new spec.ctor(input as never) as never,
@@ -2934,21 +2937,116 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private normalizeNativeInputValue(value: unknown): unknown {
-    if (Array.isArray(value)) {
-      return value.map((entry) => this.normalizeNativeInputValue(entry));
+    if (!isRecord(value)) return value;
+    const result = { ...value };
+    // Request structures, attribute maps, and AttributeValue envelopes are
+    // different namespaces. An attribute/table named B, BS, M, or Item must
+    // never be mistaken for an envelope or request field.
+    for (const key of [
+      "Key",
+      "Item",
+      "ExpressionAttributeValues",
+      "ExclusiveStartKey",
+    ]) {
+      if (isRecord(value[key]))
+        result[key] = this.normalizeNativeAttributeMap(value[key]);
     }
-    if (!isRecord(value)) {
-      return value;
+    if (Array.isArray(value.Keys)) {
+      result.Keys = value.Keys.map((key) =>
+        isRecord(key) ? this.normalizeNativeAttributeMap(key) : key,
+      );
     }
-    const attributeValue = this.normalizeAttributeValueEnvelope(value);
-    if (attributeValue !== null) {
-      return attributeValue;
+    for (const key of [
+      "AttributeUpdates",
+      "Expected",
+      "KeyConditions",
+      "QueryFilter",
+      "ScanFilter",
+    ]) {
+      const conditions = value[key];
+      if (!isRecord(conditions)) continue;
+      result[key] = Object.fromEntries(
+        Object.entries(conditions).map(([name, condition]) => {
+          if (!isRecord(condition)) return [name, condition];
+          return [
+            name,
+            {
+              ...condition,
+              ...(condition.Value !== undefined
+                ? { Value: this.normalizeNativeAttribute(condition.Value) }
+                : {}),
+              ...(Array.isArray(condition.AttributeValueList)
+                ? {
+                    AttributeValueList: condition.AttributeValueList.map(
+                      (entry) => this.normalizeNativeAttribute(entry),
+                    ),
+                  }
+                : {}),
+            },
+          ];
+        }),
+      );
     }
+    const normalizeActions = (actions: unknown) =>
+      !isRecord(actions)
+        ? actions
+        : Object.fromEntries(
+            Object.entries(actions).map(([action, input]) => [
+              action,
+              this.normalizeNativeInputValue(input),
+            ]),
+          );
+    if (Array.isArray(value.TransactItems)) {
+      result.TransactItems = value.TransactItems.map(normalizeActions);
+    }
+    if (isRecord(value.RequestItems)) {
+      result.RequestItems = Object.fromEntries(
+        Object.entries(value.RequestItems).map(([table, requests]) => [
+          table,
+          Array.isArray(requests)
+            ? requests.map(normalizeActions)
+            : this.normalizeNativeInputValue(requests),
+        ]),
+      );
+    }
+    return result;
+  }
+
+  private normalizeNativeAttributeMap(
+    value: Record<string, unknown>,
+  ): Record<string, unknown> {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [
-        key,
-        this.normalizeNativeInputValue(entry),
+      Object.entries(value).map(([name, entry]) => [
+        name,
+        this.normalizeNativeAttribute(entry),
       ]),
+    );
+  }
+
+  private normalizeNativeAttribute(value: unknown): unknown {
+    const normalized = isRecord(value)
+      ? this.normalizeAttributeValueEnvelope(value)
+      : null;
+    if (normalized === null) {
+      throw new Error(
+        "DynamoDB native AttributeValue must contain exactly one supported type with a valid JSON value.",
+      );
+    }
+    return normalized;
+  }
+
+  private decodeNativeBinary(value: unknown): Buffer {
+    if (
+      typeof value === "string" &&
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        value,
+      )
+    ) {
+      const bytes = Buffer.from(value, "base64");
+      if (bytes.toString("base64") === value) return bytes;
+    }
+    throw new Error(
+      "DynamoDB native B/BS values must be canonical base64 strings.",
     );
   }
 
@@ -2963,22 +3061,16 @@ export class DynamoDBDriver implements IDBDriver {
     const [key] = keys;
     switch (key) {
       case "B": {
-        if (typeof value.B !== "string") {
-          return null;
-        }
-        return { B: this.parseBinaryInput(value.B) ?? Buffer.from(value.B) };
+        return { B: this.decodeNativeBinary(value.B) };
       }
       case "BS": {
         if (!Array.isArray(value.BS)) {
-          return null;
+          throw new Error(
+            "DynamoDB native BS values must be an array of base64 strings.",
+          );
         }
         return {
-          BS: value.BS.map((entry) => {
-            if (typeof entry !== "string") {
-              return Buffer.from(String(entry));
-            }
-            return this.parseBinaryInput(entry) ?? Buffer.from(entry);
-          }),
+          BS: value.BS.map((entry) => this.decodeNativeBinary(entry)),
         };
       }
       case "L": {
@@ -2987,7 +3079,7 @@ export class DynamoDBDriver implements IDBDriver {
         }
         return {
           L: value.L.map(
-            (entry) => this.normalizeNativeInputValue(entry) as AttributeValue,
+            (entry) => this.normalizeNativeAttribute(entry) as AttributeValue,
           ),
         };
       }
@@ -2999,18 +3091,27 @@ export class DynamoDBDriver implements IDBDriver {
           M: Object.fromEntries(
             Object.entries(value.M).map(([entryKey, entryValue]) => [
               entryKey,
-              this.normalizeNativeInputValue(entryValue) as AttributeValue,
+              this.normalizeNativeAttribute(entryValue) as AttributeValue,
             ]),
           ),
         };
       }
       case "S":
       case "N":
+        return typeof value[key] === "string"
+          ? (value as unknown as AttributeValue)
+          : null;
       case "BOOL":
       case "NULL":
+        return typeof value[key] === "boolean"
+          ? (value as unknown as AttributeValue)
+          : null;
       case "SS":
       case "NS":
-        return value as unknown as AttributeValue;
+        return Array.isArray(value[key]) &&
+          value[key].every((entry) => typeof entry === "string")
+          ? (value as unknown as AttributeValue)
+          : null;
       default:
         return null;
     }

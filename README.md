@@ -100,6 +100,10 @@ For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with
 
 Elasticsearch and DynamoDB use a single SDK request attempt, including for reads: automatic retries are disabled because a lost response or server error can follow a committed write. This also overrides `AWS_MAX_ATTEMPTS` for DynamoDB. After a failed mutation, refresh and verify the data before retrying; the first request may already have applied.
 
+DynamoDB native JSON uses the official AWS `AttributeValue` format: `B` and `BS` contain canonical base64 strings, never hex or raw text. Binary values (including strings such as `"0xAB"` that also resemble hex) are decoded only as base64. AttributeValue shapes and binary encoding are checked across the script before its first request; scripts are still not transactions. Legacy updates with `AttributeUpdates` are dispatched as `UpdateItem`, including when `Expected` or `ReturnValues` is present.
+
+Elasticsearch REST scripts validate supported endpoints and body shapes before sending the first request. DELETE requests and non-search GET requests reject JSON bodies instead of silently discarding them: `DELETE /index` deletes the entire index, not documents matching a body filter. Scripts are not transactions; server-side errors can still follow successful mutations.
+
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
 
 <br/>
@@ -131,6 +135,8 @@ MongoDB `insertOne`, `insertMany`, `updateOne`, `updateMany`, `deleteOne`, and `
 
 MongoDB validates supported helper names, cursor limits, find projection/sort shapes, aggregate pipeline arrays, and no-argument helpers before submitting any operation in a script. These helper validation errors cannot follow an earlier delete or insert. Scripts are still not transactions: database/SDK errors can follow successful operations.
 
+MongoDB `createView` requires explicit non-empty view/source names and a pipeline array; use `[]` explicitly for an unfiltered view. Invalid pipelines are never replaced with an empty one, and options cannot override the named source or pipeline. Supported cursor modifiers are `limit`, `skip`, `toArray`, `pretty`, and `sort` for find helpers only. Other modifiers, including `explain`, `close`, and `collation`, are rejected rather than silently ignored; `toArray` and `pretty` accept no arguments.
+
 Redis query scripts are fully tokenized before the first command is sent. Invalid Unicode escapes and unpaired UTF-16 surrogates are rejected rather than addressing a replacement-character key or partially executing a script with a later parsing error. This validation does not make Redis scripts transactional; server-side errors can still follow successful commands.
 
 Redis structured table edits (hash, list, set, sorted set) reject JSON numeric literals that would lose precision before any replacement is sent. Use quoted strings for exact large integers or decimal member values, such as `{"account":"9007199254740993"}`. Ordinary Redis string values are not interpreted as JSON.
@@ -155,6 +161,8 @@ Click any table → the **Table Data Viewer** opens:
 Persisted edits are prevalidated against available column metadata before any write. Known unsupported edits fail before the batch is applied; where representation compatibility depends on the stored value, verification runs in the transaction and a mismatch rolls it back. Preview skipping does not bypass validation or verification. Schemaless sampling is not a complete database schema or a guarantee that every value has the sampled type.
 
 SQL table updates must affect exactly one row per edited row; an unexpected count aborts the transaction. This also protects against a cached primary key becoming non-unique after an external schema change. Table updates require rollback support, including temporal-only updates on MySQL; nontransactional engines such as MyISAM are blocked. Oracle catalog lookups preserve the exact identifier spelling, so quoted mixed-case objects do not borrow metadata from uppercase namesakes.
+
+SQL table deletes also require rollback support, even when the selected rows fit into one DELETE statement. Storage-engine support is checked again after preview confirmation and before execution, so a stale selection or changed engine cannot bypass this safeguard.
 
 Temporal-value verification is driver-specific: SQL Server and Oracle verify explicitly edited dates/times, while PostgreSQL, MySQL, and SQLite retain their existing temporal verification exceptions. Exact temporal persistence is not guaranteed by this safeguard for those three drivers.
 

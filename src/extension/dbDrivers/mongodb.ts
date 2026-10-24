@@ -667,6 +667,64 @@ function validateMongoshOperation({
       `[RapiDB] MongoDB ${op} does not support cursor modifiers. No operations were submitted.`,
     );
   }
+  for (const chain of chainOps) {
+    if (
+      !["limit", "skip", "toArray", "pretty"].includes(chain.op) &&
+      !(chain.op === "sort" && (op === "find" || op === "findOne"))
+    ) {
+      throw new Error(
+        `MongoDB ${op} cursor modifier "${chain.op}" is not supported. No operations were submitted.`,
+      );
+    }
+    if (
+      (chain.op === "toArray" || chain.op === "pretty") &&
+      chain.args.length
+    ) {
+      throw new Error(`MongoDB ${chain.op}() does not accept arguments.`);
+    }
+    if (
+      chain.op === "skip" &&
+      (chain.args.length !== 1 ||
+        !Number.isSafeInteger(chain.args[0]) ||
+        (chain.args[0] as number) < 0)
+    ) {
+      throw new Error("MongoDB skip() requires a non-negative safe integer.");
+    }
+    if (chain.op === "sort" && chain.args.length !== 1) {
+      throw new Error("MongoDB find().sort() expects one object argument.");
+    }
+  }
+  if (op === "createView") {
+    if (!Array.isArray(args[2])) {
+      throw new Error(
+        "MongoDB createView requires an explicit pipeline array; use [] explicitly for an unfiltered view.",
+      );
+    }
+    if (
+      args.length < 3 ||
+      args.length > 4 ||
+      args
+        .slice(0, 2)
+        .some((name) => typeof name !== "string" || name.length === 0)
+    ) {
+      throw new Error(
+        "MongoDB createView requires non-empty view and source collection names, a pipeline, and optional options.",
+      );
+    }
+    const viewOptions = args[3];
+    if (
+      viewOptions !== undefined &&
+      (viewOptions === null ||
+        typeof viewOptions !== "object" ||
+        Object.getPrototypeOf(viewOptions) !== Object.prototype ||
+        Object.hasOwn(viewOptions, "viewOn") ||
+        Object.hasOwn(viewOptions, "pipeline"))
+    ) {
+      throw new Error(
+        "MongoDB createView options must be a document and cannot override viewOn or pipeline.",
+      );
+    }
+  }
   if (["deleteOne", "deleteMany", "updateOne", "updateMany"].includes(op)) {
     const filter = args[0];
     if (
@@ -2055,7 +2113,7 @@ export class MongoDBDriver implements IDBDriver {
             ? Infinity
             : explicitLimit,
       );
-      const skipOp = chainOps.find((c) => c.op === "skip");
+      const skipOp = chainOps.filter((c) => c.op === "skip").at(-1);
       const skip =
         typeof skipOp?.args[0] === "number" && Number.isFinite(skipOp.args[0])
           ? Math.max(0, Math.floor(skipOp.args[0]))
@@ -2107,15 +2165,15 @@ export class MongoDBDriver implements IDBDriver {
         createView: async () => {
           const name = String(opArgs[0]);
           const viewOn = String(opArgs[1]);
-          const pipeline = Array.isArray(opArgs[2]) ? opArgs[2] : [];
+          const pipeline = opArgs[2] as Record<string, unknown>[];
           const options =
             opArgs[3] !== null && typeof opArgs[3] === "object"
               ? (opArgs[3] as Record<string, unknown>)
               : undefined;
           await this.requireDb(dbName).createCollection(name, {
+            ...(options ?? {}),
             viewOn,
             pipeline,
-            ...(options ?? {}),
             ...commandSdkOptions,
           });
           return this.buildMongoSingleRowQueryResult(

@@ -658,6 +658,40 @@ export class TableMutationService {
       return;
     }
 
+    try {
+      // Even one DELETE can remove only part of the selection, or more rows
+      // than expected after an external key change. Its affected-row check
+      // must be able to roll back. Recheck here: previews can outlive an engine
+      // change, and checking only multi-statement plans is not sufficient.
+      const risk = await driver.getMutationAtomicityRisk?.(
+        plan.database,
+        plan.schema,
+        plan.table,
+      );
+      if (risk) {
+        throw new Error(
+          `DELETE verification requires rollback support. ${risk}`,
+        );
+      }
+      assertConnectionWritable(
+        this.connectionManager,
+        plan.connectionId,
+        "delete data",
+      );
+      if (this.connectionManager.getDriver(plan.connectionId) !== driver) {
+        throw new Error(
+          "Connection changed during mutation preflight. Prepare the changes again before retrying.",
+        );
+      }
+    } catch (error) {
+      throw new DeleteExecutionError(
+        unattemptedDeleteResult(
+          identities,
+          error instanceof Error ? error.message : String(error),
+        ),
+      );
+    }
+
     let committed = false;
     try {
       await driver.runTransaction(plan.operations, undefined, {

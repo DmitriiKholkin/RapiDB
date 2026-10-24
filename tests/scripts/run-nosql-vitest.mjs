@@ -14,6 +14,7 @@ const child = spawn(
     "--no-file-parallelism",
     "tests/node/nosqlLive.test.ts",
     "tests/node/mutationDataSafetyLive.test.ts",
+    "tests/node/dynamodbNativeSafety.test.ts",
   ],
   {
     stdio: "inherit",

@@ -567,6 +567,7 @@ export class ElasticsearchDriver implements IDBDriver {
       if (!command) {
         throw this.buildInvalidRestCommandError();
       }
+      this.validateRestCommand(command);
       return command;
     });
   }
@@ -772,6 +773,73 @@ export class ElasticsearchDriver implements IDBDriver {
     };
   }
 
+  private resolveRestCommandKind(command: ElasticsearchRestCommand) {
+    const [first, second] = command.pathSegments;
+    const length = command.pathSegments.length;
+    const method = command.method;
+    if (
+      method === "GET" &&
+      length === 2 &&
+      (second === "_mapping" || second === "_settings")
+    )
+      return "metadata";
+    if (method === "PUT" && length === 1) return "createIndex";
+    if (method === "DELETE" && length === 1) return "deleteIndex";
+    if (
+      (method === "GET" || method === "POST") &&
+      ((length === 2 && second === "_search") ||
+        (length === 1 && first === "_search"))
+    )
+      return "search";
+    if (method === "GET" && length === 3 && second === "_doc")
+      return "getDocument";
+    if (
+      (method === "PUT" || method === "POST") &&
+      (length === 2 || length === 3) &&
+      second === "_doc"
+    )
+      return "indexDocument";
+    if (method === "POST" && length === 3 && second === "_update")
+      return "updateDocument";
+    if (method === "DELETE" && length === 3 && second === "_doc")
+      return "deleteDocument";
+    if (method === "PUT" && length === 2 && second === "_mapping")
+      return "putMapping";
+    if (method === "PUT" && length === 2 && second === "_settings")
+      return "putSettings";
+    if (method === "POST" && length === 1 && first === "_aliases")
+      return "updateAliases";
+    throw new Error(
+      `Unsupported Elasticsearch REST command: ${command.method} ${command.path}`,
+    );
+  }
+
+  private validateRestCommand(command: ElasticsearchRestCommand): void {
+    const kind = this.resolveRestCommandKind(command);
+    const label = `${command.method} ${command.path}`;
+    if (
+      ["metadata", "deleteIndex", "getDocument", "deleteDocument"].includes(
+        kind,
+      )
+    ) {
+      if (command.body !== undefined) {
+        throw new Error(
+          `${label} does not accept a JSON body; refusing to silently ignore it.`,
+        );
+      }
+      return;
+    }
+    const body = this.readObjectBody(command, label, {
+      allowEmpty: kind === "search",
+    });
+    if (kind === "search") {
+      this.enforceSearchRequestHardCap(body);
+      this.enforceSearchQueryParamsHardCap(
+        this.queryParamsToObject(command.queryParams),
+      );
+    }
+  }
+
   private async executeRestCommand(
     command: ElasticsearchRestCommand,
     startedAt: number,
@@ -792,12 +860,9 @@ export class ElasticsearchDriver implements IDBDriver {
     // fields such as index/id silently replace the resource named in the path.
     const queryParams = this.queryParamsToObject(command.queryParams);
     const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
+    const kind = this.resolveRestCommandKind(command);
 
-    if (
-      command.method === "GET" &&
-      command.pathSegments.length === 2 &&
-      (secondSegment === "_mapping" || secondSegment === "_settings")
-    ) {
+    if (kind === "metadata") {
       const params = { index: firstSegment, querystring: queryParams };
       const response =
         secondSegment === "_mapping"
@@ -812,7 +877,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (command.method === "PUT" && command.pathSegments.length === 1) {
+    if (kind === "createIndex") {
       const response = await client.indices.create(
         {
           index: firstSegment,
@@ -832,7 +897,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (command.method === "DELETE" && command.pathSegments.length === 1) {
+    if (kind === "deleteIndex") {
       const response = await client.indices.delete(
         {
           index: firstSegment,
@@ -850,11 +915,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      (command.method === "GET" || command.method === "POST") &&
-      thirdSegment === undefined &&
-      secondSegment === "_search"
-    ) {
+    if (kind === "search" && command.pathSegments.length === 2) {
       const body = this.enforceSearchRequestHardCap(
         this.readObjectBody(command, `${command.method} ${command.path}`, {
           allowEmpty: true,
@@ -875,11 +936,7 @@ export class ElasticsearchDriver implements IDBDriver {
       return this.buildRowsQueryResult(rows, startedAt);
     }
 
-    if (
-      (command.method === "GET" || command.method === "POST") &&
-      command.pathSegments.length === 1 &&
-      firstSegment === "_search"
-    ) {
+    if (kind === "search") {
       const body = this.enforceSearchRequestHardCap(
         this.readObjectBody(command, `${command.method} ${command.path}`, {
           allowEmpty: true,
@@ -899,11 +956,7 @@ export class ElasticsearchDriver implements IDBDriver {
       return this.buildRowsQueryResult(rows, startedAt);
     }
 
-    if (
-      command.method === "GET" &&
-      command.pathSegments.length === 3 &&
-      secondSegment === "_doc"
-    ) {
+    if (kind === "getDocument") {
       const response = await client.get(
         {
           index: firstSegment,
@@ -920,11 +973,7 @@ export class ElasticsearchDriver implements IDBDriver {
       return this.buildRowsQueryResult([row], startedAt);
     }
 
-    if (
-      (command.method === "PUT" || command.method === "POST") &&
-      secondSegment === "_doc" &&
-      (command.pathSegments.length === 2 || command.pathSegments.length === 3)
-    ) {
+    if (kind === "indexDocument") {
       const response = await client.index(
         {
           index: firstSegment,
@@ -947,11 +996,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      command.method === "POST" &&
-      command.pathSegments.length === 3 &&
-      secondSegment === "_update"
-    ) {
+    if (kind === "updateDocument") {
       const body = this.readObjectBody(command, `POST ${command.path}`);
       const response = await client.update(
         {
@@ -973,11 +1018,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      command.method === "DELETE" &&
-      command.pathSegments.length === 3 &&
-      secondSegment === "_doc"
-    ) {
+    if (kind === "deleteDocument") {
       const response = await client.delete(
         {
           index: firstSegment,
@@ -997,11 +1038,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      command.method === "PUT" &&
-      command.pathSegments.length === 2 &&
-      secondSegment === "_mapping"
-    ) {
+    if (kind === "putMapping") {
       const response = await client.indices.putMapping(
         {
           index: firstSegment,
@@ -1020,11 +1057,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      command.method === "PUT" &&
-      command.pathSegments.length === 2 &&
-      secondSegment === "_settings"
-    ) {
+    if (kind === "putSettings") {
       const response = await client.indices.putSettings(
         {
           index: firstSegment,
@@ -1043,11 +1076,7 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
-    if (
-      command.method === "POST" &&
-      command.pathSegments.length === 1 &&
-      firstSegment === "_aliases"
-    ) {
+    if (kind === "updateAliases") {
       const response = await client.indices.updateAliases(
         {
           querystring: queryParams,
