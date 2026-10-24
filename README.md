@@ -131,6 +131,8 @@ MongoDB `NumberDecimal(...)` requires exactly one string argument, such as `Numb
 
 MongoDB `BinData(subtype, base64)` requires an integer subtype from 0 to 255 and a canonical base64 string (including padding when needed). Invalid literals are rejected before any operation in the script is sent, rather than silently decoding to different bytes.
 
+MongoDB regular expressions preserve the `i`, `m`, `s`, and `u` flags in BSON. JavaScript-only flags `d`, `g`, `v`, and `y` are rejected before any operation in the script is sent; they must never be silently dropped or converted into different matching rules for an update or delete.
+
 MongoDB `Date` / `ISODate` literals reject invalid dates before any operation in the script is sent. They accept no arguments (current time), one date string or Date value, or one to seven safe integer arguments. Calendar-component arguments follow JavaScript's local-time `Date` constructor; use an ISO string with an explicit time zone for an unambiguous instant. Arguments are never silently discarded, and invalid dates cannot become Unix epoch during BSON serialization.
 
 MongoDB updates and deletes require an explicit document filter; use `{}` explicitly to target all documents. Cursor modifiers on non-cursor operations, such as `deleteMany({}).limit(1)`, are rejected rather than silently ignored. Explicit database/collection names must be non-empty strings. BSON `Timestamp(t, i)` and `Timestamp({t, i})` components must be unsigned 32-bit integers, without coercion or rounding (`Timestamp(t)` defaults the increment to zero). Invalid filters, namespaces, modifiers, and timestamps are rejected before any operation in the script is sent.

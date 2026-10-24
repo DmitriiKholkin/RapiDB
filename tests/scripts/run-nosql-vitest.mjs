@@ -16,6 +16,7 @@ const child = spawn(
     "tests/node/mutationDataSafetyLive.test.ts",
     "tests/node/dynamodbNativeSafety.test.ts",
     "tests/node/queryTargetSafetyLive.test.ts",
+    "tests/node/mongodbMongoshRegexSafety.test.ts",
   ],
   {
     stdio: "inherit",

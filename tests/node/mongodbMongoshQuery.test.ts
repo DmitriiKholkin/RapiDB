@@ -1,5 +1,6 @@
 import {
   Binary,
+  BSONRegExp,
   BSONSymbol,
   Code,
   DBRef,
@@ -515,14 +516,18 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     const { driver, mockDeleteMany } = createMockDriver();
     await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
       Object.defineProperty(RegExp["proto"+"type"], "source", { get: function() { return ".*"; } })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({ name: /^Alice$/ });
+    expect(mockDeleteMany).toHaveBeenCalledWith({
+      name: new BSONRegExp("^Alice$"),
+    });
   });
 
   it("uses native RegExp flag getters after query code changes ignoreCase", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
     await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
       Object.defineProperty(nativeRegExp["proto"+"type"], "ignoreCase", { get: function() { return true; } })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({ name: /^Alice$/ });
+    expect(mockDeleteMany).toHaveBeenCalledWith({
+      name: new BSONRegExp("^Alice$"),
+    });
   });
 
   it("preserves RegExp filters after query code replaces Symbol.hasInstance", async () => {
@@ -530,7 +535,7 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     await driver.query(`db.users.deleteMany({ name: { $nin: [/^Alice$/] } });
       Object.defineProperty(nativeRegExp, Symbol.hasInstance, { value: function() { return false; } })`);
     expect(mockDeleteMany).toHaveBeenCalledWith({
-      name: { $nin: [/^Alice$/] },
+      name: { $nin: [new BSONRegExp("^Alice$")] },
     });
   });
 

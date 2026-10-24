@@ -1,3 +1,4 @@
+import { BSON } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 
@@ -52,6 +53,10 @@ describe("MongoDB optimistic literal values", () => {
     );
     expect(preview).toContain('"payload": { "$eq":');
     await driver.query(preview);
-    expect(updateOne.mock.calls[1][0]).toEqual(updateOne.mock.calls[0][0]);
+    // Native JS RegExp and explicit BSONRegExp can represent the same filter.
+    // Compare the actual wire values, not their in-memory wrapper classes.
+    expect(BSON.serialize(updateOne.mock.calls[1][0])).toEqual(
+      BSON.serialize(updateOne.mock.calls[0][0]),
+    );
   });
 });

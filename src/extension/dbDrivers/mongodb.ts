@@ -386,7 +386,7 @@ const MONGOSH_SANDBOX_SETUP = `
   globalThis.Proxy = undefined;
   const Date = function mongoDate(...args) { return marker('Date', args); };
   const ISODate = Date;
-  const RegExp = function mongoRegExp(pattern, flags) { return marker('RegExp', [pattern, flags]); };
+  const RegExp = function mongoRegExp(...args) { return marker('RegExp', args); };
   const ObjectId = function mongoObjectId(hex) { return marker('ObjectId', [hex]); };
   const BinData = function mongoBinData(...args) { return marker('BinData', args); };
   const DBRef = function mongoDBRef(collection, oid, database) { return marker('DBRef', [collection, oid, database]); };
@@ -459,6 +459,31 @@ function reviveMongoshDate(args: unknown[]): Date {
   return date;
 }
 
+function reviveMongoshRegExp(args: unknown[]): BSONRegExp {
+  if (args.length > 2) {
+    throw new Error(
+      "MongoDB RegExp accepts a pattern and optional flags only.",
+    );
+  }
+  const original = args[0] instanceof BSONRegExp ? args[0] : undefined;
+  const regex = new RegExp(
+    original?.pattern ?? (args[0] === undefined ? "" : String(args[0])),
+    args[1] === undefined ? original?.options : String(args[1]),
+  );
+  if (/[^imsu]/.test(regex.flags)) {
+    throw new Error(
+      "MongoDB regex flags must be limited to i, m, s, and u. JavaScript-only flags d, g, v, and y are not supported.",
+    );
+  }
+  if (regex.source.includes("\u0000")) {
+    throw new Error("MongoDB regex patterns cannot contain null bytes.");
+  }
+  // BSON's native JS RegExp serializer maps g to s and drops s/u.
+  // That can broaden a destructive filter. Use an explicit BSON value
+  // for every revived regex, including nested filters and documents.
+  return new BSONRegExp(regex.source, regex.flags);
+}
+
 function reviveMongoshValue(value: unknown): unknown {
   if (value === null || typeof value !== "object") return value;
   const record = value as { kind: string; value?: unknown; args?: unknown[] };
@@ -491,10 +516,7 @@ function reviveMongoshValue(value: unknown): unknown {
       case "Date":
         return reviveMongoshDate(args);
       case "RegExp":
-        return new RegExp(
-          String(args[0]),
-          args[1] === undefined ? undefined : String(args[1]),
-        );
+        return reviveMongoshRegExp(args);
       case "ObjectId":
         return args[0] === undefined
           ? new ObjectId()
