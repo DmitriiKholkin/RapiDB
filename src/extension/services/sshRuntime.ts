@@ -12,6 +12,7 @@ export interface ConnectionSshSettings {
   username: string;
   hostVerificationMode: ConnectionSshHostVerificationMode;
   fingerprintSha256?: string;
+  readyTimeoutMs?: number;
   auth:
     | {
         kind: "password";
@@ -51,8 +52,12 @@ export type SshRuntimeTransport =
 export interface SshRuntime {
   transport: SshRuntimeTransport;
   verifiedFingerprintSha256: string;
+  onDidClose?(listener: (error: Error) => void): { dispose(): void };
   dispose(): Promise<void>;
 }
+
+const SSH_KEEPALIVE_INTERVAL_MS = 15_000;
+const SSH_KEEPALIVE_COUNT_MAX = 3;
 
 type SshHostVerifier = (hostKey: Buffer | string) => boolean;
 
@@ -61,6 +66,9 @@ type SshClientConnectOptions = {
   port: number;
   username: string;
   hostVerifier: SshHostVerifier;
+  readyTimeout?: number;
+  keepaliveInterval: number;
+  keepaliveCountMax: number;
   password?: string;
   privateKey?: string;
   passphrase?: string;
@@ -101,6 +109,8 @@ class SshTransportLifetime {
   private readonly abortController = new AbortController();
   private readonly streams = new Set<Duplex>();
   readonly pendingForwards = new Set<(error: Error) => void>();
+  private readonly closeListeners = new Set<(error: Error) => void>();
+  private disposed = false;
   private ended = false;
   private readonly externalSignal?: AbortSignal;
   private readonly onExternalAbort = () => {
@@ -145,6 +155,28 @@ class SshTransportLifetime {
     return stream;
   }
 
+  onDidClose(listener: (error: Error) => void): { dispose(): void } {
+    if (this.signal.aborted) {
+      let active = true;
+      queueMicrotask(() => {
+        if (active && !this.disposed) listener(this.signal.reason);
+      });
+      return {
+        dispose: () => {
+          active = false;
+        },
+      };
+    }
+    this.closeListeners.add(listener);
+    return { dispose: () => this.closeListeners.delete(listener) };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.closeListeners.clear();
+    this.stop();
+  }
+
   stop(error = new Error("[RapiDB] SSH runtime disposed")): void {
     this.externalSignal?.removeEventListener("abort", this.onExternalAbort);
     if (this.signal.aborted) return;
@@ -157,6 +189,13 @@ class SshTransportLifetime {
       this.ended = true;
       try {
         this.client.end();
+      } catch {}
+    }
+    const listeners = [...this.closeListeners];
+    this.closeListeners.clear();
+    for (const listener of listeners) {
+      try {
+        listener(error);
       } catch {}
     }
   }
@@ -500,6 +539,9 @@ async function createVerifiedClient(
         port: ssh.port,
         username: ssh.username,
         hostVerifier: hostVerifierState.hostVerifier,
+        readyTimeout: ssh.readyTimeoutMs,
+        keepaliveInterval: SSH_KEEPALIVE_INTERVAL_MS,
+        keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
         password: ssh.auth.kind === "password" ? ssh.auth.password : undefined,
         privateKey:
           ssh.auth.kind === "privateKey" ? ssh.auth.privateKey : undefined,
@@ -591,9 +633,10 @@ async function createTcpForwardRuntime(
         remotePort: request.remotePort,
       },
       verifiedFingerprintSha256,
+      onDidClose: (listener) => lifetime.onDidClose(listener),
       dispose: () => {
         if (disposal) return disposal;
-        lifetime.stop();
+        lifetime.dispose();
         disposal = close();
         return disposal;
       },
@@ -603,9 +646,7 @@ async function createTcpForwardRuntime(
     await close();
     throw error;
   } finally {
-    if (lifetime.signal.aborted) {
-      lifetime.signal.removeEventListener("abort", onAbort);
-    }
+    lifetime.signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -663,8 +704,9 @@ async function createHttpAgentRuntime(
       httpsAgent,
     },
     verifiedFingerprintSha256,
+    onDidClose: (listener) => lifetime.onDidClose(listener),
     dispose: async () => {
-      lifetime.stop();
+      lifetime.dispose();
     },
   };
 }

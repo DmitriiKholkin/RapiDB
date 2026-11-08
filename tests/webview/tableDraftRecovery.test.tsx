@@ -130,7 +130,7 @@ function mountController(
     preserveScrollPositionRef: { current: vi.fn() },
     rowsRef: { current: [] as Row[] },
     mongoIdTypesRef: { current: [] },
-    mongoValueTypesRef: { current: [] },
+    rowValueTypesRef: { current: [] },
   };
   const initialDraft = draft();
   const hook = renderHook(() =>

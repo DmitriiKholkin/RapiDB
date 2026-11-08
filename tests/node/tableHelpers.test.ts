@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
-import { verifyTransaction } from "../../src/extension/dbDrivers/transactionVerification";
+import {
+  TransactionVerificationError,
+  verifyTransaction,
+} from "../../src/extension/dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
   IDBDriver,
@@ -563,7 +566,13 @@ describe("table helpers", () => {
     );
   });
 
-  it("passes verification into an atomic transaction and fails the whole apply on mismatch", async () => {
+  it.each([
+    { rollbackConfirmed: true, status: "verification_failed" },
+    { rollbackConfirmed: false, status: "unknown" },
+  ])("passes verification into an atomic transaction and fails the whole apply on mismatch (rollback confirmed: $rollbackConfirmed)", async ({
+    rollbackConfirmed,
+    status,
+  }) => {
     const query = vi.fn(async () => ({
       columns: ["__col_0"],
       rows: [{ __col_0: "mismatch" }],
@@ -580,7 +589,12 @@ describe("table helpers", () => {
           options?.verifications,
           transactionRead,
           context,
-        );
+        ).catch((error: unknown) => {
+          if (error instanceof TransactionVerificationError) {
+            error.rollbackConfirmed = rollbackConfirmed;
+          }
+          throw error;
+        });
       },
     };
     const manager = { getDriver: () => driver } as never;
@@ -613,11 +627,16 @@ describe("table helpers", () => {
     expect(result).toMatchObject({
       success: false,
       failedRows: [0],
+      changesPossible: !rollbackConfirmed,
+      outcomeUnknown: !rollbackConfirmed,
       rowOutcomes: [
-        { rowIndex: 0, status: "verification_failed", columns: ["amount"] },
+        { rowIndex: 0, status },
         { rowIndex: 1, status: "skipped" },
       ],
     });
+    if (rollbackConfirmed) {
+      expect(result.rowOutcomes?.[0]).toMatchObject({ columns: ["amount"] });
+    }
     expect(result.insertApplied).not.toBe(true);
   });
 
@@ -1525,13 +1544,14 @@ describe("table helpers", () => {
     expect(maxInFlightExistenceChecks).toBeLessThanOrEqual(8);
   });
 
-  it("adds exact affected-row expectations to chunked delete plans", async () => {
+  it("deletes each MySQL single-key row with its own exact affected-row expectation", async () => {
     const getMutationAtomicityRisk = vi.fn(async () => null);
     const mutationService = new TableMutationService(
       {
         getConnection: () => ({
           id: "conn-1",
           name: "Writable",
+          type: "mysql",
           readOnly: false,
         }),
         getDriver: () => ({ ...fakeDriver, getMutationAtomicityRisk }),
@@ -1548,10 +1568,61 @@ describe("table helpers", () => {
     );
 
     expect(plan?.executionMode).toBe("transaction");
-    expect(plan?.operations).toEqual([
-      expect.objectContaining({ expectedAffectedRows: 1000 }),
-      expect.objectContaining({ expectedAffectedRows: 1 }),
-    ]);
+    expect(plan?.operations).toHaveLength(1001);
+    expect(plan?.operations[1000]).toEqual({
+      sql: expect.not.stringContaining(" IN ("),
+      params: [1001],
+      expectedAffectedRows: 1,
+    });
+    expect(
+      plan?.operations.every(
+        (operation) =>
+          operation.expectedAffectedRows === 1 &&
+          operation.params?.length === 1,
+      ),
+    ).toBe(true);
+    expect(getMutationAtomicityRisk).toHaveBeenCalledWith(
+      "main",
+      "public",
+      "fixture_rows",
+    );
+  });
+
+  it("batches PostgreSQL single-key deletes with a unique-key guard and exact counts", async () => {
+    const getMutationAtomicityRisk = vi.fn(async () => null);
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({
+          id: "conn-1",
+          name: "Writable",
+          type: "pg",
+          readOnly: false,
+        }),
+        getDriver: () => ({ ...fakeDriver, getMutationAtomicityRisk }),
+      } as never,
+      { getColumns: async () => columns },
+    );
+
+    const plan = await mutationService.prepareDeleteRowsPlan(
+      "conn-1",
+      "main",
+      "public",
+      "fixture_rows",
+      Array.from({ length: 1001 }, (_, index) => ({ id: index + 1 })),
+    );
+
+    expect(plan?.executionMode).toBe("transaction");
+    expect(
+      plan?.operations.map((operation) => operation.expectedAffectedRows),
+    ).toEqual([500, 500, 1]);
+    expect(
+      plan?.operations.map((operation) => operation.params?.length),
+    ).toEqual([500, 500, 1]);
+    for (const operation of plan?.operations ?? []) {
+      expect(operation.sql).toMatch(
+        /^DELETE FROM .+ WHERE (\S+) IN \(SELECT \1 FROM .+ WHERE \1 IN \(.+\) GROUP BY \1 HAVING COUNT\(\*\) = 1\)$/,
+      );
+    }
     expect(getMutationAtomicityRisk).toHaveBeenCalledWith(
       "main",
       "public",

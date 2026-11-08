@@ -5,10 +5,14 @@ import type {
   ReadOnlyQueryDecision,
   ReadOnlyQueryGuard,
 } from "../dbDrivers/types";
+import { splitMySQLScript } from "./mysqlScriptSplit";
 import {
   hasPostgresDollarQuoteTag,
+  isAmbiguousMysqlDashComment,
+  isMysqlDashCommentStart,
   oracleAlternativeQuoteEnd,
   readPostgresDollarQuoteTag,
+  toPostgresWireText,
 } from "./sqlStatementScan";
 
 const ALLOWED_READ_ONLY_QUERY: ReadOnlyQueryDecision = { allowed: true };
@@ -79,6 +83,7 @@ const SQLITE_PRAGMA_ARGUMENT_SAFE_ALLOWLIST = new Set([
   "foreign_key_check",
   "foreign_key_list",
   "index_info",
+  "index_list",
   "index_xinfo",
   "integrity_check",
   "quick_check",
@@ -140,6 +145,173 @@ const SQL_MUTATION_KEYWORDS = new Set([
   "vacuum",
 ]);
 
+const SQL_EXPRESSION_CONTEXT_PREVIOUS_TOKENS = new Set([
+  "where",
+  "and",
+  "or",
+  "by",
+  "having",
+  "=",
+  "<",
+  ">",
+  "+",
+  "-",
+  "/",
+  "%",
+]);
+
+const SEMICOLON_SEPARATED_STATEMENT_DIALECTS: ReadonlySet<QueryEditorSqlDialect> =
+  new Set(["postgresql", "mysql", "sqlite"]);
+
+const SQL_EXPRESSION_OPERATOR_WORDS = new Set([
+  "and",
+  "or",
+  "is",
+  "isnull",
+  "notnull",
+  "in",
+  "not",
+  "between",
+  "like",
+  "ilike",
+  "similar",
+  "collate",
+  "at",
+  "escape",
+  "glob",
+  "regexp",
+  "rlike",
+  "div",
+  "mod",
+  "xor",
+]);
+
+const TRANSACTION_CONTROL_KEYWORDS: Readonly<
+  Partial<Record<QueryEditorSqlDialect, ReadonlySet<string>>>
+> = {
+  postgresql: new Set([
+    "abort",
+    "begin",
+    "commit",
+    "end",
+    "execute",
+    "prepare",
+    "release",
+    "rollback",
+    "savepoint",
+    "set",
+    "start",
+  ]),
+  mysql: new Set([
+    "begin",
+    "commit",
+    "release",
+    "rollback",
+    "savepoint",
+    "set",
+    "start",
+  ]),
+};
+
+const TRANSACTION_CONTROL_IDENTIFIER_PREVIOUS_TOKENS = new Set([
+  "from",
+  "join",
+  "as",
+  "on",
+  "then",
+  "else",
+  "when",
+  "character",
+  "char",
+  "describe",
+  "desc",
+  "table",
+]);
+
+const TRANSACTION_CONTROL_IDENTIFIER_NEXT_TOKENS = new Set([
+  "asc",
+  "desc",
+  "nulls",
+  "from",
+  "as",
+  "on",
+  "where",
+  "using",
+  "then",
+  "else",
+  "when",
+  "end",
+  "group",
+  "order",
+  "limit",
+  "offset",
+  "union",
+  "except",
+  "intersect",
+  "join",
+  "inner",
+  "left",
+  "right",
+  "full",
+  "cross",
+  "natural",
+  "having",
+  "window",
+  "over",
+  "filter",
+]);
+
+const POSTGRES_EXPLAIN_OPTIONS = new Set([
+  "buffers",
+  "costs",
+  "format",
+  "generic_plan",
+  "memory",
+  "serialize",
+  "settings",
+  "summary",
+  "timing",
+  "verbose",
+  "wal",
+]);
+
+const TSQL_STATEMENT_KEYWORDS = new Set([
+  "shutdown",
+  "dbcc",
+  "reconfigure",
+  "deny",
+  "waitfor",
+  "enable",
+  "disable",
+  "writetext",
+  "updatetext",
+  "receive",
+  "send",
+  "move",
+  "open",
+  "close",
+  "deallocate",
+]);
+
+const MYSQL_DELIMITER_DIRECTIVE = /(?:^|[\r\n])\s*DELIMITER\b/i;
+
+const SQL_COLUMN_LIST_PREVIOUS_TOKENS = new Set([
+  "select",
+  "distinct",
+  ",",
+  "as",
+]);
+
+const SQL_COLUMN_LIST_NEXT_TOKENS = new Set(["from", ",", "as", ")"]);
+
+const SELECT_INTO_STATEMENT_KEYWORDS = new Set([
+  "select",
+  "insert",
+  "merge",
+  "update",
+  "delete",
+]);
+
 const SQL_MUTATING_FUNCTIONS = new Set([
   "nextval",
   "setval",
@@ -155,6 +327,22 @@ const SQL_MUTATING_FUNCTIONS = new Set([
   "pg_logical_slot_get_changes",
   "pg_logical_slot_get_binary_changes",
   "pg_logical_emit_message",
+  "pg_switch_wal",
+  "pg_switch_xlog",
+  "pg_stat_statements_reset",
+  "pg_copy_logical_replication_slot",
+  "pg_copy_physical_replication_slot",
+  "pg_rotate_logfile",
+  "pg_promote",
+  "pg_wal_replay_pause",
+  "pg_wal_replay_resume",
+  "pg_xlog_replay_pause",
+  "pg_xlog_replay_resume",
+  "pg_backup_start",
+  "pg_backup_stop",
+  "pg_start_backup",
+  "pg_stop_backup",
+  "pg_log_backend_memory_contexts",
   "pg_advisory_lock",
   "pg_advisory_xact_lock",
   "pg_try_advisory_lock",
@@ -182,7 +370,12 @@ const SQL_MUTATING_FUNCTIONS = new Set([
   "lo_lseek",
 ]);
 
-const SQL_MUTATING_FUNCTION_PREFIXES = ["dblink_", "pg_advisory_"];
+const SQL_MUTATING_FUNCTION_PREFIXES = [
+  "dblink_",
+  "pg_advisory_",
+  "pg_stat_reset",
+  "pg_replication_origin_",
+];
 const MYSQL_SESSION_MUTATING_FUNCTIONS = new Set([
   "get_lock",
   "release_lock",
@@ -201,6 +394,60 @@ function isMutatingFunctionCall(
   }
   return SQL_MUTATING_FUNCTION_PREFIXES.some((prefix) =>
     keyword.startsWith(prefix),
+  );
+}
+
+function isSqlMutationKeywordAt(
+  tokens: string[],
+  index: number,
+  dialect?: QueryEditorSqlDialect,
+): boolean {
+  const keyword = tokens[index]?.toLowerCase() ?? "";
+  if (!SQL_MUTATION_KEYWORDS.has(keyword)) {
+    return false;
+  }
+  if (keyword === "replace" && tokens[index + 1] === "(") {
+    return false;
+  }
+  return dialect && SEMICOLON_SEPARATED_STATEMENT_DIALECTS.has(dialect)
+    ? isNestedStatementStartPosition(tokens, index)
+    : isSqlStatementStartPosition(tokens, index);
+}
+
+function isNestedStatementStartPosition(
+  tokens: string[],
+  index: number,
+): boolean {
+  if (index === 0) {
+    return true;
+  }
+  if (tokens[index - 1] !== "(") {
+    return false;
+  }
+  const next = tokens[index + 1]?.toLowerCase();
+  return (
+    next === undefined ||
+    (/^[\p{L}\p{Nl}_(*@]/u.test(next) &&
+      !SQL_EXPRESSION_OPERATOR_WORDS.has(next))
+  );
+}
+
+function isSqlStatementStartPosition(tokens: string[], index: number): boolean {
+  const previous = tokens[index - 1]?.toLowerCase();
+  const next = tokens[index + 1]?.toLowerCase();
+  if (previous === "." && /^[\p{L}\p{Nl}_]/u.test(tokens[index - 2] ?? "")) {
+    return false;
+  }
+  if (previous && SQL_EXPRESSION_CONTEXT_PREVIOUS_TOKENS.has(previous)) {
+    return false;
+  }
+  if (previous === "(" && (next === ")" || next === "," || next === "as")) {
+    return false;
+  }
+  return !(
+    previous &&
+    SQL_COLUMN_LIST_PREVIOUS_TOKENS.has(previous) &&
+    (next === undefined || SQL_COLUMN_LIST_NEXT_TOKENS.has(next))
   );
 }
 
@@ -280,27 +527,56 @@ export function sqlReadOnlyQueryGuard(
   if (dialect === "plsql") {
     return denyReadOnlyQuery(ORACLE_READ_ONLY_ENFORCEMENT_MESSAGE);
   }
+  const statements = readOnlyClassifiedStatements(queryText, dialect);
+  if (
+    !statements ||
+    (dialect === "mysql" &&
+      !matchesMysqlDriverStatements(queryText, statements.length))
+  ) {
+    return denyReadOnlyQuery(SQL_READ_ONLY_QUERY_REASON);
+  }
+  return allowReadOnlyQuery();
+}
+
+function readOnlyClassifiedStatements(
+  queryText: string,
+  dialect: QueryEditorSqlDialect,
+): string[] | undefined {
   const sanitized = sanitizeSqlForReadOnlyClassification(queryText, dialect);
   if (
     sanitized.includes(EXECUTABLE_MYSQL_COMMENT_SENTINEL) ||
     sanitized.includes(AMBIGUOUS_SQL_SYNTAX_SENTINEL)
   ) {
-    return denyReadOnlyQuery(SQL_READ_ONLY_QUERY_REASON);
+    return undefined;
   }
   const statements = sanitized
     .split(";")
     .map((statement) => statement.trim())
     .filter((statement) => statement.length > 0);
 
-  if (statements.length === 0) {
-    return denyReadOnlyQuery(SQL_READ_ONLY_QUERY_REASON);
-  }
+  return statements.length > 0 &&
+    statements.every((statement) => isReadOnlySqlStatement(statement, dialect))
+    ? statements
+    : undefined;
+}
 
-  return statements.every((statement) =>
-    isReadOnlySqlStatement(statement, dialect),
-  )
-    ? allowReadOnlyQuery()
-    : denyReadOnlyQuery(SQL_READ_ONLY_QUERY_REASON);
+function matchesMysqlDriverStatements(
+  queryText: string,
+  statementCount: number,
+): boolean {
+  let driverStatements: string[];
+  try {
+    driverStatements = splitMySQLScript(queryText);
+  } catch {
+    return false;
+  }
+  return (
+    driverStatements.length === statementCount &&
+    driverStatements.every(
+      (statement) =>
+        readOnlyClassifiedStatements(statement, "mysql")?.length === 1,
+    )
+  );
 }
 
 export function createSqlReadOnlyQueryGuard(
@@ -328,20 +604,36 @@ function resolveDriverCapabilities(
   return driver?.getCapabilities?.();
 }
 
-function isSqlLineComment(
+function sqlLineCommentEnd(
   queryText: string,
   index: number,
   dialect: QueryEditorSqlDialect,
-): boolean {
-  if (dialect === "mysql" && queryText[index] === "#") {
-    return true;
+): number | null | undefined {
+  let start: number;
+  if (queryText[index] === "#") {
+    if (dialect === "sql") return null;
+    if (dialect !== "mysql") return undefined;
+    start = index + 1;
+  } else if (queryText[index] === "-" && queryText[index + 1] === "-") {
+    if (
+      (dialect === "mysql" || dialect === "sql") &&
+      !isMysqlDashCommentStart(queryText, index)
+    ) {
+      return dialect === "sql" || isAmbiguousMysqlDashComment(queryText, index)
+        ? null
+        : undefined;
+    }
+    start = index + 2;
+  } else {
+    return undefined;
   }
-  if (queryText[index] !== "-" || queryText[index + 1] !== "-") {
-    return false;
-  }
-  if (dialect !== "mysql" && dialect !== "sql") return true;
-  const following = queryText.charCodeAt(index + 2);
-  return following <= 32;
+  const newline = queryText.indexOf("\n", start);
+  const lineEnd = newline < 0 ? queryText.length : newline;
+  if (dialect === "mysql" || dialect === "sqlite") return lineEnd;
+  const carriageReturn = queryText.indexOf("\r", start);
+  if (carriageReturn < 0 || carriageReturn >= lineEnd) return lineEnd;
+  if (dialect === "postgresql") return carriageReturn;
+  return carriageReturn + 1 === lineEnd ? carriageReturn : null;
 }
 
 function skipSqlTrivia(
@@ -353,15 +645,10 @@ function skipSqlTrivia(
   while (pos < queryText.length) {
     const char = queryText[pos];
     const next = queryText[pos + 1];
-    if (isSqlLineComment(queryText, pos, dialect)) {
-      pos += char === "#" ? 1 : 2;
-      while (
-        pos < queryText.length &&
-        queryText[pos] !== "\n" &&
-        queryText[pos] !== "\r"
-      ) {
-        pos += 1;
-      }
+    const lineCommentEnd = sqlLineCommentEnd(queryText, pos, dialect);
+    if (lineCommentEnd === null) break;
+    if (lineCommentEnd !== undefined) {
+      pos = lineCommentEnd;
       continue;
     }
     if (char === "/" && next === "*") {
@@ -385,9 +672,14 @@ function skipSqlTrivia(
 }
 
 function sanitizeSqlForReadOnlyClassification(
-  queryText: string,
+  rawQueryText: string,
   dialect: QueryEditorSqlDialect = "sql",
 ): string {
+  if (dialect === "mysql" && MYSQL_DELIMITER_DIRECTIVE.test(rawQueryText)) {
+    return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
+  }
+  const queryText =
+    dialect === "postgresql" ? toPostgresWireText(rawQueryText) : rawQueryText;
   let sanitized = "";
 
   for (let index = 0; index < queryText.length; ) {
@@ -407,16 +699,13 @@ function sanitizeSqlForReadOnlyClassification(
       }
     }
 
-    if (isSqlLineComment(queryText, index, dialect)) {
+    const lineCommentEnd = sqlLineCommentEnd(queryText, index, dialect);
+    if (lineCommentEnd === null) {
+      return AMBIGUOUS_SQL_SYNTAX_SENTINEL;
+    }
+    if (lineCommentEnd !== undefined) {
       sanitized += " ";
-      index += char === "#" ? 1 : 2;
-      while (
-        index < queryText.length &&
-        queryText[index] !== "\n" &&
-        queryText[index] !== "\r"
-      ) {
-        index += 1;
-      }
+      index = lineCommentEnd;
       continue;
     }
 
@@ -449,7 +738,7 @@ function sanitizeSqlForReadOnlyClassification(
     }
 
     if (char === "'") {
-      sanitized += dialect === "mysql" ? " __rapidb_quoted_value__ " : " ";
+      sanitized += " __rapidb_quoted_value__ ";
       index += 1;
       let closed = false;
       while (index < queryText.length) {
@@ -527,7 +816,7 @@ function sanitizeSqlForReadOnlyClassification(
       } else if (dialect === "mysql") {
         sanitized += " __rapidb_quoted_value__ ";
       } else {
-        sanitized += " ";
+        sanitized += " __rapidb_quoted_identifier__ ";
       }
       continue;
     }
@@ -561,7 +850,7 @@ function sanitizeSqlForReadOnlyClassification(
       ) {
         sanitized += ` ${lowered} (`;
       } else {
-        sanitized += " ";
+        sanitized += " __rapidb_quoted_identifier__ ";
       }
       continue;
     }
@@ -571,7 +860,7 @@ function sanitizeSqlForReadOnlyClassification(
         ? readPostgresDollarQuoteTag(queryText, index)
         : null;
     if (dollarQuoteTag) {
-      sanitized += " ";
+      sanitized += " __rapidb_quoted_value__ ";
       index += dollarQuoteTag.length;
       const closingIndex = queryText.indexOf(dollarQuoteTag, index);
       if (closingIndex === -1) {
@@ -609,9 +898,19 @@ export function mayChangeDatabaseSchema(
     return true;
   }
   if (
-    /\b(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE)\b/i.test(
+    /\b(?:CREATE|ALTER|DROP|TRUNCATE|RENAME|COMMENT|GRANT|REVOKE|ATTACH|DETACH|SP_RENAME)\b|\bIMPORT\s+FOREIGN\s+SCHEMA\b/i.test(
       sanitizedQuery,
     )
+  ) {
+    return true;
+  }
+  if (
+    (dialect === "postgresql" || dialect === "transactsql") &&
+    sanitizedQuery
+      .split(";")
+      .some((statement) =>
+        createsTableFromSelect(tokenizeSql(statement, dialect)),
+      )
   ) {
     return true;
   }
@@ -621,40 +920,149 @@ export function mayChangeDatabaseSchema(
   );
 }
 
-function tokenizeSql(statement: string): string[] {
-  return (
-    statement.match(/[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$#]*|[(),.]/gu) ?? []
-  );
+function createsTableFromSelect(tokens: string[]): boolean {
+  let statementKeyword: string | undefined;
+  for (const token of tokens) {
+    const keyword = token.toLowerCase();
+    if (SELECT_INTO_STATEMENT_KEYWORDS.has(keyword)) {
+      statementKeyword = keyword;
+    } else if (keyword === "into" && statementKeyword === "select") {
+      return true;
+    }
+  }
+  return false;
+}
+
+function tokenizeSql(
+  statement: string,
+  dialect: QueryEditorSqlDialect,
+): string[] {
+  const pattern =
+    dialect === "transactsql" || dialect === "plsql"
+      ? /[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$#]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|[(),.]|[^\s[\]]/gu
+      : /[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{N}\p{M}_$]*|[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?|[(),.]|[^\s[\]]/gu;
+  return statement.match(pattern) ?? [];
 }
 
 function isReadOnlySqlStatement(
   statement: string,
   dialect: QueryEditorSqlDialect,
 ): boolean {
-  const tokens = tokenizeSql(statement);
+  const tokens = tokenizeSql(statement, dialect);
   if (tokens.length === 0) {
     return false;
   }
   if (dialect === "mysql" && hasMysqlSessionSideEffect(statement, tokens)) {
     return false;
   }
-  if (dialect === "transactsql" && hasTsqlSequenceAdvance(tokens)) {
+  if (hasTransactionControlStatement(tokens, dialect)) {
+    return false;
+  }
+  if (
+    (dialect === "transactsql" || dialect === "mysql") &&
+    hasSequenceAdvance(tokens, dialect)
+  ) {
+    return false;
+  }
+  if (dialect === "transactsql" && hasTsqlStatementStarter(tokens)) {
     return false;
   }
 
-  if (isReadOnlySqlTokens(tokens)) {
+  if (isReadOnlySqlTokens(tokens, dialect)) {
     return true;
   }
 
   return isDialectReadOnlySqlStatement(statement, tokens, dialect);
 }
 
-function hasTsqlSequenceAdvance(tokens: string[]): boolean {
-  for (let index = 0; index + 2 < tokens.length; index += 1) {
+function hasTransactionControlStatement(
+  tokens: string[],
+  dialect: QueryEditorSqlDialect,
+): boolean {
+  const keywords = TRANSACTION_CONTROL_KEYWORDS[dialect];
+  if (keywords === undefined) {
+    return false;
+  }
+  let caseDepth = 0;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const keyword = tokens[index]?.toLowerCase() ?? "";
+    const previous = tokens[index - 1]?.toLowerCase();
+    if (keyword === "case" && previous !== "." && previous !== "as") {
+      caseDepth += 1;
+      continue;
+    }
+    if (
+      keyword === "end" &&
+      caseDepth > 0 &&
+      previous !== "." &&
+      previous !== "as"
+    ) {
+      caseDepth -= 1;
+      continue;
+    }
+    if (
+      index > 0 &&
+      keywords.has(keyword) &&
+      isTransactionControlStatementAt(tokens, index)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isTransactionControlStatementAt(
+  tokens: string[],
+  index: number,
+): boolean {
+  const keyword = tokens[index]?.toLowerCase();
+  const previous = tokens[index - 1]?.toLowerCase();
+  const next = tokens[index + 1]?.toLowerCase();
+  if (keyword === "start") {
+    return next === "transaction";
+  }
+  if (
+    previous &&
+    TRANSACTION_CONTROL_IDENTIFIER_PREVIOUS_TOKENS.has(previous)
+  ) {
+    return false;
+  }
+  if (
+    next !== undefined &&
+    (TRANSACTION_CONTROL_IDENTIFIER_NEXT_TOKENS.has(next) ||
+      (SQL_EXPRESSION_OPERATOR_WORDS.has(next) && next !== "and") ||
+      !/^[\p{L}\p{Nl}_(@]/u.test(next))
+  ) {
+    return false;
+  }
+  return isSqlStatementStartPosition(tokens, index);
+}
+
+function hasTsqlStatementStarter(tokens: string[]): boolean {
+  return tokens.some(
+    (token, index) =>
+      index > 0 &&
+      TSQL_STATEMENT_KEYWORDS.has(token.toLowerCase()) &&
+      isSqlStatementStartPosition(tokens, index),
+  );
+}
+
+function hasSequenceAdvance(
+  tokens: string[],
+  dialect: QueryEditorSqlDialect,
+): boolean {
+  for (let index = 0; index + 1 < tokens.length; index += 1) {
     if (
       tokens[index]?.toLowerCase() === "next" &&
       tokens[index + 1]?.toLowerCase() === "value" &&
       tokens[index + 2]?.toLowerCase() === "for"
+    ) {
+      return true;
+    }
+    if (
+      dialect === "mysql" &&
+      tokens[index] === "." &&
+      tokens[index + 1]?.toLowerCase() === "nextval"
     ) {
       return true;
     }
@@ -695,18 +1103,21 @@ function hasMysqlSessionSideEffect(
   return false;
 }
 
-export function isReadOnlySqlTokens(tokens: string[]): boolean {
+export function isReadOnlySqlTokens(
+  tokens: string[],
+  dialect?: QueryEditorSqlDialect,
+): boolean {
   if (tokens.length === 0) {
     return false;
   }
 
   const firstToken = tokens[0]?.toLowerCase();
   if (firstToken === "select") {
-    return isReadOnlySelectTokens(tokens);
+    return isReadOnlySelectTokens(tokens, dialect);
   }
 
   if (firstToken === "with") {
-    return isReadOnlyCteTokens(tokens);
+    return isReadOnlyCteTokens(tokens, dialect);
   }
 
   return false;
@@ -736,9 +1147,13 @@ function isDialectReadOnlySqlStatement(
     case "pragma":
       return dialect === "sqlite" && isReadOnlySqlitePragma(statement, tokens);
     case "table":
-      return dialect === "postgresql" && tokens.length >= 2;
+      return (
+        dialect === "postgresql" &&
+        tokens.length >= 2 &&
+        isReadOnlySelectTokens(tokens, dialect)
+      );
     case "values":
-      return isReadOnlyValuesTokens(tokens);
+      return isReadOnlyValuesTokens(tokens, dialect);
     case "explain":
       return isReadOnlyExplainStatement(tokens, dialect);
     default:
@@ -763,14 +1178,22 @@ function isReadOnlyDescribeStatement(
   }
 
   const secondToken = tokens[1]?.toLowerCase();
-  if (secondToken === "select") {
-    return isReadOnlySelectTokens(tokens.slice(1));
+  if (
+    secondToken === "select" ||
+    secondToken === "with" ||
+    secondToken === "analyze" ||
+    secondToken === "format"
+  ) {
+    return isReadOnlyExplainStatement(tokens, dialect);
   }
 
   return true;
 }
 
-function isReadOnlyValuesTokens(tokens: string[]): boolean {
+function isReadOnlyValuesTokens(
+  tokens: string[],
+  dialect: QueryEditorSqlDialect,
+): boolean {
   if (tokens.length < 2 || tokens[1] !== "(") {
     return false;
   }
@@ -791,7 +1214,7 @@ function isReadOnlyValuesTokens(tokens: string[]): boolean {
     }
 
     const keyword = token.toLowerCase();
-    if (SQL_MUTATION_KEYWORDS.has(keyword)) {
+    if (isSqlMutationKeywordAt(tokens, index, dialect)) {
       return false;
     }
     if (isMutatingFunctionCall(keyword, tokens[index + 1])) {
@@ -815,6 +1238,14 @@ function isReadOnlyExplainStatement(
     index += 2;
   }
 
+  if (dialect === "postgresql" && tokens[index] === "(") {
+    const optionsEnd = postgresExplainOptionsEnd(tokens, index + 1);
+    return (
+      optionsEnd !== undefined &&
+      isReadOnlySqlTokens(tokens.slice(optionsEnd), dialect)
+    );
+  }
+
   while (index < tokens.length) {
     const keyword = tokens[index]?.toLowerCase();
     if (!keyword) {
@@ -825,10 +1256,18 @@ function isReadOnlyExplainStatement(
       return false;
     }
 
+    if (keyword === "verbose" && dialect === "postgresql") {
+      index += 1;
+      continue;
+    }
+
     if (keyword === "format") {
       index += 1;
       while (index < tokens.length && tokens[index] !== "(") {
         const nextKeyword = tokens[index]?.toLowerCase();
+        if (nextKeyword === "into") {
+          return false;
+        }
         if (
           nextKeyword === "select" ||
           nextKeyword === "with" ||
@@ -842,10 +1281,36 @@ function isReadOnlyExplainStatement(
       continue;
     }
 
-    return isReadOnlySqlTokens(tokens.slice(index));
+    return isReadOnlySqlTokens(tokens.slice(index), dialect);
   }
 
   return false;
+}
+
+function postgresExplainOptionsEnd(
+  tokens: string[],
+  start: number,
+): number | undefined {
+  let index = start;
+  while (true) {
+    const option = tokens[index]?.toLowerCase();
+    if (!option || !POSTGRES_EXPLAIN_OPTIONS.has(option)) {
+      return undefined;
+    }
+    index += 1;
+    const value = tokens[index];
+    if (value !== undefined && value !== "," && value !== ")") {
+      if (!/^[\p{L}\p{N}_]/u.test(value)) {
+        return undefined;
+      }
+      index += 1;
+    }
+    if (tokens[index] === ",") {
+      index += 1;
+      continue;
+    }
+    return tokens[index] === ")" ? index + 1 : undefined;
+  }
 }
 
 function isReadOnlySqlitePragma(statement: string, tokens: string[]): boolean {
@@ -858,15 +1323,17 @@ function isReadOnlySqlitePragma(statement: string, tokens: string[]): boolean {
     return false;
   }
 
-  const pragmaName = tokens[1]?.toLowerCase();
+  const nameIndex = tokens[2] === "." ? 3 : 1;
+  const pragmaName = tokens[nameIndex]?.toLowerCase();
   if (!pragmaName || !SQLITE_READ_ONLY_PRAGMAS.has(pragmaName)) {
     return false;
   }
 
-  const hasPragmaArguments = new RegExp(
-    `^pragma\\s+(?:[a-z_][a-z0-9_]*\\.)?${pragmaName}\\s*\\(`,
-    "i",
-  ).test(normalizedStatement);
+  const nextToken = tokens[nameIndex + 1];
+  if (nextToken !== undefined && nextToken !== "(") {
+    return false;
+  }
+  const hasPragmaArguments = nextToken === "(";
 
   if (
     hasPragmaArguments &&
@@ -878,7 +1345,10 @@ function isReadOnlySqlitePragma(statement: string, tokens: string[]): boolean {
   return true;
 }
 
-function isReadOnlyCteTokens(tokens: string[]): boolean {
+function isReadOnlyCteTokens(
+  tokens: string[],
+  dialect?: QueryEditorSqlDialect,
+): boolean {
   let index = 1;
 
   if (tokens[index]?.toLowerCase() === "recursive") {
@@ -933,7 +1403,7 @@ function isReadOnlyCteTokens(tokens: string[]): boolean {
       return false;
     }
 
-    if (!isReadOnlySqlTokens(tokens.slice(bodyStart, index - 1))) {
+    if (!isReadOnlySqlTokens(tokens.slice(bodyStart, index - 1), dialect)) {
       return false;
     }
 
@@ -942,13 +1412,16 @@ function isReadOnlyCteTokens(tokens: string[]): boolean {
       continue;
     }
 
-    return isReadOnlySqlTokens(tokens.slice(index));
+    return isReadOnlySqlTokens(tokens.slice(index), dialect);
   }
 
   return false;
 }
 
-function isReadOnlySelectTokens(tokens: string[]): boolean {
+function isReadOnlySelectTokens(
+  tokens: string[],
+  dialect?: QueryEditorSqlDialect,
+): boolean {
   for (let index = 0; index < tokens.length; index += 1) {
     const token = tokens[index];
     if (token === "(" || token === ")" || token === ",") {
@@ -962,20 +1435,10 @@ function isReadOnlySelectTokens(tokens: string[]): boolean {
     if (keyword === "for" && isSelectLockingClause(tokens, index)) {
       return false;
     }
-    const previous = tokens[index - 1]?.toLowerCase();
-    const next = tokens[index + 1]?.toLowerCase();
-    const isCommentColumn =
-      keyword === "comment" &&
-      (((previous === "select" || previous === ",") &&
-        (next === "from" || next === "," || next === "as")) ||
-        (previous === "." &&
-          /^[a-z_][a-z_0-9]*$/i.test(tokens[index - 2] ?? "") &&
-          (next === "from" || next === ")" || next === "," || next === "as")) ||
-        (previous === "(" &&
-          /^[a-z_][a-z_0-9]*$/i.test(tokens[index - 2] ?? "") &&
-          !SQL_MUTATION_KEYWORDS.has(tokens[index - 2]?.toLowerCase() ?? "") &&
-          (next === ")" || next === ",")));
-    if (SQL_MUTATION_KEYWORDS.has(keyword) && !isCommentColumn) {
+    if (keyword === "lock" && isSelectLockingClause(tokens, index)) {
+      return false;
+    }
+    if (isSqlMutationKeywordAt(tokens, index, dialect)) {
       return false;
     }
     if (isMutatingFunctionCall(keyword, tokens[index + 1])) {
@@ -988,6 +1451,13 @@ function isReadOnlySelectTokens(tokens: string[]): boolean {
 
 function isSelectLockingClause(tokens: string[], index: number): boolean {
   const nextToken = tokens[index + 1]?.toLowerCase();
+  if (tokens[index]?.toLowerCase() === "lock") {
+    return (
+      nextToken === "in" &&
+      tokens[index + 2]?.toLowerCase() === "share" &&
+      tokens[index + 3]?.toLowerCase() === "mode"
+    );
+  }
   if (nextToken === "update" || nextToken === "share") {
     return true;
   }

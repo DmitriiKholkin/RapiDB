@@ -55,7 +55,10 @@ process.on("message", (request: SQLiteWorkerRequest) => {
           message: error instanceof Error ? error.message : String(error),
           name: error instanceof Error ? error.name : "Error",
           ...(error instanceof TransactionVerificationError
-            ? { verificationFailure: error.verificationFailure }
+            ? {
+                verificationFailure: error.verificationFailure,
+                rollbackConfirmed: error.rollbackConfirmed,
+              }
             : {}),
           ...(executionState === "not-executed" || executionState === "unknown"
             ? {

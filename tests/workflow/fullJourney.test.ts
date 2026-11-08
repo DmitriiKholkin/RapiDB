@@ -3,7 +3,6 @@ import { execSync } from "node:child_process";
 import { cleanup, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
-import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import { ErdPanel } from "../../src/extension/panels/erdPanel";
 import { QueryPanel } from "../../src/extension/panels/queryPanel";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
@@ -23,7 +22,6 @@ import {
   bootstrapWorkflowContext,
   ensureTempSqlitePath,
   type OpenTableResult,
-  type WorkflowContext,
 } from "./workflowContext";
 
 async function seedEntities(

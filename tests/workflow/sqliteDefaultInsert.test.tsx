@@ -32,7 +32,6 @@ vi.doMock("../../src/webview/components/MonacoEditor", () => ({
       onChange={(event) => onChange?.(event.target.value)}
     />
   ),
-  connTypeToDialect: () => "sqlite",
 }));
 
 async function withTable(
@@ -78,6 +77,8 @@ function editTitle(rowIndex: number, value: string) {
   fireEvent.doubleClick(getBodyCell("title", rowIndex));
   const inlineEditor = screen.queryByLabelText("Cell value");
   const editor = inlineEditor ?? screen.getByLabelText("Cell data");
+  if ((editor as HTMLInputElement).value === value)
+    fireEvent.change(editor, { target: { value: `${value}x` } });
   fireEvent.change(editor, { target: { value } });
   if (inlineEditor) fireEvent.keyDown(editor, { key: "Enter" });
   else fireEvent.click(screen.getByRole("button", { name: "Apply" }));

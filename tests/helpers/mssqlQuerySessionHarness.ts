@@ -15,8 +15,6 @@ export class MockMssqlConnection {
   });
 }
 
-// A real exclusive lease/queue, not the old pool.request-only stub. A borrower
-// already waiting at release observes exactly the state exposed by production.
 export function mockMssqlSessionPool(requests: object[] | (() => object)) {
   let next = 0;
   let borrowed = false;

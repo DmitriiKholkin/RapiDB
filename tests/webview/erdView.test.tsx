@@ -397,6 +397,32 @@ describe("ErdView", () => {
     expect(renderedPosition(HIDDEN)).toEqual(savedPositions[HIDDEN]);
   });
 
+  it("keeps the host initial state when persisting view state for panel restore", async () => {
+    const initialState = {
+      view: "erd",
+      connectionId: "conn-1",
+      database: "app_db",
+      schema: "public",
+      panelRetentionMode: "rehydrate",
+    };
+    vscodeStateMock().getState.mockReturnValue({
+      initialState,
+      nodePositions: savedPositions,
+    });
+    render(<ErdView connectionId="conn-1" />);
+    await sendGraph();
+    await userEvent
+      .setup()
+      .click(screen.getByRole("checkbox", { name: "Hide isolated" }));
+
+    const persisted = vscodeStateMock().setState.mock.calls.at(-1)?.[0];
+    expect(persisted).toMatchObject({
+      initialState,
+      hideIsolated: true,
+      nodePositions: savedPositions,
+    });
+  });
+
   it("commits viewport position snapshots before later filter persistence", async () => {
     vscodeStateMock().getState.mockReturnValue({
       hideIsolated: true,
@@ -762,6 +788,29 @@ describe("ErdView", () => {
 
     expect(screen.getByText("Error:")).toBeTruthy();
     expect(screen.getByText("Could not load schema metadata")).toBeTruthy();
+  });
+
+  it("retries the graph load from the error-only screen", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <ErdView connectionId="conn-1" database="app_db" schema="public" />,
+    );
+
+    await act(async () => {
+      dispatchIncomingMessage("erdError", { error: "Not connected" });
+    });
+    await expectNoAxeViolations(container);
+    clearPostedMessages();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(getPostedMessages()).toEqual([{ type: "reload" }]);
+
+    await act(async () => {
+      dispatchIncomingMessage("erdLoading", { forceReload: true });
+    });
+    expect(screen.queryByText("Not connected")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.getByText("Loading data...")).toBeTruthy();
   });
 
   it("shows the empty state when the selected scope has no tables", async () => {

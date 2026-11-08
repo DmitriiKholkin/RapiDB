@@ -48,7 +48,9 @@ describe.skipIf(!url)("Redis literal prefix isolation on a real server", () => {
           sort,
           skipCount: false,
         });
-        expect(page.rows).toEqual([{ key: ownKey, value: "own", ttl: null }]);
+        expect(page.rows).toEqual([
+          { key: ownKey, value: "own", ttl: null, type: "string" },
+        ]);
         expect(page.totalCount).toBe(1);
         const service = new TableReadService({
           getConnection: () => ({ id, type: "redis" }),

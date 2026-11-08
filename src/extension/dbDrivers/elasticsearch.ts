@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
-import { Client } from "@elastic/elasticsearch";
+import { Client, errors } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
 import {
   getElasticsearchTlsEndpointError,
@@ -9,10 +9,14 @@ import {
 } from "../../shared/connectionConfig";
 import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
-import { getSshHttpAgentTransport } from "../driverRuntimeConfig";
+import {
+  getSshHttpAgentTransport,
+  getTlsServername,
+} from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { createOwnedSshConnectionAgentFactory } from "../services/sshConnectionAgent";
 import {
+  isRoundTripJsonNumberToken,
   JsonNumericPrecisionError,
   parseJsonForWrite,
 } from "../utils/jsonWriteSafety";
@@ -26,7 +30,10 @@ import {
   drainElasticsearchCleanup,
   ElasticsearchPitSession,
 } from "./elasticsearchPitSession";
-import { ElasticsearchSerializer } from "./elasticsearchSerializer";
+import {
+  ElasticsearchSerializer,
+  stringifyElasticsearchJson,
+} from "./elasticsearchSerializer";
 import { getMetadataContext } from "./metadataCancellation";
 import {
   applyFilters,
@@ -38,6 +45,7 @@ import {
   unsupported,
 } from "./nosqlUtils";
 import {
+  DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
   getDefaultDriverTimeoutSettings,
   getQueryRemainingTimeoutMs,
@@ -156,7 +164,7 @@ export class ElasticsearchDriver implements IDBDriver {
       const node =
         this.config.connectionUri ??
         this.config.endpoint ??
-        `${protocol}://${this.config.host || "localhost"}:${this.config.port ?? 9200}`;
+        `${protocol}://${this.formatUrlHost(this.config.host || "localhost")}:${this.config.port ?? 9200}`;
       const sshAgentTransport = getSshHttpAgentTransport(this.config);
       const tlsSettings = await resolveConnectionTlsSettings(
         this.config,
@@ -169,8 +177,6 @@ export class ElasticsearchDriver implements IDBDriver {
       this.assertConnectionEpoch(epoch);
       client = new Client({
         Serializer: ElasticsearchSerializer,
-        // A lost response is not proof that a write failed. Replaying an
-        // auto-ID insert or update script can apply the mutation twice.
         maxRetries: 0,
         ...(sshAgentTransport ? { Connection: SshTlsHttpConnection } : {}),
         node: this.config.cloudId ? undefined : node,
@@ -211,17 +217,25 @@ export class ElasticsearchDriver implements IDBDriver {
               servername: tlsSettings.servername,
               checkServerIdentity: tlsSettings.checkServerIdentity,
             }
-          : undefined,
+          : getTlsServername(this.config)
+            ? { servername: getTlsServername(this.config) }
+            : undefined,
       });
       this.client = client;
       this.assertConnectionEpoch(epoch);
-      await client.ping();
+      if (!(await client.ping())) {
+        throw new Error(
+          "Elasticsearch ping failed: the endpoint did not respond as an Elasticsearch cluster.",
+        );
+      }
       this.assertConnectionEpoch(epoch);
       this.connected = true;
     } catch (error) {
-      if (this.client === client && client) {
-        this.client = null;
-        this.connected = false;
+      if (client) {
+        if (this.client === client) {
+          this.client = null;
+          this.connected = false;
+        }
         await client.close().catch(() => undefined);
       }
       throw error;
@@ -230,6 +244,10 @@ export class ElasticsearchDriver implements IDBDriver {
         this.connectionAbortController = undefined;
       }
     }
+  }
+
+  private formatUrlHost(host: string): string {
+    return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   }
 
   private assertConnectionEpoch(epoch: number): void {
@@ -456,8 +474,19 @@ export class ElasticsearchDriver implements IDBDriver {
           primary: true,
         },
       ];
-    } catch {
-      return [];
+    } catch (error: unknown) {
+      const detail = (
+        error as {
+          meta?: { body?: { error?: { type?: unknown } } };
+        } | null
+      )?.meta?.body?.error;
+      if (
+        this.elasticsearchStatus(error) === 404 &&
+        detail?.type === "index_not_found_exception"
+      ) {
+        return [];
+      }
+      throw error;
     }
   }
 
@@ -586,22 +615,56 @@ export class ElasticsearchDriver implements IDBDriver {
 
     const results: Array<Record<string, unknown>> = [];
     let affectedRows = 0;
-    for (const command of commands) {
-      const result = await this.executeRestCommand(command, startedAt, options);
-      throwIfQueryCancelled(options);
+    let mutated = false;
+    let partialError: string | undefined;
+    const total = commands.length;
+    const completedText = (count: number) =>
+      `${count} of ${total} statement${total === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} completed and earlier writes were applied`;
+    for (const [index, command] of commands.entries()) {
+      let result: QueryResult;
+      try {
+        result = await this.executeRestCommand(command, startedAt, options);
+      } catch (error: unknown) {
+        if (!mutated) throw error;
+        const message = error instanceof Error ? error.message : String(error);
+        const statement = `statement ${index + 1} of ${total}`;
+        partialError = options?.signal?.aborted
+          ? `Elasticsearch script was cancelled during ${statement} after ${completedText(index)}. The outcome of ${statement} is unknown and the remaining statements were not sent.`
+          : error instanceof errors.ResponseError &&
+              error.statusCode !== undefined &&
+              error.statusCode >= 400 &&
+              error.statusCode < 500
+            ? `Elasticsearch ${statement} failed after ${completedText(index)}. It was not applied and the remaining statements were not sent. ${message}`
+            : `Elasticsearch ${statement} failed after ${completedText(index)}. Its outcome is unknown and the remaining statements were not sent. ${message}`;
+        break;
+      }
+      mutated ||= !this.isReadOnlyRestCommand(command);
+      try {
+        throwIfQueryCancelled(options);
+      } catch (error: unknown) {
+        if (!mutated) throw error;
+        partialError = `Elasticsearch script was cancelled after ${completedText(index + 1)}.${index + 1 < total ? " The remaining statements were not sent." : ""}`;
+      }
       affectedRows += result.affectedRows ?? 0;
       results.push({
         statement: this.formatParsedRestCommand(command),
         rowCount: result.rowCount,
         affectedRows: result.affectedRows,
-        rows: this.toPlainRows(result),
+        ...(result.resultSets
+          ? {
+              resultSets: result.resultSets.map((resultSet) => ({
+                id: resultSet.id,
+                rows: this.toPlainRows(resultSet),
+              })),
+            }
+          : { rows: this.toPlainRows(result) }),
       });
+      if (partialError !== undefined) break;
     }
-    return this.buildMultiStatementQueryResult(
-      results,
-      startedAt,
-      affectedRows,
-    );
+    return {
+      ...this.buildMultiStatementQueryResult(results, startedAt, affectedRows),
+      ...(partialError !== undefined ? { error: partialError } : {}),
+    };
   }
 
   private buildMultiStatementQueryResult(
@@ -609,7 +672,7 @@ export class ElasticsearchDriver implements IDBDriver {
     startedAt: number,
     affectedRows: number,
   ): QueryResult {
-    const row = flattenRootRecord({ results });
+    const row = flattenRootRecord({ results }, stringifyElasticsearchJson);
     return {
       columns: ["results"],
       rows: [this.mapRowToQueryRow(row, ["results"])],
@@ -649,7 +712,8 @@ export class ElasticsearchDriver implements IDBDriver {
       const remainder = input.slice(bodyStart);
       const nextHeader = /^(GET|POST|PUT|DELETE)\s+\S+/i.exec(remainder);
       if (nextHeader) {
-        statements.push(input.slice(statementStart, cursor).trim());
+        const statementEnd = input[cursor - 1] === ";" ? cursor - 1 : cursor;
+        statements.push(input.slice(statementStart, statementEnd).trim());
         cursor = bodyStart;
         continue;
       }
@@ -758,9 +822,6 @@ export class ElasticsearchDriver implements IDBDriver {
     const method = match[1].toUpperCase() as ElasticsearchRestMethod;
     const rawPath = match[2];
     const bodyText = commandText.slice(match[0].length).trim();
-    // WHATWG URL parsing removes dot segments and treats backslashes as slashes.
-    // A document DELETE ending in /.. would otherwise become an index DELETE.
-    // Absolute URLs/fragments also silently discard user-specified targeting.
     const rawSegments = rawPath.split("?", 1)[0].split("/");
     if (
       !rawPath.startsWith("/") ||
@@ -787,7 +848,10 @@ export class ElasticsearchDriver implements IDBDriver {
       path: parsedUrl.pathname,
       pathSegments,
       queryParams: parsedUrl.searchParams,
-      body: bodyText.length > 0 ? parseJsonForWrite(bodyText) : undefined,
+      body:
+        bodyText.length > 0
+          ? parseJsonForWrite(bodyText, isRoundTripJsonNumberToken)
+          : undefined,
     };
   }
 
@@ -812,8 +876,8 @@ export class ElasticsearchDriver implements IDBDriver {
     if (method === "GET" && length === 3 && second === "_doc")
       return "getDocument";
     if (
-      (method === "PUT" || method === "POST") &&
-      (length === 2 || length === 3) &&
+      ((method === "PUT" && length === 3) ||
+        (method === "POST" && (length === 2 || length === 3))) &&
       second === "_doc"
     )
       return "indexDocument";
@@ -850,6 +914,11 @@ export class ElasticsearchDriver implements IDBDriver {
     const body = this.readObjectBody(command, label, {
       allowEmpty: kind === "search",
     });
+    if (kind === "indexDocument" && Object.hasOwn(body, "_id")) {
+      throw new Error(
+        `${label} cannot set the "_id" metadata field in the document body. Put the document ID in the path instead.`,
+      );
+    }
     if (kind === "search") {
       this.enforceSearchRequestHardCap(body);
       this.enforceSearchQueryParamsHardCap(
@@ -874,8 +943,6 @@ export class ElasticsearchDriver implements IDBDriver {
         ? ([transportOptions] as const)
         : ([] as const);
     const client = this.requireClient();
-    // REST query/body fields are not SDK arguments: spreading them here lets
-    // fields such as index/id silently replace the resource named in the path.
     const queryParams = this.queryParamsToObject(command.queryParams);
     const [firstSegment, secondSegment, thirdSegment] = command.pathSegments;
     const kind = this.resolveRestCommandKind(command);
@@ -948,10 +1015,7 @@ export class ElasticsearchDriver implements IDBDriver {
         ...transportArgs,
       );
       this.assertCompleteSearch(response);
-      const rows = this.hitsToRows(
-        response.hits.hits as unknown as Array<Record<string, unknown>>,
-      );
-      return this.buildRowsQueryResult(rows, startedAt);
+      return this.buildSearchQueryResult(response, firstSegment, startedAt);
     }
 
     if (kind === "search") {
@@ -968,10 +1032,7 @@ export class ElasticsearchDriver implements IDBDriver {
         ...transportArgs,
       );
       this.assertCompleteSearch(response);
-      const rows = this.hitsToRows(
-        response.hits.hits as unknown as Array<Record<string, unknown>>,
-      );
-      return this.buildRowsQueryResult(rows, startedAt);
+      return this.buildSearchQueryResult(response, undefined, startedAt);
     }
 
     if (kind === "getDocument") {
@@ -983,11 +1044,14 @@ export class ElasticsearchDriver implements IDBDriver {
         },
         ...transportArgs,
       );
-      const row = flattenRootRecord({
-        _id: response._id,
-        ...(((response as { _source?: Record<string, unknown> })._source ??
-          {}) as Record<string, unknown>),
-      });
+      const row = flattenRootRecord(
+        {
+          _id: response._id,
+          ...(((response as { _source?: Record<string, unknown> })._source ??
+            {}) as Record<string, unknown>),
+        },
+        stringifyElasticsearchJson,
+      );
       return this.buildRowsQueryResult([row], startedAt);
     }
 
@@ -996,8 +1060,9 @@ export class ElasticsearchDriver implements IDBDriver {
         {
           index: firstSegment,
           ...(thirdSegment ? { id: thirdSegment } : {}),
-          document: this.stripDocumentId(
-            this.readObjectBody(command, `${command.method} ${command.path}`),
+          document: this.readObjectBody(
+            command,
+            `${command.method} ${command.path}`,
           ),
           querystring: queryParams,
         },
@@ -1161,8 +1226,6 @@ export class ElasticsearchDriver implements IDBDriver {
   ): Record<string, unknown> {
     const result: Record<string, unknown> = Object.create(null);
     for (const key of new Set(queryParams.keys())) {
-      // HTTP query values are strings. Numeric-looking names (pipeline,
-      // preference, etc.) and 64-bit concurrency tokens must remain exact.
       const values = queryParams.getAll(key);
       if (values.length === 1) {
         result[key] = values[0];
@@ -1187,6 +1250,87 @@ export class ElasticsearchDriver implements IDBDriver {
       rowCount: rows.length,
       affectedRows,
       executionTimeMs: Date.now() - startedAt,
+    };
+  }
+
+  private buildSearchQueryResult(
+    response: {
+      hits: {
+        total?: unknown;
+        hits: ReadonlyArray<{
+          _index?: unknown;
+          fields?: unknown;
+          highlight?: unknown;
+        }>;
+      };
+      aggregations?: unknown;
+      suggest?: unknown;
+    },
+    target: string | undefined,
+    startedAt: number,
+  ): QueryResult {
+    const hits = response.hits.hits;
+    const includeIndex =
+      target === undefined ||
+      /[*,]/.test(target) ||
+      hits.some(
+        (hit) => typeof hit._index === "string" && hit._index !== target,
+      );
+    const rows = this.hitsToRows(hits).map((row, index) => {
+      const hit = hits[index];
+      return {
+        ...(includeIndex
+          ? { _id: row._id, _index: hit._index, _source: row._source }
+          : row),
+        ...(hit.fields !== undefined
+          ? { fields: stringifyElasticsearchJson(hit.fields) }
+          : {}),
+        ...(hit.highlight !== undefined
+          ? { highlight: stringifyElasticsearchJson(hit.highlight) }
+          : {}),
+      };
+    });
+    const hitsResult = this.buildRowsQueryResult(rows, startedAt);
+    const hasSummary =
+      response.aggregations !== undefined ||
+      response.suggest !== undefined ||
+      (hits.length === 0 && response.hits.total !== undefined);
+    if (!hasSummary) return hitsResult;
+    const summaryResult = this.buildSingleRowQueryResult(
+      flattenRootRecord(
+        {
+          ...(response.hits.total !== undefined
+            ? { total: response.hits.total }
+            : {}),
+          ...(response.aggregations !== undefined
+            ? { aggregations: response.aggregations }
+            : {}),
+          ...(response.suggest !== undefined
+            ? { suggest: response.suggest }
+            : {}),
+        },
+        stringifyElasticsearchJson,
+      ),
+      startedAt,
+    );
+    if (hits.length === 0) return summaryResult;
+    return {
+      ...summaryResult,
+      rowCount: summaryResult.rowCount + hitsResult.rowCount,
+      resultSets: [
+        {
+          id: "summary",
+          columns: summaryResult.columns,
+          rows: summaryResult.rows,
+          rowCount: summaryResult.rowCount,
+        },
+        {
+          id: "hits",
+          columns: hitsResult.columns,
+          rows: hitsResult.rows,
+          rowCount: hitsResult.rowCount,
+        },
+      ],
     };
   }
 
@@ -1245,67 +1389,44 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
 
-    const client = this.requireClient();
-    const reader = new ElasticsearchPitSession(
-      client,
-      this.timeoutSettingsProvider().dbOperationTimeoutMs,
-      "readTablePage",
-      request.signal,
+    const timeoutMs = this.timeoutSettingsProvider().dbOperationTimeoutMs;
+    const deadline = Math.min(
       request.deadline ?? Infinity,
-      () => this.pitReaders.delete(reader),
+      Date.now() + timeoutMs,
     );
-    this.pitReaders.add(reader);
-    try {
-      return await reader.advance(async () => {
-        const response = await reader.request((options) =>
-          client.search(
-            {
-              index: request.table,
-              query: { match_all: {} },
-              sort: ["_doc"],
-              size: ELASTICSEARCH_READ_BUDGET.hardCap,
-              track_total_hits: true,
-              allow_partial_search_results: false,
-              seq_no_primary_term: true,
-            },
-            { ...options, maxRetries: 0 },
-          ),
-        );
-        this.assertCompleteSearch(response);
-        const rows = this.hitsToRows(response.hits.hits, request.table);
-        if (
-          this.resolveElasticsearchTotalCount(response.hits.total) > rows.length
-        ) {
-          throw new Error(
-            `Elasticsearch filtering or sorting requires reading the entire index and exceeded the ${ELASTICSEARCH_READ_BUDGET.hardCap}-row safety limit. Use an unfiltered, unsorted read or export.`,
-          );
-        }
-        const filtered = applyFilters(rows, request.filters, columns);
-        const sorted = applySort(filtered, request.sort, columns);
-        const paged = pageRows(sorted, request.page, request.pageSize).map(
-          (row) =>
-            Object.fromEntries(
-              Object.entries(row).map(([columnName, value]) => {
-                const column = columnMetaByName.get(columnName);
-                return [
-                  columnName,
-                  column ? this.formatOutputValue(value, column) : value,
-                ];
-              }),
-            ),
-        );
-        reader.check();
-        return {
-          columns,
-          rows: paged,
-          totalCount: request.skipCount ? 0 : sorted.length,
-          executionTimeMs: Math.round(performance.now() - startTime),
-        };
-      });
-    } finally {
-      if (reader.signal.aborted) void reader.close().catch(() => undefined);
-      else await reader.waitForClose();
+    const rows: Record<string, unknown>[] = [];
+    for await (const batch of this.readPitBatches(
+      request.table,
+      500,
+      true,
+      request.signal,
+      deadline,
+      ELASTICSEARCH_READ_BUDGET.hardCap,
+    )) {
+      rows.push(...batch.rows);
     }
+    const filtered = applyFilters(rows, request.filters, columns);
+    const sorted = applySort(filtered, request.sort, columns);
+    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
+      Object.fromEntries(
+        Object.entries(row).map(([columnName, value]) => {
+          const column = columnMetaByName.get(columnName);
+          return [
+            columnName,
+            column ? this.formatOutputValue(value, column) : value,
+          ];
+        }),
+      ),
+    );
+    request.signal?.throwIfAborted();
+    if (Date.now() >= deadline)
+      throw new DriverTimeoutError("dbOperation", "readTablePage", timeoutMs);
+    return {
+      columns,
+      rows: paged,
+      totalCount: request.skipCount ? 0 : sorted.length,
+      executionTimeMs: Math.round(performance.now() - startTime),
+    };
   }
 
   async *exportTableChunks(
@@ -1313,13 +1434,40 @@ export class ElasticsearchDriver implements IDBDriver {
     signal?: AbortSignal,
   ): AsyncGenerator<DriverTableExportChunk> {
     const columns = this.describeIndexColumnsSync();
+    const filters = request.filters ?? [];
+    const sort = request.sort ?? null;
+    if (filters.length === 0 && sort === null) {
+      for await (const batch of this.readPitBatches(
+        request.table,
+        request.chunkSize,
+        false,
+        signal,
+      )) {
+        yield { columns, rows: batch.rows };
+      }
+      return;
+    }
+    const rows: Record<string, unknown>[] = [];
     for await (const batch of this.readPitBatches(
       request.table,
-      request.chunkSize,
-      false,
+      500,
+      true,
       signal,
+      Infinity,
+      ELASTICSEARCH_READ_BUDGET.hardCap,
     )) {
-      yield { columns, rows: batch.rows };
+      rows.push(...batch.rows);
+    }
+    const sorted = applySort(
+      applyFilters(rows, filters, columns),
+      sort,
+      columns,
+    );
+    const chunkSize = Math.max(1, request.chunkSize);
+    if (sorted.length === 0) yield { columns, rows: [] };
+    for (let offset = 0; offset < sorted.length; offset += chunkSize) {
+      signal?.throwIfAborted();
+      yield { columns, rows: sorted.slice(offset, offset + chunkSize) };
     }
   }
 
@@ -1329,6 +1477,7 @@ export class ElasticsearchDriver implements IDBDriver {
     trackCount: boolean,
     signal?: AbortSignal,
     pageDeadline = Infinity,
+    fullIndexSafetyCap?: number,
   ): AsyncGenerator<{ rows: Record<string, unknown>[]; totalCount: number }> {
     signal?.throwIfAborted();
     const client = this.requireClient();
@@ -1348,6 +1497,7 @@ export class ElasticsearchDriver implements IDBDriver {
       let unknownWindow = false;
       let cursor: number | undefined;
       let totalCount = 0;
+      let readCount = 0;
       let first = true;
       while (true) {
         const response = await reader.advance(async () => {
@@ -1432,8 +1582,37 @@ export class ElasticsearchDriver implements IDBDriver {
         this.assertCompleteSearch(response);
         if (first && trackCount) {
           totalCount = this.resolveElasticsearchTotalCount(response.hits.total);
+          if (fullIndexSafetyCap !== undefined) {
+            const total = response.hits.total;
+            if (
+              total === undefined ||
+              (typeof total === "object" && total.relation !== "eq") ||
+              !Number.isSafeInteger(totalCount) ||
+              totalCount < 0
+            ) {
+              throw new Error(
+                "Elasticsearch full-index read requires an exact total hit count.",
+              );
+            }
+          }
         }
         const hits = response.hits.hits;
+        readCount += hits.length;
+        if (fullIndexSafetyCap !== undefined) {
+          if (
+            totalCount > fullIndexSafetyCap ||
+            readCount > fullIndexSafetyCap
+          ) {
+            throw new Error(
+              `Elasticsearch filtering or sorting requires reading the entire index and exceeded the ${fullIndexSafetyCap}-row safety limit. Use an unfiltered, unsorted read or export.`,
+            );
+          }
+          if (hits.length < size && readCount !== totalCount) {
+            throw new Error(
+              "Elasticsearch full-index read returned incomplete results (hit count mismatch).",
+            );
+          }
+        }
         for (const hit of hits) {
           const next = hit.sort?.[0];
           if (
@@ -1540,6 +1719,23 @@ export class ElasticsearchDriver implements IDBDriver {
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
+    for (const [rowIndex, update] of request.updates.entries()) {
+      try {
+        this.assertConditionalSourceReplacement(
+          update.originalValues,
+          update.changes,
+        );
+      } catch (error) {
+        throw failedDriverUpdateRows(
+          error,
+          request.updates.length,
+          [],
+          rowIndex,
+          0,
+          false,
+        );
+      }
+    }
     let affectedRows = 0;
     const updateRowOutcomes: DriverUpdateRowOutcome[] = [];
     for (const [rowIndex, update] of request.updates.entries()) {
@@ -1571,20 +1767,25 @@ export class ElasticsearchDriver implements IDBDriver {
           update.changes,
         );
         const client = this.requireClient();
+        const conditional = Object.hasOwn(
+          update.originalValues ?? {},
+          "_source",
+        );
+        const script = conditional
+          ? this.originalSourceScript(update.originalValues, document)
+          : undefined;
+        const replace = Object.hasOwn(update.changes, "_source");
         writeMayHaveApplied = true;
-        const response = Object.hasOwn(update.originalValues ?? {}, "_source")
+        const response = conditional
           ? await client.update(
               {
                 ...identity,
-                script: this.originalSourceScript(
-                  update.originalValues,
-                  document,
-                ),
+                script,
                 refresh: "wait_for",
               },
               context ? { signal: context.signal } : undefined,
             )
-          : Object.hasOwn(update.changes, "_source")
+          : replace
             ? await client.index(
                 {
                   ...identity,
@@ -1602,11 +1803,12 @@ export class ElasticsearchDriver implements IDBDriver {
                 context ? { signal: context.signal } : undefined,
               );
         writeMayHaveApplied = false;
-        if (response.result === "noop") {
+        if (response.result === "noop" && conditional) {
           updateRowOutcomes.push({ rowIndex, status: "not_applied" });
         } else if (
           response.result === "updated" ||
-          response.result === "created"
+          response.result === "created" ||
+          (response.result === "noop" && !replace)
         ) {
           affectedRows++;
           updateRowOutcomes.push({ rowIndex, status: "applied" });
@@ -1620,11 +1822,21 @@ export class ElasticsearchDriver implements IDBDriver {
           updateRowOutcomes,
           rowIndex,
           affectedRows,
-          writeMayHaveApplied,
+          writeMayHaveApplied && !this.isVersionConflict(error),
         );
       }
     }
     return completeDriverUpdateRowsResult(affectedRows, updateRowOutcomes);
+  }
+
+  private isVersionConflict(error: unknown): boolean {
+    const body = (
+      error as { meta?: { body?: { error?: { type?: unknown } } } } | null
+    )?.meta?.body;
+    return (
+      this.elasticsearchStatus(error) === 409 &&
+      body?.error?.type === "version_conflict_engine_exception"
+    );
   }
 
   async insertRow(
@@ -1780,6 +1992,7 @@ export class ElasticsearchDriver implements IDBDriver {
     ) {
       throw new Error("Elasticsearch document identity is read-only.");
     }
+    this.assertConditionalSourceReplacement(originalValues, changes);
     const document = this.resolveDocumentForMutation(
       { ...primaryKeys, ...changes },
       changes,
@@ -1797,14 +2010,57 @@ export class ElasticsearchDriver implements IDBDriver {
     );
   }
 
+  private assertConditionalSourceReplacement(
+    originalValues: Record<string, unknown> | undefined,
+    changes: Record<string, unknown>,
+  ): void {
+    if (
+      Object.hasOwn(originalValues ?? {}, "_source") &&
+      !Object.hasOwn(changes, "_source")
+    ) {
+      throw new Error(
+        "Elasticsearch conditional _source updates require a complete replacement _source; partial changes are not supported.",
+      );
+    }
+  }
+
   private originalSourceScript(
     originalValues: Record<string, unknown> | undefined,
     next: Record<string, unknown>,
   ) {
     return {
       lang: "painless",
-      source:
-        "if (ctx._source != params.original) { ctx.op = 'none' } else { ctx._source = params.next }",
+      source: `boolean same(def a, def b, int[] budget) {
+  if (--budget[0] < 0) throw new IllegalArgumentException('JSON comparison exceeds the 2000000-node safety limit');
+  if (a == null || b == null) return a == null && b == null;
+  if (a instanceof Number && b instanceof Number) {
+    boolean af = a instanceof Double || a instanceof Float;
+    boolean bf = b instanceof Double || b instanceof Float;
+    if (af && bf) return ((Number)a).doubleValue() == ((Number)b).doubleValue();
+    if (!af && !bf) return new BigDecimal(a.toString()).compareTo(new BigDecimal(b.toString())) == 0;
+    double d = ((Number)(af ? a : b)).doubleValue();
+    def n = af ? b : a;
+    if (d - d != 0.0) return false;
+    int k = 0;
+    while (d >= 9007199254740992.0 || d <= -9007199254740992.0) { d /= 2; k++; }
+    long m = (long) d;
+    if (m != d) return false;
+    if (k == 0 && (n instanceof Integer || n instanceof Long)) return m == ((Number)n).longValue();
+    BigDecimal exact = new BigDecimal('' + m).multiply(new BigDecimal('2').pow(k));
+    return exact.compareTo(new BigDecimal(n.toString())) == 0;
+  }
+  if (a instanceof Map && b instanceof Map) {
+    if (a.size() != b.size()) return false;
+    return a.entrySet().stream().allMatch(e -> b.containsKey(e.getKey()) && same(e.getValue(), b.get(e.getKey()), budget));
+  }
+  if (a instanceof List && b instanceof List) {
+    if (a.size() != b.size()) return false;
+    def it = b.iterator();
+    return a.stream().allMatch(x -> same(x, it.next(), budget));
+  }
+  return a.equals(b);
+}
+if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' } else { ctx._source = params.next }`,
       params: {
         original: this.resolveDocumentForMutation({
           _source: originalValues?._source,
@@ -1885,7 +2141,7 @@ export class ElasticsearchDriver implements IDBDriver {
           return {};
         }
         try {
-          const parsed = parseJsonForWrite(trimmed);
+          const parsed = parseJsonForWrite(trimmed, isRoundTripJsonNumberToken);
           if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
             throw new Error();
           }
@@ -1919,6 +2175,23 @@ export class ElasticsearchDriver implements IDBDriver {
       }
     }
     return value;
+  }
+
+  coerceTableEditValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.name === "_source") this.assertSourceUpdateValue(value);
+    return this.coerceInputValue(value, column);
+  }
+
+  private assertSourceUpdateValue(value: unknown): void {
+    if (
+      value === null ||
+      value === undefined ||
+      (typeof value === "string" && !value.trim())
+    ) {
+      throw new Error(
+        'Elasticsearch field "_source" must be a JSON object. Enter {} explicitly to replace the document with an empty one.',
+      );
+    }
   }
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
@@ -2151,7 +2424,7 @@ export class ElasticsearchDriver implements IDBDriver {
           : {
               _identity: this.encodeRowIdentity(table, hit),
             }),
-        _source: JSON.stringify(source),
+        _source: stringifyElasticsearchJson(source),
       };
     });
   }
@@ -2298,6 +2571,10 @@ export class ElasticsearchDriver implements IDBDriver {
       );
     }
 
+    if (changes && Object.hasOwn(changes, "_source")) {
+      this.assertSourceUpdateValue(changes._source);
+    }
+
     if (Object.hasOwn(record, "_source")) {
       return this.normalizeSourceDocument(record._source);
     }
@@ -2312,7 +2589,7 @@ export class ElasticsearchDriver implements IDBDriver {
       if (!trimmed) {
         return {};
       }
-      const parsed = parseJsonForWrite(trimmed);
+      const parsed = parseJsonForWrite(trimmed, isRoundTripJsonNumberToken);
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error(
           'Elasticsearch field "_source" must be a valid JSON object.',
@@ -2342,10 +2619,12 @@ export class ElasticsearchDriver implements IDBDriver {
     if (!body) {
       return `${method} ${path}`;
     }
-    return `${method} ${path}\n${JSON.stringify(body, null, 2)}`;
+    return `${method} ${path}\n${stringifyElasticsearchJson(body, 2)}`;
   }
 
-  private toPlainRows(result: QueryResult): Array<Record<string, unknown>> {
+  private toPlainRows(
+    result: Pick<QueryResult, "columns" | "rows">,
+  ): Array<Record<string, unknown>> {
     return result.rows.map((row) =>
       Object.fromEntries(
         result.columns.map((columnName, index) => [
@@ -2393,11 +2672,11 @@ export class ElasticsearchDriver implements IDBDriver {
       return fallback;
     }
 
-    const normalized = Math.trunc(value);
-    if (normalized < 1) {
-      return 1;
+    if (value < 0) {
+      return value;
     }
 
+    const normalized = Math.trunc(value);
     return Math.min(normalized, ELASTICSEARCH_READ_BUDGET.hardCap);
   }
 }

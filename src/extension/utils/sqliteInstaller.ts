@@ -1,17 +1,22 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   cpSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
+  statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { hostname, tmpdir } from "node:os";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { logger } from "./logger";
 import {
@@ -35,6 +40,37 @@ import {
 } from "./sqliteBuildTools";
 
 const execFileAsync = promisify(execFile);
+
+const SQLITE_DOWNLOAD_TIMEOUT_MS = 60_000;
+const SQLITE_BUILD_STEP_TIMEOUT_MS = 300_000;
+const SQLITE_INSTALL_MAX_DURATION_MS =
+  5 * SQLITE_DOWNLOAD_TIMEOUT_MS + 2 * SQLITE_BUILD_STEP_TIMEOUT_MS + 120_000;
+const SQLITE_INSTALL_LOCK_OWNER_FILE = "owner.json";
+const SQLITE_INSTALL_LOCK_TRANSIENT_ERRORS = new Set([
+  "EPERM",
+  "EBUSY",
+  "EACCES",
+]);
+const DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS = {
+  waitMs: SQLITE_INSTALL_MAX_DURATION_MS + 60_000,
+  initGraceMs: 10_000,
+  heartbeatMs: 15_000,
+  staleHeartbeatMs: 120_000,
+  clockSkewMs: 300_000,
+  fastPollMs: 150,
+  slowPollMs: 1_000,
+  fastPollWindowMs: 5_000,
+  releaseRetryMs: 100,
+  releaseAttempts: 5,
+};
+let installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
+
+interface SQLiteInstallLockOwner {
+  pid: number;
+  hostname: string;
+  createdAt: number;
+  token: string;
+}
 
 type BetterSqlite3PackageJson = {
   name?: string;
@@ -284,9 +320,15 @@ function manifestMatches(baseDir: string): boolean {
     return false;
   }
 
-  const actual = JSON.parse(
-    readFileSync(manifestPath, "utf8"),
-  ) as Partial<InstalledRuntimeManifest>;
+  let actual: Partial<InstalledRuntimeManifest> | null;
+  try {
+    actual = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch {
+    return false;
+  }
+  if (!actual || typeof actual !== "object") {
+    return false;
+  }
   const expected = expectedManifestFor(baseDir);
   return (
     actual.betterSqlite3Version === expected.betterSqlite3Version &&
@@ -355,34 +397,323 @@ async function waitFor(milliseconds: number): Promise<void> {
   });
 }
 
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function isTransientLockError(error: unknown): boolean {
+  return SQLITE_INSTALL_LOCK_TRANSIENT_ERRORS.has(
+    (error as NodeJS.ErrnoException).code ?? "",
+  );
+}
+
+function readInstallLockOwner(
+  lockRoot: string,
+): { owner: SQLiteInstallLockOwner; heartbeatAt: number } | null {
+  try {
+    const ownerPath = join(lockRoot, SQLITE_INSTALL_LOCK_OWNER_FILE);
+    const owner = JSON.parse(
+      readFileSync(ownerPath, "utf8"),
+    ) as Partial<SQLiteInstallLockOwner>;
+    if (
+      typeof owner.pid === "number" &&
+      Number.isSafeInteger(owner.pid) &&
+      owner.pid > 0 &&
+      typeof owner.hostname === "string" &&
+      typeof owner.createdAt === "number" &&
+      Number.isFinite(owner.createdAt) &&
+      typeof owner.token === "string"
+    ) {
+      return {
+        owner: owner as SQLiteInstallLockOwner,
+        heartbeatAt: statSync(ownerPath).mtimeMs,
+      };
+    }
+  } catch {}
+  return null;
+}
+
+function inspectInstallLock(lockRoot: string): {
+  id: string;
+  stale: boolean;
+  heartbeatAt: number | null;
+  description: string;
+} | null {
+  let stats: import("node:fs").BigIntStats;
+  try {
+    stats = statSync(lockRoot, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+  const record = readInstallLockOwner(lockRoot);
+  const now = Date.now();
+  if (!record) {
+    const age = now - Number(stats.mtimeMs);
+    return {
+      id: `dir:${stats.dev}:${stats.ino}`,
+      stale: age > installLockTimings.initGraceMs,
+      heartbeatAt: null,
+      description: `no owner record, created ${Math.round(age / 1000)}s ago`,
+    };
+  }
+  const { owner, heartbeatAt } = record;
+  const sameHost = owner.hostname === hostname();
+  return {
+    id: `owner:${owner.token}`,
+    stale:
+      owner.createdAt > now + installLockTimings.clockSkewMs ||
+      (sameHost && !isProcessAlive(owner.pid)),
+    heartbeatAt,
+    description: `pid ${owner.pid} on ${owner.hostname}, started ${Math.round((now - owner.createdAt) / 1000)}s ago, last heartbeat ${Math.round((now - heartbeatAt) / 1000)}s ago`,
+  };
+}
+
+function removeInstallLock(
+  lockRoot: string,
+  expectedId: string,
+): { status: "removed" | "busy" | "kept"; error?: unknown } {
+  const tombstone = `${lockRoot}.stale-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(lockRoot, tombstone);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { status: "kept" };
+    }
+    if (isTransientLockError(error)) {
+      return { status: "busy", error };
+    }
+    throw error;
+  }
+  if (inspectInstallLock(tombstone)?.id !== expectedId) {
+    try {
+      renameSync(tombstone, lockRoot);
+    } catch (error) {
+      installerLog(
+        `Could not restore SQLite runtime installation lock ${tombstone} to ${lockRoot}: ${errorMessage(error)}. Leaving it in place.`,
+      );
+    }
+    return { status: "kept" };
+  }
+  try {
+    rmSync(tombstone, { recursive: true, force: true });
+  } catch (error) {
+    installerLog(
+      `Could not delete SQLite runtime installation lock ${tombstone}: ${errorMessage(error)}.`,
+    );
+  }
+  return { status: "removed" };
+}
+
+function tryCreateInstallLock(lockRoot: string, token: string): boolean {
+  try {
+    mkdirSync(lockRoot, { recursive: false });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      return false;
+    }
+    throw error;
+  }
+  const owner: SQLiteInstallLockOwner = {
+    pid: process.pid,
+    hostname: hostname(),
+    createdAt: Date.now(),
+    token,
+  };
+  try {
+    writeFileSync(
+      join(lockRoot, SQLITE_INSTALL_LOCK_OWNER_FILE),
+      JSON.stringify(owner),
+      { flag: "wx" },
+    );
+    return true;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "EEXIST" || code === "ENOENT") {
+      return false;
+    }
+    try {
+      rmdirSync(lockRoot);
+    } catch {}
+    throw error;
+  }
+}
+
+function refreshInstallLockHeartbeat(lockRoot: string, token: string): unknown {
+  try {
+    if (readInstallLockOwner(lockRoot)?.owner.token === token) {
+      const now = new Date();
+      utimesSync(join(lockRoot, SQLITE_INSTALL_LOCK_OWNER_FILE), now, now);
+    }
+    return null;
+  } catch (error) {
+    return error;
+  }
+}
+
+async function releaseInstallLock(
+  lockRoot: string,
+  token: string,
+): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      if (readInstallLockOwner(lockRoot)?.owner.token !== token) {
+        return;
+      }
+      const removal = removeInstallLock(lockRoot, `owner:${token}`);
+      if (removal.status !== "busy") {
+        return;
+      }
+      if (attempt >= installLockTimings.releaseAttempts) {
+        throw removal.error;
+      }
+    } catch (error) {
+      installerLog(
+        `Could not release SQLite runtime installation lock at ${lockRoot}: ${errorMessage(error)}. Other windows will reclaim it once this process exits.`,
+      );
+      return;
+    }
+    await waitFor(installLockTimings.releaseRetryMs * attempt);
+  }
+}
+
+function removeAbandonedInstallDirectories(runtimeRoot: string): void {
+  const parent = dirname(runtimeRoot);
+  const temporaryPrefix = `${basename(runtimeRoot)}.tmp-`;
+  const tombstonePrefix = `${basename(runtimeRoot)}.lock.stale-`;
+  let entries: string[];
+  try {
+    entries = readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const path = join(parent, entry);
+    if (entry.startsWith(tombstonePrefix)) {
+      const tombstone = inspectInstallLock(path);
+      if (
+        tombstone &&
+        !tombstone.stale &&
+        (tombstone.heartbeatAt === null ||
+          Date.now() - tombstone.heartbeatAt <=
+            installLockTimings.staleHeartbeatMs)
+      ) {
+        continue;
+      }
+    } else if (entry.startsWith(temporaryPrefix)) {
+      const pid = Number(entry.slice(temporaryPrefix.length).split("-")[0]);
+      if (
+        pid !== process.pid &&
+        Number.isSafeInteger(pid) &&
+        pid > 0 &&
+        isProcessAlive(pid)
+      ) {
+        continue;
+      }
+    } else {
+      continue;
+    }
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 async function withInstallLock<T>(
   lockRoot: string,
   action: () => Promise<T>,
+  completed: () => T | null,
 ): Promise<T> {
   mkdirSync(dirname(lockRoot), { recursive: true });
-  const deadline = Date.now() + 30_000;
+  const token = randomUUID();
+  const startedAt = performance.now();
+  const deadline = startedAt + installLockTimings.waitMs;
+  const reported = new Set<string>();
+  const report = (key: string, message: string): void => {
+    if (!reported.has(key)) {
+      reported.add(key);
+      installerLog(message);
+    }
+  };
+  const observedHeartbeat = { key: "", since: 0 };
   while (true) {
-    try {
-      mkdirSync(lockRoot, { recursive: false });
+    const result = completed();
+    if (result !== null) {
+      return result;
+    }
+    if (tryCreateInstallLock(lockRoot, token)) {
       break;
-    } catch (error) {
-      const nodeError = error as NodeJS.ErrnoException;
-      if (nodeError.code !== "EEXIST") {
-        throw error;
+    }
+    const current = inspectInstallLock(lockRoot);
+    let stale = current?.stale ?? false;
+    if (current && !stale && current.heartbeatAt !== null) {
+      const key = `${current.id}:${current.heartbeatAt}`;
+      if (observedHeartbeat.key !== key) {
+        observedHeartbeat.key = key;
+        observedHeartbeat.since = performance.now();
+      } else if (
+        performance.now() - observedHeartbeat.since >
+        installLockTimings.staleHeartbeatMs
+      ) {
+        stale = true;
       }
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `Timed out waiting for SQLite runtime installation lock at ${lockRoot}.`,
+    }
+    if (current && stale) {
+      report(
+        `stale:${current.id}`,
+        `Removing stale SQLite runtime installation lock at ${lockRoot} (${current.description}).`,
+      );
+      const removal = removeInstallLock(lockRoot, current.id);
+      if (removal.status === "removed") {
+        continue;
+      }
+      if (removal.status === "busy") {
+        report(
+          `busy:${current.id}`,
+          `SQLite runtime installation lock at ${lockRoot} is busy (${errorMessage(removal.error)}); retrying.`,
         );
       }
-      await waitFor(150);
     }
+    if (current) {
+      report(
+        "waiting",
+        `Waiting for another SQLite runtime installation to finish (${current.description}); lock at ${lockRoot}.`,
+      );
+    }
+    if (performance.now() >= deadline) {
+      throw new Error(
+        `Timed out waiting for SQLite runtime installation lock at ${lockRoot} (${current?.description ?? "lock released"}). If no other VS Code window is installing the SQLite runtime, close other windows and delete this folder, then retry.`,
+      );
+    }
+    await waitFor(
+      performance.now() - startedAt < installLockTimings.fastPollWindowMs
+        ? installLockTimings.fastPollMs
+        : installLockTimings.slowPollMs,
+    );
   }
 
+  const heartbeat = setInterval(() => {
+    const error = refreshInstallLockHeartbeat(lockRoot, token);
+    if (error) {
+      report(
+        "heartbeat",
+        `Could not refresh SQLite runtime installation lock heartbeat at ${lockRoot}: ${errorMessage(error)}.`,
+      );
+    }
+  }, installLockTimings.heartbeatMs);
+  heartbeat.unref?.();
   try {
     return await action();
   } finally {
-    rmSync(lockRoot, { recursive: true, force: true });
+    clearInterval(heartbeat);
+    await releaseInstallLock(lockRoot, token);
   }
 }
 
@@ -400,7 +731,7 @@ interface DownloadLimits {
 export function downloadToFile(
   url: string,
   destPath: string,
-  timeoutMs = 60_000,
+  timeoutMs = SQLITE_DOWNLOAD_TIMEOUT_MS,
   options: DownloadLimits = {},
 ): Promise<void> {
   const { createWriteStream } = require("node:fs") as typeof import("node:fs");
@@ -631,7 +962,7 @@ export async function downloadPinnedSQLiteArtifact(
     pin.size > SQLITE_ARCHIVE_LIMITS.compressedBytes
   )
     throw new Error("Missing/invalid static SQLite artifact pin.");
-  await downloadToFile(pin.url, destination, 60_000, {
+  await downloadToFile(pin.url, destination, SQLITE_DOWNLOAD_TIMEOUT_MS, {
     maxBytes: pin.size,
     allowedHosts,
   });
@@ -708,6 +1039,7 @@ export function sqliteNodeGypArguments(
   headerVersion: string,
   platform: NodeJS.Platform,
   arch: NodeJS.Architecture,
+  python?: string,
 ): string[] {
   assertSQLiteBuildPath(toolDir, "tools", platform);
   assertSQLiteBuildPath(headerDir, "headers", platform);
@@ -719,6 +1051,7 @@ export function sqliteNodeGypArguments(
     `--target_platform=${platform}`,
     `--nodedir=${headerDir}`,
     `--devdir=${join(toolDir, "node-gyp-devdir")}`,
+    ...(python ? [`--python=${python}`] : []),
     "--release",
   ];
 }
@@ -813,6 +1146,24 @@ async function downloadPatchedPrebuilt(
   }
 }
 
+function resolveTrustedSQLiteBuildTools(baseDir: string, buildRoot: string) {
+  const buildTools = resolveSQLiteBuildTools(
+    findPackageRoot(baseDir) ?? baseDir,
+    buildRoot,
+    process.env,
+    installerConfiguration?.workspaceRoots?.() ?? [],
+  );
+  const python = buildTools.python;
+  if (!python) {
+    const candidates =
+      process.platform === "win32" ? "py.exe/python.exe" : "python3/python";
+    throw new Error(
+      `A trusted Python 3 installation is required for the verified SQLite source build. No ${candidates} entry on the sanitized PATH resolved outside the extension package, runtime and all workspace roots. Add the actual Python installation directory to the extension host PATH; workspace-controlled interpreters are never executed.`,
+    );
+  }
+  return { ...buildTools, python };
+}
+
 async function rebuildFromSourceWithPatch(
   runtimeRoot: string,
   baseDir: string,
@@ -842,9 +1193,10 @@ async function rebuildFromSourceWithPatch(
         `No locked SQLite source integrity for better-sqlite3 ${pkg.version}. Update the source pin from package-lock.json.`,
       );
     }
+    resolveTrustedSQLiteBuildTools(baseDir, buildRoot);
     const tarballUrl = SQLITE_SOURCE.url;
     installerLog(`Downloading better-sqlite3 ${pkg.version} source tarball…`);
-    await downloadToFile(tarballUrl, tarballPath, 60_000, {
+    await downloadToFile(tarballUrl, tarballPath, SQLITE_DOWNLOAD_TIMEOUT_MS, {
       allowedHosts: ["registry.npmjs.org"],
     });
 
@@ -855,12 +1207,8 @@ async function rebuildFromSourceWithPatch(
       "source",
       SQLITE_SOURCE.integrity,
     );
-    const buildTools = resolveSQLiteBuildTools(
-      findPackageRoot(baseDir) ?? baseDir,
-      buildRoot,
-      process.env,
-      installerConfiguration?.workspaceRoots?.() ?? [],
-    );
+    const buildTools = resolveTrustedSQLiteBuildTools(baseDir, buildRoot);
+    const python = buildTools.python;
     pinSQLiteSourceNodeActions(sourceDir, buildTools.node);
     const toolLock = createSQLiteBuildToolLock();
     for (const directory of [
@@ -900,7 +1248,11 @@ async function rebuildFromSourceWithPatch(
         `--userconfig=${userConfig}`,
         `--globalconfig=${globalConfig}`,
       ],
-      { cwd: toolDir, timeout: 300_000, env: buildTools.env },
+      {
+        cwd: toolDir,
+        timeout: SQLITE_BUILD_STEP_TIMEOUT_MS,
+        env: buildTools.env,
+      },
     );
 
     installerLog("Applying Electron 42 V8 API compatibility patch…");
@@ -924,8 +1276,13 @@ async function rebuildFromSourceWithPatch(
         headerPins.version,
         process.platform,
         process.arch,
+        python,
       ),
-      { cwd: sourceDir, timeout: 300_000, env: buildTools.env },
+      {
+        cwd: sourceDir,
+        timeout: SQLITE_BUILD_STEP_TIMEOUT_MS,
+        env: { ...buildTools.env, NODE_GYP_FORCE_PYTHON: python },
+      },
     );
 
     const builtBinary = join(
@@ -1087,30 +1444,35 @@ async function installManagedRuntime(baseDir: string): Promise<string | null> {
   }
 
   const lockRoot = `${runtimeRoot}.lock`;
-  return withInstallLock(lockRoot, async () => {
-    if (manifestMatches(baseDir)) {
-      return installedPackagePath;
-    }
+  return withInstallLock(
+    lockRoot,
+    async () => {
+      if (manifestMatches(baseDir)) {
+        return installedPackagePath;
+      }
 
-    const tempRoot = `${runtimeRoot}.tmp-${process.pid}-${Date.now()}`;
-    rmSync(tempRoot, { recursive: true, force: true });
-    rmSync(runtimeRoot, { recursive: true, force: true });
-    mkdirSync(tempRoot, { recursive: true });
-
-    try {
-      copyBundledRuntimeScaffold(baseDir, tempRoot);
-      await downloadPrebuiltBinary(tempRoot, baseDir);
-      renameSync(tempRoot, runtimeRoot);
-    } catch (error) {
+      removeAbandonedInstallDirectories(runtimeRoot);
+      const tempRoot = `${runtimeRoot}.tmp-${process.pid}-${Date.now()}`;
       rmSync(tempRoot, { recursive: true, force: true });
-      throw error;
-    }
+      rmSync(runtimeRoot, { recursive: true, force: true });
+      mkdirSync(tempRoot, { recursive: true });
 
-    installerLog(
-      `SQLite runtime ready at ${runtimeRoot} for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
-    );
-    return installedPackagePath;
-  });
+      try {
+        copyBundledRuntimeScaffold(baseDir, tempRoot);
+        await downloadPrebuiltBinary(tempRoot, baseDir);
+        renameSync(tempRoot, runtimeRoot);
+      } catch (error) {
+        rmSync(tempRoot, { recursive: true, force: true });
+        throw error;
+      }
+
+      installerLog(
+        `SQLite runtime ready at ${runtimeRoot} for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
+      );
+      return installedPackagePath;
+    },
+    () => (manifestMatches(baseDir) ? installedPackagePath : null),
+  );
 }
 
 export function configureSQLiteInstaller(
@@ -1127,6 +1489,13 @@ export function configureSQLiteInstaller(
 export function resetSQLiteInstallerForTests(): void {
   installerConfiguration = null;
   inFlightInstall = null;
+  installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
+}
+
+export function setSQLiteInstallLockTimingsForTests(
+  timings: Partial<typeof DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS>,
+): void {
+  installLockTimings = { ...installLockTimings, ...timings };
 }
 
 export function probeInstalledBetterSqlite3Runtime(
@@ -1167,32 +1536,26 @@ export function resolveInstalledBetterSqlite3PackagePath(
 export async function ensureSQLiteRuntimeInstalled(
   baseDir: string,
 ): Promise<string | null> {
-  if (resolveInstalledBetterSqlite3PackagePath(baseDir)) {
-    return resolveInstalledBetterSqlite3PackagePath(baseDir);
+  const installedPackagePath =
+    resolveInstalledBetterSqlite3PackagePath(baseDir);
+  if (installedPackagePath && manifestMatches(baseDir)) {
+    return installedPackagePath;
   }
   if (!installerConfiguration) {
     return null;
   }
   if (!inFlightInstall) {
-    if (
-      installerConfiguration.allowInstall &&
-      !(await installerConfiguration.allowInstall())
-    ) {
-      throw new Error(
-        "SQLite runtime installation was not authorized. The database was not opened.",
-      );
-    }
-    inFlightInstall = installManagedRuntime(baseDir).finally(() => {
+    const allowInstall = installerConfiguration.allowInstall;
+    inFlightInstall = (async () => {
+      if (allowInstall && !(await allowInstall())) {
+        throw new Error(
+          "SQLite runtime installation was not authorized. The database was not opened.",
+        );
+      }
+      return installManagedRuntime(baseDir);
+    })().finally(() => {
       inFlightInstall = null;
     });
   }
   return inFlightInstall;
-}
-
-export async function warmupSQLiteRuntime(baseDir: string): Promise<void> {
-  try {
-    await ensureSQLiteRuntimeInstalled(baseDir);
-  } catch (error) {
-    installerLog(`[best-effort] ${errorMessage(error)}`);
-  }
 }

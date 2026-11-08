@@ -126,11 +126,43 @@ export function prepareInsertVerification(
       );
     }
   }
+  const keyBinds = keys.map((column, index) => {
+    const name = driver.quoteIdentifier(column.name);
+    const mysqlKey =
+      backend === "mysql" && !captureKeys && keyValues[index] !== null;
+    const comparison =
+      mysqlKey && column.category !== "spatial"
+        ? driver.buildOriginalValueComparisonWithParams?.(
+            column,
+            keyValues[index],
+            index + 1,
+          )
+        : null;
+    if (comparison) return { ...comparison, comparison: comparison.sql };
+    const mutation = mysqlKey
+      ? driver.buildMutationValueExpr?.(
+          column,
+          keyValues[index],
+          "insert",
+          undefined,
+          index + 1,
+        )
+      : null;
+    const bind =
+      mutation && mutation.sql !== "?"
+        ? { sql: mutation.sql, params: mutation.params }
+        : {
+            sql: driver.buildInsertValueExpr(column, index + 1),
+            params: [keyValues[index]],
+          };
+    return { ...bind, comparison: `${name} = ${bind.sql}` };
+  });
+  const keyBindParams = keyBinds.flatMap((bind) => bind.params);
   if (backend === "mysql" && !captureKeys) {
     operation.captureIdentity = {
       mysqlKeyGuard: {
-        sql: `SELECT 1 FROM ${qualified} WHERE ${keys.map((column, index) => `${driver.quoteIdentifier(column.name)} = ${driver.buildInsertValueExpr(column, index + 1)}`).join(" AND ")} LIMIT 1 FOR UPDATE`,
-        params: keyValues,
+        sql: `SELECT 1 FROM ${qualified} WHERE ${keyBinds.map((bind) => bind.comparison).join(" AND ")} LIMIT 1 FOR UPDATE`,
+        params: keyBindParams,
       },
     };
     operation.expectedAffectedRows = 1;
@@ -140,6 +172,7 @@ export function prepareInsertVerification(
     mutation: "insert",
     sql: `SELECT ${values.map(({ column }, index) => `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${keys
       .map((column, index) => {
+        if (!captureKeys) return keyBinds[index].comparison;
         const name = driver.quoteIdentifier(column.name);
         const expression =
           captureKeys && backend === "oracle"
@@ -152,11 +185,11 @@ export function prepareInsertVerification(
             ? backend === "oracle"
               ? `:${index + 1}`
               : "?"
-            : driver.buildInsertValueExpr(column, index + 1);
+            : keyBinds[index].sql;
         return `${expression} ${backend === "sqlite" ? "IS" : "="} ${bind}`;
       })
       .join(" AND ")}`,
-    params: captureKeys ? keys.map(() => null) : keyValues,
+    params: captureKeys ? keys.map(() => null) : keyBindParams,
     values,
     ...(captureKeys
       ? {

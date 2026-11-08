@@ -1,15 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { NULL_SENTINEL } from "../../src/shared/tableTypes";
-import { buildInsertValues as buildCellInsertValues } from "../../src/webview/components/table/tableCellUtils";
 import {
   applyUndoRedoSnapshot,
   buildInsertValues,
   buildPendingRestoreState,
   buildUndoRedoSnapshot,
+  getFilterDraftValidationError,
   INSERT_DEFAULT_SENTINEL,
   parsePersistedTableDraft,
   parsePersistedTableViewState,
-  restorePendingEdits,
   restorePendingEditsSafely,
   serializeTableDraft,
 } from "../../src/webview/components/table/tableViewHelpers";
@@ -35,6 +34,53 @@ function row(col: string, value: unknown): InsertDraftRow {
 function rows(...cols: Array<[string, unknown]>): InsertDraftRow[] {
   return cols.map(([c, v]) => row(c, v));
 }
+
+describe("table filter draft validation", () => {
+  const columns = [
+    {
+      name: "age",
+      filterable: true,
+      filterOperators: ["between", "in"] as const,
+    },
+  ];
+
+  it.each([
+    ["missing lower bound", ["", "35"]],
+    ["missing upper bound", ["25", ""]],
+    ["both bounds empty", ["", ""]],
+  ])("validates Between with %s", (_label, value) => {
+    expect(
+      getFilterDraftValidationError(columns, {
+        age: { operator: "between", value: value as [string, string] },
+      }),
+    ).toMatch(/requires both bounds/);
+  });
+
+  it.each([
+    "",
+    " , ",
+    "  ,\t,",
+  ])("validates an empty In list draft %j", (value) => {
+    expect(
+      getFilterDraftValidationError(columns, {
+        age: { operator: "in", value },
+      }),
+    ).toMatch(/requires at least one value/);
+  });
+
+  it("accepts complete range and list drafts", () => {
+    expect(
+      getFilterDraftValidationError(columns, {
+        age: { operator: "between", value: ["25", "35"] },
+      }),
+    ).toBeNull();
+    expect(
+      getFilterDraftValidationError(columns, {
+        age: { operator: "in", value: "25, 35" },
+      }),
+    ).toBeNull();
+  });
+});
 
 describe("prototype-named persisted columns", () => {
   it.each([
@@ -102,8 +148,11 @@ describe("prototype-named persisted columns", () => {
 });
 
 describe("MongoDB pending edit restoration", () => {
+  const id = "507f1f77bcf86cd799439011";
+  const longType = { category: "integer", nativeType: "long" } as const;
+  const stringType = { category: "text", nativeType: "string" } as const;
+
   it("keeps edits on the BSON-typed row when string and ObjectId keys look identical", () => {
-    const id = "507f1f77bcf86cd799439011";
     const before = [
       { _id: id, name: "object" },
       { _id: id, name: "string" },
@@ -114,18 +163,89 @@ describe("MongoDB pending edit restoration", () => {
       ["_id"],
       ["objectId", "string"],
     );
-    const restored = restorePendingEdits(
+    const restored = restorePendingEditsSafely(
       state,
       [before[1], before[0]],
       ["_id"],
       ["string", "objectId"],
-    );
+    ).pendingEdits;
     expect(
       [...restored.entries()].map(([index, changes]) => [
         index,
         changes.get("name"),
       ]),
     ).toEqual([[1, "edited"]]);
+  });
+
+  function persistMongoDraft() {
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { count: "11" }]]),
+      [{ _id: id, count: "10" }],
+      ["_id"],
+      ["objectId"],
+      true,
+      [],
+      [{ count: longType }],
+    );
+    return parsePersistedTableDraft(
+      JSON.parse(JSON.stringify(serializeTableDraft("table", state, []))),
+      "table",
+    );
+  }
+
+  it("does not restore a draft whose field changed BSON type with the same display value", () => {
+    const parsed = persistMongoDraft();
+    expect(parsed?.restoreState.entries[0].originalTypes?.get("count")).toEqual(
+      longType,
+    );
+
+    const conflicted = restorePendingEditsSafely(
+      parsed?.restoreState ?? null,
+      [{ _id: id, count: "10" }],
+      ["_id"],
+      ["objectId"],
+      true,
+      [{ count: stringType }],
+    );
+    expect(conflicted.pendingEdits.size).toBe(0);
+    expect(conflicted.unresolved).toHaveLength(1);
+
+    const matching = restorePendingEditsSafely(
+      parsed?.restoreState ?? null,
+      [{ _id: id, count: "10" }],
+      ["_id"],
+      ["objectId"],
+      true,
+      [{ count: longType }],
+    );
+    expect(matching.pendingEdits.get(0)?.get("count")).toBe("11");
+    expect(matching.unresolved).toEqual([]);
+  });
+
+  it("keeps legacy Mongo drafts without baseline types unresolved", () => {
+    const state = buildPendingRestoreState(
+      pendingEditsFrom([[0, { count: "11" }]]),
+      [{ _id: id, count: "10" }],
+      ["_id"],
+      ["objectId"],
+      true,
+      [],
+      [{ count: longType }],
+    );
+    const serialized = serializeTableDraft("table", state, []);
+    delete serialized.restoreState.entries[0].originalTypes;
+    const legacy = parsePersistedTableDraft(serialized, "table");
+
+    const restored = restorePendingEditsSafely(
+      legacy?.restoreState ?? null,
+      [{ _id: id, count: "10" }],
+      ["_id"],
+      ["objectId"],
+      true,
+      [{ count: longType }],
+    );
+    expect(restored.pendingEdits.size).toBe(0);
+    expect(restored.unresolved).toHaveLength(1);
   });
 });
 
@@ -501,10 +621,8 @@ describe("snapshot round-trip", () => {
 });
 
 describe("buildInsertValues", () => {
-  it.each([
-    buildInsertValues,
-    buildCellInsertValues,
-  ])("serializes explicit NULL without changing draft state or other values", (serialize) => {
+  it("serializes explicit NULL without changing draft state or other values", () => {
+    const serialize = buildInsertValues;
     const structured = { nested: [NULL_SENTINEL, false, 0] };
     const draft: InsertDraftRow = {
       omitted: { value: INSERT_DEFAULT_SENTINEL },

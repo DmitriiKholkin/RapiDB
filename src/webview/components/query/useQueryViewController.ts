@@ -4,6 +4,7 @@ import {
   type QueryBookmarkPayload,
   type QueryEditorLanguage,
   type QueryEditorPresentation,
+  type QuerySchemaPayload,
 } from "../../../shared/webviewContracts";
 import {
   type ConnectionEntry,
@@ -27,6 +28,8 @@ import {
 
 const BLANK_QUERY_VALIDATION_MESSAGE =
   "Select or enter a query before running.";
+const MULTIPLE_SELECTIONS_MESSAGE =
+  "Multiple selections cannot be run together. Select a single query to run.";
 
 interface QueryViewControllerParams {
   panelId: string;
@@ -96,6 +99,7 @@ export function useQueryViewController({
   const { schemaByConnection, setSchema } = useSchemaStore();
 
   const schemaFetchedRef = useRef<Set<string>>(new Set());
+  const schemaErrorsRef = useRef<Record<string, string>>({});
   const bookmarkedRef = useRef(draftInitiallyBookmarked);
   const bookmarkTextRef = useRef(editorInitialValue.trim());
   const bookmarkConnectionRef = useRef(connectionId);
@@ -109,11 +113,6 @@ export function useQueryViewController({
   const dragStartH = useRef(DEFAULT_EDITOR_H);
   const didAutoFormat = useRef(queryDraft.restored);
   const didPlaceCursor = useRef(false);
-  const operationSequenceRef = useRef(0);
-  const activeOperationRef = useRef<{
-    operationId: string;
-    connectionId: string;
-  } | null>(null);
   const blankQueryValidationRef = useRef(false);
 
   const [editorHeight, setEditorHeight] = useState(DEFAULT_EDITOR_H);
@@ -121,12 +120,15 @@ export function useQueryViewController({
   const [connectionsLoaded, setConnectionsLoaded] = useState(false);
   const [bookmarked, setBookmarked] = useState(draftInitiallyBookmarked);
   const [bookmarking, setBookmarking] = useState(false);
+  const [bookmarkError, setBookmarkError] = useState<string | null>(null);
+  const [schemaErrors, setSchemaErrors] = useState<Record<string, string>>({});
 
   const invalidateBookmark = useCallback(() => {
     pendingBookmarkRef.current = null;
     bookmarkedRef.current = false;
     setBookmarked(false);
     setBookmarking(false);
+    setBookmarkError(null);
   }, []);
 
   const clearBlankQueryValidation = useCallback((queryText: string) => {
@@ -199,7 +201,10 @@ export function useQueryViewController({
 
     const cachedSchema =
       useSchemaStore.getState().schemaByConnection[resolvedConnectionId];
-    if (cachedSchema !== undefined) {
+    if (
+      cachedSchema !== undefined &&
+      schemaErrorsRef.current[resolvedConnectionId] === undefined
+    ) {
       schemaFetchedRef.current.add(resolvedConnectionId);
       return;
     }
@@ -223,7 +228,6 @@ export function useQueryViewController({
         invalidateBookmark();
       }
       blankQueryValidationRef.current = false;
-      activeOperationRef.current = null;
       reset();
       setActiveConnection(nextConnectionId);
       if (!nextConnectionId) return;
@@ -233,7 +237,10 @@ export function useQueryViewController({
 
       const cachedSchema =
         useSchemaStore.getState().schemaByConnection[nextConnectionId];
-      if (cachedSchema === undefined) {
+      if (
+        cachedSchema === undefined ||
+        schemaErrorsRef.current[nextConnectionId] !== undefined
+      ) {
         schemaFetchedRef.current.delete(nextConnectionId);
       }
     },
@@ -250,7 +257,7 @@ export function useQueryViewController({
     const unsubscribeResult = onMessage<QueryResult>(
       "queryResult",
       (payload) => {
-        const activeOperation = activeOperationRef.current;
+        const activeOperation = useQueryStore.getState().activeOperation;
         if (
           !activeOperation ||
           payload.operationId !== activeOperation.operationId ||
@@ -260,6 +267,13 @@ export function useQueryViewController({
         }
         if (payload.error) {
           blankQueryValidationRef.current = false;
+          if (
+            payload.columns.length > 0 ||
+            (payload.resultSets?.length ?? 0) > 0
+          ) {
+            setResult(payload);
+            return;
+          }
           setError(payload.error);
           return;
         }
@@ -286,12 +300,24 @@ export function useQueryViewController({
       },
     );
 
-    const unsubscribeSchema = onMessage<{
-      connectionId: string;
-      schema: SchemaObject[];
-    }>("schema", (payload) => {
-      setSchema(payload.connectionId, payload.schema);
-    });
+    const unsubscribeSchema = onMessage<QuerySchemaPayload<SchemaObject>>(
+      "schema",
+      (payload) => {
+        const { [payload.connectionId]: _previous, ...otherErrors } =
+          schemaErrorsRef.current;
+        if (payload.error) {
+          schemaFetchedRef.current.delete(payload.connectionId);
+          schemaErrorsRef.current = {
+            ...otherErrors,
+            [payload.connectionId]: payload.error,
+          };
+        } else {
+          schemaErrorsRef.current = otherErrors;
+        }
+        setSchemaErrors(schemaErrorsRef.current);
+        setSchema(payload.connectionId, payload.schema);
+      },
+    );
 
     const unsubscribeBookmark = onMessage<unknown>("bookmarkSaved", (input) => {
       const payload = parseBookmarkSavedPayload(input);
@@ -311,6 +337,14 @@ export function useQueryViewController({
       if (payload.ok) {
         bookmarkedRef.current = true;
         setBookmarked(true);
+        setBookmarkError(null);
+      } else {
+        const detail = payload.error?.trim();
+        setBookmarkError(
+          detail
+            ? `Failed to save bookmark: ${detail}`
+            : "Failed to save bookmark.",
+        );
       }
     });
 
@@ -376,7 +410,13 @@ export function useQueryViewController({
     if (useQueryStore.getState().status === "running") return;
     const queryConnectionId = useConnectionStore.getState().activeConnectionId;
     if (!queryConnectionId) return;
-    const queryText = editorRef.current?.getSelectionOrValue().trim() ?? "";
+    const selectedText = editorRef.current?.getSelectionOrValue();
+    if (selectedText === null) {
+      blankQueryValidationRef.current = false;
+      setError(MULTIPLE_SELECTIONS_MESSAGE);
+      return;
+    }
+    const queryText = selectedText?.trim() ?? "";
     if (!queryText) {
       blankQueryValidationRef.current = true;
       setError(BLANK_QUERY_VALIDATION_MESSAGE);
@@ -384,12 +424,8 @@ export function useQueryViewController({
     }
 
     blankQueryValidationRef.current = false;
-    setRunning();
-    const operationId = `${panelId}:${++operationSequenceRef.current}`;
-    activeOperationRef.current = {
-      operationId,
-      connectionId: queryConnectionId,
-    };
+    const operationId = useQueryStore.getState().nextOperationId(panelId);
+    setRunning({ operationId, connectionId: queryConnectionId });
     postMessage("executeQuery", {
       queryText,
       connectionId: queryConnectionId,
@@ -398,8 +434,8 @@ export function useQueryViewController({
   }, [panelId, setError, setRunning]);
 
   const cancelQuery = useCallback(() => {
-    const activeOperation = activeOperationRef.current;
-    if (!activeOperation || useQueryStore.getState().status !== "running") {
+    const { activeOperation, status } = useQueryStore.getState();
+    if (!activeOperation || status !== "running") {
       return;
     }
     postMessage("cancelQuery", {
@@ -446,6 +482,7 @@ export function useQueryViewController({
       connectionId: bookmarkConnectionId,
     };
     pendingBookmarkRef.current = pending;
+    setBookmarkError(null);
     setBookmarking(true);
     postMessage("addBookmark", pending satisfies QueryBookmarkPayload);
   }, [panelId]);
@@ -521,6 +558,7 @@ export function useQueryViewController({
     activeConnectionId: resolvedConnectionId,
     bookmarked,
     bookmarking,
+    bookmarkError,
     connections,
     containerRef,
     editorHeight,
@@ -535,6 +573,7 @@ export function useQueryViewController({
     isResizing,
     result,
     schema,
+    schemaError: schemaErrors[resolvedConnectionId] ?? null,
     schemaLoading:
       !!resolvedConnectionId &&
       connections.length > 0 &&

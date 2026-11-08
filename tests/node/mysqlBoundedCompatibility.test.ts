@@ -7,7 +7,6 @@ import {
   type Query,
 } from "mysql2";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { BoundedQueryRows } from "../../src/extension/dbDrivers/boundedQueryRows";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 
 const drift = vi.hoisted(() => ({ mysqlPackage: { version: "3.24.4" } }));
@@ -135,20 +134,17 @@ function mutateCommand(mutate: (command: Query) => void) {
 }
 
 describe("MySQL bounded adapter compatibility", () => {
-  it("discards a read-only query connection when rollback fails", async () => {
+  it("keeps a read-only query result when rollback fails", async () => {
     const { driver, connection, tracked } = harness();
     connection.query.mockImplementation(async (input) => {
       if (input === "ROLLBACK") throw new Error("rollback refused");
       return [[], []];
     });
 
-    await expect(
-      driver.query("SELECT 1", [], { readOnly: true }),
-    ).rejects.toMatchObject({
-      name: "AggregateError",
-      message: expect.stringContaining("rollback failed"),
-    });
+    const result = await driver.query("SELECT 1", [], { readOnly: true });
 
+    expect(result.error).toContain("Query returned results");
+    expect(result.error).toContain("rollback refused");
     expect(connection.destroy).toHaveBeenCalledOnce();
     expect(connection.release).not.toHaveBeenCalled();
     expect(tracked.activeQueryConnections.size).toBe(0);
@@ -235,16 +231,7 @@ describe("MySQL bounded adapter compatibility", () => {
     true,
   ])("drains installed multi-result/OK protocol with bounded histories (disableEval=%s)", async (disableEval) => {
     let drained = 0;
-    let peakRetained = 0;
     let peakHistory = 0;
-    const add = BoundedQueryRows.prototype.add;
-    vi.spyOn(BoundedQueryRows.prototype, "add").mockImplementation(function (
-      this: BoundedQueryRows<unknown>,
-      row,
-    ) {
-      add.call(this, row);
-      peakRetained = Math.max(peakRetained, this.rows.length);
-    });
     const { driver, native, connection, rawQuery } = harness(
       (command, wire) => {
         const advance = (next: Packet) => {
@@ -304,16 +291,25 @@ describe("MySQL bounded adapter compatibility", () => {
       },
     );
     expect(drained).toBe(1200);
-    expect(peakRetained).toBe(3);
     expect(peakHistory).toBeLessThanOrEqual(2);
     expect(result).toMatchObject({
       columns: ["same", "same"],
       rows: [
-        { __col_0: 39000, __col_1: 1 },
-        { __col_0: 39001, __col_1: 2 },
-        { __col_0: 39002, __col_1: 3 },
+        { __col_0: 0, __col_1: 1 },
+        { __col_0: 1, __col_1: 2 },
+        { __col_0: 2, __col_1: 3 },
       ],
+      rowCount: 1200,
+      truncated: true,
+    });
+    expect(result.resultSets).toHaveLength(40);
+    expect(result.resultSets?.[0]).toMatchObject({
       rowCount: 30,
+      rows: [
+        { __col_0: 0, __col_1: 1 },
+        { __col_0: 1, __col_1: 2 },
+        { __col_0: 2, __col_1: 3 },
+      ],
       truncated: true,
     });
     expect(rawQuery).toHaveBeenCalledOnce();

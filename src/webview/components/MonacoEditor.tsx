@@ -1,5 +1,6 @@
 import * as monaco from "monaco-editor";
-import React, {
+import type React from "react";
+import {
   forwardRef,
   useCallback,
   useEffect,
@@ -8,10 +9,8 @@ import React, {
   useState,
 } from "react";
 import { format as sqlFormatterFormat } from "sql-formatter";
-import type {
-  ClipboardTextPayload,
-  QueryEditorSqlDialect,
-} from "../../shared/webviewContracts";
+import type { ClipboardTextPayload } from "../../shared/webviewContracts";
+import type { ClipboardWrittenPayload } from "../../shared/webviewContracts/table";
 import type { SchemaObject } from "../store";
 import { onMessage, postMessage } from "../utils/messaging";
 import {
@@ -98,7 +97,10 @@ function applyVSCodeTheme(): void {
 
 let providerDisposable: monaco.IDisposable | null = null;
 
-let getActiveSchema: () => SchemaObject[] = () => [];
+const schemaGetterByModel = new WeakMap<
+  monaco.editor.ITextModel,
+  () => SchemaObject[]
+>();
 
 function monacoCompletionKindFor(
   kind: SqlCompletionSuggestionKind,
@@ -128,7 +130,7 @@ function ensureCompletionProvider() {
     triggerCharacters: [" ", ".", "(", ","],
 
     provideCompletionItems(model, position) {
-      const schema = getActiveSchema();
+      const schema = schemaGetterByModel.get(model)?.() ?? [];
 
       const word = model.getWordUntilPosition(position);
       const range: monaco.IRange = {
@@ -154,9 +156,25 @@ function ensureCompletionProvider() {
   });
 }
 
+function getSelectionOrValueFromEditor(
+  editor: monaco.editor.IStandaloneCodeEditor,
+): string | null {
+  const model = editor.getModel();
+  const selections = (editor.getSelections() ?? []).filter(
+    (selection) => !selection.isEmpty(),
+  );
+  if (!model || selections.length === 0) {
+    return editor.getValue();
+  }
+  if (selections.length > 1) {
+    return null;
+  }
+  return model.getValueInRange(selections[0]);
+}
+
 export interface MonacoEditorHandle {
   getValue(): string;
-  getSelectionOrValue(): string;
+  getSelectionOrValue(): string | null;
   setValue(v: string): void;
   clearValue(): void;
 
@@ -166,36 +184,6 @@ export interface MonacoEditorHandle {
 
   placeCursor(options?: { reveal?: boolean; preserveViewport?: boolean }): void;
   selectAllKeepCursorEndScrollTop(): void;
-}
-
-export function connTypeToDialect(connType: string): QueryEditorSqlDialect {
-  switch (connType) {
-    case "mysql":
-      return "mysql";
-    case "pg":
-      return "postgresql";
-    case "sqlite":
-      return "sqlite";
-    case "mssql":
-      return "transactsql";
-    case "oracle":
-      return "plsql";
-    default:
-      return "sql";
-  }
-}
-
-export function formatSQLSafe(sql: string, dialect = "sql"): string {
-  if (!sql.trim()) {
-    return sql;
-  }
-  return sqlFormatterFormat(sql, {
-    language: dialect as SqlFormatterLanguage,
-    tabWidth: 2,
-    keywordCase: "upper",
-    linesBetweenQueries: 1,
-    indentStyle: "standard",
-  });
 }
 
 export function formatSQLOrError(
@@ -264,7 +252,7 @@ interface Props {
   language?: string;
   onChange?: (value: string) => void;
   onSelectionChange?: () => void;
-  onExecute?: (value: string) => void;
+  onExecute?: (value: string | null) => void;
   height?: string | number;
   readOnly?: boolean;
   ariaLabel?: string;
@@ -374,13 +362,6 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       schemaRef.current = schema;
     }, [schema]);
 
-    useEffect(() => {
-      getActiveSchema = () => schemaRef.current;
-      return () => {
-        getActiveSchema = () => [];
-      };
-    }, []);
-
     const dialectRef = useRef(dialect);
     useEffect(() => {
       dialectRef.current = dialect;
@@ -402,12 +383,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       getSelectionOrValue: () => {
         const editor = editorRef.current;
         if (!editor) return "";
-        const model = editor.getModel();
-        const selection = editor.getSelection();
-        if (model && selection && !selection.isEmpty()) {
-          return model.getValueInRange(selection);
-        }
-        return editor.getValue() ?? "";
+        return getSelectionOrValueFromEditor(editor);
       },
       setValue: (v) => editorRef.current?.setValue(v),
       clearValue: () => {
@@ -566,7 +542,32 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       });
       editorRef.current = editor;
 
-      const insertText = (text: string) => {
+      const editorModel = editor.getModel();
+      const getSchema = () => schemaRef.current;
+      if (editorModel) {
+        schemaGetterByModel.set(editorModel, getSchema);
+      }
+
+      const getInsertRange = (): monaco.IRange => {
+        const selection = editor.getSelection();
+        if (selection) {
+          return {
+            startLineNumber: selection.startLineNumber,
+            startColumn: selection.startColumn,
+            endLineNumber: selection.endLineNumber,
+            endColumn: selection.endColumn,
+          };
+        }
+        const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+        return {
+          startLineNumber: pos.lineNumber,
+          startColumn: pos.column,
+          endLineNumber: pos.lineNumber,
+          endColumn: pos.column,
+        };
+      };
+
+      const insertText = (text: string, range: monaco.IRange) => {
         if (readOnlyRef.current) {
           return;
         }
@@ -575,40 +576,47 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           editor.trigger("keyboard", "type", { text });
           return;
         }
-        const selection = editor.getSelection();
-        const range = selection
-          ? {
-              startLineNumber: selection.startLineNumber,
-              startColumn: selection.startColumn,
-              endLineNumber: selection.endLineNumber,
-              endColumn: selection.endColumn,
+        editor.executeEdits(
+          "paste",
+          [{ range, text, forceMoveMarkers: true }],
+          (inverseEdits) => {
+            const insertedRange = inverseEdits[0]?.range;
+            if (!insertedRange) {
+              return null;
             }
-          : (() => {
-              const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
-              return {
-                startLineNumber: pos.lineNumber,
-                startColumn: pos.column,
-                endLineNumber: pos.lineNumber,
-                endColumn: pos.column,
-              };
-            })();
-        editor.executeEdits("paste", [{ range, text, forceMoveMarkers: true }]);
-        editor.pushUndoStop();
-        const newPos = model.getPositionAt(
-          model.getOffsetAt({
-            lineNumber: range.startLineNumber,
-            column: range.startColumn,
-          }) + text.length,
+            return [
+              new monaco.Selection(
+                insertedRange.endLineNumber,
+                insertedRange.endColumn,
+                insertedRange.endLineNumber,
+                insertedRange.endColumn,
+              ),
+            ];
+          },
         );
-        editor.setPosition(newPos);
-        editor.revealPosition(newPos);
+        editor.pushUndoStop();
+        const newPos = editor.getPosition();
+        if (newPos) {
+          editor.revealPosition(newPos);
+        }
       };
 
       const clipboardRecipient = `monaco:${crypto.randomUUID()}`;
-      let pendingClipboardRequest: string | null = null;
+      let pendingClipboardRequest: {
+        requestId: string;
+        model: monaco.editor.ITextModel | null;
+        versionId: number | null;
+        range: monaco.IRange;
+      } | null = null;
       const requestClipboard = () => {
         const requestId = crypto.randomUUID();
-        pendingClipboardRequest = requestId;
+        const model = editor.getModel();
+        pendingClipboardRequest = {
+          requestId,
+          model,
+          versionId: model?.getVersionId() ?? null,
+          range: getInsertRange(),
+        };
         postMessage("readClipboard", {
           requestId,
           recipient: clipboardRecipient,
@@ -617,20 +625,72 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       const unsubClipboard = onMessage<ClipboardTextPayload>(
         "clipboardText",
         (payload) => {
+          const pending = pendingClipboardRequest;
           if (
             payload.recipient !== clipboardRecipient ||
-            payload.requestId !== pendingClipboardRequest
+            payload.requestId !== pending?.requestId
           )
             return;
           pendingClipboardRequest = null;
-          insertText(payload.text);
+          if (payload.text === "") {
+            return;
+          }
+          const model = editor.getModel();
+          if (
+            model !== pending.model ||
+            (model && model.getVersionId() !== pending.versionId)
+          ) {
+            return;
+          }
+          insertText(payload.text, pending.range);
           editor.focus();
+        },
+      );
+      let pendingCutRequest: {
+        requestId: string;
+        model: monaco.editor.ITextModel | null;
+        versionId: number | null;
+        range: monaco.IRange;
+      } | null = null;
+      const unsubClipboardWritten = onMessage<ClipboardWrittenPayload>(
+        "clipboardWritten",
+        (payload) => {
+          const pending = pendingCutRequest;
+          if (
+            payload.recipient !== clipboardRecipient ||
+            payload.requestId !== pending?.requestId
+          )
+            return;
+          pendingCutRequest = null;
+          const model = editor.getModel();
+          if (
+            !payload.success ||
+            readOnlyRef.current ||
+            model !== pending.model ||
+            (model && model.getVersionId() !== pending.versionId)
+          ) {
+            return;
+          }
+          editor.executeEdits("native-cut", [
+            {
+              range: pending.range,
+              text: "",
+              forceMoveMarkers: true,
+            },
+          ]);
+          editor.pushUndoStop();
         },
       );
 
       const domNode = editor.getDomNode();
+      const isWidgetClipboardTarget = (target: EventTarget | null) =>
+        target instanceof Element &&
+        (target.closest(".overlayWidgets, .contentWidgets") !== null ||
+          target instanceof HTMLInputElement ||
+          (target instanceof HTMLTextAreaElement &&
+            !target.matches(".inputarea, .ime-text-area")));
       const nativePaste = (e: ClipboardEvent) => {
-        if (readOnlyRef.current) {
+        if (readOnlyRef.current || isWidgetClipboardTarget(e.target)) {
           return;
         }
         e.preventDefault();
@@ -638,14 +698,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         requestClipboard();
       };
 
-      const getExecText = () => {
-        const model = editor.getModel();
-        const selection = editor.getSelection();
-        if (model && selection && !selection.isEmpty()) {
-          return model.getValueInRange(selection);
-        }
-        return editor.getValue();
-      };
+      const getExecText = () => getSelectionOrValueFromEditor(editor);
       const getSelectedText = () => {
         const model = editor.getModel();
         const selection = editor.getSelection();
@@ -654,22 +707,29 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         }
         return model.getValueInRange(selection);
       };
-      const deleteSelectedText = () => {
-        if (readOnlyRef.current) {
-          return;
-        }
+      const writeSelectionThenDelete = (selectedText: string) => {
         const selection = editor.getSelection();
         if (!selection || selection.isEmpty()) {
           return;
         }
-        editor.executeEdits("native-cut", [
-          {
-            range: selection,
-            text: "",
-            forceMoveMarkers: true,
+        const requestId = crypto.randomUUID();
+        const model = editor.getModel();
+        pendingCutRequest = {
+          requestId,
+          model,
+          versionId: model?.getVersionId() ?? null,
+          range: {
+            startLineNumber: selection.startLineNumber,
+            startColumn: selection.startColumn,
+            endLineNumber: selection.endLineNumber,
+            endColumn: selection.endColumn,
           },
-        ]);
-        editor.pushUndoStop();
+        };
+        postMessage("writeClipboard", {
+          text: selectedText,
+          requestId,
+          recipient: clipboardRecipient,
+        });
       };
       const copySelection = () => {
         const selectedText = getSelectedText();
@@ -683,8 +743,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         if (!selectedText || readOnlyRef.current) {
           return;
         }
-        postMessage("writeClipboard", { text: selectedText });
-        deleteSelectedText();
+        writeSelectionThenDelete(selectedText);
       };
       const pasteClipboard = () => {
         if (readOnlyRef.current) {
@@ -699,6 +758,9 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       pasteClipboardRef.current = pasteClipboard;
 
       const nativeCopy = (e: ClipboardEvent) => {
+        if (isWidgetClipboardTarget(e.target)) {
+          return;
+        }
         const selectedText = getSelectedText();
         if (!selectedText) {
           return;
@@ -708,86 +770,113 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         postMessage("writeClipboard", { text: selectedText });
       };
       const nativeCut = (e: ClipboardEvent) => {
+        if (isWidgetClipboardTarget(e.target)) {
+          return;
+        }
         const selectedText = getSelectedText();
         if (!selectedText || readOnlyRef.current) {
           return;
         }
         e.preventDefault();
         e.stopImmediatePropagation();
-        postMessage("writeClipboard", { text: selectedText });
-        deleteSelectedText();
+        writeSelectionThenDelete(selectedText);
       };
 
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, () => {
-        copySelection();
-      });
-
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, () => {
-        cutSelection();
-      });
-
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, () => {
-        pasteClipboard();
-      });
-
-      editor.addCommand(
-        monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
-        () => {
-          pasteClipboard();
-        },
-      );
+      const actionDisposables = [
+        editor.addAction({
+          id: "rapidb.copy",
+          label: "RapiDB: Copy",
+          keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC],
+          keybindingContext: "editorTextFocus",
+          run: () => {
+            copySelection();
+          },
+        }),
+        editor.addAction({
+          id: "rapidb.cut",
+          label: "RapiDB: Cut",
+          precondition: "!editorReadonly",
+          keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX],
+          keybindingContext: "editorTextFocus",
+          run: () => {
+            cutSelection();
+          },
+        }),
+        editor.addAction({
+          id: "rapidb.paste",
+          label: "RapiDB: Paste",
+          precondition: "!editorReadonly",
+          keybindings: [
+            monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV,
+            monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyV,
+          ],
+          keybindingContext: "editorTextFocus",
+          run: () => {
+            pasteClipboard();
+          },
+        }),
+      ];
 
       domNode?.addEventListener("copy", nativeCopy, true);
       domNode?.addEventListener("cut", nativeCut, true);
       domNode?.addEventListener("paste", nativePaste, true);
 
-      editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
-        if (readOnlyRef.current) {
-          return;
-        }
-        onExecuteRef.current?.(getExecText());
-      });
-      editor.addCommand(monaco.KeyCode.F5, () => {
-        if (readOnlyRef.current) {
-          return;
-        }
-        onExecuteRef.current?.(getExecText());
-      });
-
-      editor.addCommand(
-        monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
-        () => {
-          if (readOnlyRef.current) {
-            return;
-          }
-          const model = editor.getModel();
-          if (!model) {
-            return;
-          }
-          const raw = editor.getValue();
-          const out = formatEditorValueOrError({
-            value: raw,
-            language: languageRef.current,
-            dialect: dialectRef.current,
-          });
-          if (!out) {
-            return;
-          }
-          if ("error" in out) {
-            return;
-          }
-          if (out.result === raw) {
-            return;
-          }
-          editor.executeEdits("format-sql", [
-            {
-              range: model.getFullModelRange(),
-              text: out.result,
-              forceMoveMarkers: true,
-            },
-          ]);
-          editor.pushUndoStop();
-        },
+      actionDisposables.push(
+        editor.addAction({
+          id: "rapidb.execute",
+          label: "RapiDB: Execute Query",
+          precondition: "!editorReadonly",
+          keybindings: [
+            monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter,
+            monaco.KeyCode.F5,
+          ],
+          run: () => {
+            if (readOnlyRef.current) {
+              return;
+            }
+            onExecuteRef.current?.(getExecText());
+          },
+        }),
+        editor.addAction({
+          id: "rapidb.format",
+          label: "RapiDB: Format Document",
+          precondition: "!editorReadonly",
+          keybindings: [
+            monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
+          ],
+          run: () => {
+            if (readOnlyRef.current) {
+              return;
+            }
+            const model = editor.getModel();
+            if (!model) {
+              return;
+            }
+            const raw = editor.getValue();
+            const out = formatEditorValueOrError({
+              value: raw,
+              language: languageRef.current,
+              dialect: dialectRef.current,
+            });
+            if (!out) {
+              return;
+            }
+            if ("error" in out) {
+              return;
+            }
+            if (out.result === raw) {
+              return;
+            }
+            editor.executeEdits("format-sql", [
+              {
+                range: model.getFullModelRange(),
+                text: out.result,
+                forceMoveMarkers: true,
+              },
+            ]);
+            editor.pushUndoStop();
+          },
+        }),
       );
 
       const changeDisposable = editor.onDidChangeModelContent(() => {
@@ -815,6 +904,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         changeDisposable.dispose();
         selectionDisposable.dispose();
         unsubClipboard();
+        unsubClipboardWritten();
         domNode?.removeEventListener("copy", nativeCopy, true);
         domNode?.removeEventListener("cut", nativeCut, true);
         domNode?.removeEventListener("paste", nativePaste, true);
@@ -822,6 +912,12 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         copySelectionRef.current = () => {};
         cutSelectionRef.current = () => {};
         pasteClipboardRef.current = () => {};
+        for (const disposable of actionDisposables) {
+          disposable.dispose();
+        }
+        if (editorModel && schemaGetterByModel.get(editorModel) === getSchema) {
+          schemaGetterByModel.delete(editorModel);
+        }
         editor.dispose();
       };
     }, []);

@@ -179,7 +179,7 @@ describe("MongoDBDriver — mongosh query()", () => {
       {},
       {
         promoteValues: false,
-        bsonRegExp: false,
+        bsonRegExp: true,
       },
     );
     expect(result.columns).toContain("name");
@@ -255,7 +255,7 @@ describe("MongoDBDriver — mongosh query()", () => {
     await driver.query('db.users.find({ name: "Alice" }).limit(5)');
     expect(findReturn).toHaveBeenCalledWith(
       { name: "Alice" },
-      { promoteValues: false, bsonRegExp: false },
+      { promoteValues: false, bsonRegExp: true },
     );
   });
 
@@ -272,7 +272,7 @@ describe("MongoDBDriver — mongosh query()", () => {
       {
         projection: { name: 1, _id: 0 },
         promoteValues: false,
-        bsonRegExp: false,
+        bsonRegExp: true,
       },
     );
     expect(mockSort).toHaveBeenCalledWith({ score: -1 });
@@ -292,7 +292,7 @@ describe("MongoDBDriver — mongosh query()", () => {
 
     expect(mockFind).toHaveBeenCalledWith(
       {},
-      { promoteValues: false, bsonRegExp: false },
+      { promoteValues: false, bsonRegExp: true },
     );
     expect(result.rowCount).toBe(1);
   });
@@ -338,6 +338,7 @@ describe("MongoDBDriver — mongosh query()", () => {
       t_date: new Date("2024-07-04T12:00:00.000Z"),
       t_decimal128: Decimal128.fromString("123456789.987654321"),
       t_int64: Long.fromString("9223372036854775807"),
+      t_numeric_string: "9007199254740993",
       t_array: [
         new Int32(1),
         "two",
@@ -383,6 +384,15 @@ describe("MongoDBDriver — mongosh query()", () => {
       t_regex: "/quick\\s+fox/gi",
       t_timestamp: "Timestamp(1720094400, 1)",
     });
+    expect(result.columnMeta?.[result.columns.indexOf("t_decimal128")]).toEqual(
+      { category: "decimal" },
+    );
+    expect(result.columnMeta?.[result.columns.indexOf("t_int64")]).toEqual({
+      category: "integer",
+    });
+    expect(
+      result.columnMeta?.[result.columns.indexOf("t_numeric_string")],
+    ).toEqual({ category: null });
   });
 
   it("executes insertOne", async () => {
@@ -481,6 +491,59 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(mockDeleteMany).toHaveBeenNthCalledWith(2, taggedFilter);
   });
 
+  it.each([
+    "",
+    "i",
+    "m",
+    "s",
+    "u",
+    "x",
+    "l",
+    "xismul",
+  ])("preserves native BSON regex pattern/options %j without JavaScript conversion", async (options) => {
+    const { driver, mockInsertOne, mockDeleteMany } = createMockDriver();
+    const value = new BSONRegExp("(?i)word", options);
+    const expression = `new BSONRegExp("(?i)word", ${JSON.stringify(options)})`;
+    await driver.query(
+      `db.items.insertOne({ nested: [${expression}] }); db.items.deleteMany({ pattern: ${expression} })`,
+    );
+    expect(mockInsertOne).toHaveBeenCalledWith({ nested: [value] });
+    expect(mockDeleteMany).toHaveBeenCalledWith({ pattern: value });
+  });
+
+  it.each([
+    "new BSONRegExp()",
+    "new BSONRegExp(12)",
+    "new BSONRegExp({})",
+    'new BSONRegExp("word", 12)',
+    'new BSONRegExp("word", null)',
+    'new BSONRegExp("word", "i", "extra")',
+    'new BSONRegExp("word", "g")',
+    'new BSONRegExp("word", "z")',
+    'new BSONRegExp("bad\\0word", "i")',
+    'new BSONRegExp("word", "i\\0")',
+    'new RegExp("word", "x")',
+    'new RegExp("word", "l")',
+  ])("rejects invalid regex %s before any script write", async (expression) => {
+    const { driver, mockInsertOne, mockDeleteMany } = createMockDriver();
+    await expect(
+      driver.query(
+        `db.items.insertOne({ safe: true }); db.items.deleteMany({ pattern: ${expression} })`,
+      ),
+    ).rejects.toThrow();
+    expect(mockInsertOne).not.toHaveBeenCalled();
+    expect(mockDeleteMany).not.toHaveBeenCalled();
+  });
+
+  it("does not interpret ordinary BSONRegExp marker-shaped documents as native values", async () => {
+    const { driver, mockInsertOne } = createMockDriver();
+    const value = { kind: "marker", value: "BSONRegExp", args: [".*", "x"] };
+    await driver.query(
+      `db.items.insertOne({ value: ${JSON.stringify(value)} })`,
+    );
+    expect(mockInsertOne).toHaveBeenCalledWith({ value });
+  });
+
   it("preserves bigint values in mongosh arguments", async () => {
     const { driver, mockInsertOne, mockFind } = createMockDriver();
 
@@ -490,7 +553,7 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(mockInsertOne).toHaveBeenCalledWith({ n: 9007199254740993n });
     expect(mockFind).toHaveBeenCalledWith(
       { n: 9007199254740993n },
-      { promoteValues: false, bsonRegExp: false },
+      { promoteValues: false, bsonRegExp: true },
     );
   });
 
@@ -742,7 +805,7 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
       },
       {
         promoteValues: false,
-        bsonRegExp: false,
+        bsonRegExp: true,
       },
     );
   });
@@ -930,7 +993,7 @@ describe("MongoDBDriver — readTablePage()", () => {
       },
       {
         promoteValues: false,
-        bsonRegExp: false,
+        bsonRegExp: true,
       },
     );
     const readCursor = mockFind.mock.results.at(-1)?.value as {
@@ -1326,7 +1389,7 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
       {
         values: {
           t_binary_uuid: driver.coerceInputValue(
-            "ESIzRFVmd4iZqrvM3e7//w==",
+            "0x112233445566778899aabbccddeeffff",
             binData4Column,
           ),
           t_date: driver.coerceInputValue("2024-07-04 12:00:00", dateColumn),
@@ -1435,10 +1498,10 @@ describe("MongoDBDriver — buildMutationPreviewStatement()", () => {
     ).toBe("Timestamp(1720094400, 1)");
     expect(
       driver.formatOutputValue(
-        driver.coerceInputValue("/quick\\s+fox/gi", regexColumn),
+        driver.coerceInputValue("/quick\\s+fox/is", regexColumn),
         regexColumn,
       ),
-    ).toBe("/quick\\s+fox/gi");
+    ).toBe("/quick\\s+fox/is");
     expect(
       driver.formatOutputValue(
         driver.coerceInputValue(

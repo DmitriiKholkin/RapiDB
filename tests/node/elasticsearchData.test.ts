@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
 import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 
@@ -29,6 +30,9 @@ function createDriver() {
 
   const search = vi.fn();
   const getMapping = vi.fn();
+  const getSettings = vi.fn().mockResolvedValue({});
+  const openPointInTime = vi.fn().mockResolvedValue({ id: "page-pit" });
+  const closePointInTime = vi.fn().mockResolvedValue({ succeeded: true });
   const resolveIndex = vi.fn();
   const createIndex = vi.fn();
   const update = vi.fn().mockResolvedValue({ result: "updated" });
@@ -41,12 +45,15 @@ function createDriver() {
       client: {
         get: typeof get;
         search: typeof search;
+        openPointInTime: typeof openPointInTime;
+        closePointInTime: typeof closePointInTime;
         update: typeof update;
         delete: typeof remove;
         index: typeof index;
         indices: {
           resolveIndex: typeof resolveIndex;
           getMapping: typeof getMapping;
+          getSettings: typeof getSettings;
           create: typeof createIndex;
           get: typeof get;
           delete: ReturnType<typeof vi.fn>;
@@ -60,12 +67,15 @@ function createDriver() {
   ).client = {
     get,
     search,
+    openPointInTime,
+    closePointInTime,
     update,
     delete: remove,
     index,
     indices: {
       resolveIndex,
       getMapping,
+      getSettings,
       create: createIndex,
       get: get.mockResolvedValue({}),
       delete: vi.fn().mockResolvedValue({ acknowledged: true }),
@@ -80,6 +90,7 @@ function createDriver() {
     driver,
     search,
     getMapping,
+    getSettings,
     resolveIndex,
     createIndex,
     update,
@@ -90,6 +101,23 @@ function createDriver() {
 }
 
 describe("ElasticsearchDriver — metadata and pages", () => {
+  it("treats a semicolon after a REST path as a statement separator", async () => {
+    const { driver, getMapping, getSettings } = createDriver();
+    getMapping.mockResolvedValue({ notes: { mappings: {} } });
+    getSettings.mockResolvedValue({ notes: { settings: {} } });
+
+    await driver.query("GET /notes/_mapping;\nGET /notes/_settings");
+
+    expect(getMapping).toHaveBeenCalledWith({
+      index: "notes",
+      querystring: {},
+    });
+    expect(getSettings).toHaveBeenCalledWith({
+      index: "notes",
+      querystring: {},
+    });
+  });
+
   it("lists sorted visible concrete indices via resolveIndex", async () => {
     const { driver, resolveIndex } = createDriver();
     resolveIndex.mockResolvedValue({
@@ -130,6 +158,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         hits: [
           {
             _id: "doc-2",
+            sort: [0],
             _source: {
               created_at: "2026-04-02T10:30:00Z",
               email: "bravo@example.com",
@@ -140,6 +169,7 @@ describe("ElasticsearchDriver — metadata and pages", () => {
           },
           {
             _id: "doc-1",
+            sort: [1],
             _source: {
               created_at: "2026-04-01T09:00:00Z",
               email: "alpha@example.com",
@@ -211,10 +241,11 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(search).toHaveBeenCalledWith(
       {
-        index: "users",
+        pit: { id: "page-pit", keep_alive: "1m" },
         query: { match_all: {} },
-        sort: ["_doc"],
-        size: ELASTICSEARCH_READ_BUDGET.hardCap,
+        sort: [{ _shard_doc: "asc" }],
+        size: 500,
+        search_after: undefined,
         track_total_hits: true,
         allow_partial_search_results: false,
         seq_no_primary_term: true,
@@ -222,7 +253,6 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       {
         signal: expect.any(AbortSignal),
         requestTimeout: expect.any(Number),
-        maxRetries: 0,
       },
     );
     expect(getMapping).not.toHaveBeenCalled();
@@ -337,6 +367,185 @@ describe("ElasticsearchDriver — metadata and pages", () => {
         __col_1: '{"title":"Release note","tags":["product","beta"]}',
       },
     ]);
+  });
+
+  it("returns aggregations, suggestions and totals from REST-style searches", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValueOnce({
+      hits: { total: { value: 42, relation: "eq" }, hits: [] },
+      aggregations: { by_tag: { buckets: [{ key: "beta", doc_count: 42 }] } },
+    });
+
+    const aggregationsOnly = await driver.query(
+      'POST /notes/_search\n{"size":0,"aggs":{"by_tag":{"terms":{"field":"tag"}}}}',
+    );
+
+    expect(aggregationsOnly.columns).toEqual(["total", "aggregations"]);
+    expect(aggregationsOnly.rows).toEqual([
+      {
+        __col_0: '{"value":42,"relation":"eq"}',
+        __col_1: '{"by_tag":{"buckets":[{"key":"beta","doc_count":42}]}}',
+      },
+    ]);
+
+    search.mockResolvedValueOnce({
+      hits: {
+        total: { value: 1, relation: "eq" },
+        hits: [{ _index: "notes", _id: "doc-1", _source: { tag: "beta" } }],
+      },
+      suggest: { fix: [{ text: "bta", options: [{ text: "beta" }] }] },
+    });
+
+    const withHits = await driver.query(
+      'POST /notes/_search\n{"suggest":{"fix":{"text":"bta","term":{"field":"tag"}}}}',
+    );
+
+    expect(withHits.resultSets?.map((resultSet) => resultSet.id)).toEqual([
+      "summary",
+      "hits",
+    ]);
+    expect(withHits.resultSets?.[0].columns).toEqual(["total", "suggest"]);
+    expect(withHits.resultSets?.[1].columns).toEqual(["_id", "_source"]);
+  });
+
+  it("keeps the aggregation summary when hits reach the query row limit", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({
+      hits: {
+        total: { value: 3, relation: "eq" },
+        hits: ["a", "b", "c"].map((id) => ({
+          _index: "notes",
+          _id: id,
+          _source: {},
+        })),
+      },
+      aggregations: { count: { value: 3 } },
+    });
+
+    const formatted = formatQueryResult(
+      await driver.query(
+        'POST /notes/_search\n{"size":3,"aggs":{"count":{"value_count":{"field":"_id"}}}}',
+      ),
+      2,
+    );
+
+    expect(formatted.resultSets?.[0]).toMatchObject({
+      id: "summary",
+      rows: [{ __col_1: '{"count":{"value":3}}' }],
+      truncated: false,
+    });
+    expect(formatted.resultSets?.[1]).toMatchObject({
+      id: "hits",
+      truncated: true,
+    });
+    expect(formatted.resultSets?.[1].rows).toHaveLength(1);
+  });
+
+  it("reports multi-statement search result sets without duplicating hits", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({
+      hits: {
+        total: { value: 1, relation: "eq" },
+        hits: [{ _index: "notes", _id: "doc-1", _source: { n: 1 } }],
+      },
+      aggregations: { count: { value: 1 } },
+    });
+
+    const result = await driver.query(
+      'POST /notes/_search\n{"aggs":{"count":{"value_count":{"field":"_id"}}}}\nPOST /notes/_search\n{}',
+    );
+    const [statement] = JSON.parse(String(result.rows[0].__col_0));
+
+    expect(statement).not.toHaveProperty("rows");
+    expect(statement.resultSets).toEqual([
+      {
+        id: "summary",
+        rows: [
+          {
+            total: '{"value":1,"relation":"eq"}',
+            aggregations: '{"count":{"value":1}}',
+          },
+        ],
+      },
+      { id: "hits", rows: [{ _id: "doc-1", _source: '{"n":1}' }] },
+    ]);
+  });
+
+  it.each([
+    "POST /notes,archive/_search",
+    "POST /notes-*/_search",
+    "POST /notes-alias/_search",
+    "POST /_search",
+  ])("includes _index in multi-index search results: %s", async (path) => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({
+      hits: {
+        hits: [
+          { _index: "notes", _id: "same", _source: { n: 1 } },
+          { _index: "archive", _id: "same", _source: { n: 2 } },
+        ],
+      },
+    });
+
+    const result = await driver.query(`${path}\n{}`);
+
+    expect(result.columns).toEqual(["_id", "_index", "_source"]);
+    expect(result.rows).toEqual([
+      { __col_0: "same", __col_1: "notes", __col_2: '{"n":1}' },
+      { __col_0: "same", __col_1: "archive", __col_2: '{"n":2}' },
+    ]);
+  });
+
+  it("preserves size zero in REST-style search bodies", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    const result = await driver.query(
+      'POST /notes/_search\n{"query":{"match_all":{}},"size":0}',
+    );
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: { query: { match_all: {} }, size: 0 },
+      }),
+    );
+    expect(result.rowCount).toBe(0);
+    expect(result.rows).toEqual([]);
+  });
+
+  it("preserves size zero in REST-style search query parameters", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    const result = await driver.query("GET /notes/_search?size=0");
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({ querystring: { size: 0 } }),
+    );
+    expect(result.rowCount).toBe(0);
+    expect(result.rows).toEqual([]);
+  });
+
+  it("leaves negative REST search sizes for Elasticsearch to reject", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    await driver.query('POST /notes/_search\n{"size":-1}');
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({ body: { size: -1 } }),
+    );
+  });
+
+  it("does not truncate fractional negative REST search sizes to zero", async () => {
+    const { driver, search } = createDriver();
+    search.mockResolvedValue({ hits: { hits: [] } });
+
+    await driver.query('POST /notes/_search\n{"size":-0.5}');
+
+    expect(search).toHaveBeenCalledWith(
+      expect.objectContaining({ body: { size: -0.5 } }),
+    );
   });
 
   it("clamps REST-style search body size to hard cap", async () => {
@@ -660,6 +869,41 @@ describe("ElasticsearchDriver — metadata and pages", () => {
     );
   });
 
+  it.each([
+    "",
+    "   ",
+    null,
+  ])("rejects an empty _source update instead of wiping the document: %j", async (source) => {
+    const { driver, update, index } = createDriver();
+    const sourceColumn = {
+      ...elasticDatetimeColumn,
+      name: "_source",
+      type: "object",
+      nativeType: "object",
+      category: "json",
+    } as ColumnTypeMeta;
+
+    expect(() => driver.coerceTableEditValue(source, sourceColumn)).toThrow(
+      /must be a JSON object/,
+    );
+    expect(driver.coerceTableEditValue("{}", sourceColumn)).toEqual({});
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
+            changes: { _source: source },
+          },
+        ],
+      }),
+    ).rejects.toThrow(/must be a JSON object/);
+    expect(index).not.toHaveBeenCalled();
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it("supports updates without an original snapshot when a read identity is supplied", async () => {
     const { driver, update, index } = createDriver();
 
@@ -715,13 +959,82 @@ describe("ElasticsearchDriver — metadata and pages", () => {
           },
         ],
       }),
+    ).resolves.toEqual({ affectedRows: 2 });
+  });
+
+  it("treats a conditional script noop as a rejected snapshot", async () => {
+    const { driver, update } = createDriver();
+    update.mockResolvedValueOnce({ result: "noop" });
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-1"),
+            changes: { _source: '{"active":false}' },
+            originalValues: { _source: '{"active":true}' },
+          },
+        ],
+      }),
     ).resolves.toEqual({
-      affectedRows: 1,
-      updateRowOutcomes: [
-        { rowIndex: 0, status: "applied" },
-        { rowIndex: 1, status: "not_applied" },
-      ],
+      affectedRows: 0,
+      updateRowOutcomes: [{ rowIndex: 0, status: "not_applied" }],
     });
+  });
+
+  it.each([
+    [
+      {
+        meta: {
+          statusCode: 409,
+          body: { error: { type: "version_conflict_engine_exception" } },
+        },
+      },
+      "not_applied",
+    ],
+    [
+      {
+        meta: { statusCode: 409, body: { error: { type: "other_exception" } } },
+      },
+      "unknown",
+    ],
+    [
+      {
+        meta: {
+          statusCode: 500,
+          body: { error: { type: "version_conflict_engine_exception" } },
+        },
+      },
+      "unknown",
+    ],
+  ])("classifies only a confirmed version conflict as not applied", async (error, status) => {
+    const { driver, update } = createDriver();
+    update
+      .mockResolvedValueOnce({ result: "updated" })
+      .mockRejectedValueOnce(error);
+    await expect(
+      driver.updateRows({
+        database: "default",
+        schema: "indices",
+        table: "users",
+        updates: ["doc-1", "doc-2", "doc-3"].map((id) => ({
+          primaryKeys: elasticsearchKeys(driver, id),
+          changes: { active: false },
+        })),
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 1,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "applied" },
+          { rowIndex: 1, status },
+          { rowIndex: 2, status: "not_applied" },
+        ],
+      },
+    });
+    expect(update).toHaveBeenCalledTimes(2);
   });
 
   it("retains successful Elasticsearch documents when a later update errors", async () => {

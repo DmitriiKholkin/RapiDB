@@ -1,4 +1,4 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import type { ConnectionManager } from "../connectionManager";
 import type { RapiDBNode } from "../providers/connectionProvider";
 

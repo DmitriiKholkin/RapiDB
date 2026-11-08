@@ -3,8 +3,13 @@ import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 const queryReplyOptions = {
   typeMapping: {
+    [RESP_TYPES.SIMPLE_STRING]: Buffer,
     [RESP_TYPES.BLOB_STRING]: Buffer,
+    [RESP_TYPES.VERBATIM_STRING]: Buffer,
     [RESP_TYPES.DOUBLE]: String,
+    [RESP_TYPES.NUMBER]: String,
+    [RESP_TYPES.BIG_NUMBER]: String,
+    [RESP_TYPES.MAP]: Map,
   },
 };
 
@@ -93,16 +98,61 @@ describe("RedisDriver — query()", () => {
     );
     expect(result.rowCount).toBe(1);
     expect(result.columns).toEqual(["results"]);
+    expect(result.columnMeta).toEqual([{ category: "json" }]);
     expect(result.rows[0]?.__col_0).toBe("[1,2]");
   });
 
-  it("treats escaped whitespace as part of the same argument", async () => {
+  it("marks structured replies for JSON-aware export but leaves JSON-looking strings as text", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("string")
+      .mockResolvedValueOnce("hash")
+      .mockResolvedValueOnce("list");
+
+    const arrayResult = await driver.query(
+      "TYPE users:1\nTYPE users:2\nTYPE users:3",
+    );
+
+    expect(arrayResult.columnMeta).toEqual([{ category: "json" }]);
+    expect(arrayResult.rows[0]?.__col_0).toBe('["string","hash","list"]');
+
+    sendCommand.mockResolvedValueOnce([
+      Buffer.from("draft"),
+      Buffer.from("123"),
+    ]);
+    const singleArrayResult = await driver.query('LRANGE "users:3" 0 -1');
+
+    expect(singleArrayResult.columns).toEqual(["result"]);
+    expect(singleArrayResult.columnMeta).toEqual([{ category: "json" }]);
+    expect(singleArrayResult.rows[0]?.__col_0).toBe('["draft","123"]');
+
+    sendCommand.mockResolvedValueOnce(
+      new Map([
+        ["first", "value-1"],
+        ["second", "value-2"],
+      ]),
+    );
+    const objectResult = await driver.query('HGETALL "users:2"');
+
+    expect(objectResult.columnMeta).toEqual([{ category: "json" }]);
+    expect(objectResult.rows[0]?.__col_0).toBe(
+      '{"first":"value-1","second":"value-2"}',
+    );
+
+    sendCommand.mockResolvedValueOnce('["not","an","array"]');
+    const stringResult = await driver.query('GET "json-looking-value"');
+
+    expect(stringResult.columnMeta).toEqual([{ category: null }]);
+    expect(stringResult.rows[0]?.__col_0).toBe('["not","an","array"]');
+  });
+
+  it("keeps backslashes outside quotes literal like redis-cli", async () => {
     const { driver, sendCommand } = createDriver();
 
     await driver.query("SET key hello\\ world");
 
     expect(sendCommand).toHaveBeenCalledWith(
-      ["SET", "key", "hello world"],
+      ["SET", "key", "hello\\", "world"],
       queryReplyOptions,
     );
   });
@@ -119,13 +169,19 @@ describe("RedisDriver — query()", () => {
   });
 
   it.each([
-    String.raw`SET key '\n\r\t\b\f\u0000\u96EA\\path\'quoted\'\ space'`,
-    String.raw`SET key \n\r\t\b\f\u0000\u96EA\\path\'quoted\'\ space`,
-  ])("preserves shell escaping for single-quoted and unquoted input %s", async (query) => {
+    [
+      String.raw`SET key '\n\r\t\b\f\u0000\u96EA\\path\'quoted\'\ space'`,
+      ["SET", "key", String.raw`\n\r\t\b\f\u0000\u96EA\\path'quoted'\ space`],
+    ],
+    [
+      String.raw`SET key \n\r\t\b\f\u0000\u96EA\\path\ space`,
+      ["SET", "key", `${String.raw`\n\r\t\b\f\u0000\u96EA\\path`}\\`, "space"],
+    ],
+  ])("keeps backslashes literal in single-quoted and unquoted input %s", async (query, expected) => {
     const { driver, sendCommand } = createDriver();
     await driver.query(query);
     expect(sendCommand).toHaveBeenCalledExactlyOnceWith(
-      ["SET", "key", "nrtbfu0000u96EA\\path'quoted' space"],
+      expected,
       queryReplyOptions,
     );
   });
@@ -142,7 +198,7 @@ describe("RedisDriver — query()", () => {
       false,
       ["GET", "key"],
     ],
-    [String.raw`'G\u0045T' key`, false, ["GU0045T", "key"]],
+    [String.raw`'G\u0045T' key`, false, [String.raw`G\U0045T`, "key"]],
     ["PING", true, ["PING"]],
   ] as const)("classifies the same decoded commands as execution for %s", async (query, allowed, firstCommand) => {
     const { driver, sendCommand } = createDriver();
@@ -408,7 +464,7 @@ describe("RedisDriver — metadata and pages", () => {
     ]);
     expect(client.scan).toHaveBeenCalledWith("0", {
       MATCH: "*",
-      COUNT: 500,
+      COUNT: 1000,
     });
   });
 
@@ -498,30 +554,59 @@ describe("RedisDriver — metadata and pages", () => {
           type: "mixed(string, hash, list, set, zset)",
           nativeType: "mixed(string, hash, list, set, zset)",
         }),
+        expect.objectContaining({
+          name: "type",
+          category: "text",
+          type: "string",
+          nativeType: "redis_type",
+          isReadOnly: true,
+        }),
       ]),
     );
     expect(page.totalCount).toBe(5);
     expect(page.rows).toEqual([
-      { key: "users:1", value: "Alice", ttl: null },
+      { key: "users:1", value: "Alice", ttl: null, type: "string" },
       {
         key: "users:2",
         value: '{"first":"Bob","last":"Builder"}',
         ttl: null,
+        type: "hash",
       },
       {
         key: "users:3",
         value: '["draft","published"]',
         ttl: null,
+        type: "list",
       },
       {
         key: "users:4",
         value: '["alpha","beta"]',
         ttl: null,
+        type: "set",
       },
       {
         key: "users:5",
         value: '[{"value":"gold","score":10},{"value":"silver","score":5}]',
         ttl: null,
+        type: "zset",
+      },
+    ]);
+    const hashRows = await driver.readTablePage({
+      database: "db0",
+      schema: "db0",
+      table: "users",
+      page: 1,
+      pageSize: 10,
+      filters: [{ column: "type", operator: "eq", value: "hash" }],
+      sort: { column: "key", direction: "asc" },
+      skipCount: false,
+    });
+    expect(hashRows.rows).toEqual([
+      {
+        key: "users:2",
+        value: '{"first":"Bob","last":"Builder"}',
+        ttl: null,
+        type: "hash",
       },
     ]);
   });
@@ -629,9 +714,12 @@ describe("RedisDriver — metadata and pages", () => {
         value:
           '[{"id":"1716115200000-0","message":{"event":"created","userId":"42"}}]',
         ttl: null,
+        type: "stream",
       },
     ]);
-    expect(client.xRange).toHaveBeenCalledWith("events:1", "-", "+");
+    expect(client.xRange).toHaveBeenCalledWith("events:1", "-", "+", {
+      COUNT: REDIS_READ_BUDGET.maxValueEntries + 1,
+    });
   });
 
   it("filters rows by ttl column values", async () => {
@@ -684,7 +772,9 @@ describe("RedisDriver — metadata and pages", () => {
       skipCount: false,
     });
 
-    expect(page.rows).toEqual([{ key: "users:3", value: "users:3", ttl: 120 }]);
+    expect(page.rows).toEqual([
+      { key: "users:3", value: "users:3", ttl: 120, type: "string" },
+    ]);
     expect(page.totalCount).toBe(1);
   });
 
@@ -714,15 +804,21 @@ describe("RedisDriver — metadata and pages", () => {
     const listJson =
       '["{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}","{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"]';
 
-    await expect(
-      driver.buildMutationPreviewStatements("update", "db0", "db0", "list", {
+    const [preview] = await driver.buildMutationPreviewStatements(
+      "update",
+      "db0",
+      "db0",
+      "list",
+      {
         primaryKeys: { key: "list:activity:recent" },
         changes: { value: listJson },
-      }),
-    ).resolves.toEqual([
-      'DEL "list:activity:recent"',
-      'RPUSH "list:activity:recent" "{\\"id\\":\\"high-1\\",\\"type\\":\\"payment\\",\\"amount\\":999.99}" "{\\"id\\":\\"high-2\\",\\"type\\":\\"alert\\",\\"message\\":\\"System critical\\"}"',
-    ]);
+      },
+    );
+    expect(JSON.parse(preview)).toMatchObject({
+      source: "list:activity:recent",
+      value: { input: listJson },
+      ttl: "keep existing TTL",
+    });
 
     await expect(
       driver.updateRows({
@@ -929,12 +1025,22 @@ describe("RedisDriver — metadata and pages", () => {
       host: "localhost",
     });
 
-    expect(
-      driver.buildMutationPreviewStatement("update", "db0", "db0", "users", {
+    const preview = driver.buildMutationPreviewStatement(
+      "update",
+      "db0",
+      "db0",
+      "users",
+      {
         primaryKeys: { key: "users:1" },
         changes: { key: "users:1:renamed" },
-      }),
-    ).toBe('RENAME "users:1" "users:1:renamed"');
+      },
+    );
+    expect(JSON.parse(preview)).toMatchObject({
+      source: "users:1",
+      target: "users:1:renamed",
+      preview: expect.stringContaining("not an executable command"),
+      conditions: expect.stringContaining("target must not exist"),
+    });
   });
 
   it("applies ttl during inserts", async () => {

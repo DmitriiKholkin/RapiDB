@@ -42,9 +42,13 @@ export interface ConnectionFormExistingState extends SanitizedConnectionConfig {
   hasStoredSshPrivateKey?: boolean;
   hasStoredSshPassphrase?: boolean;
   hasStoredTlsKeyPassphrase?: boolean;
+  hasAmbiguousStoredUri?: boolean;
 }
 
 export interface ConnectionFormSubmission extends SanitizedConnectionConfig {
+  clearAmbiguousStoredUri?: boolean;
+  clearSshPassphrase?: boolean;
+  clearTlsKeyPassphrase?: boolean;
   password?: string;
   hasStoredMongoUriCredentials?: boolean;
   hasStoredConnectionUriCredentials?: boolean;
@@ -77,10 +81,6 @@ export interface ConnectionFormInitialState extends PanelRetentionState {
 const CONNECTION_FORM_BROWSE_TARGETS: ReadonlySet<ConnectionFormBrowseTarget> =
   new Set(["filePath", "tlsCaFile", "tlsCertFile", "tlsKeyFile"]);
 
-const SQLITE_WAL_MODES: ReadonlySet<
-  NonNullable<ConnectionConfig["sqliteWalMode"]>
-> = new Set(["auto", "off"]);
-
 const SSH_AUTH_METHODS: ReadonlySet<
   NonNullable<ConnectionSshConfig["authMethod"]>
 > = new Set(["password", "privateKey"]);
@@ -108,17 +108,6 @@ function readConnectionSshHostVerificationMode(
       value as NonNullable<ConnectionSshConfig["hostVerificationMode"]>,
     )
     ? (value as ConnectionSshConfig["hostVerificationMode"])
-    : undefined;
-}
-
-function readSqliteWalMode(
-  value: unknown,
-): ConnectionConfig["sqliteWalMode"] | undefined {
-  return typeof value === "string" &&
-    SQLITE_WAL_MODES.has(
-      value as NonNullable<ConnectionConfig["sqliteWalMode"]>,
-    )
-    ? (value as ConnectionConfig["sqliteWalMode"])
     : undefined;
 }
 
@@ -201,7 +190,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   const id = readRequiredString(input, "id");
   const name = readOptionalString(input, "name");
   const type = readConnectionType(input.type);
-  const sqliteWalMode = readSqliteWalMode(input.sqliteWalMode);
   const tls = readConnectionTlsConfig(input.tls);
   if (tls === null) {
     return null;
@@ -244,7 +232,6 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
       readOptionalString(input, "uri"),
     replicaSet: readOptionalString(input, "replicaSet"),
     directConnection: readOptionalBoolean(input, "directConnection"),
-    ...(type === "sqlite" ? { sqliteWalMode: sqliteWalMode ?? "auto" } : {}),
     awsProfile: readOptionalString(input, "awsProfile"),
     endpoint:
       readOptionalString(input, "endpoint") ??
@@ -310,6 +297,8 @@ function readStoredSecretFlags(input: Record<string, unknown>) {
     clearPassword: readOptionalBoolean(input, "clearPassword"),
     clearApiKey: readOptionalBoolean(input, "clearApiKey"),
     clearAwsCredentials: readOptionalBoolean(input, "clearAwsCredentials"),
+    clearSshPassphrase: readOptionalBoolean(input, "clearSshPassphrase"),
+    clearTlsKeyPassphrase: readOptionalBoolean(input, "clearTlsKeyPassphrase"),
     hasStoredApiKey: readOptionalBoolean(input, "hasStoredApiKey"),
     hasStoredAwsCredentials: readOptionalBoolean(
       input,
@@ -342,6 +331,7 @@ export function parseConnectionFormExistingState(
     ...base,
     ...readStoredSecretFlags(input),
     hasStoredAwsKeyPair: readOptionalBoolean(input, "hasStoredAwsKeyPair"),
+    hasAmbiguousStoredUri: readOptionalBoolean(input, "hasAmbiguousStoredUri"),
   };
 }
 
@@ -355,6 +345,10 @@ export function parseConnectionFormSubmission(
   return {
     ...base,
     password: readOptionalString(input, "password"),
+    clearAmbiguousStoredUri: readOptionalBoolean(
+      input,
+      "clearAmbiguousStoredUri",
+    ),
     ssh: parseConnectionSshConfig(input.ssh),
     ...readStoredSecretFlags(input),
   };
@@ -374,9 +368,13 @@ export function parseConnectionFormInitialState(
   return { view: "connection", existing: null };
 }
 
+export interface ConnectionFormTestRequest extends ConnectionFormSubmission {
+  requestId?: string;
+}
+
 export type ConnectionFormPanelMessage =
   | WebviewMessageEnvelope<"saveConnection", ConnectionFormSubmission>
-  | WebviewMessageEnvelope<"testConnection", ConnectionFormSubmission>
+  | WebviewMessageEnvelope<"testConnection", ConnectionFormTestRequest>
   | WebviewMessageEnvelope<"cancelTestConnection">
   | WebviewMessageEnvelope<"cancel">
   | WebviewMessageEnvelope<
@@ -397,10 +395,21 @@ export function parseConnectionFormPanelMessage(
     case "cancelTestConnection":
       return { type: envelope.type };
 
-    case "saveConnection":
-    case "testConnection": {
+    case "saveConnection": {
       const payload = parseConnectionFormSubmission(envelope.payload);
       return payload ? { type: envelope.type, payload } : null;
+    }
+
+    case "testConnection": {
+      const payload = parseConnectionFormSubmission(envelope.payload);
+      if (!payload || !isRecord(envelope.payload)) {
+        return null;
+      }
+      const requestId = readOptionalString(envelope.payload, "requestId");
+      return {
+        type: envelope.type,
+        payload: requestId ? { ...payload, requestId } : payload,
+      };
     }
 
     case "browseFile": {

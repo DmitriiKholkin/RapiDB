@@ -850,29 +850,7 @@ describe("parseConnectionFormPanelMessage", () => {
     });
   });
 
-  it("defaults sqlite WAL mode to auto in connection submissions", () => {
-    const parsed = parseConnectionFormPanelMessage({
-      type: "saveConnection",
-      payload: {
-        id: "conn-sqlite-auto",
-        name: "SQLite Auto WAL",
-        type: "sqlite",
-        filePath: "/tmp/sqlite-auto.db",
-      },
-    });
-
-    expect(parsed).toEqual({
-      type: "saveConnection",
-      payload: expect.objectContaining({
-        id: "conn-sqlite-auto",
-        type: "sqlite",
-        filePath: "/tmp/sqlite-auto.db",
-        sqliteWalMode: "auto",
-      }),
-    });
-  });
-
-  it("preserves explicit sqlite WAL mode selections in connection submissions", () => {
+  it("drops legacy sqlite WAL mode from connection submissions", () => {
     const parsed = parseConnectionFormPanelMessage({
       type: "testConnection",
       payload: {
@@ -889,9 +867,12 @@ describe("parseConnectionFormPanelMessage", () => {
       payload: expect.objectContaining({
         id: "conn-sqlite-off",
         type: "sqlite",
-        sqliteWalMode: "off",
+        filePath: "/tmp/sqlite-off.db",
       }),
     });
+    expect(
+      parsed?.type === "testConnection" ? parsed.payload : undefined,
+    ).not.toHaveProperty("sqliteWalMode");
   });
 });
 
@@ -1189,7 +1170,7 @@ describe("parseWebviewInitialState", () => {
     });
   });
 
-  it("defaults sqlite WAL mode to auto in existing connection state", () => {
+  it("parses sqlite existing connection state without a WAL mode", () => {
     const parsed = parseWebviewInitialState({
       view: "connection",
       existing: {
@@ -1206,9 +1187,11 @@ describe("parseWebviewInitialState", () => {
         id: "conn-sqlite-existing",
         type: "sqlite",
         filePath: "/tmp/sqlite-existing.db",
-        sqliteWalMode: "auto",
       }),
     });
+    expect(
+      parsed?.view === "connection" ? parsed.existing : undefined,
+    ).not.toHaveProperty("sqliteWalMode");
   });
 
   it("parses a valid erd state", () => {
@@ -1248,6 +1231,23 @@ describe("parseWebviewInitialState", () => {
 });
 
 describe("parseErdPanelMessage", () => {
+  it.each([
+    undefined,
+    "",
+    "sales",
+    " sales ",
+    "   ",
+  ])("preserves ERD state and action identifiers: %j", (name) => {
+    const scope = { database: name, schema: name };
+    const state = { view: "erd", connectionId: "conn-1", ...scope };
+    expect(parseWebviewInitialState(state)).toEqual(state);
+    const message = {
+      type: "openTableData",
+      payload: { table: " orders ", ...scope, isView: false },
+    };
+    expect(parseErdPanelMessage(message)).toEqual(message);
+  });
+
   it("parses a reload message", () => {
     const parsed = parseErdPanelMessage({ type: "reload" });
     expect(parsed).toEqual({ type: "reload" });

@@ -1,5 +1,6 @@
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import { sqlReadOnlyQueryGuard } from "../utils/readOnlyGuards";
 import { SQLiteCoreDriver } from "./sqliteCore";
 import { SQLiteWorkerClient } from "./sqliteWorkerClient";
 import type { SQLiteWorkerMethod } from "./sqliteWorkerProtocol";
@@ -126,11 +127,15 @@ export class SQLiteDriver extends SQLiteCoreDriver {
     params?: unknown[],
     context?: QueryExecutionOptions,
   ): Promise<QueryResult> {
+    const { signal, ...workerContext } = context ?? {};
     return this.worker.call(
       "query",
-      [sql, params, context],
+      [sql, params, context ? workerContext : undefined],
       this.getDbOperationTimeoutMs(),
       context?.requestToken,
+      signal,
+      context?.deadline,
+      signal !== undefined && sqlReadOnlyQueryGuard(sql, "sqlite").allowed,
     );
   }
   override runTransaction(

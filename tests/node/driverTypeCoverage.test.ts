@@ -968,7 +968,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     });
   });
 
-  it("builds Oracle INTERVAL eq filters against exact displayed text", () => {
+  it("builds Oracle INTERVAL eq filters as native interval comparisons", () => {
     const driver = new OracleDriver({
       ...baseConfig,
       type: "oracle",
@@ -986,7 +986,7 @@ describe("filter SQL compatibility for complex null-only types", () => {
     );
 
     expect(result).toEqual({
-      sql: 'TRIM(CAST("probe_col" AS VARCHAR2(128))) = :1',
+      sql: '"probe_col" = TO_DSINTERVAL(:1)',
       params: ["1 02:03:04.500"],
     });
   });

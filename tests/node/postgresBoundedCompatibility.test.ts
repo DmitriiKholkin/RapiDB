@@ -65,6 +65,12 @@ async function expectNotSubmitted(detail: string) {
 }
 
 describe("PostgreSQL bounded adapter compatibility", () => {
+  it("rejects incompatible parser-error state before submitting SQL", async () => {
+    drift.mutate = (query) =>
+      Reflect.deleteProperty(query, "_canceledDueToError");
+    await expectNotSubmitted("unexpected parser-error state");
+  });
+
   it("rejects unvalidated pg versions before submitting SQL, with no buffered fallback", async () => {
     drift.pgPackage.version = "9.0.0";
     await expectNotSubmitted("unvalidated version");

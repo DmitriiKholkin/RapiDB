@@ -42,7 +42,6 @@ describe("SQLite query transaction isolation through the real worker", () => {
     ).rejects.toThrow(/unfinished SQLite transaction.*rolled back/i);
     expect(await values(driver)).toEqual([]);
 
-    // A later editor write must commit independently and survive disconnect.
     await driver.query("INSERT INTO items VALUES(2)");
     await driver.disconnect();
     expect(await values(await open(filePath))).toEqual([2]);

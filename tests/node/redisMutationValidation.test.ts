@@ -68,10 +68,16 @@ describe("Redis mutation TTL validation", () => {
     });
     expect(client.sendCommand.mock.calls[0]?.[0].at(-2)).toBe("9007199254740");
     expect(
-      driver.buildMutationPreviewStatement("update", "db0", "", "audit", {
-        primaryKeys: { key: "audit:source" },
-        changes: { ttl },
-      }),
-    ).toBe('EXPIRE "audit:source" "9007199254740"');
+      JSON.parse(
+        driver.buildMutationPreviewStatement("update", "db0", "", "audit", {
+          primaryKeys: { key: "audit:source" },
+          changes: { ttl },
+        }),
+      ),
+    ).toMatchObject({
+      source: "audit:source",
+      target: "audit:source",
+      ttl: "set to 9007199254740 seconds",
+    });
   });
 });

@@ -55,8 +55,10 @@ class RespServer {
           continue;
         if (args[0] === "HELLO") {
           socket.write("%1\r\n+server\r\n+redis\r\n");
-        } else if (args[0] === "GET") {
+        } else if (args[0] === "GET" || args[0] === "GETRANGE") {
           socket.write(this.bulk(`db-${database}`));
+        } else if (args[0] === "STRLEN") {
+          socket.write(`:${Buffer.byteLength(`db-${database}`)}\r\n`);
         } else if (args[0] === "SCAN") {
           socket.write(
             `*2\r\n${this.bulk("0")}*1\r\n${this.bulk("users:shared")}`,
@@ -406,7 +408,7 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     const entries = [...state(driver).clients];
     const native = entries[2];
     const nativeSocket = server.commands.find(
-      ({ database, args }) => database === 1 && args[0] === "GET",
+      ({ database, args }) => database === 1 && args[0] === "GETRANGE",
     )?.socket;
     expect(nativeSocket).toBeDefined();
     delayNext = true;
@@ -460,7 +462,6 @@ describe("B02 real node-redis 6 transport lifecycle", () => {
     ["SELECT", "ERR DB index is out of range"],
   ])("surfaces a handshake %s error without hiding it behind reconnect timeout", async (command, message) => {
     server.handshakeError = { command, message };
-    // DB 1 makes node-redis send SELECT during its handshake.
     const driver = makeDriver(2000, false, 1);
     await expect(bounded(driver.connect())).rejects.toThrow(message);
     expect(driver.isConnected()).toBe(false);

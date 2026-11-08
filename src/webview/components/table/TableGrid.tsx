@@ -3,11 +3,16 @@ import {
   flexRender,
   getCoreRowModel,
   type ColumnDef as TanColumnDef,
+  type Cell as TanStackCell,
   type Column as TanStackColumn,
   type Row as TanStackRow,
   useReactTable,
 } from "@tanstack/react-table";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  defaultRangeExtractor,
+  useVirtualizer,
+  type Range as VirtualRange,
+} from "@tanstack/react-virtual";
 import React, {
   useCallback,
   useEffect,
@@ -247,13 +252,7 @@ function ColumnResizeHandle({
   );
 }
 
-function TopSpacerRow({
-  height,
-  colSpan,
-}: {
-  height: number;
-  colSpan: number;
-}) {
+function SpacerRow({ height, colSpan }: { height: number; colSpan: number }) {
   if (height <= 0) {
     return null;
   }
@@ -305,6 +304,13 @@ function BottomSpacerRow({
   );
 }
 
+function renderBodyCell(cell: TanStackCell<Row, unknown>): React.ReactNode {
+  const renderer = cell.column.columnDef.cell;
+  return typeof renderer === "function"
+    ? renderer(cell.getContext())
+    : flexRender(renderer, cell.getContext());
+}
+
 function toDraftEditInitialValue(value: unknown): string {
   if (value === INSERT_DEFAULT_SENTINEL) {
     return "";
@@ -317,6 +323,7 @@ interface TableGridProps {
   getRowMutationBlockReason?: (rowIdx: number) => string | null;
   canEditRows: boolean;
   canSelectAndDeleteRows: boolean;
+  rowSelectionDisabled?: boolean;
   colSizes: Record<string, number>;
   columns: readonly ColumnMeta[];
   editCell: EditTarget | null;
@@ -361,6 +368,7 @@ interface TableGridProps {
   ) => void;
   onSelectionChange: (selection: Set<number>) => void;
   onSort: (column: string) => void;
+  getRowCellColumn?: (rowIdx: number, column: ColumnMeta) => ColumnMeta;
   onOpenStructuredCell: (options: {
     rowKind: "persisted" | "draft";
     rowIdx?: number;
@@ -379,6 +387,8 @@ interface TableGridProps {
   sort: TableSortState;
   columnOrderRef?: React.MutableRefObject<string[]>;
   hiddenColumnIdsRef?: React.MutableRefObject<Set<string>>;
+  pasteStructureEpochRef?: React.MutableRefObject<number>;
+  mongoColumnTypes?: boolean;
 }
 
 interface QueryModeTableGridProps {
@@ -399,9 +409,11 @@ export function TableGrid(props: UnifiedTableGridProps) {
 }
 
 function TableDataGrid({
+  getRowCellColumn,
   getRowMutationBlockReason,
   canEditRows,
   canSelectAndDeleteRows,
+  rowSelectionDisabled = false,
   colSizes,
   columns,
   editCell,
@@ -428,6 +440,8 @@ function TableDataGrid({
   sort,
   columnOrderRef: exportColumnOrderRef,
   hiddenColumnIdsRef,
+  pasteStructureEpochRef,
+  mongoColumnTypes = false,
 }: TableGridProps) {
   const selectableRowIndexes = useMemo(
     () =>
@@ -510,21 +524,29 @@ function TableDataGrid({
         const draftIdx = rowIndex + newRowsRef.current.length;
         const draft = newRowsRef.current[draftIdx];
         if (!draft) return undefined;
-        const dv = draft[colId]?.value;
+        const dv = Object.hasOwn(draft, colId)
+          ? draft[colId]?.value
+          : undefined;
         if (dv === INSERT_DEFAULT_SENTINEL) return undefined;
         if (dv === NULL_SENTINEL) return null;
         return dv;
       }
       const row = rows[rowIndex];
       if (!row) return undefined;
+      const pendingRow = pendingEdits.get(rowIndex);
+      const value = pendingRow?.has(colId)
+        ? pendingRow.get(colId)
+        : Object.hasOwn(row, colId)
+          ? row[colId]
+          : undefined;
       return (
         redisBinarySnapshotDisplay(
-          row[colId],
+          value,
           columnsMapRef.current.get(colId)?.nativeType,
-        ) ?? row[colId]
+        ) ?? value
       );
     },
-    [rows, selectionColumnId],
+    [rows, pendingEdits, selectionColumnId],
   );
 
   const getCellFromPoint = useCallback((x: number, y: number) => {
@@ -546,22 +568,68 @@ function TableDataGrid({
   const clipboardRequestRef = useRef<string | null>(null);
   const clipboardEpochRef = useRef(fetchEpochRef.current);
   const pendingPasteRangeRef = useRef<CellRange | null>(null);
+  const pendingPasteContextRef = useRef<{ row: number; col: number } | null>(
+    null,
+  );
+  const clipboardStructureEpochRef = useRef(pasteStructureEpochRef?.current);
+  const committedStructureEpochRef = useRef(pasteStructureEpochRef?.current);
+  const layoutUpdatePendingRef = useRef(false);
   const selectionRangeRef = useRef<CellRange | null>(null);
   const pasteContextRef = useRef<{
     current: { row: number; col: number } | null;
   } | null>(null);
 
+  const pasteLayout = JSON.stringify(
+    columnOrder.map((id) => [
+      id,
+      isCollapsedWidth(columnSizing[id] ?? colSizes[id] ?? 160),
+    ]),
+  );
+  useLayoutEffect(() => {
+    committedStructureEpochRef.current = pasteStructureEpochRef?.current;
+    layoutUpdatePendingRef.current = false;
+  });
+  // biome-ignore lint/correctness/useExhaustiveDependencies: these values invalidate an outstanding request, not a derived render value.
+  useLayoutEffect(() => {
+    clipboardRequestRef.current = null;
+    pendingPasteRangeRef.current = null;
+    pendingPasteContextRef.current = null;
+  }, [
+    pasteLayout,
+    columns,
+    rows,
+    newRows.length,
+    pasteStructureEpochRef ? null : newRows,
+    pasteStructureEpochRef,
+    canEditRows,
+    canSelectAndDeleteRows,
+    loading,
+    fetchEpochRef,
+  ]);
+
   const handlePaste = useCallback(
     (fromContextMenu = false) => {
-      if (loadingRef.current) return;
+      if (
+        loadingRef.current ||
+        layoutUpdatePendingRef.current ||
+        committedStructureEpochRef.current !== pasteStructureEpochRef?.current
+      )
+        return;
       const range = selectionRangeRef.current;
       const contextCell = fromContextMenu
         ? pasteContextRef.current?.current
         : null;
       if (!range && !contextCell) return;
+      const targetRow =
+        contextCell?.row ??
+        (range ? Math.min(range.anchorRow, range.activeRow) : undefined);
+      if (targetRow === undefined || (!canEditRows && targetRow >= 0)) return;
+      if (targetRow < -newRowsRef.current.length) return;
       const requestId = crypto.randomUUID();
       clipboardRequestRef.current = requestId;
       clipboardEpochRef.current = fetchEpochRef.current;
+      clipboardStructureEpochRef.current = pasteStructureEpochRef?.current;
+      pendingPasteContextRef.current = contextCell ?? null;
       pendingPasteRangeRef.current = contextCell
         ? {
             anchorRow: contextCell.row,
@@ -577,7 +645,7 @@ function TableDataGrid({
         recipient: clipboardRecipientRef.current,
       });
     },
-    [loadingRef, fetchEpochRef],
+    [loadingRef, fetchEpochRef, pasteStructureEpochRef, canEditRows],
   );
 
   const isColumnCollapsed = useCallback(
@@ -610,11 +678,33 @@ function TableDataGrid({
 
   pasteContextRef.current = selection.contextMenuCellRef;
 
+  const handleContextMenuOpen = useCallback(
+    (target: HTMLElement) => {
+      const cell = target.closest("td[data-row][data-col]");
+      if (!cell || !containerRef.current?.contains(cell)) {
+        selection.contextMenuCellRef.current = null;
+        return;
+      }
+      const row = Number(cell.getAttribute("data-row"));
+      const col = Number(cell.getAttribute("data-col"));
+      selection.contextMenuCellRef.current =
+        Number.isInteger(row) && Number.isInteger(col) ? { row, col } : null;
+    },
+    [selection.contextMenuCellRef],
+  );
+  const handleContextMenuClose = useCallback(() => {
+    selection.contextMenuCellRef.current = null;
+  }, [selection.contextMenuCellRef]);
+
   const openCell = useCallback(
     (row: number, columnId: string) => {
-      const column = columnsMap.get(columnId);
+      const schemaColumn = columnsMap.get(columnId);
       const isDraft = row < 0;
       const rowIdx = isDraft ? row + newRows.length : row;
+      const column =
+        schemaColumn && !isDraft
+          ? (getRowCellColumn?.(rowIdx, schemaColumn) ?? schemaColumn)
+          : schemaColumn;
       const rowKind = isDraft ? "draft" : "persisted";
       if (
         !canOpenColumn(column, rowKind) ||
@@ -628,7 +718,9 @@ function TableDataGrid({
       if (isDraft ? !newRows[rowIdx] : !rows[rowIdx]) return;
 
       const originalValue = isDraft
-        ? (newRows[rowIdx][columnId]?.value ?? INSERT_DEFAULT_SENTINEL)
+        ? ((Object.hasOwn(newRows[rowIdx], columnId)
+            ? newRows[rowIdx][columnId]?.value
+            : undefined) ?? INSERT_DEFAULT_SENTINEL)
         : rows[rowIdx][columnId];
       const pendingRow = pendingEdits.get(rowIdx);
       const currentValue = isDraft
@@ -666,6 +758,7 @@ function TableDataGrid({
     },
     [
       columnsMap,
+      getRowCellColumn,
       newRows,
       rows,
       columnSizing,
@@ -700,29 +793,59 @@ function TableDataGrid({
         }
         return;
       }
+      if (
+        (event.key === "v" || event.key === "V") &&
+        (event.ctrlKey || event.metaKey) &&
+        ((target !== scrollRef.current &&
+          !(
+            target?.matches("td[data-row][data-col]") &&
+            scrollRef.current?.contains(target)
+          )) ||
+          document.activeElement !== scrollRef.current ||
+          (!canEditRows &&
+            (selection.range
+              ? Math.min(selection.range.anchorRow, selection.range.activeRow)
+              : 0) >= 0))
+      ) {
+        return;
+      }
       selection.handleKeyDown(event);
     };
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [openCell, scrollRef, selection.handleKeyDown, selection.range]);
+  }, [
+    canEditRows,
+    openCell,
+    scrollRef,
+    selection.handleKeyDown,
+    selection.range,
+  ]);
 
   useEffect(() => {
     const handlePasteEvent = (event: ClipboardEvent) => {
-      const target = event.target as HTMLElement | null;
+      const scroll = scrollRef.current;
+      const target = event.target;
       if (
-        isEditableElement(target) ||
-        isEditableElement(document.activeElement)
+        !scroll ||
+        document.activeElement !== scroll ||
+        (target !== scroll &&
+          target !== event.currentTarget &&
+          target !== document)
       ) {
         return;
       }
-      if (!canEditRows || !selectionRangeRef.current) return;
+      const range = selectionRangeRef.current;
+      if (!range) return;
+      const topRow = Math.min(range.anchorRow, range.activeRow);
+      if (!canEditRows && topRow >= 0) return;
+      if (topRow < -newRowsRef.current.length) return;
       event.preventDefault();
       event.stopPropagation();
       handlePaste();
     };
     window.addEventListener("paste", handlePasteEvent, true);
     return () => window.removeEventListener("paste", handlePasteEvent, true);
-  }, [canEditRows, handlePaste]);
+  }, [canEditRows, handlePaste, scrollRef]);
 
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
@@ -744,10 +867,13 @@ function TableDataGrid({
         return;
       clipboardRequestRef.current = null;
       const requestedRange = pendingPasteRangeRef.current;
+      const requestedContext = pendingPasteContextRef.current;
       pendingPasteRangeRef.current = null;
+      pendingPasteContextRef.current = null;
       if (
         loadingRef.current ||
-        clipboardEpochRef.current !== fetchEpochRef.current
+        clipboardEpochRef.current !== fetchEpochRef.current ||
+        clipboardStructureEpochRef.current !== pasteStructureEpochRef?.current
       ) {
         return;
       }
@@ -756,8 +882,14 @@ function TableDataGrid({
       const pasteData = parseTsv(text);
       if (pasteData.rows.length === 0) return;
 
-      const startRow = requestedRange.anchorRow;
-      const anchorCol = requestedRange.anchorCol;
+      const startRow = Math.min(
+        requestedRange.anchorRow,
+        requestedRange.activeRow,
+      );
+      const anchorCol = Math.min(
+        requestedRange.anchorCol,
+        requestedRange.activeCol,
+      );
       const startCol = anchorCol - selColOffset;
 
       if (!canEditRows && startRow >= 0) return;
@@ -806,7 +938,6 @@ function TableDataGrid({
         if (draftCount === 0) return;
 
         const startVirtualIndex = startRow + draftCount;
-        const totalRows = rows.length + draftCount;
 
         const errors: PasteValidationError[] = [];
         const normalizedCells: Array<{
@@ -819,6 +950,16 @@ function TableDataGrid({
         for (let r = 0; r < pasteData.rows.length; r++) {
           const row = pasteData.rows[r];
           const targetVirtualIndex = startVirtualIndex + r;
+          if (targetVirtualIndex >= draftCount) {
+            errors.push({
+              rowIndex: targetVirtualIndex,
+              columnIndex: anchorCol,
+              columnName: "",
+              value: row.join("\t"),
+              message: `Paste starting in a new row cannot continue into existing rows: ${pasteData.rows.length - r} more pasted row${pasteData.rows.length - r === 1 ? "" : "s"} than new rows. Add more new rows first.`,
+            });
+            break;
+          }
 
           for (let c = 0; c < row.length; c++) {
             const value = row[c];
@@ -835,24 +976,24 @@ function TableDataGrid({
               continue;
             }
 
-            const isPersistedRow = targetVirtualIndex >= draftCount;
-            if (
-              !canEditColumn(column) ||
-              (isPersistedRow && (!canEditRows || column.isPrimaryKey))
-            ) {
+            const columnName = column.name;
+            if (!canEditColumn(column)) {
               errors.push({
-                rowIndex: isPersistedRow
-                  ? targetVirtualIndex - draftCount
-                  : targetVirtualIndex,
+                rowIndex: targetVirtualIndex,
                 columnIndex: targetCol + selColOffset,
-                columnName: column.name,
+                columnName,
                 value,
-                message: `Cannot paste into read-only column "${column.name}"`,
+                message: `Cannot paste into read-only column "${columnName}"`,
               });
               continue;
             }
 
-            const validation = validatePasteValue(value, column);
+            const validation = validatePasteValue(
+              value,
+              column,
+              pasteData.quoted?.[r]?.[c],
+              { mongoTypes: mongoColumnTypes },
+            );
             if (!validation.valid) {
               errors.push({
                 rowIndex: targetVirtualIndex,
@@ -860,17 +1001,6 @@ function TableDataGrid({
                 columnName: column.name,
                 value,
                 message: validation.error ?? "Validation failed",
-              });
-              continue;
-            }
-
-            if (targetVirtualIndex >= totalRows) {
-              errors.push({
-                rowIndex: targetVirtualIndex,
-                columnIndex: targetCol + selColOffset,
-                columnName: column.name,
-                value,
-                message: `Row ${targetVirtualIndex + 1} does not exist`,
               });
               continue;
             }
@@ -889,52 +1019,21 @@ function TableDataGrid({
           return;
         }
 
-        const batchEdits: Array<{
-          rowIdx: number;
-          column: ColumnMeta;
-          newVal: string;
-          originalVal: unknown;
-        }> = [];
-
-        const draftEdits: Array<{
-          rowIdx: number;
-          column: ColumnMeta;
-          newVal: string;
-        }> = [];
-
-        for (const cell of normalizedCells) {
-          const coercedValue = formatNormalizedPasteValue(
-            cell.value,
-            cell.normalized,
-          );
-
-          if (cell.targetVirtualIndex < draftCount) {
-            const draftIdx = cell.targetVirtualIndex;
-            draftEdits.push({
-              rowIdx: draftIdx,
-              column: cell.column,
-              newVal: coercedValue,
-            });
-          } else {
-            const persistedRowIdx = cell.targetVirtualIndex - draftCount;
-            const originalValue = rows[persistedRowIdx]?.[cell.column.name];
-            batchEdits.push({
-              rowIdx: persistedRowIdx,
-              column: cell.column,
-              newVal: coercedValue,
-              originalVal: originalValue,
-            });
-          }
-        }
+        const draftEdits = normalizedCells.map((cell) => ({
+          rowIdx: cell.targetVirtualIndex,
+          column: cell.column,
+          newVal: formatNormalizedPasteValue(cell.value, cell.normalized),
+        }));
 
         const commitErrors =
-          draftEdits.length > 0
-            ? onMixedBatchEdit(draftEdits, batchEdits)
-            : batchEdits.length > 0
-              ? onBatchCellEdit(batchEdits)
-              : undefined;
+          draftEdits.length > 0 ? onMixedBatchEdit(draftEdits, []) : undefined;
         setPasteErrors(commitErrors ?? []);
-        if (!commitErrors?.length) selection.contextMenuCellRef.current = null;
+        if (
+          !commitErrors?.length &&
+          requestedContext &&
+          selection.contextMenuCellRef.current === requestedContext
+        )
+          selection.contextMenuCellRef.current = null;
 
         return;
       }
@@ -946,6 +1045,7 @@ function TableDataGrid({
         visiblePasteColumns,
         rows.length,
         canEditColumn,
+        { mongoTypes: mongoColumnTypes },
       );
 
       if (validationResult.errors.length > 0) {
@@ -965,7 +1065,11 @@ function TableDataGrid({
         const targetRow = startRow + r;
 
         for (const cell of normalizedRow) {
-          const originalValue = rows[targetRow]?.[cell.column.name];
+          const persistedRow = rows[targetRow];
+          const originalValue =
+            persistedRow && Object.hasOwn(persistedRow, cell.column.name)
+              ? persistedRow[cell.column.name]
+              : undefined;
           const coercedValue = formatNormalizedPasteValue(
             cell.value,
             cell.normalized,
@@ -982,7 +1086,12 @@ function TableDataGrid({
 
       const commitErrors = onBatchCellEdit(edits);
       setPasteErrors(commitErrors ?? []);
-      if (!commitErrors?.length) selection.contextMenuCellRef.current = null;
+      if (
+        !commitErrors?.length &&
+        requestedContext &&
+        selection.contextMenuCellRef.current === requestedContext
+      )
+        selection.contextMenuCellRef.current = null;
     };
 
     const unsubscribe = onMessage<ClipboardTextPayload>(
@@ -1000,21 +1109,40 @@ function TableDataGrid({
     onMixedBatchEdit,
     loadingRef,
     fetchEpochRef,
+    pasteStructureEpochRef,
+    mongoColumnTypes,
     selection.contextMenuCellRef.current,
     selection.contextMenuCellRef,
   ]);
 
   useEffect(() => {
     void rows;
+    void selColOffset;
     selection.clearSelection();
     selection.contextMenuCellRef.current = null;
-  }, [rows, selection.clearSelection, selection.contextMenuCellRef]);
+  }, [
+    rows,
+    selColOffset,
+    selection.clearSelection,
+    selection.contextMenuCellRef,
+  ]);
 
   useEffect(() => {
-    setColumnOrder([
-      ...(canSelectAndDeleteRows ? [selectionColumnId] : []),
-      ...columns.map((column) => column.name),
-    ]);
+    setColumnOrder((previous) => {
+      const columnNames = columns.map((column) => column.name);
+      const available = new Set(columnNames);
+      const retained = previous.filter((id) => available.has(id));
+      const retainedSet = new Set(retained);
+      const next = [
+        ...(canSelectAndDeleteRows ? [selectionColumnId] : []),
+        ...retained,
+        ...columnNames.filter((name) => !retainedSet.has(name)),
+      ];
+      return next.length === previous.length &&
+        next.every((id, index) => id === previous[index])
+        ? previous
+        : next;
+    });
   }, [columns, canSelectAndDeleteRows, selectionColumnId]);
 
   const wasDraggedRef = React.useRef(false);
@@ -1027,7 +1155,11 @@ function TableDataGrid({
   const { onHeaderMouseDown: handleHeaderMouseDown, cancelDrag } =
     useColumnDragReorder({
       getColumnOrder: () => columnOrderRef.current,
-      setColumnOrder: (updater) => setColumnOrder(updater),
+      setColumnOrder: (updater) => {
+        clipboardRequestRef.current = null;
+        layoutUpdatePendingRef.current = true;
+        setColumnOrder(updater);
+      },
       excludedIds: [selectionColumnId],
       onDragActivated: () => {
         wasDraggedRef.current = true;
@@ -1035,7 +1167,11 @@ function TableDataGrid({
       onDragEnded: (activated) => {
         if (!activated) {
           wasDraggedRef.current = false;
+          return;
         }
+        setTimeout(() => {
+          wasDraggedRef.current = false;
+        }, 0);
       },
     });
 
@@ -1050,7 +1186,9 @@ function TableDataGrid({
                 <input
                   type="checkbox"
                   aria-label="Select all rows"
-                  disabled={selectableRowIndexes.length === 0}
+                  disabled={
+                    rowSelectionDisabled || selectableRowIndexes.length === 0
+                  }
                   checked={
                     selectableRowIndexes.length > 0 &&
                     selected.size === selectableRowIndexes.length
@@ -1062,13 +1200,14 @@ function TableDataGrid({
                         selected.size < selectableRowIndexes.length;
                     }
                   }}
-                  onChange={(event) =>
+                  onChange={(event) => {
+                    if (rowSelectionDisabled) return;
                     onSelectionChange(
                       event.target.checked
                         ? new Set(selectableRowIndexes)
                         : new Set(),
-                    )
-                  }
+                    );
+                  }}
                   style={{
                     cursor: "pointer",
                     accentColor: "var(--vscode-button-background)",
@@ -1080,11 +1219,18 @@ function TableDataGrid({
                 <input
                   type="checkbox"
                   aria-label={`Select row ${row.index + 1}`}
-                  disabled={Boolean(getRowMutationBlockReason?.(row.index))}
+                  disabled={
+                    rowSelectionDisabled ||
+                    Boolean(getRowMutationBlockReason?.(row.index))
+                  }
                   title={getRowMutationBlockReason?.(row.index) ?? undefined}
                   checked={selected.has(row.index)}
                   onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
-                    if (getRowMutationBlockReason?.(row.index)) return;
+                    if (
+                      rowSelectionDisabled ||
+                      getRowMutationBlockReason?.(row.index)
+                    )
+                      return;
                     const nextSelection = new Set(selected);
                     if (event.target.checked) {
                       nextSelection.add(row.index);
@@ -1137,8 +1283,6 @@ function TableDataGrid({
             </span>
           ),
           cell: ({ row }) => {
-            // Read literal names directly: TanStack's object-backed value cache
-            // cannot safely store __proto__, and accessorKey treats dots as paths.
             const originalValue = Object.hasOwn(row.original, column.name)
               ? row.original[column.name]
               : undefined;
@@ -1158,6 +1302,7 @@ function TableDataGrid({
               return (
                 <EditInput
                   initial={startString}
+                  initialMissing={startValue === undefined}
                   nullable={column.nullable}
                   category={column.category}
                   readOnly={
@@ -1194,6 +1339,7 @@ function TableDataGrid({
       canEditRows,
       selectionColumnId,
       canSelectAndDeleteRows,
+      rowSelectionDisabled,
       getRowMutationBlockReason,
       selectableRowIndexes,
       colSizes,
@@ -1221,11 +1367,32 @@ function TableDataGrid({
   const visibleColumns = tanTable.getVisibleLeafColumns();
   const draftRowCount = newRows.length;
   const hasDraftRow = draftRowCount > 0;
+  const editingVirtualIndex = editCell
+    ? editCell.kind === "draft"
+      ? editCell.rowIdx
+      : editCell.rowIdx + draftRowCount
+    : null;
+  const rangeExtractor = useCallback(
+    (range: VirtualRange) => {
+      const indexes = defaultRangeExtractor(range);
+      if (
+        editingVirtualIndex === null ||
+        editingVirtualIndex < 0 ||
+        editingVirtualIndex >= range.count ||
+        indexes.includes(editingVirtualIndex)
+      ) {
+        return indexes;
+      }
+      return [...indexes, editingVirtualIndex].sort((a, b) => a - b);
+    },
+    [editingVirtualIndex],
+  );
   const virtualizer = useVirtualizer({
     count: tableRows.length + draftRowCount,
     getScrollElement: () => scrollRef.current,
     estimateSize: () => ROW_H,
     overscan: 15,
+    rangeExtractor,
   });
   const virtualItems = virtualizer.getVirtualItems();
   const totalVirtualHeight = virtualizer.getTotalSize();
@@ -1390,6 +1557,17 @@ function TableDataGrid({
                                 1,
                                 startSize + (clientX - startX),
                               );
+                              const oldWidth =
+                                columnSizingRef.current[columnId] ??
+                                colSizesRef.current[columnId] ??
+                                160;
+                              if (
+                                isCollapsedWidth(oldWidth) !==
+                                isCollapsedWidth(nextWidth)
+                              ) {
+                                clipboardRequestRef.current = null;
+                                layoutUpdatePendingRef.current = true;
+                              }
                               setColumnSizing((previous) => ({
                                 ...previous,
                                 [columnId]: nextWidth,
@@ -1475,14 +1653,25 @@ function TableDataGrid({
             </tr>
           </thead>
           <tbody>
-            <TopSpacerRow
+            <SpacerRow
               colSpan={tanColumns.length}
               height={virtualItems[0]?.start ?? 0}
             />
-            {virtualItems.map((virtualRow) => {
+            {virtualItems.flatMap((virtualRow, itemIndex) => {
+              const previousEnd =
+                itemIndex > 0 ? virtualItems[itemIndex - 1].end : null;
+              const gapRow =
+                previousEnd !== null && virtualRow.start > previousEnd ? (
+                  <SpacerRow
+                    key={`gap-${virtualRow.key}`}
+                    colSpan={tanColumns.length}
+                    height={virtualRow.start - previousEnd}
+                  />
+                ) : null;
               if (hasDraftRow && virtualRow.index < draftRowCount) {
                 const draftIdx = virtualRow.index;
-                return (
+                return [
+                  gapRow,
                   <DraftTableRow
                     key={virtualRow.key}
                     rowIndex={draftIdx}
@@ -1499,8 +1688,8 @@ function TableDataGrid({
                     onCommit={onCommitDraftCellEdit}
                     onCancelEdit={onCancelEdit}
                     selection={selection}
-                  />
-                );
+                  />,
+                ];
               }
 
               const persistedIndex = virtualRow.index - draftRowCount;
@@ -1512,7 +1701,8 @@ function TableDataGrid({
                   ? editCell.col
                   : null;
 
-              return (
+              return [
+                gapRow,
                 <TableRow
                   key={virtualRow.key}
                   row={row}
@@ -1524,8 +1714,8 @@ function TableDataGrid({
                   editingCol={editingCol}
                   onOpenCell={openCell}
                   selection={selection}
-                />
-              );
+                />,
+              ];
             })}
             <BottomSpacerRow
               virtualItems={virtualItems}
@@ -1624,6 +1814,8 @@ function TableDataGrid({
 
       <GridContextMenu
         containerRef={containerRef}
+        onOpen={handleContextMenuOpen}
+        onClose={handleContextMenuClose}
         onCopy={handleCopy}
         onPaste={() => handlePaste(true)}
         canPaste={canEditRows || newRows.length > 0}
@@ -1787,8 +1979,7 @@ function TableRow({
               }
             }}
           >
-            {!isCollapsed &&
-              flexRender(cell.column.columnDef.cell, cell.getContext())}
+            {!isCollapsed && renderBodyCell(cell)}
           </td>
         );
       })}
@@ -1867,7 +2058,9 @@ function DraftTableRow({
           );
         }
 
-        const draftCell = draft[columnId] ?? { value: INSERT_DEFAULT_SENTINEL };
+        const draftCell = (Object.hasOwn(draft, columnId)
+          ? draft[columnId]
+          : undefined) ?? { value: INSERT_DEFAULT_SENTINEL };
         const canOpenCellEditor = canOpenColumn(columnDef, "draft");
         const isEditing = editingCol === columnId;
         const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
@@ -1963,6 +2156,7 @@ function DraftTableRow({
                 {!isCollapsed && isEditing ? (
                   <EditInput
                     initial={toDraftEditInitialValue(draftCell.value)}
+                    initialMissing={isDefault}
                     nullable={columnDef.nullable}
                     category={columnDef.category}
                     suppressPlaceholder

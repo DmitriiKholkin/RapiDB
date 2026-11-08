@@ -68,8 +68,11 @@ export abstract class SqlEntryProvider<
     protected readonly cm: ConnectionManager,
     onDidChange: vscode.Event<void>,
   ) {
-    this._subscription = onDidChange(() =>
-      this._onDidChangeTreeData.fire(undefined),
+    const refresh = () => this._onDidChangeTreeData.fire(undefined);
+    this._subscription = vscode.Disposable.from(
+      onDidChange(refresh),
+      cm.onDidChangeConnections(refresh),
+      this._onDidChangeTreeData,
     );
   }
   get disposable(): vscode.Disposable {

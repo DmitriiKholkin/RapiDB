@@ -49,6 +49,7 @@ export function attachConnectionScopedPanelLifecycle(
   connectionManager: ConnectionLifecycleManager,
   connectionId: string,
   onConnectionsConfigurationChange: () => void,
+  keepOpenOnDisconnect?: () => boolean,
 ): void {
   const configSubscription = vscode.workspace.onDidChangeConfiguration(
     (event) => {
@@ -59,7 +60,7 @@ export function attachConnectionScopedPanelLifecycle(
   );
 
   const disconnectSubscription = connectionManager.onDidDisconnect((id) => {
-    if (id === connectionId) {
+    if (id === connectionId && keepOpenOnDisconnect?.() !== true) {
       panel.dispose();
     }
   });

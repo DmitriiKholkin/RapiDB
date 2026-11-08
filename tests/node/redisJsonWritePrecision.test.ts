@@ -11,6 +11,10 @@ function harness(kind: string) {
   });
   const client = {
     type: vi.fn().mockResolvedValue(kind),
+    hLen: vi.fn().mockResolvedValue(1),
+    lLen: vi.fn().mockResolvedValue(1),
+    sCard: vi.fn().mockResolvedValue(1),
+    zCard: vi.fn().mockResolvedValue(1),
     sendCommand: vi.fn().mockResolvedValue(1),
   };
   Object.assign(driver, { getDatabaseClient: async () => client });

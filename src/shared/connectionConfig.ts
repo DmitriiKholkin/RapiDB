@@ -14,7 +14,6 @@ export interface ConnectionSshConfig {
   passphrase?: string;
   hostFingerprintSha256?: string;
 }
-export type SQLiteWalMode = "auto" | "off";
 export const CONNECTION_TLS_MODES = [
   "disabled",
   "requireTrustServerCertificate",
@@ -95,7 +94,6 @@ export interface ConnectionConfig {
   connectionUri?: string;
   replicaSet?: string;
   directConnection?: boolean;
-  sqliteWalMode?: SQLiteWalMode;
   awsProfile?: string;
   endpoint?: string;
   apiKey?: string;

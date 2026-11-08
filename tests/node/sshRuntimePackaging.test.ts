@@ -21,8 +21,6 @@ const net = require('node:net');
 const root = process.cwd();
 const originalLoad = Module._load;
 const originalResolve = Module._resolveFilename;
-// Only VS Code's host API is mocked. SSH and all its dependencies must resolve
-// from the packaged files, never the checkout or a global NODE_PATH.
 Module._load = function(name, ...args) {
   if (name === 'vscode') return {
     TreeItem: class {}, EventEmitter: class {}, ThemeColor: class {}, ThemeIcon: class {}

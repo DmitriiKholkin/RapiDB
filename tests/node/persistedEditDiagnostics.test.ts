@@ -1,7 +1,9 @@
 import mssql from "mssql";
 import { describe, expect, it } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
@@ -212,7 +214,7 @@ describe("C01 UUID syntax and parameter inference", () => {
       (
         sqlServer as unknown as { typeForValue(value: unknown): unknown }
       ).typeForValue(uuid.toUpperCase()),
-    ).toBe(mssql.UniqueIdentifier);
+    ).toMatchObject({ type: mssql.NVarChar, length: uuid.length });
     expect(
       sqlServer.checkPersistedEdit(column("uniqueidentifier", "uuid"), uuid)
         ?.ok,
@@ -268,6 +270,26 @@ describe("C02 exact numeric precision", () => {
         "12345678901234567890.1234567890",
         { persistedValue: "12345678901234567890.1234567891" },
       )?.ok,
+    ).toBe(false);
+  });
+  it.each([
+    ["numeric(10,2)", "1.235e0", false],
+    ["numeric(10,2)", "1.23e0", true],
+    ["numeric(10,2)", "12345e-2", true],
+    ["numeric(4,2)", "1e3", false],
+    ["numeric(2)", "-1.2E1", true],
+  ])("%s validates exponent input %s: %s", (type, value, ok) => {
+    expect(driver.checkPersistedEdit(column(type, "decimal"), value)?.ok).toBe(
+      ok,
+    );
+  });
+  it("verifies exponent input against the persisted decimal", () => {
+    const meta = column("numeric(10,2)", "decimal");
+    expect(
+      driver.checkPersistedEdit(meta, "1.5e1", { persistedValue: "15.00" }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      driver.checkPersistedEdit(meta, "1.5e1", { persistedValue: "1.50" })?.ok,
     ).toBe(false);
   });
   it("preserves native negative-scale and nonfinite fallback", () => {
@@ -380,5 +402,116 @@ describe("persisted edit diagnostics", () => {
       ok: true,
       shouldVerify: false,
     });
+  });
+});
+
+describe("JSON persisted-edit number normalization", () => {
+  const mysqlDriver = new MySQLDriver({
+    id: "json-numbers",
+    name: "json-numbers",
+    type: "mysql",
+  });
+  const sqliteDriver = new SQLiteDriver({
+    id: "json-numbers",
+    name: "json-numbers",
+    type: "sqlite",
+    filePath: ":memory:",
+  });
+
+  it.each([
+    ['{"a":1e2}', '{"a": 100}'],
+    ['{"a":1.50,"b":[0.10]}', { b: [0.1], a: 1.5 }],
+    ["-0.0", "0"],
+  ])("accepts PostgreSQL jsonb %s stored as %j", (expected, persisted) => {
+    expect(
+      driver.checkPersistedEdit(column("jsonb", "json"), expected, {
+        persistedValue: persisted,
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+  });
+
+  it("accepts MySQL JSON numbers rewritten by the server", () => {
+    const meta = column("json", "json");
+    expect(
+      mysqlDriver.checkPersistedEdit(meta, '{"a":1.50}', {
+        persistedValue: { a: 1.5 },
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      mysqlDriver.checkPersistedEdit(meta, '{"a":1e2}', {
+        persistedValue: '{"a": 100.0}',
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      mysqlDriver.checkPersistedEdit(meta, '{"a":1.5}', {
+        persistedValue: '{"a": 1.6}',
+      })?.ok,
+    ).toBe(false);
+  });
+
+  it("keeps exact number text for PostgreSQL json and SQLite JSON", () => {
+    expect(
+      driver.checkPersistedEdit(column("json", "json"), '{"a":1e2}', {
+        persistedValue: '{"a": 100}',
+      })?.ok,
+    ).toBe(false);
+    expect(
+      sqliteDriver.checkPersistedEdit(column("JSON", "json"), '{"a":1.50}', {
+        persistedValue: '{"a":1.5}',
+      })?.ok,
+    ).toBe(false);
+  });
+});
+
+describe("binary and single-precision persisted edits", () => {
+  it("verifies a binary cell cleared to empty text against zero bytes", () => {
+    expect(
+      driver.checkPersistedEdit(column("bytea", "binary"), "", {
+        persistedValue: Buffer.alloc(0),
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      driver.checkPersistedEdit(column("bytea", "binary"), "", {
+        persistedValue: Buffer.from([0]),
+      })?.ok,
+    ).toBe(false);
+  });
+
+  it.each([
+    ["16777216", true],
+    ["12345678", true],
+    ["1.2345678", true],
+    ["0.1", true],
+    ["16777217", false],
+    ["3.14159265", false],
+  ])("real precheck for %s: %s", (value, ok) => {
+    expect(driver.checkPersistedEdit(column("real", "float"), value)?.ok).toBe(
+      ok,
+    );
+  });
+
+  it("verifies real values at single precision after save", () => {
+    const meta = column("real", "float");
+    expect(
+      driver.checkPersistedEdit(meta, "1.2345678", {
+        persistedValue: "1.2345679",
+      })?.ok,
+    ).toBe(false);
+    expect(
+      driver.checkPersistedEdit(meta, "1.2345678", {
+        persistedValue: Math.fround(1.2345678),
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      driver.checkPersistedEdit(meta, "16777216", {
+        persistedValue: "1.6777216e+07",
+      }),
+    ).toEqual({ ok: true, shouldVerify: true });
+  });
+
+  it("reports the single-precision value a rejected real input rounds to", () => {
+    expect(
+      driver.checkPersistedEdit(column("real", "float"), "16777217")?.message,
+    ).toContain("would round to 16777216");
   });
 });

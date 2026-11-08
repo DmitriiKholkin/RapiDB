@@ -1,7 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
-import { SshService } from "../../src/extension/services/sshService";
-import { buildConnectionSshSettings } from "../../src/extension/sshConnectionHelper";
+import {
+  createExtensionContextStub,
+  FakeConnectionManagerStore,
+} from "../support/fakeConnectionManagerStore";
+import { MockEventEmitter } from "../support/mockVscode";
+
+vi.mock("vscode", () => ({
+  EventEmitter: MockEventEmitter,
+  ProgressLocation: { Window: 10 },
+  window: {},
+}));
 
 const config: ConnectionConfig = {
   id: "ssh-trust-settings",
@@ -15,14 +24,29 @@ const config: ConnectionConfig = {
   },
 };
 
-describe.each([
-  ["helper (also used by the facade)", buildConnectionSshSettings],
-  [
-    "service",
-    (input: ConnectionConfig) =>
-      new SshService().buildConnectionSshSettings(input),
-  ],
-] as const)("SSH trust defaults: %s", (_name, buildSettings) => {
+let buildSettings: (input: ConnectionConfig) => unknown;
+let disposeManager: () => Promise<void>;
+
+beforeAll(async () => {
+  const { ConnectionManager } = await import(
+    "../../src/extension/connectionManager"
+  );
+  const manager = new ConnectionManager(
+    createExtensionContextStub() as never,
+    new FakeConnectionManagerStore(),
+  );
+  const resolver = manager as unknown as {
+    buildConnectionSshSettings(input: ConnectionConfig): unknown;
+  };
+  buildSettings = (input) => resolver.buildConnectionSshSettings(input);
+  disposeManager = () => manager.dispose();
+});
+
+afterAll(async () => {
+  await disposeManager();
+});
+
+describe("SSH trust defaults", () => {
   it.each([
     undefined,
     "manual",

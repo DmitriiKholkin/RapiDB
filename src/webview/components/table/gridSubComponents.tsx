@@ -1,4 +1,4 @@
-import React from "react";
+import type React from "react";
 
 export const RESIZE_HANDLE_WIDTH = 12;
 export const RESIZE_HANDLE_OVERHANG = 6;

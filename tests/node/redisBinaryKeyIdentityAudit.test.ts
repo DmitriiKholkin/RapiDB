@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import type { DriverTablePageRequest } from "../../src/extension/dbDrivers/types";
-import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { logger } from "../../src/extension/utils/logger";
 
@@ -88,7 +87,11 @@ class BinaryKeyServer {
             socket.write(entry ? "+string\r\n" : "+none\r\n");
             break;
           case "GET":
+          case "GETRANGE":
             socket.write(entry ? bulk(entry.value) : "_\r\n");
+            break;
+          case "STRLEN":
+            socket.write(`:${entry?.value.length ?? 0}\r\n`);
             break;
           case "TTL":
             socket.write(":-1\r\n");
@@ -164,6 +167,74 @@ afterEach(async () => {
 });
 
 describe("Redis binary key identity: real node-redis transport", () => {
+  it("rejects surrogate aliases before sending commands that could affect a U+FFFD neighbor", async () => {
+    server.entries = [
+      { key: Buffer.from("neighbor:�"), value: Buffer.from("safe") },
+    ];
+    const invalid = "neighbor:\ud800";
+    const scope = { database: "db0", schema: "", table: "neighbor" };
+    await expect(
+      driver.deleteRows({ ...scope, primaryKeyValuesList: [{ key: invalid }] }),
+    ).rejects.toThrow(/losslessly UTF-8/);
+    await expect(
+      driver.insertRow({ ...scope, values: { key: invalid, value: "wrong" } }),
+    ).rejects.toThrow(/losslessly UTF-8/);
+    for (const [source, target] of [
+      [invalid, "other"],
+      ["other", invalid],
+    ]) {
+      await expect(
+        driver.updateRows({
+          ...scope,
+          updates: [{ primaryKeys: { key: source }, changes: { key: target } }],
+        }),
+      ).rejects.toThrow(/losslessly UTF-8/);
+    }
+    expect(
+      server.commands.some((args) =>
+        ["TYPE", "DEL", "SET", "EVAL"].includes(args[0].toString()),
+      ),
+    ).toBe(false);
+    expect(server.entries).toEqual([
+      { key: Buffer.from("neighbor:�"), value: Buffer.from("safe") },
+    ]);
+  });
+
+  it("reads and mutates an empty key using exact RESP identities", async () => {
+    server.entries = [{ key: Buffer.alloc(0), value: Buffer.from("value") }];
+    const page = await driver.readTablePage({
+      ...pageRequest,
+      table: "__rapidb:unprefixed-keys",
+    });
+    expect(page.rows).toEqual([
+      { key: "", value: "value", ttl: null, type: "string" },
+    ]);
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "",
+        table: "__rapidb:unprefixed-keys",
+        updates: [{ primaryKeys: { key: "" }, changes: { key: "renamed" } }],
+      }),
+    ).resolves.toMatchObject({ affectedRows: 1 });
+    const evalArgs = server.commands.find(
+      (args) => args[0].toString() === "EVAL",
+    )!;
+    expect(evalArgs[3]).toEqual(Buffer.alloc(0));
+    expect(evalArgs[4]).toEqual(Buffer.from("renamed"));
+    await expect(
+      driver.deleteRows({
+        database: "db0",
+        schema: "",
+        table: "__rapidb:unprefixed-keys",
+        primaryKeyValuesList: [{ key: "" }],
+      }),
+    ).resolves.toMatchObject({ affectedRows: 1 });
+    expect(
+      server.commands.find((args) => args[0].toString() === "DEL")![1],
+    ).toEqual(Buffer.alloc(0));
+  });
+
   it("aborts an in-flight SCAN through node-redis without reading late values or poisoning a retry", async () => {
     server.entries = [{ key: validKey, value: Buffer.from("VALID") }];
     let release!: () => void;
@@ -196,7 +267,9 @@ describe("Redis binary key identity: real node-redis transport", () => {
       server.onScan = undefined;
     }
     const retry = await driver.readTablePage(pageRequest);
-    expect(retry.rows).toEqual([{ key: "audit:�", value: "VALID", ttl: null }]);
+    expect(retry.rows).toEqual([
+      { key: "audit:�", value: "VALID", ttl: null, type: "string" },
+    ]);
     expect(
       server.commands.filter((args) => args[0].toString() === "TYPE"),
     ).toHaveLength(1);
@@ -226,7 +299,7 @@ describe("Redis binary key identity: real node-redis transport", () => {
       "audit:c",
     ]);
     const reads = server.commands.filter(
-      (args) => args[0].toString() === "GET",
+      (args) => args[0].toString() === "GETRANGE",
     );
     expect(reads).toHaveLength(3);
   });
@@ -323,7 +396,6 @@ describe("Redis binary key identity: real node-redis transport", () => {
     "value-sorted page",
     "describeTable",
     "describeColumns",
-    "listObjects",
   ])("fails closed before reading values or exposing identities: %s", async (operation) => {
     const result =
       operation === "page"
@@ -335,9 +407,7 @@ describe("Redis binary key identity: real node-redis transport", () => {
             })
           : operation === "describeTable"
             ? driver.describeTable("db0", "", "audit")
-            : operation === "describeColumns"
-              ? driver.describeColumns("db0", "", "audit")
-              : driver.listObjects("db0");
+            : driver.describeColumns("db0", "", "audit");
     await expect(result).rejects.toThrow(binaryKeyError);
     expect(
       server.commands
@@ -362,27 +432,20 @@ describe("Redis binary key identity: real node-redis transport", () => {
     );
   });
 
-  it("reports binary discovery as a metadata error, not an empty loaded schema", async () => {
-    const failed = await loadDatabaseScope(driver, "db0", "baseline");
-    expect(failed.loadedSchemas).toEqual([]);
-    expect(failed.failedSchemas).toHaveLength(1);
-    expect(failed.failedSchemas?.[0].name).toBe("db0");
-    expect(failed.failedSchemas?.[0].error).toBeInstanceOf(Error);
-    expect((failed.failedSchemas?.[0].error as Error).message).toMatch(
-      binaryKeyError,
-    );
+  it("skips binary keys in discovery instead of failing the whole database", async () => {
+    server.entries = [
+      { key: binaryKey, value: Buffer.from("BINARY") },
+      { key: Buffer.from("other:\xff", "latin1"), value: Buffer.from("X") },
+      { key: validKey, value: Buffer.from("VALID") },
+    ];
+    expect(
+      (await driver.listObjects("db0")).map((object) => object.name),
+    ).toEqual(["__rapidb:all-keys", "audit"]);
     expect(server.commands.some((args) => args[0].toString() === "TYPE")).toBe(
       false,
     );
-
-    server.entries = [{ key: validKey, value: Buffer.from("VALID") }];
-    const recovered = await loadDatabaseScope(driver, "db0", "baseline");
-    expect(recovered.failedSchemas).toEqual([]);
-    expect(recovered.loadedSchemas).toHaveLength(1);
-    expect(recovered.loadedSchemas[0].objects).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ name: "audit", type: "table" }),
-      ]),
+    await expect(driver.readTablePage(pageRequest)).rejects.toThrow(
+      binaryKeyError,
     );
   });
 
@@ -393,7 +456,7 @@ describe("Redis binary key identity: real node-redis transport", () => {
     );
     expect(
       server.commands.some((args) =>
-        ["GET", "EVAL", "DEL"].includes(args[0].toString()),
+        ["GET", "GETRANGE", "EVAL", "DEL"].includes(args[0].toString()),
       ),
     ).toBe(false);
   });
@@ -413,10 +476,10 @@ describe("Redis binary key identity: real node-redis transport", () => {
         ...request,
         primaryKeyValuesList: [{ key: binaryKey }],
       }),
-    ).rejects.toThrow("Redis delete requires a non-empty key");
+    ).rejects.toThrow("Redis delete requires a string key");
     expect(
       server.commands.some((args) =>
-        ["TYPE", "GET", "EVAL", "DEL"].includes(args[0].toString()),
+        ["TYPE", "GET", "GETRANGE", "EVAL", "DEL"].includes(args[0].toString()),
       ),
     ).toBe(false);
     expect(server.entries.map((entry) => entry.value.toString())).toEqual([
@@ -492,7 +555,7 @@ describe("Redis binary key identity: SCAN validation unit cases", () => {
     expect(withTypeMapping).toHaveBeenCalledWith({
       [RESP_TYPES.BLOB_STRING]: Buffer,
     });
-    expect(scan).toHaveBeenCalledWith("0", { MATCH: "audit:*", COUNT: 1 });
+    expect(scan).toHaveBeenCalledWith("0", { MATCH: "audit:*", COUNT: 1000 });
   });
 });
 

@@ -3,6 +3,7 @@ import {
   REDIS_ALL_KEYS_TABLE,
   REDIS_UNPREFIXED_KEYS_TABLE,
 } from "../../src/extension/dbDrivers/redisKeyspace";
+import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 vi.mock("vscode", () => {
   class EventEmitter<T> {
@@ -1129,7 +1130,6 @@ describe("ConnectionProvider", () => {
           type: "sqlite",
           filePath: "/tmp/app.db",
           readOnly: true,
-          sqliteWalMode: "off",
         },
       ]),
       isConnected: vi.fn((id: string) => id === "conn-can"),
@@ -1146,7 +1146,6 @@ describe("ConnectionProvider", () => {
             type: "sqlite",
             filePath: "/tmp/app.db",
             readOnly: true,
-            sqliteWalMode: "off",
           },
         ].find((connection) => connection.id === id),
       ),
@@ -1191,7 +1190,7 @@ describe("ConnectionProvider", () => {
     ).toContain("Access: `read-only`");
     expect(
       (disconnectedSqlite?.tooltip as { value?: string } | undefined)?.value,
-    ).toContain("WAL: `disabled`");
+    ).not.toContain("WAL");
     expect(disconnectedRedis?.command).toEqual({
       command: "rapidb.connect",
       title: "Connect",
@@ -2378,6 +2377,57 @@ describe("ConnectionProvider", () => {
     expect(indexNode?.contextValue).toBe("table_detail_index");
   });
 
+  it("flags partial indexes in the index detail description", async () => {
+    const detail = loadedTableDetailState();
+    Object.assign(detail.snapshot.indexes.items[0], {
+      unique: true,
+      partial: true,
+    });
+    const connectionManager = {
+      getConnections: vi.fn(() => [{ id: "conn-1", name: "PG", type: "pg" }]),
+      getConnection: vi.fn(() => ({ id: "conn-1", name: "PG", type: "pg" })),
+      isConnected: vi.fn((id: string) => id === "conn-1"),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      ensureTableDetailLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "app_db",
+              schemas: [
+                {
+                  name: "public",
+                  objects: [{ name: "users", type: "table", columns: [] }],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      getTableDetailState: vi.fn(() => detail),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    let nodes = await provider.getChildren();
+    while (!nodes.some((node) => node.label === "Indexes")) {
+      const expandable = nodes.find((node) => node.collapsibleState !== 0);
+      if (!expandable) throw new Error("Expected indexes section");
+      nodes = await provider.getChildren(expandable);
+    }
+    const indexesSection = nodes.find((node) => node.label === "Indexes");
+    const [indexNode] = await provider.getChildren(indexesSection);
+    expect(indexNode?.description).toMatch(/^unique, partial - /);
+  });
+
   it("marks DynamoDB table and index detail nodes with noDdl context values", async () => {
     const connectionManager = {
       getConnections: vi.fn(() => [
@@ -2467,6 +2517,95 @@ describe("ConnectionProvider", () => {
 
     expect(tableNode?.contextValue).toBe("table_noDdl");
     expect(indexNode?.contextValue).toBe("table_detail_index_noDdl");
+  });
+
+  it("renders propagated Elasticsearch index errors through the schema loader when indexes are enabled", async () => {
+    const { ElasticsearchDriver } = await import(
+      "../../src/extension/dbDrivers/elasticsearch"
+    );
+    const { loadTableDetail } = await import(
+      "../../src/extension/schema/schemaLoaders"
+    );
+    const { ConnectionProvider, RapiDBNode } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const config = {
+      id: "conn-1",
+      name: "Search",
+      type: "elasticsearch" as const,
+    };
+    const driver = new ElasticsearchDriver(config);
+    const denied = new Error("security_exception: forbidden index metadata");
+    const get = vi.fn().mockRejectedValue(denied);
+    Object.assign(driver, { client: { indices: { get } }, connected: true });
+    vi.spyOn(driver, "describeColumns").mockResolvedValue([]);
+    const manifest = driver.getEntityManifest();
+    vi.spyOn(driver, "getEntityManifest").mockReturnValue({
+      ...manifest,
+      tableSections: { ...manifest.tableSections, indexes: "supported" },
+    });
+    const request = {
+      connectionId: config.id,
+      database: "default",
+      schema: "indices",
+      table: "users",
+      objectKind: "table" as const,
+    };
+    let state = { request, ...(await loadTableDetail(driver, request)) };
+    expect(state).toMatchObject({
+      status: "loaded",
+      isPartial: true,
+      snapshot: {
+        indexes: { status: "error", items: [], error: denied.message },
+      },
+    });
+    const connectionManager = {
+      getConnections: vi.fn(() => [config]),
+      getConnection: vi.fn(() => config),
+      getDriverEntityManifest: vi.fn(() => driver.getEntityManifest()),
+      ensureTableDetailLoading: vi.fn(),
+      getTableDetailState: vi.fn(() => state),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    const provider = new ConnectionProvider(connectionManager as never);
+    try {
+      const table = new RapiDBNode(
+        "users",
+        "table",
+        1,
+        config.id,
+        "default",
+        "indices",
+        "users",
+      );
+      const indexes = (await provider.getChildren(table)).find(
+        (node) => node.section === "indexes",
+      );
+      if (!indexes) throw new Error("Expected test-enabled Indexes section");
+      expect(indexes.description).toBe("error");
+      const children = await provider.getChildren(indexes);
+      expect(children.map((node) => node.kind)).toEqual(["status_error"]);
+      expect(children[0].tooltip).toBe(`Error: ${denied.message}`);
+
+      get.mockResolvedValue({ users: {} });
+      state = { request, ...(await loadTableDetail(driver, request)) };
+      expect(state.isPartial).toBe(false);
+      expect(state.snapshot.indexes.error).toBeUndefined();
+      expect(
+        (await provider.getChildren(indexes)).map((node) => node.kind),
+      ).toEqual(["table_detail_index"]);
+      expect(
+        (await provider.getChildren(table)).find(
+          (node) => node.section === "indexes",
+        )?.description,
+      ).toBe("(1)");
+    } finally {
+      provider.disposable.dispose();
+    }
   });
 
   it("hides the Elasticsearch Indexes detail section", async () => {
@@ -3487,7 +3626,13 @@ describe("ConnectionProvider", () => {
 
     expect(packageNodes[0]).toMatchObject({
       contextValue: "procedure",
+      tooltip: expect.stringContaining("Package: DBMS_OUTPUT"),
+      iconPath: { id: "package" },
+      accessibilityInformation: {
+        label: expect.stringContaining("Package: DBMS_OUTPUT"),
+      },
     });
+    expect(procedureNodes[0]?.tooltip).toContain("Procedure: hire_emp");
   });
 
   it("does not inject a Packages category for non-Oracle connections", async () => {
@@ -3582,6 +3727,55 @@ describe("ConnectionProvider", () => {
     expect(
       filteredRoots.every((node) => node.kind === "connectionNode_connected"),
     ).toBe(true);
+  });
+
+  it("refreshes root folders even when connection subtrees are cached", async () => {
+    let connections: ConnectionConfig[] = [
+      { id: "conn-a", name: "Alpha", type: "sqlite" as const },
+    ];
+    const connectionManager = {
+      getConnections: vi.fn(() => connections),
+      isConnected: vi.fn(() => false),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    await provider.getChildren();
+    const refreshEvents: unknown[] = [];
+    provider.onDidChangeTreeData((element) => refreshEvents.push(element));
+
+    connections = [
+      ...connections,
+      {
+        id: "conn-b",
+        name: "Beta",
+        type: "sqlite",
+        folder: "MANUAL_FOLDER_A_20261026",
+      },
+    ];
+    provider.refreshConnectionTree();
+
+    expect(refreshEvents[0]).toBeUndefined();
+    expect(refreshEvents).toHaveLength(2);
+    expect((await provider.getChildren()).map((node) => node.label)).toEqual([
+      "MANUAL_FOLDER_A_20261026",
+      "Alpha",
+    ]);
   });
 
   it("restores normal tree with folders when connected-only mode is deactivated", async () => {

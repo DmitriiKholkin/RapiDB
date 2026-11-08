@@ -179,4 +179,103 @@ describe("ErdView with real ReactFlow", () => {
       expect(Boolean(screen.queryByText("Foo"))).toBe(zoom >= 0.3);
     });
   });
+
+  it("renders crow's-foot symbols from the child and parent perspectives", async () => {
+    installFlowMeasurements();
+    const vscodeApi = window.__vscode as NonNullable<Window["__vscode"]> & {
+      getState: ReturnType<typeof vi.fn>;
+    };
+    vscodeApi.getState.mockReturnValue({ viewport: { x: 0, y: 0, zoom: 1 } });
+    const parentId = JSON.stringify(["app_db", "public", "parent"]);
+    const childId = JSON.stringify(["app_db", "public", "child"]);
+    const cases = [
+      { id: "required-many", cardinality: "many-to-one", nullable: false },
+      { id: "optional-many", cardinality: "many-to-one", nullable: true },
+      { id: "required-one", cardinality: "one-to-one", nullable: false },
+      { id: "optional-one", cardinality: "one-to-one", nullable: true },
+    ] as const;
+    const graph: ErdGraph = {
+      scope: { database: "app_db", schema: "public" },
+      nodes: [
+        {
+          id: parentId,
+          database: "app_db",
+          schema: "public",
+          table: "parent",
+          isView: false,
+          position: { x: 0, y: 0 },
+          columns: [
+            {
+              name: "id",
+              type: "int",
+              isPrimaryKey: true,
+              isForeignKey: false,
+              nullable: false,
+            },
+          ],
+        },
+        {
+          id: childId,
+          database: "app_db",
+          schema: "public",
+          table: "child",
+          isView: false,
+          position: { x: 600, y: 0 },
+          columns: cases.map((item) => ({
+            name: item.id,
+            type: "int",
+            isPrimaryKey: false,
+            isForeignKey: true,
+            nullable: item.nullable,
+          })),
+        },
+      ],
+      edges: cases.map((item) => ({
+        id: item.id,
+        fromTableId: childId,
+        toTableId: parentId,
+        fromColumn: item.id,
+        toColumn: "id",
+        constraintName: item.id,
+        cardinality: item.cardinality,
+        sourceNullable: item.nullable,
+      })),
+    };
+    const { container } = render(<ErdView connectionId="conn-1" />);
+    await act(async () => {
+      dispatchIncomingMessage("erdGraph", {
+        graph,
+        fromCache: false,
+        loadedAt: "now",
+      });
+    });
+    await screen.findByText("public.child");
+    const glyphKind = (glyph: Element) => {
+      const hasCircle = glyph.querySelector("circle") !== null;
+      const hasCrow = glyph.querySelector('path[d="M -12 0 L 0 -5"]') !== null;
+      if (hasCircle) return hasCrow ? "zeroOrMany" : "zeroOrOne";
+      return hasCrow ? "oneOrMany" : "oneOnly";
+    };
+    await waitFor(() => {
+      const kinds = Object.fromEntries(
+        cases.map((item) => {
+          const edge = container.querySelector(
+            `.react-flow__edge[data-id="${item.id}"]`,
+          );
+          return [
+            item.id,
+            Array.from(edge?.querySelectorAll("g[transform]") ?? []).map(
+              glyphKind,
+            ),
+          ];
+        }),
+      );
+      expect(kinds).toEqual({
+        "required-many": ["zeroOrMany", "oneOnly"],
+        "optional-many": ["zeroOrMany", "zeroOrOne"],
+        "required-one": ["zeroOrOne", "oneOnly"],
+        "optional-one": ["zeroOrOne", "zeroOrOne"],
+      });
+    });
+  });
 });

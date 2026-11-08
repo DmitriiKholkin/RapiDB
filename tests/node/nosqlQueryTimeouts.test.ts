@@ -241,9 +241,29 @@ describe.each([
       controller.abort(reason);
       return reply;
     });
-    await expect(
-      wrapped.query(batch, undefined, { signal: controller.signal }),
-    ).rejects.toBe(reason);
+    const query = wrapped.query(batch, undefined, {
+      signal: controller.signal,
+    });
+    if (kind === "dynamodb") {
+      await expect(query).resolves.toMatchObject({
+        affectedRows: 1,
+        error: expect.stringContaining("cancelled after 1 of 2 requests"),
+      });
+    } else if (kind === "elasticsearch") {
+      await expect(query).resolves.toMatchObject({
+        affectedRows: 1,
+        error: expect.stringContaining(
+          "cancelled after 1 of 2 statements was completed and earlier writes were applied",
+        ),
+      });
+    } else if (kind === "mongodb") {
+      await expect(query).resolves.toMatchObject({
+        affectedRows: 1,
+        error: expect.stringContaining("cancelled after statement 1 of 2"),
+      });
+    } else {
+      await expect(query).rejects.toBe(reason);
+    }
     expect(send).toHaveBeenCalledOnce();
   });
 

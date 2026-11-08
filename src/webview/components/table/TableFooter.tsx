@@ -1,4 +1,3 @@
-import React from "react";
 import { PAGE_SIZES, tableButtonStyle } from "./tableViewHelpers";
 
 interface TableFooterProps {

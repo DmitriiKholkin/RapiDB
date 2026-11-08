@@ -1,17 +1,23 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
   chmodSync,
+  cpSync,
   existsSync,
   mkdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, join } from "node:path";
+import { hostname } from "node:os";
+import { delimiter, dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { promisify } from "node:util";
 import { gzipSync } from "node:zlib";
@@ -41,6 +47,7 @@ import {
   preparePinnedSQLiteHeaders,
   probeInstalledBetterSqlite3Runtime,
   resetSQLiteInstallerForTests,
+  setSQLiteInstallLockTimingsForTests,
   sqliteNodeGypArguments,
 } from "../../src/extension/utils/sqliteInstaller";
 import { createProjectTempDir } from "../runtime/tempDirectories";
@@ -51,7 +58,13 @@ const versions = Object.getOwnPropertyDescriptors(process.versions);
 const originalPrebuilts = { ...SQLITE_ARTIFACTS.prebuilts };
 const originalHeaders = { ...SQLITE_ARTIFACTS.headers };
 
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
+
 afterEach(() => {
+  vi.mocked(renameSync).mockReset();
   vi.restoreAllMocks();
   Object.defineProperties(process.versions, versions);
   if (!versions.electron)
@@ -367,6 +380,7 @@ function mockDownloads(
     status?: number;
     location?: string;
   },
+  delayMs = 0,
 ) {
   const urls: string[] = [];
   vi.spyOn(https, "get").mockImplementation(((
@@ -378,7 +392,7 @@ function mockDownloads(
       setTimeout: () => request,
       destroy: () => request,
     });
-    queueMicrotask(() => {
+    const deliver = () => {
       const reply = respond(String(url));
       const response = Object.assign(
         Readable.from(reply.data ? [reply.data] : []),
@@ -388,7 +402,9 @@ function mockDownloads(
         },
       );
       callback(response);
-    });
+    };
+    if (delayMs > 0) setTimeout(deliver, delayMs);
+    else queueMicrotask(deliver);
     return request;
   }) as unknown as typeof https.get);
   return urls;
@@ -649,6 +665,8 @@ describe("SQLite installer security across callers and fallback paths", () => {
       chmodSync(join(bin, "node"), 0o700);
       writeFileSync(join(npmBin, "npm-cli.js"), "test npm, never executed");
       symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
+      writeFileSync(join(bin, "python3"), "test python, never executed");
+      chmodSync(join(bin, "python3"), 0o700);
       const workspaceRoots = [
         join(installation, "workspace-first"),
         join(installation, "workspace-second"),
@@ -772,7 +790,7 @@ describe("SQLite installer security across callers and fallback paths", () => {
         expect(installed).toBeTruthy();
         expect(installed).toContain("fresh storage");
         expect(workspaceRootsGetter).toHaveBeenCalledTimes(
-          withWorkspaceGetter ? 1 : 0,
+          withWorkspaceGetter ? 2 : 0,
         );
         expect(urls).toEqual([SQLITE_SOURCE.url, headers.pins.archive.url]);
         expect(calls).toHaveLength(2);
@@ -785,6 +803,9 @@ describe("SQLite installer security across callers and fallback paths", () => {
         );
         expect(build.actions).not.toContain("'action': ['node'");
         expect(build.args).toContain("--target=42.0.0");
+        const python = realpathSync(join(bin, "python3"));
+        expect(build.args).toContain(`--python=${python}`);
+        expect(build.env.NODE_GYP_FORCE_PYTHON).toBe(python);
         const nodedir = build.args
           .find((arg) => arg.startsWith("--nodedir="))
           ?.slice("--nodedir=".length);
@@ -807,6 +828,43 @@ describe("SQLite installer security across callers and fallback paths", () => {
         vi.unstubAllEnvs();
         vi.doUnmock("node:child_process");
         vi.resetModules();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "fails the source fallback before any download when no trusted Python is on PATH",
+    async () => {
+      Object.defineProperty(process.versions, "modules", {
+        value: "146",
+        configurable: true,
+      });
+      Object.defineProperty(process.versions, "electron", {
+        value: "42.1.0",
+        configurable: true,
+      });
+      const f = await runtimeFixture();
+      const installation = await createProjectTempDir(
+        "sqlite-source-no-python",
+      );
+      const bin = join(installation, "bin");
+      const npmBin = join(installation, "lib/node_modules/npm/bin");
+      mkdirSync(bin, { recursive: true });
+      mkdirSync(npmBin, { recursive: true });
+      writeFileSync(join(bin, "node"), "test interpreter, never executed");
+      chmodSync(join(bin, "node"), 0o700);
+      writeFileSync(join(npmBin, "npm-cli.js"), "test npm, never executed");
+      symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
+      SQLITE_ARTIFACTS.headers["42-146"] = headerFixture().pins;
+      const urls = mockDownloads(() => ({ data: Buffer.alloc(0) }));
+      vi.stubEnv("PATH", bin);
+      try {
+        await expect(
+          ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+        ).rejects.toThrow("trusted Python 3 installation");
+        expect(urls).toEqual([]);
+      } finally {
+        vi.unstubAllEnvs();
       }
     },
   );
@@ -1283,5 +1341,421 @@ describe("Pinned executable-input manifest and private Electron headers", () => 
       ),
     ).rejects.toThrow("expected SQLite ABI");
     expect(existsSync(join(root, "electron-headers"))).toBe(false);
+  });
+});
+
+async function exitedPid(): Promise<number> {
+  const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  await new Promise((resolvePromise) => child.once("exit", resolvePromise));
+  return child.pid as number;
+}
+
+function sleep(milliseconds: number) {
+  return new Promise((resolvePromise) =>
+    setTimeout(resolvePromise, milliseconds),
+  );
+}
+
+async function lockFixture() {
+  const f = await runtimeFixture();
+  const probe = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
+  const runtimeRoot = dirname(dirname(probe.installedPackagePath as string));
+  const lockRoot = `${runtimeRoot}.lock`;
+  const data = archive([
+    { name: "build/Release/better_sqlite3.node", data: "fresh" },
+  ]);
+  fixturePrebuiltPin("official", data);
+  return { ...f, runtimeRoot, lockRoot, data };
+}
+
+function writeLock(
+  lockRoot: string,
+  owner: { pid: number; hostname: string; createdAt: number; token: string },
+) {
+  mkdirSync(lockRoot, { recursive: true });
+  writeFileSync(join(lockRoot, "owner.json"), JSON.stringify(owner));
+}
+
+function liveOwner(token: string, createdAt = Date.now()) {
+  return { pid: process.pid, hostname: hostname(), createdAt, token };
+}
+
+function lockToken(lockRoot: string) {
+  return JSON.parse(readFileSync(join(lockRoot, "owner.json"), "utf8")).token;
+}
+
+async function actualRenameSync() {
+  return (await vi.importActual<typeof import("node:fs")>("node:fs"))
+    .renameSync;
+}
+
+describe("SQLite runtime installation lock recovery", () => {
+  it("reclaims a lock left by a process that no longer exists", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, {
+      pid: await exitedPid(),
+      hostname: hostname(),
+      createdAt: Date.now(),
+      token: "crashed",
+    });
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const started = Date.now();
+    const installed = await ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(urls).toHaveLength(1);
+    expect(
+      readFileSync(
+        join(installed as string, "build/Release/better_sqlite3.node"),
+        "utf8",
+      ),
+    ).toBe("fresh");
+    expect(existsSync(f.lockRoot)).toBe(false);
+  });
+
+  it("reclaims an ownerless lock directory after the initialization grace period", async () => {
+    const f = await lockFixture();
+    mkdirSync(f.lockRoot, { recursive: true });
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(f.lockRoot, past, past);
+    const urls = mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(urls).toHaveLength(1);
+    expect(existsSync(f.lockRoot)).toBe(false);
+  });
+
+  it("waits on an ownerless lock directory that is still within the initialization grace period", async () => {
+    const f = await lockFixture();
+    mkdirSync(f.lockRoot, { recursive: true });
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(400);
+    expect(urls).toHaveLength(0);
+    expect(existsSync(f.lockRoot)).toBe(true);
+    rmSync(f.lockRoot, { recursive: true, force: true });
+    await expect(installation).resolves.toBeTruthy();
+    expect(urls).toHaveLength(1);
+  });
+
+  it("does not steal a live owner's lock right after a sleep makes its heartbeat look old, but does once it stays unchanged", async () => {
+    const f = await lockFixture();
+    setSQLiteInstallLockTimingsForTests({ staleHeartbeatMs: 1_500 });
+    writeLock(f.lockRoot, liveOwner("asleep"));
+    const past = new Date(Date.now() - 10 * 60_000);
+    utimesSync(join(f.lockRoot, "owner.json"), past, past);
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(300);
+    expect(urls).toHaveLength(0);
+    expect(lockToken(f.lockRoot)).toBe("asleep");
+    await expect(installation).resolves.toBeTruthy();
+    expect(urls).toHaveLength(1);
+    expect(existsSync(f.lockRoot)).toBe(false);
+    expect(
+      f.logs.filter((line) => line.includes("Removing stale")),
+    ).toHaveLength(1);
+  });
+
+  it("does not steal a long-running live owner's lock while its heartbeat continues", async () => {
+    const f = await lockFixture();
+    setSQLiteInstallLockTimingsForTests({ staleHeartbeatMs: 300 });
+    writeLock(f.lockRoot, liveOwner("long", Date.now() - 2 * 60 * 60_000));
+    const beat = setInterval(() => {
+      const now = new Date();
+      utimesSync(join(f.lockRoot, "owner.json"), now, now);
+    }, 50);
+    const urls = mockDownloads(() => ({ data: f.data }));
+    try {
+      const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+      await sleep(900);
+      expect(urls).toHaveLength(0);
+      expect(lockToken(f.lockRoot)).toBe("long");
+      clearInterval(beat);
+      await expect(installation).resolves.toBeTruthy();
+      expect(urls).toHaveLength(1);
+    } finally {
+      clearInterval(beat);
+    }
+  });
+
+  it("refreshes its own heartbeat while installing", async () => {
+    const f = await lockFixture();
+    setSQLiteInstallLockTimingsForTests({ heartbeatMs: 50 });
+    mockDownloads(() => ({ data: f.data }), 500);
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(100);
+    const ownerPath = join(f.lockRoot, "owner.json");
+    const first = statSync(ownerPath).mtimeMs;
+    await sleep(250);
+    expect(statSync(ownerPath).mtimeMs).toBeGreaterThan(first);
+    await expect(installation).resolves.toBeTruthy();
+    expect(existsSync(f.lockRoot)).toBe(false);
+  });
+
+  it("reclaims a lock whose creation time is implausibly far in the future", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, liveOwner("future", Date.now() + 24 * 60 * 60_000));
+    const urls = mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(urls).toHaveLength(1);
+  });
+
+  it("waits for a live owner instead of failing or stealing its lock", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, liveOwner("live"));
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(500);
+    expect(urls).toHaveLength(0);
+    expect(lockToken(f.lockRoot)).toBe("live");
+    expect(f.logs.some((line) => line.includes("Waiting for another"))).toBe(
+      true,
+    );
+    rmSync(f.lockRoot, { recursive: true, force: true });
+    await expect(installation).resolves.toBeTruthy();
+    expect(urls).toHaveLength(1);
+  });
+
+  it("returns as soon as another installer finishes, even while its lock remains", async () => {
+    const f = await lockFixture();
+    const urls = mockDownloads(() => ({ data: f.data }));
+    await ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    resetSQLiteInstallerForTests();
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "second-storage"),
+      allowInstall: () => true,
+    });
+    const target = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
+    const targetRoot = dirname(dirname(target.installedPackagePath as string));
+    writeLock(`${targetRoot}.lock`, liveOwner("other-window"));
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(300);
+    cpSync(f.runtimeRoot, targetRoot, { recursive: true });
+    await expect(installation).resolves.toBe(target.installedPackagePath);
+    expect(urls).toHaveLength(1);
+    expect(lockToken(`${targetRoot}.lock`)).toBe("other-window");
+  });
+
+  it("reports a successful install even when releasing the lock keeps failing", async () => {
+    const f = await lockFixture();
+    setSQLiteInstallLockTimingsForTests({
+      releaseAttempts: 2,
+      releaseRetryMs: 10,
+    });
+    const rename = await actualRenameSync();
+    vi.mocked(renameSync).mockImplementation((from, to) => {
+      if (from === f.lockRoot) {
+        throw Object.assign(new Error("EPERM: operation not permitted"), {
+          code: "EPERM",
+        });
+      }
+      rename(from, to);
+    });
+    mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(
+      f.logs.some((line) =>
+        line.includes("Could not release SQLite runtime installation lock"),
+      ),
+    ).toBe(true);
+    vi.mocked(renameSync).mockReset();
+  });
+
+  it("retries a takeover that hits a transient filesystem error", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, {
+      pid: await exitedPid(),
+      hostname: hostname(),
+      createdAt: Date.now(),
+      token: "crashed",
+    });
+    const rename = await actualRenameSync();
+    let failures = 0;
+    vi.mocked(renameSync).mockImplementation((from, to) => {
+      if (from === f.lockRoot && failures < 2) {
+        failures += 1;
+        throw Object.assign(new Error("EBUSY: resource busy"), {
+          code: "EBUSY",
+        });
+      }
+      rename(from, to);
+    });
+    const urls = mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(failures).toBe(2);
+    expect(urls).toHaveLength(1);
+    expect(f.logs.filter((line) => line.includes("is busy"))).toHaveLength(1);
+    expect(
+      f.logs.filter((line) => line.includes("Removing stale")),
+    ).toHaveLength(1);
+  });
+
+  it("restores a lock that changed owner during takeover and keeps waiting without spinning", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, {
+      pid: await exitedPid(),
+      hostname: hostname(),
+      createdAt: Date.now(),
+      token: "crashed",
+    });
+    const rename = await actualRenameSync();
+    let takeovers = 0;
+    vi.mocked(renameSync).mockImplementation((from, to) => {
+      if (from === f.lockRoot && String(to).includes(".stale-")) {
+        takeovers += 1;
+        if (takeovers === 1) {
+          writeFileSync(
+            join(f.lockRoot, "owner.json"),
+            JSON.stringify(liveOwner("replacement")),
+          );
+        }
+      }
+      rename(from, to);
+    });
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(400);
+    expect(takeovers).toBe(1);
+    expect(urls).toHaveLength(0);
+    expect(lockToken(f.lockRoot)).toBe("replacement");
+    rmSync(f.lockRoot, { recursive: true, force: true });
+    await expect(installation).resolves.toBeTruthy();
+    expect(takeovers).toBe(2);
+  });
+
+  it("leaves a mismatched tombstone in place when it cannot be restored", async () => {
+    const f = await lockFixture();
+    writeLock(f.lockRoot, {
+      pid: await exitedPid(),
+      hostname: hostname(),
+      createdAt: Date.now(),
+      token: "crashed",
+    });
+    const rename = await actualRenameSync();
+    let tombstone = "";
+    vi.mocked(renameSync).mockImplementation((from, to) => {
+      if (from === f.lockRoot && String(to).includes(".stale-") && !tombstone) {
+        tombstone = String(to);
+        writeFileSync(
+          join(f.lockRoot, "owner.json"),
+          JSON.stringify(liveOwner("replacement")),
+        );
+      } else if (from === tombstone && to === f.lockRoot) {
+        throw Object.assign(new Error("EEXIST: file already exists"), {
+          code: "EEXIST",
+        });
+      }
+      rename(from, to);
+    });
+    mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(lockToken(tombstone)).toBe("replacement");
+    expect(f.logs.some((line) => line.includes("Leaving it in place"))).toBe(
+      true,
+    );
+  });
+
+  it("does not release a lock that another installer re-created after a takeover", async () => {
+    const f = await lockFixture();
+    const foreign = liveOwner("foreign");
+    mockDownloads(() => {
+      renameSync(f.lockRoot, `${f.lockRoot}-taken`);
+      writeLock(f.lockRoot, foreign);
+      return { data: f.data };
+    });
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(
+      JSON.parse(readFileSync(join(f.lockRoot, "owner.json"), "utf8")),
+    ).toEqual(foreign);
+  });
+
+  it("lets only one of two concurrent installers download while the other waits", async () => {
+    const f = await lockFixture();
+    vi.resetModules();
+    const freshPins = await import(
+      "../../src/extension/utils/sqliteArtifactPins"
+    );
+    freshPins.SQLITE_ARTIFACTS.prebuilts = { ...SQLITE_ARTIFACTS.prebuilts };
+    const installerPath = "../../src/extension/utils/sqliteInstaller";
+    const instances = [
+      await import(installerPath),
+      await import(`${installerPath}?second-window`),
+    ] as typeof import("../../src/extension/utils/sqliteInstaller")[];
+    expect(instances[0]).not.toBe(instances[1]);
+    for (const instance of instances) {
+      instance.configureSQLiteInstaller({
+        storageRoot: join(f.root, "storage"),
+        allowInstall: () => true,
+      });
+    }
+    const urls = mockDownloads(() => ({ data: f.data }), 200);
+    const [first, second] = await Promise.all(
+      instances.map((instance) =>
+        instance.ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+      ),
+    );
+    expect(urls).toHaveLength(1);
+    expect(first).toBeTruthy();
+    expect(second).toBe(first);
+    expect(existsSync(`${dirname(dirname(first as string))}.lock`)).toBe(false);
+  });
+
+  it("asks for installation consent once for concurrent first-time connects", async () => {
+    const f = await lockFixture();
+    let approve: (value: boolean) => void = () => {};
+    const allowInstall = vi.fn(
+      () =>
+        new Promise<boolean>((resolvePromise) => {
+          approve = resolvePromise;
+        }),
+    );
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall,
+    });
+    const urls = mockDownloads(() => ({ data: f.data }));
+    const first = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const second = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    await sleep(50);
+    approve(true);
+    const [firstPath, secondPath] = await Promise.all([first, second]);
+    expect(allowInstall).toHaveBeenCalledTimes(1);
+    expect(urls).toHaveLength(1);
+    expect(secondPath).toBe(firstPath);
+  });
+
+  it("removes abandoned temporary installs and lock tombstones but keeps ones owned by live processes", async () => {
+    const f = await lockFixture();
+    const deadPid = await exitedPid();
+    const abandonedTemp = `${f.runtimeRoot}.tmp-${deadPid}-1`;
+    const abandonedTombstone = `${f.lockRoot}.stale-${deadPid}-x`;
+    const activeTemp = `${f.runtimeRoot}.tmp-${process.ppid}-1`;
+    const activeTombstone = `${f.lockRoot}.stale-${process.pid}-y`;
+    for (const directory of [abandonedTemp, abandonedTombstone, activeTemp]) {
+      mkdirSync(join(directory, "node_modules"), { recursive: true });
+    }
+    const past = new Date(Date.now() - 60_000);
+    utimesSync(abandonedTombstone, past, past);
+    writeLock(activeTombstone, liveOwner("misplaced"));
+    mockDownloads(() => ({ data: f.data }));
+    await expect(
+      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
+    ).resolves.toBeTruthy();
+    expect(existsSync(abandonedTemp)).toBe(false);
+    expect(existsSync(abandonedTombstone)).toBe(false);
+    expect(existsSync(activeTemp)).toBe(true);
+    expect(existsSync(activeTombstone)).toBe(true);
+    expect(existsSync(f.lockRoot)).toBe(false);
   });
 });

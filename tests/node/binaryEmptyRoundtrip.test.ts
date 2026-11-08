@@ -5,10 +5,8 @@ import type {
   ConnectionManager,
 } from "../../src/extension/connectionManager";
 import { hexFromBuffer as baseHexFromBuffer } from "../../src/extension/dbDrivers/BaseDBDriver";
-import { hexFromBuffer as extractedHexFromBuffer } from "../../src/extension/dbDrivers/hexUtils";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
-import { canonicalizeBinaryPersistedEditValue } from "../../src/extension/dbDrivers/persistedEditCanonicalizers";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
@@ -167,21 +165,26 @@ describe.each(cases)("$name zero-length binary round trip", ({
   });
 });
 
-describe("empty binary persisted-edit canonicalization", () => {
-  it("does not treat empty text as a zero-length buffer", () => {
-    expect(canonicalizeBinaryPersistedEditValue(Buffer.alloc(0))).toEqual({
-      canonical: "0x",
-    });
-    expect(canonicalizeBinaryPersistedEditValue("0x")).toEqual({
-      canonical: "0x",
-    });
-    expect(canonicalizeBinaryPersistedEditValue("")).toEqual({
-      canonical: "",
-    });
+describe("empty binary persisted-edit verification", () => {
+  it("verifies empty input, 0x, and zero-length buffers as the same empty bytes", () => {
+    const driver = new PostgresDriver(config("pg"));
+    for (const expectedValue of ["", "0x", Buffer.alloc(0)]) {
+      for (const persistedValue of [Buffer.alloc(0), "0x", "\\x"]) {
+        expect(
+          driver.checkPersistedEdit(binaryColumn, expectedValue, {
+            persistedValue,
+          }),
+        ).toMatchObject({ ok: true, shouldVerify: true });
+      }
+    }
+    expect(
+      driver.checkPersistedEdit(binaryColumn, "", {
+        persistedValue: Buffer.from([0]),
+      }),
+    ).toMatchObject({ ok: false, shouldVerify: true });
   });
 
-  it("keeps both binary formatters in sync", () => {
+  it("formats zero-length buffers as 0x", () => {
     expect(baseHexFromBuffer(Buffer.alloc(0))).toBe("0x");
-    expect(extractedHexFromBuffer(Buffer.alloc(0))).toBe("0x");
   });
 });

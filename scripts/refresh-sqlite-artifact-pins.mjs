@@ -1,8 +1,3 @@
-// Maintainer-only bootstrap/verification, NEVER invoked by the runtime installer.
-// GitHub API asset digests are compared with separately downloaded asset bytes.
-// Electron's header service publishes separate SHASUMS: its exact bytes/hash,
-// release ID and every checked artifact hash are recorded for review and pinned
-// statically. Runtime installations do not fetch or trust mutable checksums.
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -182,9 +177,6 @@ export async function collectSQLitePins() {
       `${kind}: API and downloaded bytes verified for ${selected.length} assets (release status ${info.status})`,
     );
   }
-  // Baseline headers are selected by Electron major + ABI, not by a mutable
-  // latest endpoint. All minor/patch runtimes of that ABI build against this
-  // pinned baseline; new majors/ABIs require an explicit reviewed refresh.
   for (const headerVersion of ["42.0.0", "43.0.0", "44.0.0"]) {
     const info = await release("electron/electron", `v${headerVersion}`, true);
     if (info.status !== 200) {

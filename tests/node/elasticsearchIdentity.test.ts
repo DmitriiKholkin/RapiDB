@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { ElasticsearchSerializer } from "../../src/extension/dbDrivers/elasticsearchSerializer";
 import type { DriverTablePageRequest } from "../../src/extension/dbDrivers/types";
 import {
   applyChangesTransactional,
@@ -46,7 +47,9 @@ function fixture() {
     type: "elasticsearch",
   });
   const client = {
-    search: vi.fn().mockResolvedValue({ hits: { total: { value: 2 }, hits } }),
+    search: vi.fn().mockResolvedValue({
+      hits: { total: { value: 2, relation: "eq" }, hits },
+    }),
     openPointInTime: vi.fn().mockResolvedValue({ id: "pit" }),
     closePointInTime: vi.fn().mockResolvedValue({ succeeded: true }),
     indices: {
@@ -75,6 +78,194 @@ function primaryKeys(
 }
 
 describe("Elasticsearch read-to-mutation identity", () => {
+  it("uses the same numeric-aware script in execution and preview after JSON number normalization", async () => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    const source = new ElasticsearchSerializer().deserialize(
+      '{"nested":[1.0,1e3]}',
+    );
+    const originalValues = { _source: JSON.stringify(source) };
+    expect(originalValues._source).toBe('{"nested":[1,1000]}');
+    const update = {
+      primaryKeys: primaryKeys(page),
+      changes: { _source: '{"nested":[2]}' },
+      originalValues,
+    };
+    const preview = driver.buildMutationPreviewStatement(
+      "update",
+      "default",
+      "indices",
+      "current",
+      update,
+    );
+    await driver.updateRows({ ...request, updates: [update] });
+    const script = client.update.mock.calls[0][0].script;
+    expect(script.source).toContain("exact.compareTo(new BigDecimal(");
+    expect(JSON.parse(preview.slice(preview.indexOf("\n") + 1)).script).toEqual(
+      script,
+    );
+  });
+
+  it("reports an ordinary doc noop as a satisfied viewer update", async () => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    client.update.mockResolvedValueOnce({ result: "noop" });
+    const manager = {
+      getConnection: () => ({ type: "elasticsearch", readOnly: false }),
+      getDriver: () => driver,
+    } as unknown as ConnectionManager;
+    const columns = [
+      ...page.columns,
+      {
+        ...page.columns[0],
+        name: "tenant",
+        isPrimaryKey: false,
+        primaryKeyOrdinal: undefined,
+      },
+    ];
+    const result = await applyChangesTransactional(
+      manager,
+      "es-identity",
+      "default",
+      "indices",
+      "current",
+      [{ primaryKeys: primaryKeys(page), changes: { tenant: "selected" } }],
+      columns,
+    );
+    expect(result).toMatchObject({
+      success: true,
+      rowOutcomes: [{ rowIndex: 0, status: "applied" }],
+    });
+  });
+
+  it.each([
+    "script noop",
+    "version conflict",
+    "network error",
+  ])("reports %s through the viewer apply result", async (mode) => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    if (mode === "script noop")
+      client.update.mockResolvedValueOnce({ result: "noop" });
+    else if (mode === "version conflict")
+      client.update.mockRejectedValueOnce({
+        meta: {
+          statusCode: 409,
+          body: { error: { type: "version_conflict_engine_exception" } },
+        },
+      });
+    else client.update.mockRejectedValueOnce(new Error("Connection lost"));
+    const manager = {
+      getConnection: () => ({ type: "elasticsearch", readOnly: false }),
+      getDriver: () => driver,
+    } as unknown as ConnectionManager;
+    const result = await applyChangesTransactional(
+      manager,
+      "es-identity",
+      "default",
+      "indices",
+      "current",
+      [
+        {
+          primaryKeys: primaryKeys(page),
+          changes: { _source: '{"tenant":"edited"}' },
+          originalValues: { _source: '{"tenant":"selected"}' },
+        },
+      ],
+      page.columns,
+    );
+    const unknown = mode === "network error";
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: unknown,
+      outcomeUnknown: unknown,
+      rowOutcomes: [
+        { rowIndex: 0, status: unknown ? "unknown" : "not_applied" },
+      ],
+    });
+  });
+
+  it("preflights conditional partial changes across the entire batch", async () => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    const keys = primaryKeys(page);
+    await expect(
+      driver.updateRows({
+        ...request,
+        updates: [
+          { primaryKeys: keys, changes: { tenant: "valid" } },
+          {
+            primaryKeys: keys,
+            changes: { tenant: "invalid" },
+            originalValues: { _source: '{"tenant":"selected","keep":1}' },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "not_applied" },
+          { rowIndex: 1, status: "not_applied" },
+        ],
+      },
+    });
+    expect(client.update).not.toHaveBeenCalled();
+    expect(client.index).not.toHaveBeenCalled();
+  });
+
+  it("reports an invalid original source as not applied before calling the client", async () => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    await expect(
+      driver.updateRows({
+        ...request,
+        updates: [
+          {
+            primaryKeys: primaryKeys(page),
+            changes: { _source: '{"tenant":"edited"}' },
+            originalValues: { _source: "not json" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [{ rowIndex: 0, status: "not_applied" }],
+      },
+    });
+    expect(client.update).not.toHaveBeenCalled();
+    expect(client.index).not.toHaveBeenCalled();
+  });
+
+  it("rejects conditional partial changes before writing or generating a preview", async () => {
+    const { driver, client } = fixture();
+    const page = await driver.readTablePage(request);
+    const update = {
+      primaryKeys: primaryKeys(page),
+      originalValues: {
+        _source: '{"tenant":"selected","keep":{"nested":1}}',
+      },
+      changes: { tenant: "edited" },
+    };
+    const message =
+      /conditional _source updates require a complete replacement/;
+    expect(() =>
+      driver.buildMutationPreviewStatement(
+        "update",
+        "default",
+        "indices",
+        "current",
+        update,
+      ),
+    ).toThrow(message);
+    await expect(
+      driver.updateRows({ ...request, updates: [update] }),
+    ).rejects.toThrow(message);
+    expect(client.update).not.toHaveBeenCalled();
+    expect(client.index).not.toHaveBeenCalled();
+  });
+
   it("preserves the read-only identity through Viewer apply and delete preflight", async () => {
     const { driver, client } = fixture();
     const page = await driver.readTablePage(request);

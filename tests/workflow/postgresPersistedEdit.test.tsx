@@ -27,7 +27,6 @@ vi.doMock("../../src/webview/components/MonacoEditor", () => ({
       onChange={(event) => onChange?.(event.target.value)}
     />
   ),
-  connTypeToDialect: () => "postgresql",
 }));
 
 function edit(column: string, row: number, value: string) {

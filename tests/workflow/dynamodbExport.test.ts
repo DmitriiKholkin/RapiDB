@@ -167,12 +167,18 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
           expect(lines[0]).toBe("pk,sk,value");
           for (let index = 0; index < 501; index++) {
             expect(lines[index + 1]).toBe(
-              `${queriedPartition},${String(index).padStart(4, "0")},hello`,
+              `"{""S"":""${queriedPartition}""}","{""S"":""${String(index).padStart(4, "0")}""}","{""S"":""hello""}"`,
             );
           }
         } else {
           expect(JSON.parse(output)).toEqual(
-            rows.filter((row) => row.pk === queriedPartition),
+            rows
+              .filter((row) => row.pk === queriedPartition)
+              .map((row) => ({
+                pk: { S: row.pk },
+                sk: { S: row.sk },
+                value: { S: row.value },
+              })),
           );
         }
         const exportCalls = read.mock.calls
@@ -329,8 +335,8 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
       for (let index = 0; index < 1001; index++) {
         expect(lines[index + 1]).toBe(
           index < 500
-            ? `,${String(index).padStart(4, "0")},X${index},audit`
-            : `Y${index},${String(index).padStart(4, "0")},,audit`,
+            ? `MISSING,"{""S"":""${String(index).padStart(4, "0")}""}","{""S"":""X${index}""}","{""S"":""audit""}"`
+            : `"{""S"":""Y${index}""}","{""S"":""${String(index).padStart(4, "0")}""}",MISSING,"{""S"":""audit""}"`,
         );
       }
       expect(
@@ -359,8 +365,8 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
         .split("\n");
       expect(hiddenLines).toHaveLength(1002);
       expect(hiddenLines[0]).toBe("sk,x");
-      expect(hiddenLines[501]).toBe("0500,");
-      expect(hiddenLines[1001]).toBe("1000,");
+      expect(hiddenLines[501]).toBe('"{""S"":""0500""}",MISSING');
+      expect(hiddenLines[1001]).toBe('"{""S"":""1000""}",MISSING');
 
       await writeFile(outputPath, "old export\n");
       state.showInformationMessage.mockClear();

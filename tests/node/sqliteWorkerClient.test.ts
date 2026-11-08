@@ -9,11 +9,28 @@ import {
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { createProjectTempDir } from "../runtime/tempDirectories";
 
+const installerOverride = vi.hoisted(() => ({
+  install: undefined as Promise<string | null> | undefined,
+}));
+
+vi.mock("../../src/extension/utils/sqliteInstaller", async (importOriginal) => {
+  const actual =
+    await importOriginal<
+      typeof import("../../src/extension/utils/sqliteInstaller")
+    >();
+  return {
+    ...actual,
+    ensureSQLiteRuntimeInstalled: (baseDir: string) =>
+      installerOverride.install ?? actual.ensureSQLiteRuntimeInstalled(baseDir),
+  };
+});
+
 const clients = new Set<SQLiteWorkerClient>();
 
 afterEach(async () => {
   await Promise.all(Array.from(clients, (client) => client.close()));
   clients.clear();
+  installerOverride.install = undefined;
   resetSQLiteInstallerForTests();
   vi.unstubAllEnvs();
 });
@@ -120,6 +137,89 @@ describe("SQLite worker request queue failures", () => {
     expect(error.message).toContain(
       "SQLite runtime installation was not authorized",
     );
+    expect(client.connected).toBe(false);
+  });
+
+  it("does not count the runtime installation prompt against the connect timeout", async () => {
+    const directory = await createProjectTempDir("sqlite-worker-install-slow");
+    configureSQLiteInstaller({
+      storageRoot: join(directory, ".global-storage"),
+      allowInstall: () =>
+        new Promise<boolean>((resolve) =>
+          setTimeout(() => resolve(false), 300),
+        ),
+    });
+
+    const client = new SQLiteWorkerClient();
+    clients.add(client);
+    const config: ConnectionConfig = {
+      id: "sqlite-worker-install-slow",
+      name: "SQLite worker install slow",
+      type: "sqlite",
+      filePath: join(directory, "db.sqlite"),
+    };
+
+    const error = await rejection(client.open(config, 50));
+    expect(error.name).not.toBe("DriverTimeoutError");
+    expect(error.message).toContain(
+      "SQLite runtime installation was not authorized",
+    );
+    expect(error.message).not.toContain("connection is closed");
+    expect(client.connected).toBe(false);
+  });
+
+  it("settles a connect waiting on runtime installation when disconnected, without spawning a worker later", async () => {
+    const directory = await createProjectTempDir(
+      "sqlite-worker-install-disconnect",
+    );
+    const workerPath = join(directory, "fakeSqliteWorker.cjs");
+    const logPath = join(directory, "requests.jsonl");
+    await writeFile(
+      workerPath,
+      `require("node:fs").appendFileSync(process.env.RAPIDB_SQLITE_WORKER_TEST_LOG, "spawned\\n");
+process.on("message", (request) => process.send({ id: request.id, value: "connected" }));
+process.on("disconnect", () => process.exit(0));
+`,
+      "utf8",
+    );
+    vi.stubEnv("RAPIDB_SQLITE_WORKER_PATH", workerPath);
+    vi.stubEnv("RAPIDB_SQLITE_WORKER_TEST_LOG", logPath);
+    let finishInstall!: (path: string | null) => void;
+    installerOverride.install = new Promise((resolve) => {
+      finishInstall = resolve;
+    });
+
+    const client = new SQLiteWorkerClient();
+    clients.add(client);
+    const opening = rejection(
+      client.open(
+        {
+          id: "sqlite-worker-install-disconnect",
+          name: "SQLite worker install disconnect",
+          type: "sqlite",
+          filePath: join(directory, "db.sqlite"),
+        },
+        2_000,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await client.close();
+
+    const error = await Promise.race([
+      opening,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error("open() still pending after close()")),
+          500,
+        ),
+      ),
+    ]);
+    expect(error.message).toContain("SQLite connection attempt cancelled");
+    expect(client.connected).toBe(false);
+
+    finishInstall(null);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await readFile(logPath, "utf8").catch(() => "")).toBe("");
     expect(client.connected).toBe(false);
   });
 
@@ -243,16 +343,23 @@ describe("SQLite worker request queue failures", () => {
   it("expires a queued request at its own earlier deadline without poisoning the active worker", async () => {
     const { client, logPath } = await startClient();
     const active = client.call("query", ["DELAY"], 2_000);
-    const queued = rejection(
-      client.call(
-        "query",
-        ["INSERT INTO sample VALUES (2)"],
-        2_000,
-        undefined,
-        undefined,
-        Date.now() + 35,
-      ),
-    );
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let queued: Promise<Error>;
+    try {
+      queued = rejection(
+        client.call(
+          "query",
+          ["INSERT INTO sample VALUES (2)"],
+          2_000,
+          undefined,
+          undefined,
+          now + 35,
+        ),
+      );
+    } finally {
+      clock.mockRestore();
+    }
 
     const queueError = diagnostic(await queued);
     expect(queueError).toMatchObject({
@@ -260,6 +367,7 @@ describe("SQLite worker request queue failures", () => {
       code: "NOT_EXECUTED",
       executionState: "not-executed",
       reason: "expired",
+      timeoutMs: 35,
     });
     expect(queueError.message).toContain("expired in the SQLite worker queue");
     await expect(active).resolves.toBe("DELAY");
@@ -268,6 +376,100 @@ describe("SQLite worker request queue failures", () => {
       undefined,
       "DELAY",
     ]);
+  });
+
+  it.each([
+    { deadlineMs: 80, timeoutMs: 2_000, message: /timed out at its deadline/ },
+    {
+      deadlineMs: 2_000,
+      timeoutMs: 80,
+      message: /timed out after 1 second\(s\)/,
+    },
+  ])("reports the effective timeout source for active work", async ({
+    deadlineMs,
+    timeoutMs,
+    message,
+  }) => {
+    const { client } = await startClient();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let pending: Promise<Error>;
+    try {
+      pending = rejection(
+        client.call(
+          "query",
+          ["HOLD"],
+          timeoutMs,
+          undefined,
+          undefined,
+          now + deadlineMs,
+        ),
+      );
+    } finally {
+      clock.mockRestore();
+    }
+    const error = await pending;
+    expect(error).toMatchObject({
+      name: "DriverTimeoutError",
+      timeoutMs: Math.min(deadlineMs, timeoutMs),
+      code: "OUTCOME_UNKNOWN",
+      executionState: "unknown",
+      message: expect.stringMatching(message),
+    });
+    expect(client.connected).toBe(false);
+  });
+
+  it("retains the original effective budget after time spent in the queue", async () => {
+    const { client, logPath } = await startClient();
+    const active = client.call("query", ["DELAY"], 2_000);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    let queued: Promise<Error>;
+    try {
+      queued = rejection(
+        client.call("query", ["HOLD"], 2_000, undefined, undefined, now + 500),
+      );
+    } finally {
+      clock.mockRestore();
+    }
+    await expect(active).resolves.toBe("DELAY");
+    const error = await queued;
+    expect(error).toMatchObject({
+      name: "DriverTimeoutError",
+      timeoutMs: 500,
+      code: "OUTCOME_UNKNOWN",
+      executionState: "unknown",
+    });
+    expect((await requests(logPath)).map(({ sql }) => sql)).toEqual([
+      undefined,
+      "DELAY",
+      "HOLD",
+    ]);
+  });
+
+  it("reports a zero budget for an already expired deadline without dispatch", async () => {
+    const { client, logPath } = await startClient();
+    const error = await rejection(
+      client.call(
+        "query",
+        ["HOLD"],
+        2_000,
+        undefined,
+        undefined,
+        Date.now() - 10,
+      ),
+    );
+    expect(error).toMatchObject({
+      name: "DriverTimeoutError",
+      timeoutMs: 0,
+      code: "NOT_EXECUTED",
+      executionState: "not-executed",
+      reason: "expired",
+    });
+    expect((await requests(logPath)).map(({ method }) => method)).toEqual([
+      "connect",
+    ]);
+    expect(client.connected).toBe(true);
   });
 
   it("keeps an active unknown outcome separate from queued requests when the worker crashes", async () => {

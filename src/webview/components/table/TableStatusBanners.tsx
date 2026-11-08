@@ -145,12 +145,14 @@ interface TableMutationStatusBarProps {
   unsavedRowCount: number;
   unresolvedPendingCount?: number;
   unresolvedPendingColumns?: readonly string[];
+  unmatchablePendingCount?: number;
   canUndo?: boolean;
   canRedo?: boolean;
   onApplyChanges: () => void;
   onDismissApplyStatus: () => void;
   onDismissMutationError: () => void;
   onRevertChanges: () => void;
+  onDiscardUnresolved?: () => void;
   onUndo?: () => void;
   onRedo?: () => void;
 }
@@ -168,20 +170,19 @@ export function TableMutationStatusBar({
   unsavedRowCount,
   unresolvedPendingCount = 0,
   unresolvedPendingColumns = [],
+  unmatchablePendingCount = 0,
   canUndo = false,
   canRedo = false,
   onApplyChanges,
   onDismissApplyStatus,
   onDismissMutationError,
   onRevertChanges,
+  onDiscardUnresolved,
   onUndo,
   onRedo,
 }: TableMutationStatusBarProps) {
-  if (readOnlyTable) {
-    return null;
-  }
-
   const shortcut = platformShortcutLabel();
+  const hasHistory = !readOnlyTable && (canUndo || canRedo);
 
   return (
     <>
@@ -191,15 +192,30 @@ export function TableMutationStatusBar({
           style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
         >
           <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
-          <span>
-            {`Unable to match ${unresolvedPendingCount} row${unresolvedPendingCount === 1 ? "" : "s"} of unverified changes safely after refresh. The edits are preserved but not attached to a displayed row; Apply Changes is blocked. Refresh to check again or use Revert All to discard them.`}
+          <span style={{ flex: 1 }}>
+            {unmatchablePendingCount === unresolvedPendingCount
+              ? `${unresolvedPendingCount} row${unresolvedPendingCount === 1 ? "" : "s"} of unsaved changes lost the original row identity and cannot be matched again, even after refresh. Apply Changes is blocked; discard the unmatched changes or use Revert All.`
+              : `Unable to match ${unresolvedPendingCount} row${unresolvedPendingCount === 1 ? "" : "s"} of unverified changes safely after refresh. The edits are preserved but not attached to a displayed row; Apply Changes is blocked. Refresh to check again or use Revert All to discard them.`}
+            {unmatchablePendingCount > 0 &&
+              unmatchablePendingCount < unresolvedPendingCount &&
+              ` ${unmatchablePendingCount} of them lost the original row identity and cannot be matched by refreshing.`}
             {unresolvedPendingColumns.length > 0 && (
               <> Changed fields: {unresolvedPendingColumns.join(", ")}.</>
             )}
           </span>
+          {onDiscardUnresolved && (
+            <button
+              type="button"
+              style={tableButtonStyle("ghost", applying || loading)}
+              disabled={applying || loading}
+              onClick={onDiscardUnresolved}
+            >
+              Discard Unmatched
+            </button>
+          )}
         </div>
       )}
-      {(unsavedRowCount > 0 || canUndo || canRedo || applyStatus) && (
+      {(unsavedRowCount > 0 || hasHistory || applyStatus) && (
         <div
           style={{
             flexShrink: 0,
@@ -219,7 +235,21 @@ export function TableMutationStatusBar({
             }`,
           }}
         >
-          {(unsavedRowCount > 0 || canUndo || canRedo) &&
+          {readOnlyTable &&
+            unsavedRowCount > 0 &&
+            applyStatus?.tone !== "error" && (
+              <span
+                style={{
+                  fontSize: 12,
+                  color: "var(--vscode-editorWarning-foreground, #cca700)",
+                  flex: 1,
+                }}
+              >
+                <Icon name="edit" size={12} style={{ marginRight: 4 }} />
+                {`${unsavedRowCount} row${unsavedRowCount !== 1 ? "s" : ""} with unsaved changes. The table is read-only, so they cannot be applied; use Revert All to discard them.`}
+              </span>
+            )}
+          {(hasHistory || (!readOnlyTable && unsavedRowCount > 0)) &&
             applyStatus?.tone !== "error" && (
               <>
                 <button
@@ -311,7 +341,7 @@ export function TableMutationStatusBar({
               {applyStatus.message}
             </span>
           )}
-          {unsavedRowCount > 0 && (
+          {!readOnlyTable && unsavedRowCount > 0 && (
             <button
               type="button"
               style={tableButtonStyle(
@@ -329,7 +359,7 @@ export function TableMutationStatusBar({
               {applying ? "Applying…" : "Apply Changes"}
             </button>
           )}
-          {(unsavedRowCount > 0 || canUndo || canRedo) && (
+          {(unsavedRowCount > 0 || hasHistory) && (
             <button
               type="button"
               style={tableButtonStyle("ghost", applying || loading)}

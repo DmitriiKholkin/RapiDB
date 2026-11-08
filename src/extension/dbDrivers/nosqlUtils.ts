@@ -1,7 +1,6 @@
 import { compareNumericTokens } from "../../shared/numericNormalization";
 import {
   type FilterExpression,
-  type FilterOperator,
   inferValueCategory,
   type ScalarFilterOperator,
   type TypeCategory,
@@ -15,13 +14,23 @@ import type {
 } from "./types";
 import { resolveFilterOperators } from "./types";
 
-function stringifyNested(value: unknown): unknown {
+export function ownField(
+  row: Record<string, unknown>,
+  column: string,
+): unknown {
+  return Object.hasOwn(row, column) ? row[column] : undefined;
+}
+
+function stringifyNested(
+  value: unknown,
+  stringify: (value: unknown) => string,
+): unknown {
   if (value === null || value === undefined) {
     return value;
   }
   if (typeof value === "object") {
     try {
-      return JSON.stringify(value);
+      return stringify(value);
     } catch {
       return String(value);
     }
@@ -31,9 +40,13 @@ function stringifyNested(value: unknown): unknown {
 
 export function flattenRootRecord(
   record: Record<string, unknown>,
+  stringify: (value: unknown) => string = JSON.stringify,
 ): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(record).map(([key, value]) => [key, stringifyNested(value)]),
+    Object.entries(record).map(([key, value]) => [
+      key,
+      stringifyNested(value, stringify),
+    ]),
   );
 }
 
@@ -72,8 +85,10 @@ export function inferColumnsFromRows(
   return orderedColumnNames.map((name) => {
     const isPrimaryKey = primaryKeyNameSet.has(name);
     const samples = options?.consistentCategories
-      ? rows.filter((row) => row[name] != null).map((row) => row[name])
-      : [rows.find((row) => row[name] !== undefined)?.[name]];
+      ? rows
+          .filter((row) => ownField(row, name) != null)
+          .map((row) => ownField(row, name))
+      : [ownField(rows.find((row) => ownField(row, name) != null) ?? {}, name)];
     const categories = new Set(
       samples.map(
         (sample) =>
@@ -97,7 +112,7 @@ export function inferColumnsFromRows(
       ? false
       : options?.nullableMode === "schemaLess"
         ? true
-        : rows.some((row) => row[name] == null);
+        : rows.some((row) => ownField(row, name) == null);
     const filterable = category !== "spatial";
     return {
       name,
@@ -182,9 +197,13 @@ function compareValues(
     }
     const timestamp = (value: unknown) => {
       if (value instanceof Date) return value.getTime();
-      return Date.parse(
-        category === "time" ? `1970-01-01T${value}Z` : String(value),
-      );
+      if (category === "time") return Date.parse(`1970-01-01T${value}Z`);
+      const text = String(value);
+      const zoneless =
+        /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)$/.exec(
+          text,
+        );
+      return Date.parse(zoneless ? `${zoneless[1]}T${zoneless[2]}Z` : text);
     };
     const a = timestamp(left);
     const b = timestamp(right);
@@ -309,7 +328,7 @@ function evaluateFilter(
     filter: FilterExpression,
   ) => boolean | undefined,
 ): boolean {
-  const rawValue = row[filter.column];
+  const rawValue = ownField(row, filter.column);
   if (filter.operator === "is_null") {
     return rawValue === null || rawValue === undefined;
   }
@@ -402,24 +421,24 @@ export function applySort(
     isTemporalCategory(declaredCategory) &&
     new Set(
       rows
-        .filter((row) => row[sort.column] != null)
+        .filter((row) => ownField(row, sort.column) != null)
         .map((row) =>
-          bsonTimestampParts(row[sort.column]) ? "timestamp" : "date",
+          bsonTimestampParts(ownField(row, sort.column)) ? "timestamp" : "date",
         ),
     ).size > 1;
   const category =
     mixedTemporalKinds ||
     rows.some(
       (row) =>
-        row[sort.column] != null &&
+        ownField(row, sort.column) != null &&
         ((valueCategory &&
           !compatibleCategory(
             declaredCategory,
             valueCategory(row, sort.column),
           )) ||
           compareValues(
-            row[sort.column],
-            row[sort.column],
+            ownField(row, sort.column),
+            ownField(row, sort.column),
             declaredCategory,
           ) === null),
     )
@@ -427,8 +446,14 @@ export function applySort(
       : declaredCategory;
   sorted.sort((left, right) => {
     const cmp =
-      compareValues(left[sort.column], right[sort.column], category) ??
-      String(left[sort.column]).localeCompare(String(right[sort.column]));
+      compareValues(
+        ownField(left, sort.column),
+        ownField(right, sort.column),
+        category,
+      ) ??
+      String(ownField(left, sort.column)).localeCompare(
+        String(ownField(right, sort.column)),
+      );
     return sort.direction === "desc" ? -cmp : cmp;
   });
   return sorted;
@@ -452,13 +477,6 @@ export function stringifyCommandPayload(
   payload: unknown,
 ): string {
   return `${command} ${JSON.stringify(payload)}`;
-}
-
-export function hasOperator(
-  operator: FilterOperator,
-  supported: readonly FilterOperator[],
-): boolean {
-  return supported.includes(operator);
 }
 
 export function createNoSqlUnsupportedMetadataHandlers(driverName: string): {

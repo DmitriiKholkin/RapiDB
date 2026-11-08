@@ -1,4 +1,4 @@
-import React from "react";
+import type React from "react";
 import type {
   QueryEditorLanguage,
   QueryEditorPresentation,
@@ -48,6 +48,7 @@ export function QueryView({
         connectionId={connectionId}
         connections={view.connections}
         formatButtonTitle={view.editorState.formatButtonTitle}
+        schemaError={view.schemaError}
         schemaLoading={view.schemaLoading}
         selectedConnectionId={view.activeConnectionId}
         status={view.status}
@@ -58,6 +59,21 @@ export function QueryView({
         onFormat={view.formatQuery}
         onRun={view.executeQuery}
       />
+
+      {view.bookmarkError && (
+        <div
+          role="alert"
+          aria-label="Bookmark error"
+          style={{
+            padding: "8px 12px",
+            flexShrink: 0,
+            color: "var(--vscode-errorForeground)",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {view.bookmarkError}
+        </div>
+      )}
 
       <QueryEditorPanels
         editorHeight={view.editorHeight}

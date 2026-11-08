@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnNpm } from "./npm-command.mjs";
 
 const rawArgs = process.argv.slice(2);
 const mainScripts = [];
@@ -27,8 +27,6 @@ if (mainScripts.length === 0) {
   process.exit(1);
 }
 
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-
 function isTruthyEnv(value) {
   if (typeof value !== "string") {
     return false;
@@ -39,7 +37,7 @@ function isTruthyEnv(value) {
 
 function runScript(scriptName) {
   return new Promise((resolve) => {
-    const child = spawn(npmCommand, ["run", scriptName], {
+    const child = spawnNpm(["run", scriptName], {
       stdio: "inherit",
       env: process.env,
     });

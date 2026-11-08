@@ -1,9 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawnNpm } from "./npm-command.mjs";
 
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-
-const child = spawn(
-  npmCommand,
+const child = spawnNpm(
   [
     "exec",
     "--",

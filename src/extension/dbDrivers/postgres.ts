@@ -1,8 +1,9 @@
 import { isIP } from "node:net";
-import type { PoolClient } from "pg";
-import { Pool, types as pgTypes } from "pg";
+import type { ClientConfig, PoolClient } from "pg";
+import { Connection, DatabaseError, Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import {
@@ -11,7 +12,10 @@ import {
 } from "../services/connectionTls";
 import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { serializeArrayPreservingRawTokens } from "../utils/arraySerialization";
+import { normalizeUnknownError } from "../utils/errorHandling";
 import {
+  canonicalizeJsonNumericValues,
+  canonicalizeJsonPreservingRawNumbers,
   parseJsonPreservingRawNumbers,
   serializeCanonicalJson,
 } from "../utils/jsonCanonical";
@@ -22,6 +26,7 @@ import {
   parsePostgresArrayLiteral,
   parsePostgresBooleanArrayElement,
 } from "../utils/postgresArrayParser";
+import { scanSqlForCap } from "../utils/sqlStatementScan";
 import {
   BaseDBDriver,
   formatDatetimeForDisplay,
@@ -34,7 +39,15 @@ import {
   getMetadataContext,
   withMetadataResource,
 } from "./metadataCancellation";
+import {
+  isMutationNotExecutedError,
+  MutationNotExecutedError,
+} from "./mutationExecutionState";
 import { BoundedPostgresQuery } from "./postgresBoundedQuery";
+import {
+  isPostgresStatementRejection,
+  PostgresStatementRejectedAndRolledBackError,
+} from "./postgresStatementRejection";
 import {
   type IndexedPlaceholderOptions,
   indexedPlaceholderOffsets,
@@ -46,6 +59,7 @@ import {
 } from "./timeout";
 import {
   TransactionIdentityStore,
+  TransactionVerificationError,
   verifyTransaction,
 } from "./transactionVerification";
 import type {
@@ -103,6 +117,13 @@ const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 const POSTGRES_POOL_MAX = 5;
+const POSTGRES_BACKEND_CANCEL_TIMEOUT_MS = 2000;
+const POSTGRES_SESSION_FLOAT_DIGITS_SQL = "SET extra_float_digits = 3";
+const POSTGRES_SESSION_RESET_UNSUPPORTED_CODES = new Set([
+  "0A000",
+  "42601",
+  "42704",
+]);
 const PG_GENERATED_KIND_EXPRESSION = "NULLIF(to_jsonb(a)->>'attgenerated', '')";
 
 interface PostgresPoolWaitOperation {
@@ -118,15 +139,220 @@ interface PostgresQueryOperation extends PostgresPoolWaitOperation {
 
 const PG_OID_DATE = 1082;
 const PG_OID_MONEY = 790;
+const PG_OID_INT8 = 20;
+const PG_OID_INT2 = 21;
+const PG_OID_INT4 = 23;
+const PG_OID_OID = 26;
+const PG_OID_FLOAT4 = 700;
+const PG_OID_FLOAT8 = 701;
 const PG_OID_NUMERIC = 1700;
 const PG_OID_TIMESTAMP = 1114;
 const PG_OID_TIMESTAMPTZ = 1184;
 const PG_OID_JSON = 114;
 const PG_OID_JSONB = 3802;
+const PG_OID_POINT = 600;
+const PG_OID_CIRCLE = 718;
+const PG_OID_INTERVAL = 1186;
+const PG_ARRAY_NATIVE_TYPES = new Map<number, string>([
+  [199, "json[]"],
+  [651, "cidr[]"],
+  [791, "money[]"],
+  [1000, "boolean[]"],
+  [1001, "bytea[]"],
+  [1002, '"char"[]'],
+  [1003, "name[]"],
+  [1005, "smallint[]"],
+  [1007, "integer[]"],
+  [1008, "regproc[]"],
+  [1009, "text[]"],
+  [1014, "character[]"],
+  [1015, "character varying[]"],
+  [1016, "bigint[]"],
+  [1017, "point[]"],
+  [1021, "real[]"],
+  [1022, "double precision[]"],
+  [1028, "oid[]"],
+  [1040, "macaddr[]"],
+  [1041, "inet[]"],
+  [1115, "timestamp without time zone[]"],
+  [1182, "date[]"],
+  [1183, "time without time zone[]"],
+  [1185, "timestamp with time zone[]"],
+  [1187, "interval[]"],
+  [1231, "numeric[]"],
+  [1270, "time with time zone[]"],
+  [2951, "uuid[]"],
+  [3807, "jsonb[]"],
+  [3907, "numrange[]"],
+]);
 const PG_ARRAY_OIDS = [
-  1000, 1001, 1002, 1003, 1005, 1007, 1008, 1009, 1015, 1016, 1021, 1022, 1028,
-  1231,
+  199, 1000, 1001, 1002, 1003, 1005, 1007, 1008, 1009, 1015, 1016, 1017, 1021,
+  1022, 1028, 1115, 1182, 1185, 1187, 1231, 3807,
 ];
+
+const POSTGRES_TRANSACTION_CONTROL_KEYWORDS = new Set([
+  "abort",
+  "begin",
+  "commit",
+  "end",
+  "prepare",
+  "release",
+  "rollback",
+  "savepoint",
+  "start",
+]);
+const POSTGRES_TRANSACTION_END_KEYWORDS = new Set([
+  "abort",
+  "commit",
+  "end",
+  "prepare",
+  "rollback",
+]);
+const POSTGRES_READ_STATEMENT_KEYWORDS = new Set([
+  "explain",
+  "select",
+  "show",
+  "table",
+  "values",
+]);
+
+function postgresStatementKeywords(sql: string): string[] | undefined {
+  let tokens: ReturnType<typeof scanSqlForCap>;
+  try {
+    tokens = scanSqlForCap(sql, "pg");
+  } catch {
+    return undefined;
+  }
+  const keywords: string[] = [];
+  let statementStart = true;
+  for (const token of tokens) {
+    if (token.kind === "symbol" && token.text === ";") {
+      statementStart = true;
+    } else if (statementStart && token.kind === "word") {
+      keywords.push(token.text.toLowerCase());
+      statementStart = false;
+    }
+  }
+  return keywords;
+}
+
+function wasPostgresBatchRolledBack(
+  sql: string,
+  error: unknown,
+  transactionStatus: string | null | undefined,
+): boolean {
+  if (!(error instanceof DatabaseError)) return false;
+  const keywords = postgresStatementKeywords(sql);
+  if (!keywords?.length) return false;
+  if (
+    keywords.length === 1 &&
+    POSTGRES_READ_STATEMENT_KEYWORDS.has(keywords[0])
+  )
+    return false;
+  const controls =
+    transactionStatus === "E"
+      ? POSTGRES_TRANSACTION_END_KEYWORDS
+      : POSTGRES_TRANSACTION_CONTROL_KEYWORDS;
+  return !keywords.some((keyword) => controls.has(keyword));
+}
+
+type PostgresTransportOptions = Pick<
+  ClientConfig,
+  "host" | "port" | "stream" | "ssl"
+>;
+
+type PostgresCancelConnection = Connection & {
+  connect(port: number | string, host?: string): void;
+  cancel(processID: number, secretKey: number): void;
+};
+
+function sendPostgresCancelRequest(
+  transport: PostgresTransportOptions,
+  target: { processID: number; secretKey: number },
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let connection: PostgresCancelConnection | undefined;
+    let settled = false;
+    const finish = (error?: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error !== undefined) {
+        logger.warn(
+          `PostgreSQL backend cancel failed: ${normalizeUnknownError(error).message}`,
+        );
+      }
+      connection?.stream.destroy();
+      resolve();
+    };
+    const timer = setTimeout(
+      () => finish(new Error("cancel request timed out")),
+      POSTGRES_BACKEND_CANCEL_TIMEOUT_MS,
+    );
+    try {
+      const cancelConnection = new Connection({
+        stream: transport.stream,
+        ssl: transport.ssl,
+      }) as PostgresCancelConnection;
+      connection = cancelConnection;
+      cancelConnection.on("error", finish);
+      cancelConnection.on("end", () => finish());
+      cancelConnection.once("connect", () => {
+        cancelConnection.cancel(target.processID, target.secretKey);
+        cancelConnection.stream.end();
+      });
+      const host = transport.host || "localhost";
+      const port = transport.port ?? 5432;
+      if (host.startsWith("/")) {
+        cancelConnection.connect(`${host}/.s.PGSQL.${port}`);
+      } else {
+        cancelConnection.connect(port, host);
+      }
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+function postgresQueryColumnMeta(dataTypeID?: number): QueryColumnMeta {
+  if (dataTypeID === undefined) {
+    return { category: null };
+  }
+  if (
+    dataTypeID === PG_OID_INT2 ||
+    dataTypeID === PG_OID_INT4 ||
+    dataTypeID === PG_OID_INT8 ||
+    dataTypeID === PG_OID_OID
+  ) {
+    return { category: "integer" };
+  }
+  if (dataTypeID === PG_OID_NUMERIC) {
+    return { category: "decimal" };
+  }
+  if (dataTypeID === PG_OID_MONEY) {
+    return { category: "decimal" };
+  }
+  if (dataTypeID === PG_OID_FLOAT4 || dataTypeID === PG_OID_FLOAT8) {
+    return { category: "float" };
+  }
+  if (dataTypeID === PG_OID_TIMESTAMP || dataTypeID === PG_OID_TIMESTAMPTZ) {
+    return { category: "datetime" };
+  }
+  if (dataTypeID === PG_OID_JSON || dataTypeID === PG_OID_JSONB) {
+    return { category: "json" };
+  }
+  if (dataTypeID === PG_OID_POINT || dataTypeID === PG_OID_CIRCLE) {
+    return { category: "spatial" };
+  }
+  if (dataTypeID === PG_OID_INTERVAL) {
+    return { category: "interval" };
+  }
+  const arrayNativeType = PG_ARRAY_NATIVE_TYPES.get(dataTypeID);
+  if (arrayNativeType !== undefined) {
+    return { category: "array", nativeType: arrayNativeType };
+  }
+  return { category: null };
+}
 pgTypes.setTypeParser(PG_OID_DATE, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_MONEY, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_NUMERIC, (val: string) => val);
@@ -320,54 +546,6 @@ function normalizePostgresTemporalValue(value: string): string {
   }
   return trimmed;
 }
-function _canonicalizePostgresTemporalPersistedValue(
-  value: unknown,
-): { canonical: string } | null {
-  if (value === NULL_SENTINEL || value === null || value === undefined) {
-    return { canonical: "__rapidb_null__" };
-  }
-
-  const raw =
-    value instanceof Date
-      ? (formatDatetimeForDisplay(value) ?? value.toISOString())
-      : typeof value === "string"
-        ? value
-        : typeof value === "number" ||
-            typeof value === "boolean" ||
-            typeof value === "bigint"
-          ? String(value)
-          : null;
-  if (raw === null) {
-    return null;
-  }
-
-  const trimmed = raw.trim();
-  if (trimmed === "") {
-    return { canonical: "" };
-  }
-
-  const normalizedSql = normalizeSqlDatetimeOffsetSpacing(
-    trimmed.replace("T", " "),
-  );
-  const normalizedOffset = normalizedSql
-    .replace(/[zZ]$/, "+00:00")
-    .replace(/([+-]\d{2})$/, "$1:00")
-    .replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
-  const normalizedFraction = normalizedOffset
-    .replace(/(\.\d*?[1-9])0+(?=[+-]\d{2}:\d{2}$|$)/, "$1")
-    .replace(/\.0+(?=[+-]\d{2}:\d{2}$|$)/, "");
-
-  return { canonical: normalizedFraction };
-}
-function _isLikelyPostgresAutoUpdatedTemporalColumn(
-  column: Pick<ColumnTypeMeta, "name" | "category">,
-): boolean {
-  if (column.category !== "datetime") {
-    return false;
-  }
-
-  return /(^|_)(updated|modified)(_at|at|_on|on)?$/i.test(column.name);
-}
 function postgresTemporalCastType(
   column: Pick<ColumnTypeMeta, "category" | "nativeType">,
 ): "date" | "time" | "timetz" | "timestamp" | "timestamptz" {
@@ -411,9 +589,7 @@ function safeJsonStringify(value: unknown): string {
   }
 }
 
-function postgresArrayElementKind(
-  nativeType: string,
-): "numeric" | "boolean" | "other" {
+function postgresArrayElementType(nativeType: string): string | undefined {
   const type = nativeType.trim().toLowerCase();
   let elementType: string;
   if (type.endsWith("[]")) {
@@ -421,13 +597,36 @@ function postgresArrayElementKind(
   } else if (type.startsWith("_")) {
     elementType = type.slice(1);
   } else {
-    return "other";
+    return undefined;
   }
-  elementType = elementType
+  return elementType
     .replace(/^pg_catalog\./, "")
     .replace(/\(\s*\d+(?:\s*,\s*-?\d+)?\s*\)$/, "")
     .trim();
+}
+
+function postgresArrayElementKind(
+  nativeType: string,
+):
+  | "numeric"
+  | "boolean"
+  | "json"
+  | "jsonb"
+  | "temporal"
+  | "geometric"
+  | "other" {
+  const elementType = postgresArrayElementType(nativeType);
+  if (elementType === undefined) return "other";
   if (["boolean", "bool"].includes(elementType)) return "boolean";
+  if (elementType === "json") return "json";
+  if (elementType === "jsonb") return "jsonb";
+  if (
+    /^(?:date|time|timetz|timestamp|timestamptz|interval)(?![a-z0-9_])/.test(
+      elementType,
+    )
+  )
+    return "temporal";
+  if (PG_GEOMETRIC_TYPES.has(elementType)) return "geometric";
   if (
     [
       "smallint",
@@ -456,7 +655,7 @@ function normalizePostgresArrayTextForDisplay(
   nativeType: string,
 ): string {
   const trimmed = value.trim();
-  if (trimmed === "") {
+  if (trimmed === "" || postgresArrayElementType(nativeType) === "box") {
     return value;
   }
   if (trimmed.startsWith("{") || hasPostgresArrayBounds(trimmed)) {
@@ -482,6 +681,29 @@ function normalizePostgresArrayTextForDisplay(
     return value;
   }
   return value;
+}
+
+function canonicalizePostgresJsonArrayElements(
+  value: unknown,
+  jsonb: boolean,
+): unknown {
+  if (typeof value !== "string" || !value.trim().startsWith("[")) {
+    return value;
+  }
+  try {
+    return serializeArrayPreservingRawTokens(
+      parsePostgresArrayLiteral(
+        jsonArrayLiteralToPgArrayLiteral(value),
+        (token) =>
+          (jsonb
+            ? canonicalizeJsonNumericValues(token)
+            : canonicalizeJsonPreservingRawNumbers(token)) ?? token,
+      ),
+      false,
+    );
+  } catch {
+    return value;
+  }
 }
 
 function normalizePostgresBooleanInput(value: unknown): unknown {
@@ -558,6 +780,7 @@ export class PostgresDriver extends BaseDBDriver {
   private readonly activeTransactionClients = new Set<PoolClient>();
   private readonly activeQueryClients = new Set<PoolClient>();
   private readonly activeQueryOperations = new Set<PostgresQueryOperation>();
+  private sessionResetUnsupported = false;
   private requirePool(database?: string): Pool {
     if (!this.pool) {
       throw new Error("[RapiDB] PostgreSQL connection is not open");
@@ -593,7 +816,7 @@ export class PostgresDriver extends BaseDBDriver {
               operation.cancelPoolCheckout?.();
               const owned = client;
               client = undefined;
-              owned?.release(true);
+              if (owned) return this.discardAfterCancel([owned]);
             };
             return withMetadataResource(cancel, async () => {
               try {
@@ -614,18 +837,13 @@ export class PostgresDriver extends BaseDBDriver {
       },
     });
   }
-  private createPool(
-    database: string,
-    max = 5,
-    applicationName?: string,
-  ): Pool {
+  private connectionTransport(): PostgresTransportOptions {
     const tlsSettings = this.tlsSettings;
     const forwardedTransport = getSshTcpForwardTransport(this.config);
-    const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
     const endpointHost = forwardedTransport?.localHost ?? this.config.host;
     const endpointPort = forwardedTransport?.localPort ?? this.config.port;
     const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
-    return new Pool({
+    return {
       host: tlsIdentity ?? endpointHost,
       port: endpointPort,
       stream: tlsIdentity
@@ -636,17 +854,6 @@ export class PostgresDriver extends BaseDBDriver {
               tlsIdentity,
             )
         : undefined,
-      database,
-      user: this.config.username,
-      password: this.config.password,
-      max,
-      ...(applicationName ? { application_name: applicationName } : {}),
-      keepAlive: true,
-      keepAliveInitialDelayMillis: 60000,
-      connectionTimeoutMillis: this.getConnectionTimeoutMs(),
-      query_timeout: dbOperationTimeoutMs,
-      statement_timeout: dbOperationTimeoutMs,
-      idleTimeoutMillis: 30000,
       ssl: tlsSettings
         ? {
             rejectUnauthorized: tlsSettings.rejectUnauthorized,
@@ -660,7 +867,35 @@ export class PostgresDriver extends BaseDBDriver {
             passphrase: tlsSettings.passphrase,
             checkServerIdentity: tlsSettings.checkServerIdentity,
           }
-        : undefined,
+        : this.config.tls?.mode === "disabled"
+          ? false
+          : undefined,
+    };
+  }
+  private createPool(
+    database: string,
+    max = 5,
+    applicationName?: string,
+  ): Pool {
+    const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
+    return new Pool({
+      ...this.connectionTransport(),
+      database,
+      user: this.config.username,
+      password: this.config.password,
+      max,
+      ...(applicationName ? { application_name: applicationName } : {}),
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 60000,
+      connectionTimeoutMillis: this.getConnectionTimeoutMs(),
+      query_timeout: dbOperationTimeoutMs,
+      statement_timeout: dbOperationTimeoutMs,
+      idleTimeoutMillis: 30000,
+      onConnect: async (client) => {
+        await client
+          .query(POSTGRES_SESSION_FLOAT_DIGITS_SQL)
+          .catch(() => undefined);
+      },
     });
   }
   private async withDatabasePool<T>(
@@ -690,8 +925,9 @@ export class PostgresDriver extends BaseDBDriver {
       session.cancelled = true;
       const owned = session.client;
       session.client = undefined;
-      owned?.release(true);
-      void this.closePool(pool).catch(() => undefined);
+      void (owned ? this.discardAfterCancel([owned]) : Promise.resolve())
+        .then(() => this.closePool(pool))
+        .catch(() => undefined);
     };
     metadata?.cleanups.add(cancelCatalog);
     pool.on("error", (error) =>
@@ -709,7 +945,7 @@ export class PostgresDriver extends BaseDBDriver {
         () => {
           const owned = session.client;
           session.client = undefined;
-          owned?.release(true);
+          if (owned) return this.discardAfterCancel([owned]);
         },
         () => run(client),
       );
@@ -745,6 +981,7 @@ export class PostgresDriver extends BaseDBDriver {
   connect(): Promise<void> {
     if (this.connectionAttempt) return this.connectionAttempt;
     const epoch = ++this.connectionEpoch;
+    this.sessionResetUnsupported = false;
     const abortController = new AbortController();
     this.connectionAbortController = abortController;
     this._connected = false;
@@ -826,6 +1063,8 @@ export class PostgresDriver extends BaseDBDriver {
   }
 
   async disconnect(): Promise<void> {
+    const cancelTransport = this.cancelTransport();
+    const discarded: PoolClient[] = [];
     ++this.connectionEpoch;
     this.connectionAbortController?.abort();
     this.connectionAbortController = undefined;
@@ -841,18 +1080,58 @@ export class PostgresDriver extends BaseDBDriver {
       const client = operation.client;
       operation.client = undefined;
       if (client && this.activeQueryClients.delete(client)) {
-        client.release(true);
+        discarded.push(client);
       }
     }
-    for (const client of this.activeQueryClients) {
-      client.release(true);
-    }
+    discarded.push(...this.activeQueryClients);
     this.activeQueryClients.clear();
     for (const client of this.activeTransactionClients) {
       this.activeTransactionClients.delete(client);
-      client.release(true);
+      discarded.push(client);
     }
-    await this.closeOwnedPools();
+    const discarding = this.discardAfterCancel(discarded, cancelTransport);
+    try {
+      await this.closeOwnedPools();
+    } finally {
+      await discarding;
+    }
+  }
+
+  private cancelTransport(): PostgresTransportOptions | undefined {
+    if (!this.pool) return undefined;
+    try {
+      return this.connectionTransport();
+    } catch (error) {
+      logger.warn(
+        `PostgreSQL backend cancel could not start: ${normalizeUnknownError(error).message}`,
+      );
+      return undefined;
+    }
+  }
+
+  private discardAfterCancel(
+    clients: PoolClient[],
+    transport = this.cancelTransport(),
+  ): Promise<void> {
+    const release = () => {
+      for (const client of clients) client.release(true);
+    };
+    const targets = clients.flatMap((client) => {
+      const { processID, secretKey } = client as {
+        processID?: unknown;
+        secretKey?: unknown;
+      };
+      return typeof processID === "number" && typeof secretKey === "number"
+        ? [{ processID, secretKey }]
+        : [];
+    });
+    if (!transport || targets.length === 0) {
+      release();
+      return Promise.resolve();
+    }
+    return Promise.all(
+      targets.map((target) => sendPostgresCancelRequest(transport, target)),
+    ).then(release);
   }
 
   private closePool(pool: Pool): Promise<void> {
@@ -895,6 +1174,7 @@ export class PostgresDriver extends BaseDBDriver {
       if (context.requestToken === undefined) {
         return;
       }
+      const discarded: PoolClient[] = [];
       for (const operation of this.activeQueryOperations) {
         if (operation.requestToken !== context.requestToken) {
           continue;
@@ -905,18 +1185,18 @@ export class PostgresDriver extends BaseDBDriver {
         if (operation.client) {
           const client = operation.client;
           operation.client = undefined;
-          if (this.activeQueryClients.delete(client)) client.release(true);
+          if (this.activeQueryClients.delete(client)) discarded.push(client);
         }
       }
+      await this.discardAfterCancel(discarded);
       return;
     }
 
     if (context?.operationName === "runTransaction" || context === undefined) {
       const hadTransactionClient = this.activeTransactionClients.size > 0;
-      for (const client of [...this.activeTransactionClients]) {
-        this.activeTransactionClients.delete(client);
-        client.release(true);
-      }
+      const discarded = [...this.activeTransactionClients];
+      this.activeTransactionClients.clear();
+      await this.discardAfterCancel(discarded);
       if (context === undefined && !hadTransactionClient) {
         await this.recycleConnectionAfterTimeout();
       }
@@ -978,7 +1258,8 @@ export class PostgresDriver extends BaseDBDriver {
       pool.query<{
         schema_name: string;
       }>(`SELECT schema_name FROM information_schema.schemata
-       WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast','pg_temp_1','pg_toast_temp_1')
+       WHERE schema_name NOT IN ('information_schema','pg_catalog','pg_toast')
+         AND schema_name !~ '^pg_(toast_)?temp_[0-9]+$'
        ORDER BY schema_name`),
     );
     return res.rows.map((r) => ({ name: r.schema_name }));
@@ -1018,10 +1299,9 @@ export class PostgresDriver extends BaseDBDriver {
         const routineRes = await pool.query(
           `SELECT p.proname AS name,
                   p.oid::text AS routine_id,
-                  CASE p.prokind WHEN 'f' THEN 'function' WHEN 'p' THEN 'procedure'
-                                 WHEN 'a' THEN 'function'  ELSE 'function' END AS type
+                  CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END AS type
            FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-           WHERE n.nspname = $1 AND p.prokind IN ('f','p','a') ORDER BY p.proname`,
+           WHERE n.nspname = $1 AND p.prokind IN ('f','p','w') ORDER BY p.proname`,
           [schema],
         );
         for (const r of routineRes.rows) {
@@ -1036,22 +1316,36 @@ export class PostgresDriver extends BaseDBDriver {
           });
         }
       } catch {
-        try {
-          const routineRes = await pool.query(
-            `SELECT routine_name AS name, routine_type AS type
-             FROM information_schema.routines WHERE routine_schema = $1 ORDER BY routine_name`,
-            [schema],
-          );
-          for (const r of routineRes.rows) {
-            objects.push({
-              schema,
-              name: r.name as string,
-              type: (r.type === "PROCEDURE"
-                ? "procedure"
-                : "function") as TableInfo["type"],
-            });
-          }
-        } catch {}
+        for (const aggregateFilter of [
+          `AND NOT EXISTS (
+                 SELECT 1
+                 FROM pg_aggregate a
+                 JOIN pg_proc p ON p.oid = a.aggfnoid
+                 WHERE r.specific_name = p.proname || '_' || p.oid
+               )`,
+          "",
+        ]) {
+          try {
+            const routineRes = await pool.query(
+              `SELECT r.routine_name AS name, r.routine_type AS type
+               FROM information_schema.routines r
+               WHERE r.routine_schema = $1
+               ${aggregateFilter}
+               ORDER BY r.routine_name`,
+              [schema],
+            );
+            for (const r of routineRes.rows) {
+              objects.push({
+                schema,
+                name: r.name as string,
+                type: (r.type === "PROCEDURE"
+                  ? "procedure"
+                  : "function") as TableInfo["type"],
+              });
+            }
+            break;
+          } catch {}
+        }
       }
       try {
         const sequenceRes = await pool.query(
@@ -1220,16 +1514,33 @@ export class PostgresDriver extends BaseDBDriver {
       rows?: unknown[][];
       rowCount?: number | null;
       command?: string;
+      truncated?: boolean;
+      partial?: boolean;
     };
     const start = Date.now();
+    const signal = operationContext?.signal;
+    signal?.throwIfAborted();
     const operation: PostgresQueryOperation = {
       cancelled: false,
       requestToken: operationContext?.requestToken,
     };
+    const onAbort = () => {
+      operation.cancelled = true;
+      operation.wakePoolWait?.();
+      operation.cancelPoolCheckout?.();
+      const active = operation.client;
+      operation.client = undefined;
+      if (active && this.activeQueryClients.delete(active)) {
+        void this.discardAfterCancel([active]);
+      }
+    };
     this.activeQueryOperations.add(operation);
+    signal?.addEventListener("abort", onAbort, { once: true });
     let client: PoolClient | undefined;
     let output: QueryResult | undefined;
     let queryError: unknown;
+    let partialQueryError: unknown;
+    let batchRolledBack = false;
     let queryFailed = false;
     let rollbackError: unknown;
     let rollbackFailed = false;
@@ -1252,50 +1563,117 @@ export class PostgresDriver extends BaseDBDriver {
         await client.query("BEGIN READ ONLY");
       }
       const queryClient = client;
-      let truncated = false;
-      const res =
-        hardCap === undefined
-          ? await client.query({
-              text: sql,
-              values: params ?? [],
-              rowMode: "array",
-            })
-          : await new Promise<PgArrayQueryResult>((resolve, reject) => {
-              const query = new BoundedPostgresQuery(
-                sql,
-                params ?? [],
-                hardCap,
-                (error, result) => {
-                  if (error) {
-                    reject(error);
-                    return;
-                  }
-                  truncated = query.retained.truncated;
-                  resolve({
-                    ...result,
-                    rows: query.retained.rows,
-                    rowCount: result?.rowCount ?? query.retained.rowCount,
-                  });
-                },
-              );
-              queryClient.query(query);
-            });
+      let boundedQuery: BoundedPostgresQuery | undefined;
+      let res: PgArrayQueryResult | PgArrayQueryResult[];
+      if (hardCap === undefined) {
+        res = await client.query({
+          text: sql,
+          values: params ?? [],
+          rowMode: "array",
+        });
+      } else {
+        try {
+          res = await new Promise<PgArrayQueryResult>((resolve, reject) => {
+            const query = new BoundedPostgresQuery(
+              sql,
+              params ?? [],
+              hardCap,
+              (error, result) => {
+                if (error) {
+                  reject(error);
+                  return;
+                }
+                resolve({
+                  ...result,
+                  rows: query.retained.rows,
+                  rowCount: result?.rowCount ?? query.retained.rowCount,
+                });
+              },
+            );
+            boundedQuery = query;
+            queryClient.query(query);
+          });
+        } catch (error) {
+          if (operation.cancelled || !boundedQuery?.hasRecoverableResult)
+            throw error;
+          boundedQuery.markIncompleteResultPartial();
+          if (
+            wasPostgresBatchRolledBack(
+              sql,
+              error,
+              (
+                queryClient as PoolClient & {
+                  getTransactionStatus?: () => string | null;
+                }
+              ).getTransactionStatus?.(),
+            )
+          ) {
+            boundedQuery.markAllResultSetsPartial();
+            batchRolledBack = true;
+          }
+          partialQueryError = error;
+          res = boundedQuery.currentResult;
+        }
+      }
       const executionTimeMs = Date.now() - start;
       const result = (
         Array.isArray(res) ? res[res.length - 1] : res
       ) as PgArrayQueryResult;
-      const columns = result.fields?.map((field) => field.name) ?? [];
-      const columnMeta: QueryColumnMeta[] | undefined = result.fields?.map(
-        (field) => ({
-          category:
-            field.dataTypeID === PG_OID_JSON ||
-            field.dataTypeID === PG_OID_JSONB
-              ? "json"
-              : null,
-        }),
+      const resultCandidates: PgArrayQueryResult[] = boundedQuery
+        ? boundedQuery.resultSets.map((resultSet) => ({
+            fields: resultSet.fields,
+            rows: resultSet.rows,
+            rowCount: resultSet.rowCount,
+            truncated: resultSet.truncated,
+            partial: resultSet.partial,
+          }))
+        : Array.isArray(res)
+          ? res
+          : [res];
+      const resultSets: QueryResultSet[] = resultCandidates
+        .filter((candidate) => (candidate.fields?.length ?? 0) > 0)
+        .map((candidate, index) => {
+          const fields = candidate.fields ?? [];
+          const columns = fields.map((field) => field.name);
+          const columnMeta: QueryColumnMeta[] = fields.map((field) =>
+            postgresQueryColumnMeta(field.dataTypeID),
+          );
+          const rawRows = candidate.rows ?? [];
+          return {
+            id: `result-${index + 1}`,
+            columns,
+            columnMeta,
+            rows: rawRows.map((row) =>
+              Object.fromEntries(
+                row.map((val, i) => {
+                  const normalized =
+                    val !== null &&
+                    typeof val === "object" &&
+                    !(val instanceof Date) &&
+                    isPointValue(val)
+                      ? `(${String(val.x)}, ${String(val.y)})`
+                      : val;
+                  return [`__col_${i}`, normalized];
+                }),
+              ),
+            ),
+            rowCount: candidate.rowCount ?? rawRows.length,
+            truncated: candidate.truncated === true,
+            ...(candidate.partial ? { partial: true } : {}),
+          };
+        });
+      const primaryResultSet = resultSets[0];
+      const hideOmittedFallback =
+        boundedQuery?.resultSetsTruncated === true && resultSets.length === 0;
+      const fallbackFields = hideOmittedFallback ? [] : (result.fields ?? []);
+      const fallbackColumns = fallbackFields.map((field) => field.name);
+      const fallbackColumnMeta: QueryColumnMeta[] = fallbackFields.map(
+        (field) => postgresQueryColumnMeta(field.dataTypeID),
       );
-      const rawRows: unknown[][] = result.rows ?? [];
-      const rows = rawRows.map((row) =>
+      const fallbackRows: unknown[][] = hideOmittedFallback
+        ? []
+        : (result.rows ?? []);
+      const fallbackFormattedRows = fallbackRows.map((row) =>
         Object.fromEntries(
           row.map((val, i) => {
             const normalized =
@@ -1309,16 +1687,43 @@ export class PostgresDriver extends BaseDBDriver {
           }),
         ),
       );
+      const columns = primaryResultSet?.columns ?? fallbackColumns;
+      const columnMeta = primaryResultSet?.columnMeta ?? fallbackColumnMeta;
+      const rows = primaryResultSet?.rows ?? fallbackFormattedRows;
+      const rowCount =
+        resultSets.length > 0
+          ? resultSets.reduce(
+              (total, resultSet) => total + resultSet.rowCount,
+              0,
+            )
+          : (result.rowCount ?? fallbackRows.length);
       const queryResult = {
         columns,
-        ...(columnMeta ? { columnMeta } : {}),
+        ...(columnMeta.length > 0 ? { columnMeta } : {}),
         rows,
-        rowCount: result.rowCount ?? rawRows.length,
+        rowCount,
         executionTimeMs,
-        ...(hardCap !== undefined ? { truncated } : {}),
+        ...(resultSets.length > 0
+          ? {
+              resultSets,
+              ...(resultSets.some((resultSet) => resultSet.truncated)
+                ? { truncated: true }
+                : {}),
+            }
+          : boundedQuery
+            ? { truncated: boundedQuery.retained.truncated }
+            : {}),
+        ...(boundedQuery?.resultSetsTruncated
+          ? { resultSetsTruncated: true }
+          : {}),
         ...(hardCap !== undefined &&
         ["INSERT", "UPDATE", "DELETE", "MERGE"].includes(result.command ?? "")
           ? { affectedRows: result.rowCount ?? 0 }
+          : {}),
+        ...(partialQueryError !== undefined
+          ? {
+              error: `${normalizeUnknownError(partialQueryError, this.config).message}${batchRolledBack ? " The transaction was rolled back; results returned before the error were not committed." : ""}`,
+            }
           : {}),
       };
       output = queryResult;
@@ -1336,9 +1741,15 @@ export class PostgresDriver extends BaseDBDriver {
             }
           ).getTransactionStatus?.();
           unfinishedTransaction =
-            !operationContext?.readOnly && (status === "T" || status === "E");
+            partialQueryError === undefined &&
+            !operationContext?.readOnly &&
+            (status === "T" || status === "E");
           try {
-            if (operationContext?.readOnly || status !== "I") {
+            if (
+              partialQueryError !== undefined ||
+              operationContext?.readOnly ||
+              status !== "I"
+            ) {
               await client.query("ROLLBACK");
             }
           } catch (error) {
@@ -1348,11 +1759,37 @@ export class PostgresDriver extends BaseDBDriver {
             if (this.activeQueryClients.delete(client)) client.release(true);
           }
         }
+        if (
+          client &&
+          operationContext?.requestToken !== undefined &&
+          this.activeQueryClients.has(client)
+        ) {
+          let sessionReset = false;
+          if (!this.sessionResetUnsupported) {
+            try {
+              await client.query("DISCARD ALL");
+              await client.query(POSTGRES_SESSION_FLOAT_DIGITS_SQL);
+              sessionReset = true;
+            } catch (error) {
+              this.sessionResetUnsupported =
+                error instanceof DatabaseError &&
+                POSTGRES_SESSION_RESET_UNSUPPORTED_CODES.has(error.code ?? "");
+              logger.warn(
+                `PostgreSQL session reset failed; the connection was discarded: ${normalizeUnknownError(error).message}`,
+              );
+            }
+          }
+          if (!sessionReset) {
+            operation.client = undefined;
+            if (this.activeQueryClients.delete(client)) client.release(true);
+          }
+        }
         if (client && this.activeQueryClients.delete(client)) {
           operation.client = undefined;
           client.release();
         }
       } finally {
+        signal?.removeEventListener("abort", onAbort);
         operation.client = undefined;
         this.activeQueryOperations.delete(operation);
       }
@@ -1456,6 +1893,24 @@ export class PostgresDriver extends BaseDBDriver {
       }
     }
   }
+  async getTableRowIdentityOrderExpressions(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<string[]> {
+    const res = await this.requirePool(database).query<{ relkind: string }>(
+      `SELECT c.relkind
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1
+         AND c.relname = $2
+       LIMIT 1`,
+      [schema, table],
+    );
+    return ["r", "p", "m"].includes(res.rows[0]?.relkind ?? "")
+      ? ["tableoid", "ctid"]
+      : [];
+  }
   async getIndexes(
     database: string,
     schema: string,
@@ -1465,12 +1920,14 @@ export class PostgresDriver extends BaseDBDriver {
       name: string;
       unique: boolean | number | string;
       primary: boolean | number | string;
+      partial: boolean | number | string;
       column: string;
     };
     const res = await this.requirePool(database).query<IndexRow>(
       `SELECT i.relname AS name,
               ix.indisunique AS unique,
               ix.indisprimary AS primary,
+              ix.indpred IS NOT NULL AS partial,
               COALESCE(
                 a.attname,
                 pg_get_indexdef(i.oid, idx.key_ordinal::int, true)
@@ -1483,6 +1940,7 @@ export class PostgresDriver extends BaseDBDriver {
        LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = idx.attnum AND idx.attnum > 0
        JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE n.nspname = $1 AND c.relname = $2
+         AND idx.key_ordinal <= COALESCE((to_jsonb(ix)->>'indnkeyatts')::int, ix.indnatts)
        ORDER BY i.relname, idx.key_ordinal`,
       [schema, table],
     );
@@ -1497,6 +1955,7 @@ export class PostgresDriver extends BaseDBDriver {
           columns: [],
           unique: isPgTrue(r.unique),
           primary: isPgTrue(r.primary),
+          ...(isPgTrue(r.partial) ? { partial: true } : {}),
         });
       }
       const index = map.get(r.name);
@@ -1656,7 +2115,23 @@ export class PostgresDriver extends BaseDBDriver {
        LIMIT 1`,
       [schema, table, constraintName],
     );
-    const ddl = res.rows[0]?.ddl;
+    const ddl =
+      res.rows[0]?.ddl ??
+      (
+        await this.requirePool(database).query<{ ddl: string }>(
+          `SELECT pg_get_indexdef(idx.oid, 0, true) || ';' AS ddl
+           FROM pg_class tbl
+           JOIN pg_index pg_idx ON pg_idx.indrelid = tbl.oid
+           JOIN pg_class idx ON idx.oid = pg_idx.indexrelid
+           JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+           WHERE ns.nspname = $1
+             AND tbl.relname = $2
+             AND idx.relname = $3
+             AND pg_idx.indisunique
+           LIMIT 1`,
+          [schema, table, constraintName],
+        )
+      ).rows[0]?.ddl;
     if (!ddl) {
       throw new Error(`Constraint "${constraintName}" not found`);
     }
@@ -1889,6 +2364,7 @@ export class PostgresDriver extends BaseDBDriver {
        FROM pg_proc p
        JOIN pg_namespace n ON n.oid = p.pronamespace
        WHERE n.nspname = $1 AND p.proname = $2
+         AND NOT EXISTS (SELECT 1 FROM pg_aggregate a WHERE a.aggfnoid = p.oid)
        LIMIT 1`,
       [schema, name],
     );
@@ -1996,12 +2472,37 @@ export class PostgresDriver extends BaseDBDriver {
     }
 
     if (meta.typtype === "d") {
-      const clauses = [
+      const constraintsRes = await this.requirePool(database).query<{
+        constraint_name: string;
+        definition: string;
+        is_validated: boolean;
+      }>(
+        `SELECT con.conname AS constraint_name,
+                pg_get_constraintdef(con.oid, false) AS definition,
+                con.convalidated AS is_validated
+         FROM pg_constraint con
+         WHERE con.contypid = $1::oid
+           AND con.contype = 'c'
+         ORDER BY con.conname COLLATE "C", con.oid`,
+        [meta.type_oid],
+      );
+      const createDomain = [
         `CREATE DOMAIN ${qualifiedName} AS ${meta.base_type ?? "text"}`,
         meta.typdefault ? `DEFAULT ${meta.typdefault}` : undefined,
         meta.typnotnull ? "NOT NULL" : undefined,
       ].filter((value): value is string => Boolean(value));
-      return `${clauses.join(" ")};`;
+      const statements = [
+        `${createDomain.join(" ")};`,
+        ...constraintsRes.rows.map((constraint) => {
+          const definition = constraint.definition.replace(
+            /\s+NOT VALID\s*$/i,
+            "",
+          );
+          const notValid = constraint.is_validated ? "" : " NOT VALID";
+          return `ALTER DOMAIN ${qualifiedName} ADD CONSTRAINT ${this.quoteIdentifier(constraint.constraint_name)} ${definition}${notValid};`;
+        }),
+      ];
+      return statements.join("\n");
     }
 
     if (meta.typtype === "r" || meta.typtype === "m") {
@@ -2110,13 +2611,15 @@ export class PostgresDriver extends BaseDBDriver {
     const waitOperation: PostgresPoolWaitOperation = { cancelled: false };
     let client: PoolClient | undefined;
     let transactionStarted = false;
+    let commitAttempted = false;
+    let rollbackConfirmed = false;
     let discardTransactionClient = false;
     const cancel = () => {
       waitOperation.cancelled = true;
       waitOperation.wakePoolWait?.();
       waitOperation.cancelPoolCheckout?.();
       if (client && this.activeTransactionClients.delete(client)) {
-        client.release(true);
+        void this.discardAfterCancel([client]);
       }
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
@@ -2200,6 +2703,7 @@ export class PostgresDriver extends BaseDBDriver {
         },
         context,
       );
+      commitAttempted = true;
       await queryTransaction("COMMIT");
     } catch (error) {
       if (
@@ -2209,6 +2713,7 @@ export class PostgresDriver extends BaseDBDriver {
       ) {
         try {
           await client.query("ROLLBACK");
+          rollbackConfirmed = true;
         } catch (rollbackError) {
           discardTransactionClient = true;
           throw new AggregateError(
@@ -2216,6 +2721,22 @@ export class PostgresDriver extends BaseDBDriver {
             "PostgreSQL transaction and rollback failed; the connection was discarded.",
           );
         }
+      }
+      if (rollbackConfirmed && isPostgresStatementRejection(error)) {
+        throw new PostgresStatementRejectedAndRolledBackError(error);
+      }
+      if (rollbackConfirmed && error instanceof TransactionVerificationError) {
+        error.rollbackConfirmed = true;
+      } else if (
+        rollbackConfirmed &&
+        !commitAttempted &&
+        !(error instanceof DatabaseError) &&
+        !isMutationNotExecutedError(error)
+      ) {
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
       }
       throw error;
     } finally {
@@ -2567,7 +3088,7 @@ export class PostgresDriver extends BaseDBDriver {
         );
       }
       const significantDigits =
-        baseType === "real" || baseType === "float4" ? 7 : 15;
+        baseType === "real" || baseType === "float4" ? 7 : 17;
       return this.checkApproximateNumericPersistedEdit(
         column,
         expectedValue,
@@ -2586,7 +3107,12 @@ export class PostgresDriver extends BaseDBDriver {
       return this.checkBinaryPersistedEdit(column, expectedValue, options);
     }
     if (column.category === "json") {
-      return this.checkJsonPersistedEdit(column, expectedValue, options);
+      return this.checkJsonPersistedEdit(
+        column,
+        expectedValue,
+        options,
+        baseType === "jsonb",
+      );
     }
     if (column.category === "uuid") {
       return this.checkUuidPersistedEdit(
@@ -2596,8 +3122,15 @@ export class PostgresDriver extends BaseDBDriver {
       );
     }
     if (column.category === "array") {
+      const elementKind = postgresArrayElementKind(column.nativeType);
+      if (elementKind === "temporal" || elementKind === "geometric") {
+        return {
+          ok: true,
+          shouldVerify: false,
+        };
+      }
       let normalizedExpected = expectedValue;
-      if (postgresArrayElementKind(column.nativeType) === "boolean") {
+      if (elementKind === "boolean") {
         try {
           if (Array.isArray(expectedValue)) {
             normalizedExpected =
@@ -2622,14 +3155,21 @@ export class PostgresDriver extends BaseDBDriver {
         normalizedExpected = this.formatOutputValue(expectedValue, column);
       }
       normalizedExpected = this.formatOutputValue(normalizedExpected, column);
+      let persistedValue = options
+        ? this.formatOutputValue(options.persistedValue, column)
+        : undefined;
+      if (elementKind === "json" || elementKind === "jsonb") {
+        normalizedExpected = canonicalizePostgresJsonArrayElements(
+          normalizedExpected,
+          elementKind === "jsonb",
+        );
+        persistedValue = canonicalizePostgresJsonArrayElements(
+          persistedValue,
+          elementKind === "jsonb",
+        );
+      }
       const normalizedOptions = options
-        ? {
-            ...options,
-            persistedValue: this.formatOutputValue(
-              options.persistedValue,
-              column,
-            ),
-          }
+        ? { ...options, persistedValue }
         : options;
       return this.checkJsonArrayPersistedEdit(
         column,

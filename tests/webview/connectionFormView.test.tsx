@@ -8,7 +8,23 @@ import {
   dispatchIncomingMessage,
   expectNoAxeViolations,
   getLastPostedMessage,
+  getPostedMessages,
 } from "./testUtils";
+
+function lastTestRequestId(): string | undefined {
+  return (
+    getPostedMessages()
+      .filter((message) => message.type === "testConnection")
+      .at(-1)?.payload as { requestId?: string } | undefined
+  )?.requestId;
+}
+
+function dispatchTestResult(payload: Record<string, unknown>) {
+  dispatchIncomingMessage("testResult", {
+    requestId: lastTestRequestId(),
+    ...payload,
+  });
+}
 
 async function submitCreateConnection(
   user: ReturnType<typeof userEvent.setup>,
@@ -24,6 +40,116 @@ async function fillRequiredPostgresFields(
 }
 
 describe("ConnectionFormView", () => {
+  it.each([
+    false,
+    true,
+  ])("blocks Cancel until a delayed Save finishes (edit=%s)", async (edit) => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={
+          edit
+            ? {
+                id: "saving",
+                name: "Saving",
+                type: "pg",
+                host: "localhost",
+                database: "app",
+                username: "reader",
+              }
+            : null
+        }
+      />,
+    );
+    if (!edit) {
+      await user.type(screen.getByLabelText("Connection name"), "Saving");
+      await fillRequiredPostgresFields(user);
+    }
+    await user.click(
+      screen.getByRole("button", {
+        name: edit ? "Save Changes" : "Create Connection",
+      }),
+    );
+    expect(getLastPostedMessage()?.type).toBe("saveConnection");
+    clearPostedMessages();
+
+    const cancel = screen.getByRole("button", { name: "Cancel" });
+    expect((cancel as HTMLButtonElement).disabled).toBe(true);
+    await user.click(cancel);
+    expect(getLastPostedMessage()).toBeUndefined();
+
+    dispatchIncomingMessage("saveResult", {
+      success: false,
+      error: "Delayed save failed",
+    });
+    await waitFor(() =>
+      expect((cancel as HTMLButtonElement).disabled).toBe(false),
+    );
+    await user.click(cancel);
+    expect(getLastPostedMessage()).toEqual({ type: "cancel" });
+  });
+
+  it("ignores uncorrelated test results and cancels a running test when the form changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "SQLite");
+    await user.click(screen.getByRole("button", { name: /sqlite/i }));
+    await user.type(screen.getByLabelText("Database file path"), "/tmp/a.db");
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    const firstRequestId = lastTestRequestId();
+    expect(firstRequestId).toEqual(expect.any(String));
+
+    dispatchIncomingMessage("testResult", { success: false, error: "boom" });
+    dispatchIncomingMessage("testResult", {
+      requestId: "other",
+      success: false,
+      error: "boom",
+    });
+    expect(screen.queryByText(/boom/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Cancel Testing" })).toBeTruthy();
+
+    clearPostedMessages();
+    await user.type(screen.getByLabelText("Database file path"), "x");
+    expect(getPostedMessages()).toEqual([
+      { type: "cancelTestConnection", payload: undefined },
+    ]);
+    dispatchIncomingMessage("testResult", {
+      requestId: firstRequestId,
+      success: false,
+      error: "stale",
+    });
+    expect(screen.queryByText(/stale/)).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    expect(lastTestRequestId()).not.toBe(firstRequestId);
+    dispatchTestResult({ success: true });
+    await waitFor(() =>
+      expect(screen.getByText(/Connection successful/)).toBeTruthy(),
+    );
+  });
+
+  it("shows the SQLite creation probe result instead of claiming the target was opened", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.type(screen.getByLabelText("Connection name"), "SQLite");
+    await user.click(screen.getByRole("button", { name: /sqlite/i }));
+    await user.type(
+      screen.getByLabelText("Database file path"),
+      "/tmp/new.sqlite",
+    );
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    dispatchTestResult({
+      success: true,
+      message:
+        "SQLite runtime and directory write permissions verified; the database will be created when connecting.",
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByText(/database will be created when connecting/),
+      ).toBeTruthy(),
+    );
+  });
+
   it.each([
     "Port",
     "SSH port",
@@ -201,12 +327,7 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /sqlite/i }));
 
     expect(screen.getByLabelText("Database file path")).toBeTruthy();
-    expect(screen.getByLabelText("SQLite WAL mode")).toBeTruthy();
-    expect(
-      screen.getByText(
-        /wal is enabled automatically for writable sqlite connections unless you disable it here/i,
-      ),
-    ).toBeTruthy();
+    expect(screen.queryByLabelText("SQLite WAL mode")).toBeNull();
     expect(screen.queryByLabelText("Host")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /oracle/i }));
@@ -228,20 +349,29 @@ describe("ConnectionFormView", () => {
     await user.click(screen.getByRole("button", { name: /elasticsearch/i }));
 
     expect(screen.getByLabelText("Elasticsearch endpoint")).toBeTruthy();
-    expect(screen.getByLabelText("Elasticsearch API key")).toBeTruthy();
-    expect(screen.getByLabelText("Elasticsearch cloud id")).toBeTruthy();
+    expect(screen.queryByLabelText("Elasticsearch API key")).toBeNull();
+    expect(screen.queryByLabelText("Elasticsearch cloud id")).toBeNull();
+    expect(screen.getByLabelText("Elasticsearch authentication")).toBeTruthy();
     expect(
       screen
         .getByRole("switch", {
           name: /store secrets in vs code secret storage/i,
         })
         .getAttribute("aria-disabled"),
-    ).toBe("true");
+    ).toBe("false");
 
     await user.click(screen.getByRole("button", { name: /dynamodb/i }));
 
+    expect(
+      screen
+        .getByRole("switch", {
+          name: /store secrets in vs code secret storage/i,
+        })
+        .getAttribute("aria-disabled"),
+    ).toBe("false");
     expect(screen.getByLabelText("AWS region")).toBeTruthy();
-    expect(screen.getByLabelText("AWS profile")).toBeTruthy();
+    expect(screen.getByLabelText("AWS credential source")).toBeTruthy();
+    expect(screen.queryByLabelText("AWS profile")).toBeNull();
     expect(screen.getByLabelText("DynamoDB endpoint")).toBeTruthy();
   });
 
@@ -283,6 +413,7 @@ describe("ConnectionFormView", () => {
     await user.clear(screen.getByLabelText("Host"));
     await user.type(screen.getByLabelText("Host"), "oracle.db.local");
     await user.type(screen.getByLabelText("Oracle service name"), "FREEPDB1");
+    await user.type(screen.getByLabelText("Username"), "qa_user");
 
     await submitCreateConnection(user);
 
@@ -321,12 +452,14 @@ describe("ConnectionFormView", () => {
       payload: {
         type: "sqlite",
         filePath: "/tmp/rapidb-form-check.sqlite",
-        sqliteWalMode: "auto",
       },
     });
+    expect(
+      (getLastPostedMessage() as { payload?: unknown } | undefined)?.payload,
+    ).not.toHaveProperty("sqliteWalMode");
   });
 
-  it("renders SSH controls conditionally, forces Secret Storage, and hides SSH for SQLite", async () => {
+  it("renders SSH controls conditionally, keeps Secret Storage optional, and hides SSH for SQLite", async () => {
     const user = userEvent.setup();
 
     const { container } = render(<ConnectionFormView existing={null} />);
@@ -362,7 +495,7 @@ describe("ConnectionFormView", () => {
     expect(screen.queryByLabelText("SSH host fingerprint SHA256")).toBeNull();
     expect(
       screen.getByText(
-        /first successful database connection through ssh will pin the discovered sha256 fingerprint automatically.*test connection does not save a pin/i,
+        /first successful ssh handshake when you connect will pin the discovered sha256 fingerprint automatically.*test connection does not save a pin/i,
       ),
     ).toBeTruthy();
 
@@ -382,8 +515,11 @@ describe("ConnectionFormView", () => {
     const secretStorageToggle = screen.getByRole("switch", {
       name: /store secrets in vs code secret storage/i,
     });
-    expect(secretStorageToggle.getAttribute("aria-disabled")).toBe("true");
+    expect(secretStorageToggle.getAttribute("aria-disabled")).toBe("false");
     expect(secretStorageToggle.getAttribute("aria-checked")).toBe("true");
+    await user.click(secretStorageToggle);
+    expect(secretStorageToggle.getAttribute("aria-checked")).toBe("false");
+    await user.click(secretStorageToggle);
 
     await user.click(screen.getByRole("button", { name: /sqlite/i }));
 
@@ -475,6 +611,7 @@ describe("ConnectionFormView", () => {
     } else {
       await user.type(screen.getByLabelText("Database"), "app");
     }
+    await user.type(screen.getByLabelText("Username"), "qa_user");
     await submitCreateConnection(user);
     expect(getLastPostedMessage()).toMatchObject({
       type: "saveConnection",
@@ -572,7 +709,15 @@ describe("ConnectionFormView", () => {
       screen.getByLabelText("Elasticsearch endpoint"),
       "http://localhost:9200",
     );
+    await user.selectOptions(
+      screen.getByLabelText("Elasticsearch authentication"),
+      "apiKey",
+    );
     await user.type(screen.getByLabelText("Elasticsearch API key"), "api-key");
+    await user.selectOptions(
+      screen.getByLabelText("Elasticsearch connection method"),
+      "cloud",
+    );
     await user.type(
       screen.getByLabelText("Elasticsearch cloud id"),
       "deployment:ZXM=",
@@ -585,7 +730,7 @@ describe("ConnectionFormView", () => {
       type: "saveConnection",
       payload: expect.objectContaining({
         type: "elasticsearch",
-        endpoint: "http://localhost:9200",
+        endpoint: undefined,
         apiKey: "api-key",
         cloudId: "deployment:ZXM=",
         useSecretStorage: true,
@@ -599,7 +744,10 @@ describe("ConnectionFormView", () => {
     await user.type(screen.getByLabelText("Connection name"), "Dynamo Local");
     await user.click(screen.getByRole("button", { name: /dynamodb/i }));
     await user.type(screen.getByLabelText("AWS region"), "us-east-1");
-    await user.type(screen.getByLabelText("AWS profile"), "default");
+    await user.selectOptions(
+      screen.getByLabelText("AWS credential source"),
+      "static",
+    );
     await user.type(screen.getByLabelText("AWS access key id"), "AKIAQA");
     await user.type(
       screen.getByLabelText("AWS secret access key"),
@@ -620,7 +768,7 @@ describe("ConnectionFormView", () => {
       payload: expect.objectContaining({
         type: "dynamodb",
         awsRegion: "us-east-1",
-        awsProfile: "default",
+        awsProfile: undefined,
         awsAccessKeyId: "AKIAQA",
         awsSecretAccessKey: "aws-secret",
         awsSessionToken: "session",
@@ -679,7 +827,7 @@ describe("ConnectionFormView", () => {
     });
   });
 
-  it("posts SSH password payloads with forced Secret Storage", async () => {
+  it("posts SSH password payloads with the default Secret Storage choice", async () => {
     const user = userEvent.setup();
 
     render(<ConnectionFormView existing={null} />);
@@ -729,6 +877,152 @@ describe("ConnectionFormView", () => {
         },
       }),
     });
+  });
+
+  it("posts SSH secrets for plaintext storage when Secret Storage is turned off", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "PG SSH");
+    await fillRequiredPostgresFields(user);
+    await user.click(
+      screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    await user.type(screen.getByLabelText("SSH host"), "bastion.example.com");
+    await user.type(screen.getByLabelText("SSH username"), "tunnel");
+    await user.selectOptions(screen.getByLabelText("SSH auth method"), [
+      "password",
+    ]);
+    await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+    await user.type(
+      screen.getByLabelText("SSH host fingerprint SHA256"),
+      "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+    );
+    await user.click(
+      screen.getByRole("switch", {
+        name: /store secrets in vs code secret storage/i,
+      }),
+    );
+    expect(
+      screen.getAllByText(/will be stored in plaintext in settings\.json/i)
+        .length,
+    ).toBeTruthy();
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        useSecretStorage: false,
+        ssh: expect.objectContaining({ password: "ssh-secret" }),
+      }),
+    });
+  });
+
+  it("posts DynamoDB keys for plaintext storage when Secret Storage is turned off", async () => {
+    const user = userEvent.setup();
+
+    render(<ConnectionFormView existing={null} />);
+
+    await user.click(screen.getByRole("button", { name: /dynamodb/i }));
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "Dynamo");
+    await user.clear(screen.getByLabelText("AWS region"));
+    await user.type(screen.getByLabelText("AWS region"), "us-east-1");
+    await user.selectOptions(screen.getByLabelText("AWS credential source"), [
+      "static",
+    ]);
+    await user.type(screen.getByLabelText("AWS access key id"), "AKIA123");
+    await user.type(screen.getByLabelText("AWS secret access key"), "secret");
+    const toggle = screen.getByRole("switch", {
+      name: /store secrets in vs code secret storage/i,
+    });
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    await user.click(toggle);
+
+    clearPostedMessages();
+    await submitCreateConnection(user);
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "dynamodb",
+        useSecretStorage: false,
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret",
+      }),
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("keeps an existing Elasticsearch and TLS storage choice editable (%s)", async (useSecretStorage) => {
+    const user = userEvent.setup();
+
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "existing-es",
+          name: "Existing ES",
+          type: "elasticsearch",
+          endpoint: "https://es.example.com",
+          hasStoredApiKey: true,
+          hasStoredTlsKeyPassphrase: true,
+          tls: {
+            mode: "mutualTls",
+            certFilePath: "/client.pem",
+            keyFilePath: "/client.key",
+          },
+          useSecretStorage,
+        }}
+      />,
+    );
+
+    const toggle = screen.getByRole("switch", {
+      name: /store secrets in vs code secret storage/i,
+    });
+    expect(toggle.getAttribute("aria-disabled")).toBe("false");
+    expect(toggle.getAttribute("aria-checked")).toBe(String(useSecretStorage));
+    await user.click(toggle);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Save Changes" }));
+
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        useSecretStorage: !useSecretStorage,
+        hasStoredApiKey: true,
+        hasStoredTlsKeyPassphrase: true,
+      }),
+    });
+  });
+
+  it("ticks Secret Storage when editing a profile without a storage flag", () => {
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "flagless",
+          name: "Flagless",
+          type: "pg",
+          host: "localhost",
+          database: "app",
+          username: "reader",
+        }}
+      />,
+    );
+
+    expect(
+      screen
+        .getByRole("switch", {
+          name: /store secrets in vs code secret storage/i,
+        })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
   });
 
   it("posts trust-on-first-use SSH payloads without a manual fingerprint", async () => {
@@ -910,7 +1204,7 @@ describe("ConnectionFormView", () => {
       }),
     });
 
-    dispatchIncomingMessage("testResult", { success: true });
+    dispatchTestResult({ success: true });
 
     await waitFor(() => {
       expect(screen.getByText(/Connection successful/)).toBeTruthy();
@@ -1001,30 +1295,19 @@ describe("ConnectionFormView", () => {
     });
   });
 
-  it("tracks SQLite WAL mode through edit state and save payloads", async () => {
+  it("offers no SQLite WAL control and saves without a WAL mode", async () => {
     const user = userEvent.setup();
     const existing = {
       id: "conn-sqlite",
       name: "Local SQLite",
       type: "sqlite" as const,
       filePath: "/tmp/app.db",
-      sqliteWalMode: "off" as const,
     };
 
     render(<ConnectionFormView existing={existing} />);
 
-    expect(
-      (screen.getByLabelText("SQLite WAL mode") as HTMLSelectElement).value,
-    ).toBe("off");
-    expect(
-      screen.getByText(
-        /automatic wal handling is disabled for this sqlite connection/i,
-      ),
-    ).toBeTruthy();
-
-    await user.selectOptions(screen.getByLabelText("SQLite WAL mode"), [
-      "auto",
-    ]);
+    expect(screen.queryByLabelText("SQLite WAL mode")).toBeNull();
+    expect(screen.queryByText("WAL Mode")).toBeNull();
 
     clearPostedMessages();
     await user.click(screen.getByRole("button", { name: "Save Changes" }));
@@ -1035,9 +1318,11 @@ describe("ConnectionFormView", () => {
         id: "conn-sqlite",
         type: "sqlite",
         filePath: "/tmp/app.db",
-        sqliteWalMode: "auto",
       }),
     });
+    expect(
+      (getLastPostedMessage() as { payload?: unknown } | undefined)?.payload,
+    ).not.toHaveProperty("sqliteWalMode");
   });
 
   it("does not prefill secret edit fields from existing state", async () => {
@@ -1146,7 +1431,7 @@ describe("MongoDB connection editor", () => {
       password: "p@ss",
     });
     expect(tested?.connectionUri).toBeUndefined();
-    dispatchIncomingMessage("testResult", { success: true });
+    dispatchTestResult({ success: true });
     await waitFor(() =>
       expect(
         screen
@@ -1155,8 +1440,10 @@ describe("MongoDB connection editor", () => {
       ).toBe(false),
     );
     await submitCreateConnection(user);
+    const { requestId: _requestId, ...testedConfig } =
+      tested as ConnectionFormSubmission & { requestId?: string };
     expect(getLastPostedMessage()?.payload).toMatchObject({
-      ...tested,
+      ...testedConfig,
       id: expect.any(String),
     });
   });
@@ -1222,7 +1509,7 @@ describe("MongoDB connection editor", () => {
         connectionUri: "mongodb+srv://cluster.example/users",
       },
     });
-    dispatchIncomingMessage("testResult", { success: true });
+    dispatchTestResult({ success: true });
     await user.click(screen.getByRole("button", { name: /save changes/i }));
     expect(getLastPostedMessage()).toMatchObject({
       type: "saveConnection",

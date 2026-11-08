@@ -28,6 +28,7 @@ interface DragState {
 interface LiveOrderAccessors {
   getOrder: () => string[];
   setOrder: (updater: (previous: string[]) => string[]) => void;
+  isExcluded: (columnId: string) => boolean;
 }
 
 export function useColumnDragReorder(
@@ -110,6 +111,7 @@ export function useColumnDragReorder(
       const accessors: LiveOrderAccessors = {
         getOrder: () => getColumnOrderRef.current(),
         setOrder: (updater) => setColumnOrderRef.current(updater),
+        isExcluded: (id) => excludedRef.current.has(id),
       };
 
       const onMouseMove = (moveEvent: MouseEvent) => {
@@ -207,7 +209,7 @@ function attemptSwap(
     accessors,
     state.ghost,
   );
-  if (!target) return;
+  if (!target || accessors.isExcluded(target)) return;
 
   const targetIndex = currentOrder.indexOf(target);
   if (targetIndex === -1 || targetIndex === draggedIndex) return;

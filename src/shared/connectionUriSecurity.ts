@@ -22,9 +22,21 @@ export function hasAmbiguousUriCredentials(value: string | undefined): boolean {
   const boundary = remainder.search(/[/?#\s\\]/);
   const lastAt = remainder.lastIndexOf("@");
   if (boundary < 0 || lastAt < boundary) return false;
+  if (/[\s\\]/.test(remainder[boundary])) return true;
 
-  return (
-    remainder.slice(0, lastAt).includes(":") ||
-    /[\s\\]/.test(remainder[boundary])
-  );
+  const queryStart = remainder.search(/[?#]/);
+  if (
+    queryStart >= 0 &&
+    queryStart < lastAt &&
+    !/[/:.]/.test(remainder.slice(lastAt + 1)) &&
+    /^(?:\[[\da-f:.]*\]|[^:@,[\]]+)(?::\d+)?(?:,(?:\[[\da-f:.]*\]|[^:@,[\]]+)(?::\d+)?)*$/i.test(
+      remainder.slice(0, boundary),
+    ) &&
+    !remainder.slice(boundary, lastAt).includes(":") &&
+    remainder.slice(queryStart, lastAt).includes("=")
+  ) {
+    return false;
+  }
+
+  return remainder.slice(0, lastAt).includes(":");
 }

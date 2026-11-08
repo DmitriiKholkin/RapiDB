@@ -1,5 +1,6 @@
-import { createServer } from "node:http";
-import { describe, expect, it } from "vitest";
+import { createServer, type ServerResponse } from "node:http";
+import { Client } from "@elastic/elasticsearch";
+import { describe, expect, it, vi } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
 
@@ -241,6 +242,144 @@ describe("Elasticsearch REST request boundaries (real SDK + HTTP)", () => {
       ).rejects.toThrow(reason);
       expect(f.requests.filter((entry) => entry.method !== "HEAD")).toEqual([]);
     } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    'PUT /records/_doc\n{"active":true}',
+    'POST /records/_doc\n{"_id":"other","active":true}',
+    'PUT /records/_doc/selected\n{"_id":"other","active":true}',
+  ])("rejects REST document writes Elasticsearch would reject: %s", async (command) => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await expect(f.driver.query(command)).rejects.toThrow(/unsupported|_id/i);
+      expect(f.requests.filter((entry) => entry.method !== "HEAD")).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("still indexes POST /index/_doc with an auto-generated ID", async () => {
+    const f = await fixture();
+    try {
+      await f.driver.connect();
+      await f.driver.query('POST /records/_doc\n{"active":true}');
+      const request = f.requests.find((entry) => entry.method === "POST");
+      expect(request?.url.pathname).toBe("/records/_doc");
+      expect(JSON.parse(request?.body ?? "")).toEqual({ active: true });
+    } finally {
+      await f.close();
+    }
+  });
+});
+
+async function connectFixture(
+  onHead: (response: ServerResponse, count: number) => void,
+  listenHost = "127.0.0.1",
+) {
+  let heads = 0;
+  const server = createServer((request, response) => {
+    response.setHeader("x-elastic-product", "Elasticsearch");
+    if (request.method === "HEAD") onHead(response, ++heads);
+    else response.end("{}");
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, listenHost, resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Missing port");
+  return {
+    port: address.port,
+    heads: () => heads,
+    async close() {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    },
+  };
+}
+
+describe("Elasticsearch connect()", () => {
+  it("fails and closes the client when ping reports a missing cluster", async () => {
+    const f = await connectFixture((response) => {
+      response.statusCode = 404;
+      response.end();
+    });
+    const close = vi.spyOn(Client.prototype, "close");
+    const driver = new ElasticsearchDriver({
+      id: "ping-404",
+      name: "Ping 404",
+      type: "elasticsearch",
+      endpoint: `http://127.0.0.1:${f.port}`,
+    });
+    try {
+      await expect(driver.connect()).rejects.toThrow(/ping failed/i);
+      expect(driver.isConnected()).toBe(false);
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      close.mockRestore();
+      await driver.disconnect();
+      await f.close();
+    }
+  });
+
+  it("closes the client of a superseded concurrent connect", async () => {
+    const pending: ServerResponse[] = [];
+    const f = await connectFixture((response, count) => {
+      if (count === 1) pending.push(response);
+      else response.end();
+    });
+    const close = vi.spyOn(Client.prototype, "close");
+    const driver = new ElasticsearchDriver({
+      id: "superseded",
+      name: "Superseded",
+      type: "elasticsearch",
+      endpoint: `http://127.0.0.1:${f.port}`,
+    });
+    try {
+      const first = driver.connect();
+      const firstRejected = expect(first).rejects.toMatchObject({
+        name: "AbortError",
+      });
+      await vi.waitFor(() => expect(pending).toHaveLength(1));
+      await driver.connect();
+      pending[0].end();
+      await firstRejected;
+      expect(driver.isConnected()).toBe(true);
+      expect(close).toHaveBeenCalledOnce();
+    } finally {
+      close.mockRestore();
+      await driver.disconnect();
+      await f.close();
+    }
+  });
+
+  it("brackets an IPv6 host when building the node URL", async (context) => {
+    const f = await connectFixture((response) => response.end(), "::1").catch(
+      (error: NodeJS.ErrnoException) => {
+        if (error.code === "EADDRNOTAVAIL" || error.code === "EAFNOSUPPORT")
+          return undefined;
+        throw error;
+      },
+    );
+    if (!f) return context.skip();
+    const driver = new ElasticsearchDriver({
+      id: "ipv6",
+      name: "IPv6",
+      type: "elasticsearch",
+      host: "::1",
+      port: f.port,
+    });
+    try {
+      await driver.connect();
+      expect(driver.isConnected()).toBe(true);
+      expect(f.heads()).toBe(1);
+    } finally {
+      await driver.disconnect();
       await f.close();
     }
   });

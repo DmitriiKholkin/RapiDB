@@ -15,9 +15,10 @@ export interface TransactionVerificationFailure {
 
 export class TransactionVerificationError extends Error {
   readonly name = "TransactionVerificationError";
+  rollbackConfirmed = false;
   constructor(readonly verificationFailure: TransactionVerificationFailure) {
     super(
-      `${verificationFailure.mutation === "insert" ? "INSERT" : "UPDATE"} verification failed; the transaction was not committed. ${verificationFailure.message}`,
+      `${verificationFailure.mutation === "insert" ? "INSERT" : "UPDATE"} verification failed. ${verificationFailure.message}`,
     );
   }
 }

@@ -571,3 +571,39 @@ describe("EditInput", () => {
     expect(onCommit).toHaveBeenCalledWith("value");
   });
 });
+
+it.each([
+  "blur",
+  "Enter",
+])("cancels untouched missing input on %s and still commits pasted content", (action) => {
+  const onCommit = vi.fn();
+  const onCancel = vi.fn();
+  const { unmount } = render(
+    <EditInput
+      initial={NULL_SENTINEL}
+      initialMissing
+      nullable
+      onCommit={onCommit}
+      onCancel={onCancel}
+    />,
+  );
+  const input = screen.getByLabelText("Cell value");
+  if (action === "blur") fireEvent.blur(input);
+  else fireEvent.keyDown(input, { key: "Enter" });
+  expect(onCommit).not.toHaveBeenCalled();
+  expect(onCancel).toHaveBeenCalledOnce();
+  unmount();
+  render(
+    <EditInput
+      initial={NULL_SENTINEL}
+      initialMissing
+      nullable
+      onCommit={onCommit}
+      onCancel={onCancel}
+    />,
+  );
+  const edited = screen.getByLabelText("Cell value") as HTMLInputElement;
+  replyToPaste(requestPaste(edited), "pasted");
+  fireEvent.keyDown(edited, { key: "Enter" });
+  expect(onCommit).toHaveBeenCalledExactlyOnceWith("pasted");
+});

@@ -234,7 +234,9 @@ describe("MSSQL sql_variant snapshot boundary", () => {
       original,
     );
     expect(expression?.sql).toContain(type);
-    expect(expression?.params).toEqual([value]);
+    expect(expression?.params).toEqual([
+      metadata.baseType === "float" ? Number(value) : value,
+    ]);
     const plan = prepare(original, value);
     expect(plan.executable).toBe(true);
     if (!plan.executable) throw new Error("Expected a plan");

@@ -2,15 +2,95 @@ import { normalizeNumericToken } from "../../shared/numericNormalization";
 import type { ColumnTypeMeta } from "../../shared/tableTypes";
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 
-export interface PasteCellTarget {
-  rowIndex: number;
-  columnIndex: number;
-  columnName: string;
-  column: ColumnTypeMeta;
+const TSV_NULL_MARKER = "NULL";
+const DATE_KEYWORD_RE =
+  /^(?:[+-]?infinity|epoch|now|today|tomorrow|yesterday)$/i;
+const QUOTED_VALUE_RE = /^(["']).*\1$/s;
+const MONGO_NUMBER_NATIVE_TYPES = new Set(["int", "long"]);
+const QUOTED_STRING_DATE_NATIVE_TYPES = new Set(["date", "timestamp"]);
+
+export interface PasteValidationOptions {
+  mongoTypes?: boolean;
+}
+
+type DecimalCommaIssue =
+  | { kind: "decimalComma" }
+  | { kind: "ambiguous"; integerPart: string }
+  | { kind: "invalid" };
+
+function findDecimalCommaIssue(
+  value: string,
+  rejectSingleGroupComma: boolean,
+): DecimalCommaIssue | null {
+  const compact = value.replace(/\s+/g, "");
+  const integerPart = /[\d,]+/.exec(compact)?.[0];
+  if (!integerPart?.includes(",")) {
+    return null;
+  }
+  const groups = integerPart.split(",");
+  const isSingleComma =
+    groups.length === 2 &&
+    groups[0] !== "" &&
+    groups[1] !== "" &&
+    !compact.includes(".");
+  if (isSingleComma && (groups[0].startsWith("0") || groups[1].length !== 3)) {
+    return { kind: "decimalComma" };
+  }
+  if (groups[0].startsWith("0")) {
+    return { kind: "invalid" };
+  }
+  return rejectSingleGroupComma && isSingleComma
+    ? { kind: "ambiguous", integerPart }
+    : null;
+}
+
+function rejectsSingleGroupComma(
+  column: ColumnTypeMeta,
+  options: PasteValidationOptions,
+): boolean {
+  return (
+    column.category !== "integer" ||
+    column.nativeType === "number" ||
+    (options.mongoTypes === true &&
+      MONGO_NUMBER_NATIVE_TYPES.has(column.nativeType))
+  );
+}
+
+function decimalCommaError(
+  issue: DecimalCommaIssue,
+  value: string,
+  column: ColumnTypeMeta,
+): string {
+  switch (issue.kind) {
+    case "decimalComma":
+      return `Invalid number value "${value}" for column "${column.name}": a comma cannot be used as the decimal separator (use a dot)`;
+    case "ambiguous": {
+      const plain = issue.integerPart.replace(/,/g, "");
+      const suggestion =
+        column.category === "integer"
+          ? plain
+          : `${plain} or ${issue.integerPart}.00`;
+      return `Ambiguous number value "${value}" for column "${column.name}": the comma could be a decimal or thousands separator (write ${suggestion})`;
+    }
+    case "invalid":
+      return `Invalid number value "${value}" for column "${column.name}"`;
+  }
+}
+
+function acceptsQuotedStringDate(
+  column: ColumnTypeMeta,
+  options: PasteValidationOptions,
+): boolean {
+  return (
+    options.mongoTypes === true &&
+    column.category === "datetime" &&
+    QUOTED_STRING_DATE_NATIVE_TYPES.has(column.nativeType)
+  );
 }
 
 export interface PasteData {
   rows: string[][];
+  quoted?: boolean[][];
 }
 
 export interface PasteValidationError {
@@ -32,13 +112,18 @@ export interface PasteValidationResult {
   >;
 }
 
-function serializeTsvCell(value: string): string {
-  return value === "" || /["\t\r\n]/.test(value)
+function serializeTsvCell(value: string | null): string {
+  if (value === null) {
+    return TSV_NULL_MARKER;
+  }
+  return value === "" || value === TSV_NULL_MARKER || /["\t\r\n]/.test(value)
     ? `"${value.replace(/"/g, '""')}"`
     : value;
 }
 
-export function serializeTsv(rows: readonly (readonly string[])[]): string {
+export function serializeTsv(
+  rows: readonly (readonly (string | null)[])[],
+): string {
   return rows.map((row) => row.map(serializeTsvCell).join("\t")).join("\n");
 }
 
@@ -68,22 +153,29 @@ export function parseTsv(text: string): PasteData {
   }
 
   const rows: string[][] = [];
+  const quoted: boolean[][] = [];
   let row: string[] = [];
+  let rowQuoted: boolean[] = [];
   let field = "";
+  let fieldQuoted = false;
   let inQuotes = false;
   let atFieldStart = true;
   let endedWithRowDelimiter = false;
 
   const finishField = () => {
     row.push(field);
+    rowQuoted.push(fieldQuoted);
     field = "";
+    fieldQuoted = false;
     atFieldStart = true;
   };
 
   const finishRow = () => {
     finishField();
     rows.push(row);
+    quoted.push(rowQuoted);
     row = [];
+    rowQuoted = [];
   };
 
   for (let index = 0; index < text.length; index++) {
@@ -106,6 +198,7 @@ export function parseTsv(text: string): PasteData {
 
     if (char === '"' && atFieldStart && hasValidClosingQuote(text, index)) {
       inQuotes = true;
+      fieldQuoted = true;
       atFieldStart = false;
       endedWithRowDelimiter = false;
       continue;
@@ -135,14 +228,16 @@ export function parseTsv(text: string): PasteData {
     finishRow();
   }
 
-  return { rows };
+  return { rows, quoted };
 }
 
 export function validatePasteValue(
   value: string,
   column: ColumnTypeMeta,
+  quoted = false,
+  options: PasteValidationOptions = {},
 ): { valid: boolean; coercedValue: unknown; error?: string } {
-  if (value === NULL_SENTINEL || value === "NULL") {
+  if (value === NULL_SENTINEL || (!quoted && value === TSV_NULL_MARKER)) {
     if (column.nullable) {
       return { valid: true, coercedValue: null };
     }
@@ -157,8 +252,28 @@ export function validatePasteValue(
     case "integer":
     case "float":
     case "decimal": {
+      if (value === "" && !quoted && column.nullable) {
+        return { valid: true, coercedValue: null };
+      }
       if (value.trim() === "") {
-        return { valid: true, coercedValue: value };
+        return {
+          valid: false,
+          coercedValue: value,
+          error: column.nullable
+            ? `Empty value is not a valid number for column "${column.name}" (use NULL)`
+            : `Empty value is not a valid number for column "${column.name}"`,
+        };
+      }
+      const commaIssue = findDecimalCommaIssue(
+        value,
+        rejectsSingleGroupComma(column, options),
+      );
+      if (commaIssue) {
+        return {
+          valid: false,
+          coercedValue: value,
+          error: decimalCommaError(commaIssue, value, column),
+        };
       }
       const normalized = normalizeNumericToken(
         value,
@@ -178,16 +293,15 @@ export function validatePasteValue(
     }
 
     case "boolean": {
-      const lower = value.toLowerCase();
-      if (
-        lower === "true" ||
-        lower === "false" ||
-        lower === "1" ||
-        lower === "0" ||
-        lower === "yes" ||
-        lower === "no"
-      ) {
-        return { valid: true, coercedValue: value };
+      const lower = value.trim().toLowerCase();
+      if (lower === "true" || lower === "yes") {
+        return { valid: true, coercedValue: "true" };
+      }
+      if (lower === "false" || lower === "no") {
+        return { valid: true, coercedValue: "false" };
+      }
+      if (lower === "1" || lower === "0") {
+        return { valid: true, coercedValue: lower };
       }
       return {
         valid: false,
@@ -198,8 +312,15 @@ export function validatePasteValue(
 
     case "date":
     case "datetime": {
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) {
+      const trimmed = value.trim();
+      if (
+        !/\d/.test(trimmed) &&
+        !DATE_KEYWORD_RE.test(trimmed) &&
+        !(
+          acceptsQuotedStringDate(column, options) &&
+          QUOTED_VALUE_RE.test(trimmed)
+        )
+      ) {
         return {
           valid: false,
           coercedValue: value,
@@ -234,6 +355,7 @@ export function validatePasteData(
   columns: ColumnTypeMeta[],
   totalRows: number,
   canEditColumn: (column: ColumnTypeMeta) => boolean,
+  options: PasteValidationOptions = {},
 ): PasteValidationResult {
   const errors: PasteValidationError[] = [];
   const rows: PasteValidationResult["rows"] = [];
@@ -295,7 +417,12 @@ export function validatePasteData(
         continue;
       }
 
-      const validation = validatePasteValue(value, column);
+      const validation = validatePasteValue(
+        value,
+        column,
+        pasteData.quoted?.[r]?.[c],
+        options,
+      );
       if (!validation.valid) {
         errors.push({
           rowIndex: targetRow,
@@ -324,7 +451,12 @@ export function formatNormalizedPasteValue(
   originalValue: string,
   normalized: unknown,
 ): string {
-  if (originalValue === NULL_SENTINEL || originalValue === "NULL") {
+  if (
+    normalized === null &&
+    (originalValue === NULL_SENTINEL ||
+      originalValue === TSV_NULL_MARKER ||
+      originalValue === "")
+  ) {
     return NULL_SENTINEL;
   }
   if (normalized === null || normalized === undefined) {

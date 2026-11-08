@@ -1,32 +1,10 @@
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 
-export function normalizeNumericDisplayValue(value: number): number | string {
-  return Number.isFinite(value) ? value : String(value);
-}
-
-export interface ExactNumericConstraint {
-  precision: number | null;
-  scale: number | null;
-}
-
 export interface CanonicalExactNumericValue {
   canonical: string;
   integerDigits: number;
   fractionDigits: number;
   scaleOverflow: boolean;
-}
-
-export function parseTypePrecisionScale(
-  nativeType: string,
-): ExactNumericConstraint {
-  const match = /\((\d+)(?:\s*,\s*(-?\d+))?\)/.exec(nativeType);
-  if (!match) {
-    return { precision: null, scale: null };
-  }
-  return {
-    precision: Number.parseInt(match[1], 10),
-    scale: match[2] === undefined ? null : Number.parseInt(match[2], 10),
-  };
 }
 
 export function numberToDecimalString(value: number): string {

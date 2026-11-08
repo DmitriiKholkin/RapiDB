@@ -47,7 +47,12 @@ export function resolveSQLiteBuildTools(
   runtimeRoot: string,
   environment: NodeJS.ProcessEnv = process.env,
   workspaceRoots: readonly string[] = [],
-): { node: string; npmCli: string; env: NodeJS.ProcessEnv } {
+): {
+  node: string;
+  npmCli: string;
+  python?: string;
+  env: NodeJS.ProcessEnv;
+} {
   const excludedRoots = [packageRoot, runtimeRoot, ...workspaceRoots].flatMap(
     (path) => {
       const absolute = resolve(path);
@@ -116,12 +121,42 @@ export function resolveSQLiteBuildTools(
         ].join(delimiter),
         runtimeRoot,
       );
-      return { node, npmCli, env };
+      const python = resolveTrustedPython(
+        (env.PATH ?? "").split(delimiter),
+        permitted,
+      );
+      return { node, npmCli, ...(python ? { python } : {}), env };
     } catch {}
   }
   throw new Error(
     "A trusted Node.js/npm installation is required for the verified SQLite source build. No node and npm entries in the same absolute PATH directory resolved outside the extension package, runtime and all workspace roots to an executable Node and npm/bin/npm-cli.js. Conventional installation/symlink layouts are supported; shim-only manager PATH entries are not resolved or executed. Add the actual Node/npm installation bin directory to the extension host PATH, or ask the publisher to provide pinned patched prebuilts. Python/C++ build tools are also required; workspace npx is never used.",
   );
+}
+
+function resolveTrustedPython(
+  directories: readonly string[],
+  permitted: (path: string) => boolean,
+): string | undefined {
+  // py.exe selects the interpreter itself; only the launcher is canonicalized.
+  const names =
+    process.platform === "win32"
+      ? ["py.exe", "python.exe"]
+      : ["python3", "python"];
+  for (const name of names) {
+    for (const directory of directories) {
+      try {
+        const python = realpathSync(join(directory, name));
+        if (!permitted(python) || /[<>$\r\n\0]/.test(python)) continue;
+        if (!statSync(python).isFile()) continue;
+        accessSync(
+          python,
+          process.platform === "win32" ? constants.F_OK : constants.X_OK,
+        );
+        return python;
+      } catch {}
+    }
+  }
+  return undefined;
 }
 
 export function pinSQLiteSourceNodeActions(

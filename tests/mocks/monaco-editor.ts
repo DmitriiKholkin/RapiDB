@@ -44,30 +44,41 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
     }
   };
   selectionEmitters.add(emitSelection);
+  let versionId = 1;
+  const model = {
+    getFullModelRange: () => ({
+      startLineNumber: 1,
+      startColumn: 1,
+      endLineNumber: 1,
+      endColumn: value.length + 1,
+    }),
+    getLineCount: () => 1,
+    getLineMaxColumn: () => value.length + 1,
+    getLineContent: () => value,
+    getWordUntilPosition: (position: { column: number }) => ({
+      word: "",
+      startColumn: position.column,
+      endColumn: position.column,
+    }),
+    getPositionAt: () => ({ lineNumber: 1, column: value.length + 1 }),
+    getOffsetAt: () => 0,
+    getValueInRange: () => mockSelectionText || value,
+    getVersionId: () => versionId,
+  };
 
   return {
     getValue: () => value,
     setValue: (nextValue: string) => {
       value = nextValue;
+      versionId++;
       for (const listener of changeListeners) {
         listener();
       }
     },
     updateOptions: () => {},
-    getModel: () => ({
-      getFullModelRange: () => ({
-        startLineNumber: 1,
-        startColumn: 1,
-        endLineNumber: 1,
-        endColumn: value.length + 1,
-      }),
-      getLineCount: () => 1,
-      getLineMaxColumn: () => value.length + 1,
-      getPositionAt: () => ({ lineNumber: 1, column: value.length + 1 }),
-      getOffsetAt: () => 0,
-      getValueInRange: () => mockSelectionText || value,
-    }),
+    getModel: () => model,
     getSelection,
+    getSelections: () => [getSelection()],
     getPosition: () => ({ lineNumber: 1, column: value.length + 1 }),
     setPosition: (_position: { lineNumber: number; column: number }) =>
       __setMockSelectionText(""),
@@ -103,7 +114,14 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
     setScrollLeft: (next: number) => {
       scrollLeft = next;
     },
-    addCommand: () => {},
+    addAction: (_descriptor: {
+      id: string;
+      label: string;
+      precondition?: string;
+      keybindings?: number[];
+      keybindingContext?: string;
+      run: () => void;
+    }) => ({ dispose: () => {} }),
     trigger: () => {},
     getDomNode: () => domNode,
     getOption: () => false,
@@ -116,6 +134,7 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
       value = mockSelectionText
         ? value.replace(mockSelectionText, nextText)
         : nextText;
+      versionId++;
     },
     pushUndoStop: () => {},
     onDidChangeModelContent: (listener: ChangeListener) => {
@@ -169,18 +188,18 @@ export const languages = {
 };
 
 export const KeyMod = {
-  CtrlCmd: 1,
-  Shift: 2,
-  Alt: 4,
+  CtrlCmd: 1 << 11,
+  Shift: 1 << 10,
+  Alt: 1 << 9,
 };
 
 export const KeyCode = {
-  KeyC: 0,
-  KeyV: 1,
-  KeyX: 5,
-  Enter: 2,
-  F5: 3,
-  KeyF: 4,
+  Enter: 3,
+  KeyC: 33,
+  KeyF: 36,
+  KeyV: 52,
+  KeyX: 54,
+  F5: 63,
 };
 
 export class Selection {

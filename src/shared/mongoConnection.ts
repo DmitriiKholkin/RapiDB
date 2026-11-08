@@ -9,7 +9,6 @@ export function resolveMongoConnectionMode(
   );
 }
 
-/** Return the active URI, preferring a nonblank canonical value to legacy `uri`. */
 export function getMongoConnectionUri(
   config: Partial<ConnectionConfig>,
 ): string | undefined {
@@ -28,7 +27,6 @@ function usesLegacyMongoFields(config: Partial<ConnectionConfig>): boolean {
   );
 }
 
-/** Materialize legacy seed ports before the editor switches to explicit fields. */
 export function getMongoFormHost(
   config: Partial<ConnectionConfig>,
 ): string | undefined {
@@ -46,7 +44,6 @@ export function getMongoFormHost(
     .join(",");
 }
 
-/** Move legacy URI overrides into the URI before presenting an explicit URI mode. */
 export function getMongoFormUri(
   config: Partial<ConnectionConfig>,
   value = getMongoConnectionUri(config),
@@ -75,7 +72,6 @@ export function getMongoFormUri(
   return `${match[1]}${match[2]}${params.size ? `?${params}` : ""}`;
 }
 
-/** Normalize fields consistently while preserving overrides on legacy URI profiles. */
 export function normalizeMongoConnectionConfig<
   T extends Partial<ConnectionConfig>,
 >(config: T): T {
@@ -118,7 +114,6 @@ export function normalizeMongoConnectionConfig<
   };
 }
 
-/** Used by the fields editor and driver; credentials are encoded exactly once. */
 export function buildMongoFieldsUri(config: Partial<ConnectionConfig>): string {
   const scheme = config.mongoScheme ?? "mongodb";
   const hosts = (config.host?.trim() || "localhost")
@@ -150,7 +145,6 @@ export function buildMongoFieldsUri(config: Partial<ConnectionConfig>): string {
   return `${scheme}://${auth}${hosts}/${encodeURIComponent(config.database?.trim() || "admin")}${params.size ? `?${params}` : ""}`;
 }
 
-/** Resolve the active MongoDB address for SSH forwarding. */
 export function resolveMongoRemoteTarget(config: Partial<ConnectionConfig>): {
   host: string;
   port: number;
@@ -159,6 +153,15 @@ export function resolveMongoRemoteTarget(config: Partial<ConnectionConfig>): {
     resolveMongoConnectionMode(config) === "uri"
       ? (getMongoConnectionUri(config) ?? "").trim()
       : buildMongoFieldsUri(config);
+  const authority = /^mongodb(\+srv)?:\/\/([^/?#]*)/i.exec(uri);
+  if (
+    authority?.[1] ||
+    authority?.[2].slice(authority[2].lastIndexOf("@") + 1).includes(",")
+  ) {
+    throw new Error(
+      "SSH tunnel requires a single MongoDB host; multi-host and mongodb+srv URIs are not supported.",
+    );
+  }
   const parsed = new URL(uri);
   return {
     host: parsed.hostname.replace(/^\[|\]$/g, ""),
@@ -166,7 +169,6 @@ export function resolveMongoRemoteTarget(config: Partial<ConnectionConfig>): {
   };
 }
 
-/** TLS controls override URI verification; enabled TLS keeps certificate fallbacks. */
 export function stripMongoUriTlsOptions(
   uri: string,
   keepCertificateOptions = false,

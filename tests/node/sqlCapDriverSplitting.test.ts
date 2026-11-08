@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { splitMssqlBatches } from "../../src/extension/dbDrivers/mssql";
+import { parseMssqlBatches } from "../../src/extension/dbDrivers/mssql";
 import { splitOracleStatements } from "../../src/extension/dbDrivers/oracle";
 import { applyHardCapToSqlQuery } from "../../src/extension/utils/sqlHardCap";
+
+const splitMssqlBatches = (sql: string) =>
+  parseMssqlBatches(sql).map((batch) => batch.sql);
 
 describe("cap and driver lexical agreement", () => {
   it("keeps Oracle q/nq literals and quoted identifiers inside one capped statement", () => {

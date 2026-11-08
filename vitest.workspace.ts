@@ -38,6 +38,7 @@ export default [
     ],
     resolveAlias: {
       "monaco-editor": resolve(__dirname, "tests/mocks/monaco-editor.ts"),
+      vscode: resolve(__dirname, "tests/mocks/vscode.ts"),
     },
   }),
   ...dbProjects,

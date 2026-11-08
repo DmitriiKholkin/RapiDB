@@ -23,15 +23,3 @@ export const DEFAULT_PORT_BY_CONNECTION_TYPE: Record<ConnectionType, number> = {
   elasticsearch: 9200,
   dynamodb: 8000,
 };
-
-export const CONNECTION_TYPE_LABELS: Record<ConnectionType, string> = {
-  pg: "PostgreSQL",
-  mysql: "MySQL / MariaDB",
-  sqlite: "SQLite",
-  mssql: "SQL Server (MSSQL)",
-  oracle: "Oracle",
-  mongodb: "MongoDB",
-  redis: "Redis",
-  elasticsearch: "Elasticsearch",
-  dynamodb: "DynamoDB",
-};

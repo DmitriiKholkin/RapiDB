@@ -39,7 +39,6 @@ describe("NoSQL mutation retries (real SDK + HTTP)", () => {
     let writes = 0;
     const server = await serve(async (request, response) => {
       for await (const _chunk of request) {
-        // Consume the full request before simulating a committed write.
       }
       if (request.method === "HEAD") {
         response.setHeader("x-elastic-product", "Elasticsearch");
@@ -86,7 +85,6 @@ describe("NoSQL mutation retries (real SDK + HTTP)", () => {
     let writes = 0;
     const server = await serve(async (request, response) => {
       for await (const _chunk of request) {
-        // Consume the complete AWS request.
       }
       if (String(request.headers["x-amz-target"]).endsWith(".ListTables")) {
         response.setHeader("content-type", "application/x-amz-json-1.0");

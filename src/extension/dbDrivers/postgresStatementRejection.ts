@@ -1,5 +1,20 @@
 import { DatabaseError } from "pg";
 
+export class PostgresStatementRejectedAndRolledBackError extends Error {
+  readonly executionState = "not-executed" as const;
+
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "PostgresStatementRejectedAndRolledBackError";
+  }
+}
+
+export function isPostgresStatementRejectedAndRolledBack(
+  error: unknown,
+): error is PostgresStatementRejectedAndRolledBackError {
+  return error instanceof PostgresStatementRejectedAndRolledBackError;
+}
+
 export function isPostgresStatementRejection(error: unknown): boolean {
   if (!(error instanceof DatabaseError)) return false;
   const code = error.code;

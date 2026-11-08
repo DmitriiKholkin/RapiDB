@@ -24,14 +24,17 @@ export type JsonExportValue =
   | { [key: string]: JsonExportValue };
 
 const RAW_EXPORT_LITERAL = Symbol("raw export JSON literal");
+const RAPIDB_JSON_EXPORT_TAG = "$rapiDB";
 export type RawJsonLiteral = {
   readonly [RAW_EXPORT_LITERAL]: true;
   readonly literal: string;
 };
 
 const JSON_NUMBER_LITERAL_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
-
-const pad2 = (n: number): string => String(n).padStart(2, "0");
+const JSON_ARRAY_NATIVE_TYPE_RE =
+  /^(?:pg_catalog\.)?(?:jsonb?(?:\[\])+|_jsonb?)$/i;
+const JSON_TEXT_ARRAY_NATIVE_TYPE_RE =
+  /^(?:pg_catalog\.)?(?:json(?:\[\])+|_json)$/i;
 
 export function queryColumnKey(index: number): string {
   return `__col_${index}`;
@@ -51,10 +54,7 @@ export function formatExportCellValue(value: unknown): string {
       return "";
     }
 
-    return (
-      `${value.getUTCFullYear()}-${pad2(value.getUTCMonth() + 1)}-${pad2(value.getUTCDate())} ` +
-      `${pad2(value.getUTCHours())}:${pad2(value.getUTCMinutes())}:${pad2(value.getUTCSeconds())}`
-    );
+    return value.toISOString();
   }
 
   if (Array.isArray(value) || (value !== null && typeof value === "object")) {
@@ -65,7 +65,15 @@ export function formatExportCellValue(value: unknown): string {
     }
   }
 
+  if (typeof value === "number") {
+    return formatNumber(value);
+  }
+
   return String(value);
+}
+
+function formatNumber(value: number): string {
+  return Object.is(value, -0) ? "-0" : String(value);
 }
 
 export function buildQueryExportColumns(
@@ -86,11 +94,13 @@ export function buildQueryExportColumns(
       nextSuffixes.set(columnName, suffix);
     }
     usedNames.add(key);
+    const nativeType = columnMeta?.[index]?.nativeType;
 
     return {
       key,
       sourceKey: queryColumnKey(index),
       category: columnMeta?.[index]?.category ?? null,
+      ...(nativeType !== undefined ? { nativeType } : {}),
     } satisfies ExportColumnDescriptor;
   });
 }
@@ -105,7 +115,9 @@ export function formatTableCsvExportValue(
   if (typeof value === "string") {
     const parsed = tryParseStructuredExportValue(value, category);
     if (parsed !== undefined) {
-      return stringifyJsonExportValue(normalizeNestedJsonExportValue(parsed));
+      return category === "json"
+        ? value
+        : stringifyJsonExportValue(normalizeNestedJsonExportValue(parsed));
     }
   }
 
@@ -165,7 +177,11 @@ export function normalizeJsonExportValue(
   if (typeof value === "string") {
     const parsed = tryParseStructuredExportValue(value, category);
     if (parsed !== undefined) {
-      return normalizeNestedJsonExportValue(parsed);
+      return category === "json"
+        ? normalizeRootJsonExportValue(parsed, rawJsonLiteral(value.trim()))
+        : normalizeNestedJsonExportValue(
+            parseJsonArrayExportElements(parsed, category, nativeType),
+          );
     }
 
     if (category === "boolean") {
@@ -177,6 +193,12 @@ export function normalizeJsonExportValue(
     if (isNumericExportCategory(category)) {
       const numericLiteral = toJsonNumericLiteral(value);
       if (numericLiteral) {
+        if (
+          category === "decimal" &&
+          hasExcessJavaScriptDecimalPrecision(numericLiteral)
+        ) {
+          return numericLiteral;
+        }
         return rawJsonLiteral(numericLiteral);
       }
     }
@@ -184,7 +206,71 @@ export function normalizeJsonExportValue(
     return value;
   }
 
-  return normalizeNestedJsonExportValue(value);
+  return category === "json"
+    ? normalizeRootJsonExportValue(value)
+    : normalizeNestedJsonExportValue(
+        parseJsonArrayExportElements(value, category, nativeType),
+      );
+}
+
+function parseJsonArrayExportElements(
+  value: unknown,
+  category: TypeCategory | null,
+  nativeType?: string,
+): unknown {
+  if (
+    category !== "array" ||
+    !Array.isArray(value) ||
+    !JSON_ARRAY_NATIVE_TYPE_RE.test(nativeType?.trim() ?? "")
+  ) {
+    return value;
+  }
+  const preservesSourceText = JSON_TEXT_ARRAY_NATIVE_TYPE_RE.test(
+    nativeType?.trim() ?? "",
+  );
+  const parseElement = (entry: unknown): unknown => {
+    if (Array.isArray(entry)) return entry.map(parseElement);
+    if (typeof entry !== "string") return entry;
+    if (preservesSourceText) {
+      const trimmed = entry.trim();
+      try {
+        JSON.parse(trimmed);
+        return rawJsonLiteral(trimmed);
+      } catch {
+        return entry;
+      }
+    }
+    const parsed = parseJsonPreservingRawNumbers(entry);
+    return parsed === undefined ? entry : parsed;
+  };
+  return value.map(parseElement);
+}
+
+function normalizeRootJsonExportValue(
+  value: unknown,
+  sourceText?: RawJsonLiteral,
+): JsonExportValue {
+  const normalized = sourceText ?? normalizeNestedJsonExportValue(value);
+  if (value === null) {
+    return {
+      [RAPIDB_JSON_EXPORT_TAG]: { type: "json-null" },
+    };
+  }
+
+  if (
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    Object.hasOwn(value, RAPIDB_JSON_EXPORT_TAG)
+  ) {
+    return {
+      [RAPIDB_JSON_EXPORT_TAG]: {
+        type: "json-value",
+        value: normalized,
+      },
+    };
+  }
+
+  return normalized;
 }
 
 function normalizeNestedJsonExportValue(value: unknown): JsonExportValue {
@@ -193,6 +279,7 @@ function normalizeNestedJsonExportValue(value: unknown): JsonExportValue {
   }
 
   if (isRawNumberToken(value)) return rawJsonLiteral(value.raw);
+  if (isRawJsonLiteral(value)) return value;
 
   if (value instanceof Date) {
     return Number.isNaN(value.getTime()) ? null : formatExportCellValue(value);
@@ -235,6 +322,11 @@ function getDriverDisplaySnapshotValue(
   nativeType?: string,
 ): string | undefined {
   const redisDisplay = redisBinarySnapshotDisplay(value, nativeType);
+  if (redisDisplay !== undefined && isRedisOversizedValueSnapshot(value)) {
+    throw new Error(
+      `Redis value ${redisDisplay} exceeds the table viewer read limit and cannot be exported without data loss. Narrow the keyspace or export it with a Redis client.`,
+    );
+  }
   if (redisDisplay !== undefined) return redisDisplay;
   if (!value || typeof value !== "object") {
     return undefined;
@@ -272,7 +364,7 @@ function stringifyJsonExportValue(value: JsonExportValue): string {
   }
 
   if (typeof value === "number") {
-    return Number.isFinite(value) ? String(value) : "null";
+    return Number.isFinite(value) ? formatNumber(value) : "null";
   }
 
   if (typeof value === "string") {
@@ -328,6 +420,15 @@ function toJsonNumericLiteral(value: string): string | null {
   return JSON_NUMBER_LITERAL_RE.test(normalized) ? normalized : null;
 }
 
+function hasExcessJavaScriptDecimalPrecision(value: string): boolean {
+  const significand = value.split(/[eE]/, 1)[0].replace(/^[+-]/, "");
+  const significantDigits = significand
+    .replace(".", "")
+    .replace(/^0+/, "")
+    .replace(/0+$/, "");
+  return significantDigits.length > 15;
+}
+
 function rawJsonLiteral(literal: string): RawJsonLiteral {
   return {
     [RAW_EXPORT_LITERAL]: true,
@@ -335,10 +436,13 @@ function rawJsonLiteral(literal: string): RawJsonLiteral {
   };
 }
 
-function isRawJsonLiteral(value: JsonExportValue): value is RawJsonLiteral {
+function isRawJsonLiteral(value: unknown): value is RawJsonLiteral {
   return (
     typeof value === "object" && value !== null && RAW_EXPORT_LITERAL in value
   );
 }
 
-import { redisBinarySnapshotDisplay } from "../../shared/redisValueSnapshot";
+import {
+  isRedisOversizedValueSnapshot,
+  redisBinarySnapshotDisplay,
+} from "../../shared/redisValueSnapshot";

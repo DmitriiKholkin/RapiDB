@@ -1,10 +1,10 @@
 import type { ConnectionType } from "../connectionTypes";
+import type { QueryColumnMeta } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
   isRecord,
   parseEnvelope,
   parseEnvelopeQueryPayload,
-  parseEnvelopeTextPayload,
   parseOptionalPayloadRecord,
   parseRequiredPayloadRecord,
   readConnectionType,
@@ -12,7 +12,11 @@ import {
   readOptionalString,
   readRequiredString,
 } from "./shared";
-import type { ClipboardReadPayload } from "./table";
+import {
+  type ClipboardReadPayload,
+  type ClipboardWritePayload,
+  parseClipboardWritePayload,
+} from "./table";
 
 export type QueryEditorLanguage = "sql" | "javascript" | "plaintext" | "json";
 
@@ -178,7 +182,26 @@ export function parseQueryInitialState(
 
 export interface QueryResultExportPayload {
   columnOrder?: string[];
+  resultSetIndex?: number;
   sort?: { id: string; desc: boolean }[];
+}
+
+export interface QuerySchemaPayload<TSchemaObject> {
+  connectionId: string;
+  schema: TSchemaObject[];
+  error?: string;
+}
+
+export interface QueryResultSet {
+  id: string;
+  columns: string[];
+  columnMeta?: QueryColumnMeta[];
+  rows: Record<string, unknown>[];
+  rowCount: number;
+  affectedRows?: number;
+  truncated?: boolean;
+  truncatedAt?: number;
+  partial?: boolean;
 }
 
 export interface QueryBookmarkPayload {
@@ -239,7 +262,7 @@ export type QueryPanelMessage =
   | WebviewMessageEnvelope<"exportResultsCSV", QueryResultExportPayload>
   | WebviewMessageEnvelope<"exportResultsJSON", QueryResultExportPayload>
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
-  | WebviewMessageEnvelope<"writeClipboard", { text: string }>
+  | WebviewMessageEnvelope<"writeClipboard", ClipboardWritePayload>
   | WebviewMessageEnvelope<"addBookmark", QueryBookmarkPayload>;
 
 export function parseQueryPanelMessage(
@@ -326,12 +349,20 @@ export function parseQueryPanelMessage(
     case "exportResultsJSON": {
       const payload = parseOptionalPayloadRecord(envelope);
       if (!payload) return null;
-      const { columnOrder, sort } = payload;
+      const { columnOrder, resultSetIndex, sort } = payload;
       if (
         columnOrder !== undefined &&
         (!Array.isArray(columnOrder) ||
           !columnOrder.every(isQueryColumnId) ||
           new Set(columnOrder).size !== columnOrder.length)
+      ) {
+        return null;
+      }
+      if (
+        resultSetIndex !== undefined &&
+        (typeof resultSetIndex !== "number" ||
+          !Number.isSafeInteger(resultSetIndex) ||
+          resultSetIndex < 0)
       ) {
         return null;
       }
@@ -352,6 +383,7 @@ export function parseQueryPanelMessage(
         type: envelope.type,
         payload: {
           ...(columnOrder !== undefined ? { columnOrder } : {}),
+          ...(resultSetIndex !== undefined ? { resultSetIndex } : {}),
           ...(sort !== undefined
             ? { sort: sort.map(({ id, desc }) => ({ id, desc })) }
             : {}),
@@ -360,7 +392,7 @@ export function parseQueryPanelMessage(
     }
 
     case "writeClipboard": {
-      const payload = parseEnvelopeTextPayload(envelope);
+      const payload = parseClipboardWritePayload(envelope.payload);
       return payload ? { type: envelope.type, payload } : null;
     }
 

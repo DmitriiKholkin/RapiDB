@@ -122,7 +122,10 @@ function activateOnce(context: vscode.ExtensionContext): void {
   }
 
   const connectionManager = new ConnectionManager(context);
-  const connectionProvider = new ConnectionProvider(connectionManager);
+  const connectionProvider = new ConnectionProvider(
+    connectionManager,
+    context.globalStorageUri?.fsPath,
+  );
   const explorerView = vscode.window.createTreeView("rapidb-explorer", {
     treeDataProvider: connectionProvider,
     dragAndDropController: connectionProvider,
@@ -132,6 +135,7 @@ function activateOnce(context: vscode.ExtensionContext): void {
   const disposables: vscode.Disposable[] = [
     QueryPanel.registerSerializer(context, connectionManager),
     TablePanel.registerSerializer(context, connectionManager),
+    ErdPanel.registerSerializer(context, connectionManager),
     ...trackExplorerTreeView(explorerView, {
       context,
       connectionManager,

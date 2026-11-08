@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import type React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { cssVar } from "../../utils/cssVar";
 
 interface GridContextMenuState {
@@ -10,6 +11,8 @@ interface GridContextMenuProps {
   containerRef: React.RefObject<HTMLDivElement | null>;
   onCopy: () => void;
   onPaste?: () => void;
+  onOpen?: (target: HTMLElement) => void;
+  onClose?: () => void;
   canPaste?: boolean;
 }
 
@@ -20,6 +23,8 @@ export function GridContextMenu({
   containerRef,
   onCopy,
   onPaste,
+  onOpen,
+  onClose,
   canPaste = false,
 }: GridContextMenuProps) {
   const [menuState, setMenuState] = useState<GridContextMenuState | null>(null);
@@ -27,9 +32,10 @@ export function GridContextMenu({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const closeMenu = useCallback(() => {
+    onClose?.();
     setMenuState(null);
     setHoveredItem(null);
-  }, []);
+  }, [onClose]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -48,6 +54,7 @@ export function GridContextMenu({
       }
 
       event.preventDefault();
+      onOpen?.(target);
 
       const bounds = container.getBoundingClientRect();
       const x = Math.min(
@@ -67,7 +74,7 @@ export function GridContextMenu({
     return () => {
       container.removeEventListener("contextmenu", handleContextMenu);
     };
-  }, [containerRef]);
+  }, [containerRef, onOpen]);
 
   useEffect(() => {
     if (!menuState) {

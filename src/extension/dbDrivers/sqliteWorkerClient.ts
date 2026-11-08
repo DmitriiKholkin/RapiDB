@@ -15,16 +15,22 @@ interface Pending {
   request: SQLiteWorkerRequest;
   token?: number;
   timeoutMs: number;
+  deadlineLimited: boolean;
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout>;
   removeAbort?: () => void;
+  detachOnAbort: boolean;
   cleaned: boolean;
   settled: boolean;
 }
 
 const LOST_SESSION =
   " SQLite execution process was stopped and the connection is closed. Uncommitted transactions are rolled back. ATTACH, temporary tables and session state are lost; in-memory databases are lost. Use Connect to reconnect explicitly before continuing (:memory: starts a new empty database). Completed statements may have persisted; refresh file data before retrying.";
+const DETACHED_READ_TIMEOUT =
+  "A cancelled background SQLite read exceeded its timeout, so the SQLite worker was stopped and the connection is closed. Use Connect to reconnect explicitly before continuing.";
+const DETACHED_READ_CANCELLED =
+  "A cancelled background SQLite read was still running, so the SQLite worker was stopped to honor an explicit cancel and the connection is closed. Use Connect to reconnect explicitly before continuing.";
 const UNKNOWN_OUTCOME =
   " The active SQLite request outcome is unknown (OUTCOME_UNKNOWN); if it contained a write, it may have partially or fully persisted. Refresh and verify before retrying.";
 
@@ -41,6 +47,7 @@ export class SQLiteWorkerNotExecutedError extends Error {
   constructor(
     readonly method: SQLiteWorkerRequest["method"],
     readonly reason: Exclude<SQLiteWorkerNotExecutedReason, "expired">,
+    detail?: string,
   ) {
     const explanation = {
       "worker-stopped": "the SQLite worker stopped before it was sent",
@@ -48,7 +55,7 @@ export class SQLiteWorkerNotExecutedError extends Error {
       disconnected: "the connection was disconnected before it was sent",
     }[reason];
     super(
-      `[RapiDB] SQLite operation ${method} was NOT_EXECUTED (not executed): ${explanation}.`,
+      `[RapiDB] SQLite operation ${method} was NOT_EXECUTED (not executed): ${explanation}.${detail ? ` ${detail}` : ""}`,
     );
     this.name = "SQLiteWorkerNotExecutedError";
   }
@@ -63,6 +70,7 @@ export class SQLiteWorkerClient {
   connected = false;
   private memoryLost = false;
   private epoch = 0;
+  private abortInstallWait?: () => void;
 
   get sessionLost(): boolean {
     return this.memoryLost;
@@ -70,6 +78,7 @@ export class SQLiteWorkerClient {
 
   async open(config: ConnectionConfig, timeoutMs: number): Promise<void> {
     const epoch = ++this.epoch;
+    this.abortInstallWait?.();
     await this.close(false);
     if (epoch !== this.epoch)
       throw new Error("[RapiDB] SQLite connection attempt cancelled");
@@ -81,6 +90,23 @@ export class SQLiteWorkerClient {
         "[RapiDB] SQLite in-memory database was lost when execution was stopped. Create a new connection explicitly to start a new empty database.",
       );
     }
+    let abort: (() => void) | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        abort = () =>
+          reject(new Error("[RapiDB] SQLite connection attempt cancelled"));
+        this.abortInstallWait = abort;
+        ensureSQLiteRuntimeInstalled(__dirname).then(() => resolve(), reject);
+      });
+    } catch (error) {
+      if (epoch !== this.epoch)
+        throw new Error("[RapiDB] SQLite connection attempt cancelled");
+      throw error;
+    } finally {
+      if (this.abortInstallWait === abort) this.abortInstallWait = undefined;
+    }
+    if (epoch !== this.epoch)
+      throw new Error("[RapiDB] SQLite connection attempt cancelled");
     const request = this.enqueue(
       "connect",
       [],
@@ -103,6 +129,7 @@ export class SQLiteWorkerClient {
     token?: number,
     signal?: AbortSignal,
     deadline?: number,
+    detachOnAbort = false,
   ): Promise<T> {
     if (!this.connected) {
       const error = new SQLiteWorkerNotExecutedError(method, "disconnected");
@@ -118,6 +145,7 @@ export class SQLiteWorkerClient {
       signal,
       undefined,
       deadline,
+      detachOnAbort,
     ) as Promise<T>;
   }
 
@@ -129,22 +157,27 @@ export class SQLiteWorkerClient {
     signal?: AbortSignal,
     config?: ConnectionConfig,
     deadline?: number,
+    detachOnAbort = false,
   ): Promise<unknown> {
     if (signal?.aborted)
       return Promise.reject(
         new SQLiteWorkerNotExecutedError(method, "cancelled"),
       );
-    const expires = Math.min(
-      deadline ?? Infinity,
-      timeoutMs > 0 ? Date.now() + timeoutMs : Infinity,
-    );
+    const enqueuedAt = Date.now();
+    const timeoutDeadline = timeoutMs > 0 ? enqueuedAt + timeoutMs : Infinity;
+    const expires = Math.min(deadline ?? Infinity, timeoutDeadline);
+    const effectiveTimeoutMs = Number.isFinite(expires)
+      ? Math.max(0, expires - enqueuedAt)
+      : timeoutMs;
     return new Promise((resolve, reject) => {
       const pending: Pending = {
         request: { id: ++this.nextId, method, args, deadline: expires, config },
         token,
-        timeoutMs,
+        timeoutMs: effectiveTimeoutMs,
+        deadlineLimited: deadline !== undefined && deadline < timeoutDeadline,
         resolve,
         reject,
+        detachOnAbort,
         cleaned: false,
         settled: false,
         timer: setTimeout(
@@ -155,11 +188,16 @@ export class SQLiteWorkerClient {
         ),
       };
       if (signal) {
-        const abort = () =>
+        const abort = () => {
+          if (this.active === pending && pending.detachOnAbort) {
+            this.detach(pending);
+            return;
+          }
           this.cancelPending(
             pending,
             new Error("[RapiDB] SQLite operation cancelled"),
           );
+        };
         signal.addEventListener("abort", abort, { once: true });
         pending.removeAbort = () => signal.removeEventListener("abort", abort);
       }
@@ -178,8 +216,14 @@ export class SQLiteWorkerClient {
     const label =
       method === "connect" ? "Database connection" : "Database operation";
     if (this.active === pending) {
-      error.message = `${label} timed out after ${Math.max(1, Math.round(pending.timeoutMs / 1000))} second(s) while running ${method}.`;
-      void this.stop(error);
+      error.message = pending.deadlineLimited
+        ? `${label} timed out at its deadline while running ${method}.`
+        : `${label} timed out after ${Math.max(1, Math.round(pending.timeoutMs / 1000))} second(s) while running ${method}.`;
+      void this.stop(
+        error,
+        "worker-stopped",
+        pending.settled ? DETACHED_READ_TIMEOUT : undefined,
+      );
     } else {
       error.message = `${label} expired in the SQLite worker queue before running ${method}. The request was NOT_EXECUTED (not executed).`;
       Object.assign(error, {
@@ -203,24 +247,20 @@ export class SQLiteWorkerClient {
     }
     this.active = pending;
     if (pending.request.method === "connect") {
-      void this.start(pending).catch((error: unknown) => {
+      try {
+        this.start(pending);
+      } catch (error) {
         if (this.active === pending)
           void this.stop(
             error instanceof Error ? error : new Error(String(error)),
           );
-      });
+      }
     } else {
       this.send(pending);
     }
   }
 
-  private async start(pending: Pending): Promise<void> {
-    try {
-      await ensureSQLiteRuntimeInstalled(__dirname);
-    } catch (error) {
-      throw error instanceof Error ? error : new Error(String(error));
-    }
-    if (this.active !== pending) return;
+  private start(pending: Pending): void {
     pending.request.runtimeTargets = resolveBetterSqlite3LoadTargets(
       __dirname,
     ).map((target) => {
@@ -250,10 +290,6 @@ export class SQLiteWorkerClient {
         void this.stop(new Error(response.error.message));
         return;
       }
-      if (Date.now() >= current.request.deadline) {
-        this.expire(current);
-        return;
-      }
       if (response.error && current.request.method === "connect") {
         void this.stop(new Error(response.error.message));
         return;
@@ -263,8 +299,13 @@ export class SQLiteWorkerClient {
         current,
         response.error
           ? response.error.verificationFailure
-            ? new TransactionVerificationError(
-                response.error.verificationFailure,
+            ? Object.assign(
+                new TransactionVerificationError(
+                  response.error.verificationFailure,
+                ),
+                {
+                  rollbackConfirmed: response.error.rollbackConfirmed === true,
+                },
               )
             : Object.assign(new Error(response.error.message), {
                 name: response.error.name,
@@ -302,11 +343,20 @@ export class SQLiteWorkerClient {
   }
 
   private finish(pending: Pending, error?: Error, value?: unknown): void {
+    this.cleanup(pending);
     if (pending.settled) return;
     pending.settled = true;
-    this.cleanup(pending);
     if (error) pending.reject(error);
     else pending.resolve(value);
+  }
+
+  private detach(pending: Pending): void {
+    if (pending.settled) return;
+    pending.settled = true;
+    pending.removeAbort?.();
+    pending.reject(
+      new DOMException("[RapiDB] SQLite operation cancelled", "AbortError"),
+    );
   }
 
   private cleanup(pending: Pending): void {
@@ -335,15 +385,25 @@ export class SQLiteWorkerClient {
         : !context?.operationName ||
           pending.request.method === context.operationName;
     const pending = [this.active, ...this.queue].find(
-      (entry) => entry && matches(entry),
+      (entry) => entry && !entry.settled && matches(entry),
     );
-    if (pending)
-      this.cancelPending(
+    const error = new Error(
+      `[RapiDB] SQLite operation cancelled (${context?.reason ?? "manual"})`,
+    );
+    if (pending && this.active?.settled && this.active !== pending) {
+      this.queue = this.queue.filter((entry) => entry !== pending);
+      this.finish(
         pending,
-        new Error(
-          `[RapiDB] SQLite operation cancelled (${context?.reason ?? "manual"})`,
+        new SQLiteWorkerNotExecutedError(
+          pending.request.method,
+          "cancelled",
+          DETACHED_READ_CANCELLED,
         ),
       );
+      void this.stop(error, "worker-stopped", DETACHED_READ_CANCELLED);
+    } else if (pending) {
+      this.cancelPending(pending, error);
+    }
     await this.stopping;
   }
 
@@ -353,6 +413,7 @@ export class SQLiteWorkerClient {
       SQLiteWorkerNotExecutedReason,
       "expired"
     > = "worker-stopped",
+    queuedDetail?: string,
   ): Promise<void> {
     const child = this.child;
     const active = this.active;
@@ -373,6 +434,7 @@ export class SQLiteWorkerClient {
         executionState: "unknown",
       });
     } else if (
+      child &&
       active?.request.method === "connect" &&
       error.message.includes("timed out") &&
       !error.message.includes("connection is closed")
@@ -404,7 +466,11 @@ export class SQLiteWorkerClient {
       for (const entry of queued) {
         this.finish(
           entry,
-          new SQLiteWorkerNotExecutedError(entry.request.method, queuedReason),
+          new SQLiteWorkerNotExecutedError(
+            entry.request.method,
+            queuedReason,
+            queuedDetail,
+          ),
         );
       }
     });
@@ -412,7 +478,10 @@ export class SQLiteWorkerClient {
   }
 
   async close(invalidateAttempt = true): Promise<void> {
-    if (invalidateAttempt) this.epoch++;
+    if (invalidateAttempt) {
+      this.epoch++;
+      this.abortInstallWait?.();
+    }
     if (this.connected && !this.active && this.queue.length === 0) {
       try {
         await this.call("disconnect", [], 1000);

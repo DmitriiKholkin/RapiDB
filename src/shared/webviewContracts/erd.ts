@@ -1,7 +1,6 @@
 import type { PrimaryKeyRole } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
-  isRecord,
   parseEnvelope,
   parseRequiredPayloadRecord,
   readOptionalBoolean,
@@ -49,10 +48,30 @@ export interface ErdGraphScope {
   schema?: string;
 }
 
+export interface ErdOmittedTable {
+  database: string;
+  schema: string;
+  table: string;
+  error: string;
+}
+
+export interface ErdExternalReference {
+  fromTableId: string;
+  fromColumns: string[];
+  constraintName: string;
+  database: string;
+  schema: string;
+  table: string;
+  columns: string[];
+}
+
 export interface ErdGraph {
   nodes: ErdTableNode[];
   edges: ErdRelationshipEdge[];
   scope: ErdGraphScope;
+  omittedTables?: ErdOmittedTable[];
+  externalReferences?: ErdExternalReference[];
+  metadataIncomplete?: boolean;
 }
 
 export interface ErdInitialState extends PanelRetentionState {

@@ -5,12 +5,10 @@ import type {
   ColumnTypeMeta,
   FilterExpression,
 } from "../../src/extension/dbDrivers/types";
+import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
-import {
-  parseDynamoDbNativeQueryInput,
-  parseDynamoDbNativeQueryInputs,
-} from "../../src/shared/dynamodbNative";
+import { parseDynamoDbNativeQueryInputs } from "../../src/shared/dynamodbNative";
 import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const emptyBinaryCellMarker = "0x (empty binary)";
@@ -122,7 +120,11 @@ type CreateDriverOptions = {
         AttributeName: string;
         KeyType: "HASH" | "RANGE";
       }>;
-      Projection: { ProjectionType: "ALL" };
+      Projection?: {
+        ProjectionType: "ALL" | "KEYS_ONLY" | "INCLUDE";
+        NonKeyAttributes?: string[];
+      };
+      IndexStatus?: "CREATING" | "UPDATING" | "DELETING" | "ACTIVE";
     }>;
   };
 };
@@ -797,6 +799,7 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
     };
     for (const [input, expected] of [
       [literal, "binary"],
+      ["0x", "binary"],
       [escapedLiteral, escapedLiteral],
       [escapedNextLiteral, escapedNextLiteral],
     ]) {
@@ -841,6 +844,50 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
     expect(page.rows.map((row) => row.user_id).sort()).toEqual(
       ["binary", escapedLiteral].sort(),
     );
+  });
+
+  it.each([
+    false,
+    true,
+  ])("compares scalar Binary Equals, Not equal, and In by bytes, including empty 0x (skipCount=%s)", async (skipCount) => {
+    const binaryColumn = {
+      ...createColumns()[2],
+      nativeType: "binary",
+      category: "binary" as const,
+    };
+    const items = [
+      { user_id: "empty", email: Buffer.alloc(0) },
+      { user_id: "zero", email: Buffer.from([0]) },
+      { user_id: "data", email: Buffer.from([0, 255, 100, 1]) },
+    ];
+    const { driver, queueResponses } = createDriver({
+      columns: [...createColumns().slice(0, 2), binaryColumn],
+    });
+    queueResponses(
+      ...Array.from({ length: 4 }, () => ({
+        Items: items.map((item) => marshall(item)),
+      })),
+    );
+
+    const read = (operator: "eq" | "neq" | "in", value: string) =>
+      driver.readTablePage({
+        ...request,
+        skipCount,
+        filters: [{ column: "email", operator, value }],
+      });
+
+    expect((await read("eq", "0x")).rows.map((row) => row.user_id)).toEqual([
+      "empty",
+    ]);
+    expect(
+      (await read("eq", emptyBinaryCellMarker)).rows.map((row) => row.user_id),
+    ).toEqual(["empty"]);
+    expect(
+      (await read("neq", "0x")).rows.map((row) => row.user_id).sort(),
+    ).toEqual(["data", "zero"]);
+    expect(
+      (await read("in", "0x,0x00")).rows.map((row) => row.user_id).sort(),
+    ).toEqual(["empty", "zero"]);
   });
 
   it.each([
@@ -919,7 +966,6 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
       ["dead", ["s-hex"]],
       ["needle", ["s-needle", "ss-needle", "l-needle", "l-mixed"]],
       ["1", ["s-number", "ss-needle", "l-needle"]],
-      ["true", ["s-boolean", "ss-needle", "l-needle"]],
       ["null", ["s-null", "ss-needle", "l-needle"]],
     ] as const) {
       const native = createMarkerDriver(items);
@@ -970,6 +1016,75 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
             expectedKeys,
           );
         }
+      }
+    }
+  });
+
+  it.each([
+    "like",
+    "ilike",
+  ] as const)("matches DynamoDB List Boolean members type-safely for %s in streaming and materialized reads", async (operator) => {
+    const items = [
+      {
+        tenant_id: "tenant",
+        user_id: "list-mixed",
+        email: ["true", true, false, 3],
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "list-string",
+        email: ["true"],
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "set-string",
+        email: new Set(["true"]),
+      },
+      {
+        tenant_id: "tenant",
+        user_id: "list-false",
+        email: [false],
+      },
+    ];
+    const cases = [
+      ["true", ["list-mixed", "list-string", "set-string"]],
+      ["BOOL(true)", ["list-mixed"]],
+      ["false", []],
+      ["BOOL(false)", ["list-false", "list-mixed"]],
+      ["N(3)", ["list-mixed"]],
+      ['"true"', ["list-mixed", "list-string", "set-string"]],
+    ] as const;
+
+    for (const [needle, expected] of cases) {
+      for (const skipCount of [true, false]) {
+        const { driver, clientSend } = createMarkerDriver(items);
+        vi.spyOn(driver, "describeColumns").mockResolvedValue(
+          createColumns().map((column) =>
+            column.name === "email"
+              ? {
+                  ...column,
+                  type: "list",
+                  nativeType: "list",
+                  category: "array",
+                }
+              : column,
+          ),
+        );
+        const page = await driver.readTablePage({
+          ...request,
+          skipCount,
+          filters: [{ column: "email", operator, value: needle }],
+        });
+
+        const expectedForOperator =
+          operator === "ilike" && needle === "N(3)" ? [] : expected;
+        expect(
+          page.rows.map((row) => row.user_id).sort(),
+          `operator=${operator}, needle=${needle}, skipCount=${skipCount}`,
+        ).toEqual([...expectedForOperator].sort());
+        expect(
+          commandInputs(clientSend, "ScanCommand")[0].FilterExpression,
+        ).toBeUndefined();
       }
     }
   });
@@ -1054,7 +1169,7 @@ describe("DynamoDB lossless marker filter inputs (R9)", () => {
   });
 });
 
-describe("parseDynamoDbNativeQueryInput", () => {
+describe("parseDynamoDbNativeQueryInputs", () => {
   it("renders native query numbers as exact scalars with numeric metadata", async () => {
     const { driver, queueResponses } = createDriver();
     queueResponses({
@@ -1125,7 +1240,9 @@ describe("parseDynamoDbNativeQueryInput", () => {
       Buffer.alloc(0),
     );
     expect(driver.coerceInputValue("", binaryColumn)).toBe("");
-    expect(driver.coerceInputValue("0xA", binaryColumn)).toBe("0xA");
+    expect(() => driver.coerceInputValue("0xA", binaryColumn)).toThrow(
+      'DynamoDB Binary value for "payload" must be 0x-prefixed hex or base64.',
+    );
     expect(driver.coerceInputValue("0x", textColumn)).toBe("0x");
 
     const escapedMarker = `\\${emptyBinaryCellMarker}`;
@@ -1246,10 +1363,10 @@ describe("parseDynamoDbNativeQueryInput", () => {
 
   it("parses a single raw AWS request body", () => {
     expect(
-      parseDynamoDbNativeQueryInput(
+      parseDynamoDbNativeQueryInputs(
         JSON.stringify({ TableName: "users", ConsistentRead: true }),
       ),
-    ).toEqual({ TableName: "users", ConsistentRead: true });
+    ).toEqual([{ TableName: "users", ConsistentRead: true }]);
   });
 
   it("parses multiple consecutive raw AWS request bodies", () => {
@@ -1267,14 +1384,14 @@ describe("parseDynamoDbNativeQueryInput", () => {
   });
 
   it("rejects empty, malformed, and legacy envelope payloads", () => {
-    expect(() => parseDynamoDbNativeQueryInput("   ")).toThrow(
+    expect(() => parseDynamoDbNativeQueryInputs("   ")).toThrow(
       /cannot be empty/i,
     );
-    expect(() => parseDynamoDbNativeQueryInput("{")).toThrow(
+    expect(() => parseDynamoDbNativeQueryInputs("{")).toThrow(
       /must be valid JSON/i,
     );
     expect(() =>
-      parseDynamoDbNativeQueryInput(
+      parseDynamoDbNativeQueryInputs(
         JSON.stringify({ operation: "Scan", input: { TableName: "users" } }),
       ),
     ).toThrow(/remove the legacy operation wrapper/i);
@@ -1282,6 +1399,261 @@ describe("parseDynamoDbNativeQueryInput", () => {
 });
 
 describe("DynamoDBDriver native API", () => {
+  it.each([
+    "Invalid FilterExpression: The BETWEEN operator requires upper bound to be greater than or equal to lower bound",
+    "ValidationException: Invalid FilterExpression: The filter expression is invalid",
+    'Invalid DynamoDB table filter: column "age" requires a numeric value',
+    'Invalid DynamoDB table filter: column "active" requires true, false, 1, or 0; received "not-a-bool".',
+  ])("classifies table filter errors for stale-row handling: %s", (message) => {
+    const { driver } = createDriver();
+
+    expect(driver.getCapabilities().isTableFilterError?.(message)).toBe(true);
+  });
+
+  it("does not classify unrelated backend failures as table filter errors", () => {
+    const { driver } = createDriver();
+
+    expect(
+      driver
+        .getCapabilities()
+        .isTableFilterError?.("NetworkingError: socket hang up"),
+    ).toBe(false);
+  });
+
+  it("classifies DynamoDB key type mismatches as table filter errors", () => {
+    const { driver } = createDriver();
+
+    expect(
+      driver
+        .getCapabilities()
+        .isTableFilterError?.(
+          "One or more parameter values were invalid: Condition parameter type does not match schema type",
+        ),
+    ).toBe(true);
+  });
+
+  it.each([
+    { operator: "eq" as const, value: "not-a-bool" },
+    { operator: "in" as const, value: "true, not-a-bool" },
+  ])("rejects invalid Boolean table filter operands before applying them: %s", async (filter) => {
+    const booleanColumn: ColumnTypeMeta = {
+      ...createColumns()[2],
+      name: "active",
+      type: "boolean",
+      nativeType: "boolean",
+      category: "boolean",
+      valueSemantics: "boolean",
+    };
+    const { driver, clientSend, queueResponses } = createDriver({
+      columns: [...createColumns(), booleanColumn],
+    });
+    const driverState = driver as unknown as {
+      describeColumns: DynamoDBDriver["describeColumns"];
+    };
+    driverState.describeColumns =
+      DynamoDBDriver.prototype.describeColumns.bind(driver);
+    queueResponses({
+      Items: [
+        marshall({ tenant_id: "tenant", user_id: "bool-row", active: true }),
+      ],
+    });
+
+    await expect(
+      driver.readTablePage({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        page: 1,
+        pageSize: 25,
+        sort: null,
+        skipCount: true,
+        filters: [{ column: "active", ...filter }],
+      }),
+    ).rejects.toThrow(
+      'Invalid DynamoDB table filter: column "active" requires true, false, 1, or 0; received "not-a-bool".',
+    );
+
+    const scans = commandInputs(clientSend, "ScanCommand");
+    expect(scans).toHaveLength(1);
+    expect(scans[0].FilterExpression).toBeUndefined();
+    expect(commandInputs(clientSend, "QueryCommand")).toHaveLength(0);
+  });
+
+  it("keeps valid Boolean Equals and In table filters native", async () => {
+    const booleanColumn: ColumnTypeMeta = {
+      ...createColumns()[2],
+      name: "active",
+      type: "boolean",
+      nativeType: "boolean",
+      category: "boolean",
+      valueSemantics: "boolean",
+    };
+    const { driver, clientSend, queueResponses } = createDriver({
+      columns: [...createColumns(), booleanColumn],
+    });
+    queueResponses(
+      {
+        Items: [
+          marshall({ tenant_id: "tenant", user_id: "yes", active: true }),
+        ],
+      },
+      {
+        Items: [
+          marshall({ tenant_id: "tenant", user_id: "no", active: false }),
+        ],
+      },
+    );
+
+    await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      sort: null,
+      skipCount: true,
+      filters: [{ column: "active", operator: "eq", value: "true" }],
+    });
+    await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      sort: null,
+      skipCount: true,
+      filters: [{ column: "active", operator: "in", value: "0,1" }],
+    });
+
+    const scanInputs = commandInputs(clientSend, "ScanCommand");
+    expect(scanInputs).toHaveLength(2);
+    expect(scanInputs[0].ExpressionAttributeValues).toEqual({
+      ":v0": { BOOL: true },
+    });
+    expect(scanInputs[1].ExpressionAttributeValues).toEqual({
+      ":v0": { BOOL: false },
+      ":v1": { BOOL: true },
+    });
+  });
+
+  it("encodes Binary partition-key Equals operands as DynamoDB B values", async () => {
+    const binaryPartitionKey: ColumnTypeMeta = {
+      ...createColumns()[0],
+      name: "pk",
+      type: "binary",
+      nativeType: "binary",
+      category: "binary",
+      primaryKeyRole: "partition",
+    };
+    const sortKey: ColumnTypeMeta = {
+      ...createColumns()[1],
+      name: "sk",
+      primaryKeyRole: "sort",
+    };
+    const describeTable = {
+      KeySchema: [
+        { AttributeName: "pk", KeyType: "HASH" as const },
+        { AttributeName: "sk", KeyType: "RANGE" as const },
+      ],
+      AttributeDefinitions: [
+        { AttributeName: "pk", AttributeType: "B" as const },
+        { AttributeName: "sk", AttributeType: "S" as const },
+      ],
+    };
+    const bytes = Buffer.from("00ff6401", "hex");
+    const { driver, clientSend, queueResponses } = createDriver({
+      columns: [binaryPartitionKey, sortKey],
+      describeTable,
+    });
+    queueResponses(
+      { Items: [marshall({ pk: bytes, sk: "one" })] },
+      { Items: [marshall({ pk: bytes, sk: "one" })] },
+      { Items: [marshall({ pk: Buffer.from([1]), sk: "other" })] },
+      { Items: [marshall({ pk: Buffer.from([1]), sk: "other" })] },
+    );
+
+    for (const value of ["0x00ff6401", "AP9kAQ==", "0x (empty binary)"]) {
+      await driver.readTablePage({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "binary-key-items",
+        page: 1,
+        pageSize: 25,
+        sort: null,
+        skipCount: true,
+        filters: [{ column: "pk", operator: "eq", value }],
+      });
+    }
+
+    await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "binary-key-items",
+      page: 1,
+      pageSize: 25,
+      sort: null,
+      skipCount: true,
+      filters: [
+        { column: "pk", operator: "eq", value: "0x (empty binary)" },
+        { column: "sk", operator: "eq", value: "empty" },
+      ],
+    });
+
+    const queryInputs = commandInputs(clientSend, "QueryCommand");
+    expect(queryInputs).toHaveLength(2);
+    for (const input of queryInputs) {
+      expect(input.KeyConditionExpression).toBe("#n0 = :v0");
+      expect(input.ExpressionAttributeNames).toEqual({ "#n0": "pk" });
+      expect(input.ExpressionAttributeValues).toEqual({
+        ":v0": { B: bytes },
+      });
+    }
+    expect(commandInputs(clientSend, "GetItemCommand")).toHaveLength(0);
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+  });
+
+  it("returns each row's native AttributeValue type for mixed-type columns", async () => {
+    const { driver, queueResponses } = createDriver();
+    queueResponses({
+      Items: [
+        marshall({
+          tenant_id: "tenant-1",
+          user_id: "string-row",
+          age: "not-a-number",
+        }),
+        marshall({
+          tenant_id: "tenant-1",
+          user_id: "number-row",
+          age: NumberValueImpl.from("9007199254740993.1250"),
+        }),
+      ],
+    });
+
+    const page = await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      filters: [],
+      sort: null,
+      skipCount: true,
+    });
+
+    expect(page.rows.map((row) => row.user_id)).toEqual([
+      "string-row",
+      "number-row",
+    ]);
+    expect(page.rowValueTypes).toEqual([
+      expect.objectContaining({
+        age: { category: "text", nativeType: "string" },
+      }),
+      expect.objectContaining({
+        age: { category: "decimal", nativeType: "number" },
+      }),
+    ]);
+  });
+
   it.each([
     '{"TableName":}',
     '{"TableName":}{"TableName":"users"}',
@@ -1295,6 +1667,33 @@ describe("DynamoDBDriver native API", () => {
     await expect(driver.query(text)).rejects.toThrow(
       /^DynamoDB native query text must be valid JSON\./,
     );
+    expect(clientSend).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "manual_create_table_probe",
+    "Users",
+  ])("rejects CreateTable-shaped input for %s instead of dispatching Scan", async (tableName) => {
+    const { driver, clientSend } = createDriver();
+    const createTableRequest = {
+      TableName: tableName,
+      AttributeDefinitions: [{ AttributeName: "userId", AttributeType: "S" }],
+      KeySchema: [{ AttributeName: "userId", KeyType: "HASH" }],
+      BillingMode: "PAY_PER_REQUEST",
+    };
+
+    await expect(
+      driver.query(JSON.stringify(createTableRequest)),
+    ).rejects.toThrow(/does not support CreateTable requests/i);
+    expect(clientSend).not.toHaveBeenCalled();
+  });
+
+  it("rejects an explicit CreateTable envelope before SDK dispatch", async () => {
+    const { driver, clientSend } = createDriver();
+
+    await expect(
+      driver.query(JSON.stringify({ CreateTable: { TableName: "Users" } })),
+    ).rejects.toThrow(/does not support CreateTable requests/i);
     expect(clientSend).not.toHaveBeenCalled();
   });
 
@@ -1321,6 +1720,97 @@ describe("DynamoDBDriver native API", () => {
     expect(result.columns).toEqual(
       expect.arrayContaining(["email", "tenant_id", "user_id"]),
     );
+  });
+
+  it("retains native AttributeValue envelopes for Table and Query exports", async () => {
+    const { driver, queueResponses } = createDriver();
+    const items = [
+      {
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        exact: NumberValueImpl.from("9007199254740993.1250"),
+        binary: Buffer.from([1, 2, 3]),
+        stringSet: new Set(["alpha", "beta"]),
+        numberSet: new Set([
+          NumberValueImpl.from("2.00"),
+          NumberValueImpl.from("9007199254740993"),
+        ]),
+        binarySet: new Set([Buffer.from([1, 2, 3]), Buffer.from([4, 5, 6])]),
+        nested: {
+          map: { amount: NumberValueImpl.from("9007199254740993") },
+          list: ["entry", true, null],
+        },
+      },
+      {
+        tenant_id: "tenant-1",
+        user_id: "user-2",
+        nullable: null,
+      },
+    ];
+    const scanResponse = { Items: items.map((item) => marshall(item)) };
+    queueResponses(scanResponse);
+
+    const queryResult = await driver.query(
+      JSON.stringify({ TableName: "users" }),
+      ["Scan"],
+    );
+    const queryRow = queryResult.exportRows?.[0];
+    const queryValue = (column: string) =>
+      queryRow?.[`__col_${queryResult.columns.indexOf(column)}`];
+    expect(queryValue("exact")).toEqual({ N: "9007199254740993.1250" });
+    expect(queryValue("binary")).toEqual({ B: "AQID" });
+    expect(queryValue("stringSet")).toEqual({ SS: ["alpha", "beta"] });
+    expect(queryValue("numberSet")).toEqual({
+      NS: ["2.00", "9007199254740993"],
+    });
+    expect(queryValue("binarySet")).toEqual({ BS: ["AQID", "BAUG"] });
+    expect(queryValue("nested")).toEqual({
+      M: {
+        map: { M: { amount: { N: "9007199254740993" } } },
+        list: {
+          L: [{ S: "entry" }, { BOOL: true }, { NULL: true }],
+        },
+      },
+    });
+    const nullableIndex = queryResult.columns.indexOf("nullable");
+    expect(queryResult.exportRows?.[1]).toHaveProperty(
+      `__col_${nullableIndex}`,
+      { NULL: true },
+    );
+    expect(queryResult.missingCells).toContainEqual({
+      rowIndex: 0,
+      columnIndex: nullableIndex,
+    });
+
+    queueResponses(scanResponse);
+    const page = await driver.readTablePage({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      page: 1,
+      pageSize: 25,
+      filters: [],
+      sort: null,
+      skipCount: true,
+    });
+    const chunk = driver.formatTableExportChunk({
+      columns: page.columns,
+      rows: page.rows,
+    });
+    const tableRow = chunk.rows[0];
+    expect(tableRow.exact).toEqual({ N: "9007199254740993.1250" });
+    expect(tableRow.binary).toEqual({ B: "AQID" });
+    expect(tableRow.stringSet).toEqual({ SS: ["alpha", "beta"] });
+    expect(tableRow.numberSet).toEqual({
+      NS: ["2.00", "9007199254740993"],
+    });
+    expect(tableRow.binarySet).toEqual({ BS: ["AQID", "BAUG"] });
+    expect(chunk.missingCells).toContainEqual({
+      rowIndex: 0,
+      columnIndex: page.columns.findIndex(
+        (column) => column.name === "nullable",
+      ),
+    });
   });
 
   it("infers UpdateItem when the editor action is still the generic default", async () => {
@@ -1597,6 +2087,230 @@ describe("DynamoDBDriver native API", () => {
     expect(deletePreviews[1]).toMatchObject({ TableName: "users" });
     expect(deletePreviews[0]).not.toHaveProperty("operation");
     expect(deletePreviews[1]).not.toHaveProperty("operation");
+  });
+
+  it("rejects invalid numeric edits before creating or sending an UpdateItem", async () => {
+    const { driver, clientSend } = createDriver();
+    const ageColumn = createColumns().find((column) => column.name === "age");
+    expect(ageColumn).toBeDefined();
+    expect(
+      driver.coerceInputValue(
+        "9007199254740993.1250",
+        ageColumn as ColumnTypeMeta,
+      ),
+    ).toEqual(NumberValueImpl.from("9007199254740993.1250"));
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => createColumns() },
+    );
+
+    await expect(
+      mutationService.updateRow(
+        "conn-ddb",
+        "us-east-1",
+        "us-east-1",
+        "users",
+        { tenant_id: "tenant-1", user_id: "user-1" },
+        { age: "not-a-number" },
+      ),
+    ).rejects.toThrow(
+      'DynamoDB Number value for "age" must be a valid number.',
+    );
+    expect(commandInputs(clientSend, "UpdateItemCommand")).toHaveLength(0);
+  });
+
+  it("preserves string-encoded decimal tokens when editing a DynamoDB Number Set", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const numberSetColumn: ColumnTypeMeta = {
+      ...createColumns()[2],
+      name: "numberSet",
+      type: "number set",
+      nativeType: "number set",
+      category: "array",
+    };
+    const columns = [...createColumns(), numberSetColumn];
+    const input = '["1.25","9007199254740993","7.50"]';
+    const expected = new Set([
+      NumberValueImpl.from("1.25"),
+      NumberValueImpl.from("9007199254740993"),
+      NumberValueImpl.from("7.50"),
+    ]);
+    queueResponses({
+      Attributes: marshall({
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        numberSet: expected,
+      }),
+    });
+
+    expect(driver.coerceInputValue(input, numberSetColumn)).toEqual(expected);
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => columns },
+    );
+
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      { tenant_id: "tenant-1", user_id: "user-1" },
+      { numberSet: input },
+    );
+
+    expect(
+      commandInputs(clientSend, "UpdateItemCommand")[0]
+        ?.ExpressionAttributeValues,
+    ).toEqual({
+      ":u0": { NS: ["1.25", "9007199254740993", "7.50"] },
+    });
+  });
+
+  it("validates Binary Set edits and deduplicates entries by bytes", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const binarySetColumn: ColumnTypeMeta = {
+      ...createColumns()[2],
+      name: "binarySet",
+      type: "binary set",
+      nativeType: "binary set",
+      category: "array",
+    };
+    const columns = [...createColumns(), binarySetColumn];
+    const expected = new Set([Buffer.from([1, 2, 3]), Buffer.from([4, 5, 6])]);
+
+    expect(
+      driver.coerceInputValue("<<0x010203, 0x040506>>", binarySetColumn),
+    ).toEqual(expected);
+    expect(
+      driver.coerceInputValue('["0x010203","BAUG"]', binarySetColumn),
+    ).toEqual(expected);
+    for (const malformed of [
+      "<<0x01GG, 0x040506>>",
+      '["0x01GG"]',
+      "<<>>",
+      emptyBinaryCellMarker,
+      `\\${emptyBinaryCellMarker}`,
+      '\\DynamoDB native value (nested sets/binary): {"BS":["AQID"]}',
+    ]) {
+      expect(() => driver.coerceInputValue(malformed, binarySetColumn)).toThrow(
+        'DynamoDB Binary Set value for "binarySet" must contain valid binary values (0x-prefixed hex or base64).',
+      );
+    }
+
+    const mutationService = new TableMutationService(
+      {
+        getConnection: () => ({ id: "conn-ddb" }),
+        getDriver: () => driver,
+      } as never,
+      { getColumns: async () => columns },
+    );
+
+    await expect(
+      mutationService.updateRow(
+        "conn-ddb",
+        "us-east-1",
+        "us-east-1",
+        "users",
+        { tenant_id: "tenant-1", user_id: "user-1" },
+        { binarySet: "<<0x01GG, 0x040506>>" },
+      ),
+    ).rejects.toThrow(
+      'DynamoDB Binary Set value for "binarySet" must contain valid binary values (0x-prefixed hex or base64).',
+    );
+    expect(commandInputs(clientSend, "UpdateItemCommand")).toHaveLength(0);
+
+    queueResponses({
+      Attributes: marshall({
+        tenant_id: "tenant-1",
+        user_id: "user-1",
+        binarySet: new Set([Buffer.from([1, 2, 3])]),
+      }),
+    });
+    await mutationService.updateRow(
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      { tenant_id: "tenant-1", user_id: "user-1" },
+      { binarySet: "<<0x010203, 0x010203>>" },
+    );
+    expect(
+      commandInputs(clientSend, "UpdateItemCommand")[0]
+        ?.ExpressionAttributeValues,
+    ).toEqual({ ":u0": { BS: [Buffer.from([1, 2, 3])] } });
+  });
+
+  it("uses each DynamoDB row's original type when preparing edit previews", () => {
+    const { driver } = createDriver();
+    const manager = {
+      getConnection: () => ({ id: "conn-ddb", readOnly: false }),
+      getDriver: () => driver,
+    } as never;
+    const ageColumn = createColumns().find((column) => column.name === "age");
+    expect(ageColumn).toBeDefined();
+    const preview = vi.spyOn(driver, "buildMutationPreviewStatement");
+
+    const stringRowPlan = prepareApplyChangesPlan(
+      manager,
+      "conn-ddb",
+      "us-east-1",
+      "us-east-1",
+      "users",
+      [
+        {
+          primaryKeys: { tenant_id: "tenant-1", user_id: "string-row" },
+          changes: { age: "not-a-number" },
+          originalTypes: {
+            age: { category: "text", nativeType: "string" },
+          },
+        },
+      ],
+      createColumns(),
+    );
+    expect(stringRowPlan.executable).toBe(true);
+    if (!stringRowPlan.executable)
+      throw new Error("Expected a string-row preview");
+    expect(stringRowPlan.plan.updates[0].changes.age).toBe("not-a-number");
+    expect(preview).toHaveBeenCalledOnce();
+
+    preview.mockClear();
+    const stringSampleColumn = {
+      ...(ageColumn as ColumnTypeMeta),
+      type: "string",
+      nativeType: "string",
+      category: "text" as const,
+    };
+    const stringSampleColumns = createColumns().map((column) =>
+      column.name === "age" ? stringSampleColumn : column,
+    );
+    expect(() =>
+      prepareApplyChangesPlan(
+        manager,
+        "conn-ddb",
+        "us-east-1",
+        "us-east-1",
+        "users",
+        [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "number-row" },
+            changes: { age: "not-a-number" },
+            originalTypes: {
+              age: { category: "decimal", nativeType: "number" },
+            },
+          },
+        ],
+        stringSampleColumns,
+      ),
+    ).toThrow('DynamoDB Number value for "age" must be a valid number.');
+    expect(preview).not.toHaveBeenCalled();
   });
 
   it("coerces edited DynamoDB values into native types before building previews", async () => {
@@ -2000,6 +2714,53 @@ describe("DynamoDBDriver native API", () => {
     });
   });
 
+  it("reports a conditional duplicate PutItem as a definite no-write failure", async () => {
+    const { driver, clientSend } = createDriver();
+    const conditionalFailure = Object.assign(
+      new Error("The conditional request failed"),
+      { name: "ConditionalCheckFailedException" },
+    );
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "PutItemCommand") {
+        throw conditionalFailure;
+      }
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "tenant_id", AttributeType: "S" },
+              { AttributeName: "user_id", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      return {};
+    });
+
+    await expect(
+      driver.insertRow({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        values: { tenant_id: "tenant-1", user_id: "user-1" },
+      }),
+    ).rejects.toMatchObject({
+      name: "MutationNotExecutedError",
+      executionState: "not-executed",
+      message:
+        "Insert rejected because an item with the same primary key already exists. No item was written.",
+    });
+
+    expect(commandInputs(clientSend, "PutItemCommand")[0]).toMatchObject({
+      ConditionExpression:
+        "attribute_not_exists(#k0) AND attribute_not_exists(#k1)",
+    });
+  });
+
   it("uses TransactWriteItems for multi-row table updates", async () => {
     const { driver, clientSend } = createDriver();
 
@@ -2091,6 +2852,109 @@ describe("DynamoDBDriver native API", () => {
     expect(commandInputs(clientSend, "TransactWriteItemsCommand")).toHaveLength(
       1,
     );
+  });
+
+  it("reports a rejected DynamoDB ValidationException as definitely not applied", async () => {
+    const { driver, clientSend } = createDriver();
+    const error = Object.assign(new Error("Invalid attribute value type"), {
+      name: "ValidationException",
+    });
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "tenant_id", AttributeType: "S" },
+              { AttributeName: "user_id", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      throw error;
+    });
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: null },
+            originalValues: { email: "alice@example.com" },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      name: "DriverUpdateRowsError",
+      message: error.message,
+      cause: error,
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [{ rowIndex: 0, status: "not_applied" }],
+      },
+    });
+    expect(commandInputs(clientSend, "UpdateItemCommand")[0]).toMatchObject({
+      ExpressionAttributeValues: { ":u0": { NULL: true } },
+    });
+  });
+
+  it("reports a rejected DynamoDB transaction ValidationException as not applied for every row", async () => {
+    const { driver, clientSend } = createDriver();
+    const error = Object.assign(new Error("Invalid attribute value type"), {
+      name: "ValidationException",
+    });
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+            AttributeDefinitions: [
+              { AttributeName: "tenant_id", AttributeType: "S" },
+              { AttributeName: "user_id", AttributeType: "S" },
+            ],
+          },
+        };
+      }
+      throw error;
+    });
+
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-1" },
+            changes: { email: null },
+          },
+          {
+            primaryKeys: { tenant_id: "tenant-1", user_id: "user-2" },
+            changes: { email: null },
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({
+      name: "DriverUpdateRowsError",
+      message: error.message,
+      cause: error,
+      result: {
+        affectedRows: 0,
+        updateRowOutcomes: [
+          { rowIndex: 0, status: "not_applied" },
+          { rowIndex: 1, status: "not_applied" },
+        ],
+      },
+    });
   });
 
   it.each([
@@ -2694,5 +3558,726 @@ describe("DynamoDBDriver native API", () => {
       TableName: "users",
     });
     expect(page.rows).toEqual([]);
+  });
+});
+
+describe("DynamoDB secondary index read plan selection", () => {
+  const baseRequest = {
+    database: "us-east-1",
+    schema: "us-east-1",
+    table: "users",
+    page: 1,
+    pageSize: 25,
+    sort: null,
+    skipCount: true,
+  };
+  const emailFilter: FilterExpression = {
+    column: "email",
+    operator: "eq",
+    value: "a@example.com",
+  };
+
+  function createIndexedDriver(
+    options: {
+      projection?: { ProjectionType: "ALL" | "KEYS_ONLY" | "INCLUDE" };
+      indexSortKey?: string;
+      indexStatus?: "CREATING" | "ACTIVE";
+    } = {},
+  ) {
+    return createDriver({
+      describeTable: {
+        KeySchema: [
+          { AttributeName: "tenant_id", KeyType: "HASH" },
+          { AttributeName: "user_id", KeyType: "RANGE" },
+        ],
+        AttributeDefinitions: [
+          { AttributeName: "tenant_id", AttributeType: "S" },
+          { AttributeName: "user_id", AttributeType: "S" },
+          { AttributeName: "email", AttributeType: "S" },
+          { AttributeName: "age", AttributeType: "N" },
+        ],
+        GlobalSecondaryIndexes: [
+          {
+            IndexName: "email-index",
+            KeySchema: [
+              { AttributeName: "email", KeyType: "HASH" },
+              ...(options.indexSortKey
+                ? [
+                    {
+                      AttributeName: options.indexSortKey,
+                      KeyType: "RANGE" as const,
+                    },
+                  ]
+                : []),
+            ],
+            ...(options.projection ? { Projection: options.projection } : {}),
+            ...(options.indexStatus
+              ? { IndexStatus: options.indexStatus }
+              : {}),
+          },
+        ],
+      },
+    });
+  }
+
+  async function expectEmailScan(
+    options: Parameters<typeof createIndexedDriver>[0],
+  ) {
+    const { driver, clientSend, queueResponses } = createIndexedDriver(options);
+    queueResponses({ Items: [] });
+
+    await driver.readTablePage({ ...baseRequest, filters: [emailFilter] });
+
+    expect(commandInputs(clientSend, "QueryCommand")).toHaveLength(0);
+    const scanInputs = commandInputs(clientSend, "ScanCommand");
+    expect(scanInputs).toHaveLength(1);
+    expect(scanInputs[0].IndexName).toBeUndefined();
+    expect(scanInputs[0]).toMatchObject({
+      FilterExpression: "#n0 = :v0",
+      ExpressionAttributeNames: { "#n0": "email" },
+      ExpressionAttributeValues: { ":v0": { S: "a@example.com" } },
+    });
+  }
+
+  async function expectEmailIndexQuery(
+    options: Parameters<typeof createIndexedDriver>[0],
+  ) {
+    const { driver, clientSend, queueResponses } = createIndexedDriver(options);
+    queueResponses({ Items: [] });
+
+    await driver.readTablePage({ ...baseRequest, filters: [emailFilter] });
+
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(0);
+    const queryInputs = commandInputs(clientSend, "QueryCommand");
+    expect(queryInputs).toHaveLength(1);
+    expect(queryInputs[0]).toMatchObject({
+      IndexName: "email-index",
+      KeyConditionExpression: "#n0 = :v0",
+      ExpressionAttributeNames: { "#n0": "email" },
+    });
+    expect(queryInputs[0].FilterExpression).toBeUndefined();
+  }
+
+  it.each([
+    "KEYS_ONLY",
+    "INCLUDE",
+  ] as const)("scans the base table instead of querying a %s projected GSI", async (projectionType) => {
+    await expectEmailScan({ projection: { ProjectionType: projectionType } });
+  });
+
+  it("scans the base table when the GSI projection is unknown", async () => {
+    await expectEmailScan({});
+  });
+
+  it("scans the base table when the GSI is not active", async () => {
+    await expectEmailScan({
+      projection: { ProjectionType: "ALL" },
+      indexStatus: "CREATING",
+    });
+  });
+
+  it("scans the base table when a sparse GSI sort key is not constrained", async () => {
+    await expectEmailScan({
+      projection: { ProjectionType: "ALL" },
+      indexSortKey: "age",
+    });
+  });
+
+  it("queries a fully projected GSI when its sort key is constrained", async () => {
+    const { driver, clientSend, queueResponses } = createIndexedDriver({
+      projection: { ProjectionType: "ALL" },
+      indexSortKey: "age",
+    });
+    queueResponses({ Items: [] });
+
+    await driver.readTablePage({
+      ...baseRequest,
+      filters: [emailFilter, { column: "age", operator: "gte", value: "18" }],
+    });
+
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(0);
+    const queryInputs = commandInputs(clientSend, "QueryCommand");
+    expect(queryInputs).toHaveLength(1);
+    expect(queryInputs[0]).toMatchObject({
+      IndexName: "email-index",
+      KeyConditionExpression: "#n0 = :v0 AND #n1 >= :v1",
+    });
+    expect(queryInputs[0].FilterExpression).toBeUndefined();
+  });
+
+  it.each([
+    undefined,
+    "user_id",
+    "tenant_id",
+  ])("queries a fully projected GSI whose sort key is %s", async (indexSortKey) => {
+    await expectEmailIndexQuery({
+      projection: { ProjectionType: "ALL" },
+      indexSortKey,
+    });
+  });
+
+  it("queries a fully projected GSI with an ACTIVE status", async () => {
+    await expectEmailIndexQuery({
+      projection: { ProjectionType: "ALL" },
+      indexStatus: "ACTIVE",
+    });
+  });
+});
+
+describe("DynamoDB driver review regressions", () => {
+  const pageRequest = {
+    database: "us-east-1",
+    schema: "us-east-1",
+    table: "users",
+    page: 1,
+    pageSize: 25,
+    sort: null,
+    skipCount: true,
+  };
+
+  function binaryColumn(name: string, nativeType = "binary"): ColumnTypeMeta {
+    return {
+      ...createMapColumn(),
+      name,
+      type: nativeType,
+      nativeType,
+      category: nativeType === "binary" ? "binary" : "array",
+    };
+  }
+
+  it.each([
+    [
+      [
+        { column: "tenant_id", operator: "eq", value: "tenant-1" },
+        { column: "user_id", operator: "like", value: "user" },
+      ],
+    ],
+    [
+      [
+        { column: "tenant_id", operator: "eq", value: "tenant-1" },
+        { column: "user_id", operator: "gte", value: "a" },
+        { column: "user_id", operator: "lte", value: "m" },
+      ],
+    ],
+    [
+      [
+        { column: "email", operator: "eq", value: "a@example.com" },
+        { column: "user_id", operator: "neq", value: "user-1" },
+      ],
+    ],
+  ] as Array<
+    [FilterExpression[]]
+  >)("scans instead of filtering a Query on its own key attributes (%j)", async (filters) => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Items: [] });
+
+    await driver.readTablePage({ ...pageRequest, filters });
+
+    expect(commandInputs(clientSend, "QueryCommand")).toHaveLength(0);
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(1);
+  });
+
+  it.each([
+    [[{ column: "tenant_id", operator: "eq", value: "" }]],
+    [[{ column: "email", operator: "eq", value: "" }]],
+    [
+      [
+        { column: "tenant_id", operator: "eq", value: "tenant-1" },
+        { column: "user_id", operator: "eq", value: "" },
+      ],
+    ],
+  ] as Array<
+    [FilterExpression[]]
+  >)("never sends an empty key value in a Query or GetItem (%j)", async (filters) => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Items: [] });
+
+    await driver.readTablePage({ ...pageRequest, filters });
+
+    expect(commandInputs(clientSend, "QueryCommand")).toHaveLength(0);
+    expect(commandInputs(clientSend, "GetItemCommand")).toHaveLength(0);
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      TableName: "users",
+      KeyConditions: {
+        tenant_id: {
+          ComparisonOperator: "EQ",
+          AttributeValueList: [{ S: "tenant-1" }],
+        },
+      },
+    },
+    {
+      TableName: "users",
+      QueryFilter: {
+        email: {
+          ComparisonOperator: "EQ",
+          AttributeValueList: [{ S: "a@example.com" }],
+        },
+      },
+    },
+  ])("runs a legacy Query request as Query (%j)", async (input) => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Items: [] });
+
+    await driver.query(JSON.stringify(input));
+
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(0);
+    expect(commandInputs(clientSend, "QueryCommand")).toHaveLength(1);
+  });
+
+  it("surfaces unprocessed batch keys and items and ignores ConditionCheck rows", async () => {
+    const { driver, queueResponses } = createDriver();
+    const unprocessedKey = marshall({ tenant_id: "t", user_id: "2" });
+    queueResponses(
+      {
+        Responses: { users: [marshall({ tenant_id: "t", user_id: "1" })] },
+        UnprocessedKeys: { users: { Keys: [unprocessedKey] } },
+      },
+      {
+        UnprocessedItems: {
+          users: [{ DeleteRequest: { Key: unprocessedKey } }],
+        },
+      },
+      {},
+    );
+
+    const batchGet = await driver.query(
+      JSON.stringify({
+        RequestItems: {
+          users: {
+            Keys: [marshall({ tenant_id: "t", user_id: "1" }), unprocessedKey],
+          },
+        },
+      }),
+    );
+    const batchWrite = await driver.query(
+      JSON.stringify({
+        RequestItems: {
+          users: [
+            {
+              PutRequest: { Item: marshall({ tenant_id: "t", user_id: "3" }) },
+            },
+            { DeleteRequest: { Key: unprocessedKey } },
+          ],
+        },
+      }),
+    );
+    const transactWrite = await driver.query(
+      JSON.stringify({
+        TransactItems: [
+          {
+            ConditionCheck: {
+              TableName: "users",
+              Key: unprocessedKey,
+              ConditionExpression: "attribute_exists(tenant_id)",
+            },
+          },
+          {
+            Put: {
+              TableName: "users",
+              Item: marshall({ tenant_id: "t", user_id: "4" }),
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(batchGet.rowCount).toBe(1);
+    expect(batchGet.responseMetadata).toEqual([
+      {
+        warning: expect.stringContaining("did not process 1 key"),
+        UnprocessedKeys: { users: { Keys: [unprocessedKey] } },
+      },
+    ]);
+    expect(batchWrite.affectedRows).toBe(1);
+    expect(batchWrite.responseMetadata).toEqual([
+      {
+        warning: expect.stringContaining("did not process 1 write request"),
+        UnprocessedItems: {
+          users: [{ DeleteRequest: { Key: unprocessedKey } }],
+        },
+      },
+    ]);
+    expect(transactWrite.affectedRows).toBe(1);
+  });
+
+  it("decodes unprefixed binary input only as base64", () => {
+    const { driver } = createDriver();
+    const payload = binaryColumn("payload");
+    const binarySet = binaryColumn("payloads", "binary set");
+
+    expect(driver.coerceInputValue("AAAA", payload)).toEqual(
+      Buffer.from("AAAA", "base64"),
+    );
+    expect(driver.coerceInputValue("0xAAAA", payload)).toEqual(
+      Buffer.from([0xaa, 0xaa]),
+    );
+    expect(driver.coerceInputValue('["AAAA"]', binarySet)).toEqual(
+      new Set([Buffer.from("AAAA", "base64")]),
+    );
+    expect(driver.coerceInputValue("<<AAAA, 0xAAAA>>", binarySet)).toEqual(
+      new Set([Buffer.from("AAAA", "base64"), Buffer.from([0xaa, 0xaa])]),
+    );
+    expect(() => driver.coerceInputValue("<<abcd12>>", binarySet)).toThrow(
+      /Binary Set/,
+    );
+    const original = Buffer.from([0, 0xaa, 0xff]);
+    const displayed = driver.formatOutputValue(original, payload);
+    expect(driver.coerceInputValue(displayed, payload)).toEqual(original);
+  });
+
+  it("reports applied requests when a later write request fails", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(
+        new Error("ProvisionedThroughputExceededException"),
+      );
+    const put = (id: string) =>
+      JSON.stringify({
+        TableName: "users",
+        Item: marshall({ tenant_id: "t", user_id: id }),
+      });
+
+    const result = await driver.query(
+      [put("1"), put("2"), put("3")].join("\n"),
+    );
+
+    expect(commandInputs(clientSend, "PutItemCommand")).toHaveLength(2);
+    expect(result.affectedRows).toBe(1);
+    expect(result.error).toMatch(
+      /PutItem request 2 of 3 failed after 1 of 3 requests was applied\. Its outcome is unknown and the remaining requests were not sent\. ProvisionedThroughputExceededException/,
+    );
+  });
+
+  it("reports a rejected later write request as not applied", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockResolvedValueOnce({}).mockRejectedValueOnce(
+      Object.assign(new Error("The conditional request failed"), {
+        name: "ConditionalCheckFailedException",
+      }),
+    );
+    const put = (id: string) =>
+      JSON.stringify({
+        TableName: "users",
+        Item: marshall({ tenant_id: "t", user_id: id }),
+      });
+
+    const result = await driver.query([put("1"), put("2")].join("\n"));
+
+    expect(result.affectedRows).toBe(1);
+    expect(result.error).toMatch(
+      /request 2 of 2 failed after 1 of 2 requests was applied\. It was not applied/,
+    );
+  });
+
+  it("returns applied requests when a write script is cancelled midway", async () => {
+    const { driver, clientSend } = createDriver();
+    const controller = new AbortController();
+    clientSend.mockImplementationOnce(async () => {
+      controller.abort();
+      return {};
+    });
+    const put = (id: string) =>
+      JSON.stringify({
+        TableName: "users",
+        Item: marshall({ tenant_id: "t", user_id: id }),
+      });
+
+    const result = await driver.query([put("1"), put("2")].join("\n"), [], {
+      signal: controller.signal,
+    });
+
+    expect(commandInputs(clientSend, "PutItemCommand")).toHaveLength(1);
+    expect(result.affectedRows).toBe(1);
+    expect(result.error).toBe(
+      "DynamoDB PutItem script was cancelled after 1 of 2 requests was applied. The remaining requests were not sent.",
+    );
+  });
+
+  it("keeps unprocessed batch warnings when a later batch fails", async () => {
+    const { driver, clientSend } = createDriver();
+    const unprocessedKey = marshall({ tenant_id: "t", user_id: "2" });
+    clientSend
+      .mockResolvedValueOnce({
+        UnprocessedItems: {
+          users: [{ DeleteRequest: { Key: unprocessedKey } }],
+        },
+      })
+      .mockRejectedValueOnce(new Error("socket hang up"));
+    const batch = JSON.stringify({
+      RequestItems: {
+        users: [
+          { PutRequest: { Item: marshall({ tenant_id: "t", user_id: "1" }) } },
+          { DeleteRequest: { Key: unprocessedKey } },
+        ],
+      },
+    });
+
+    const result = await driver.query([batch, batch].join("\n"));
+
+    expect(result.error).toMatch(/socket hang up/);
+    expect(result.error).toMatch(/did not process 1 write request/);
+  });
+
+  it("invalidates cached columns when a write outcome is unknown", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    delete (driver as unknown as { describeColumns?: unknown }).describeColumns;
+    queueResponses({ Items: [] }, { Items: [] });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+
+    clientSend.mockRejectedValueOnce(new Error("socket hang up"));
+    await expect(
+      driver.query(
+        JSON.stringify({
+          TableName: "users",
+          Item: marshall({ tenant_id: "t", user_id: "1" }),
+        }),
+      ),
+    ).rejects.toThrow("socket hang up");
+
+    queueResponses({ Items: [] }, { Items: [] });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(4);
+  });
+
+  it("keeps cached columns when a write is definitely not applied", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    delete (driver as unknown as { describeColumns?: unknown }).describeColumns;
+    queueResponses({ Items: [] }, { Items: [] });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+
+    clientSend.mockImplementation(async (command) => {
+      if (command.constructor.name === "DescribeTableCommand") {
+        return {
+          Table: {
+            KeySchema: [
+              { AttributeName: "tenant_id", KeyType: "HASH" },
+              { AttributeName: "user_id", KeyType: "RANGE" },
+            ],
+          },
+        };
+      }
+      if (command.constructor.name === "UpdateItemCommand") {
+        throw Object.assign(new Error("conditional"), {
+          name: "ConditionalCheckFailedException",
+        });
+      }
+      return { Items: [] };
+    });
+    await driver.updateRows({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      updates: [
+        {
+          primaryKeys: { tenant_id: "t", user_id: "1" },
+          changes: { email: "x" },
+        },
+      ],
+    });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+  });
+
+  it("still throws when the first write request fails", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockRejectedValueOnce(new Error("denied"));
+
+    await expect(
+      driver.query(
+        JSON.stringify({
+          TableName: "users",
+          Item: marshall({ tenant_id: "t", user_id: "1" }),
+        }),
+      ),
+    ).rejects.toThrow("denied");
+  });
+
+  it("guards updates of originally missing attributes against lost updates", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Attributes: marshall({ tenant_id: "t" }) });
+
+    await driver.updateRows({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      updates: [
+        {
+          primaryKeys: { tenant_id: "t", user_id: "1" },
+          changes: { email: "new@example.com", age: 3 },
+          originalValues: { age: 2 },
+          originalTypes: {
+            email: { category: "other", nativeType: "missing" },
+            age: { category: "float", nativeType: "number" },
+          },
+        },
+      ],
+    });
+
+    const [input] = commandInputs(clientSend, "UpdateItemCommand");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(#k0) AND attribute_exists(#k1) AND #o0 = :o0 AND attribute_not_exists(#o1)",
+    );
+    expect(input.ExpressionAttributeNames).toMatchObject({
+      "#o0": "age",
+      "#o1": "email",
+    });
+  });
+
+  it("keeps an equality guard for an original NULL attribute", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    queueResponses({ Attributes: marshall({ tenant_id: "t" }) });
+
+    await driver.updateRows({
+      database: "us-east-1",
+      schema: "us-east-1",
+      table: "users",
+      updates: [
+        {
+          primaryKeys: { tenant_id: "t", user_id: "1" },
+          changes: { email: "new@example.com" },
+          originalValues: { email: null },
+          originalTypes: { email: { category: "other", nativeType: "null" } },
+        },
+      ],
+    });
+
+    const [input] = commandInputs(clientSend, "UpdateItemCommand");
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(#k0) AND attribute_exists(#k1) AND #o0 = :o0",
+    );
+    expect(input.ExpressionAttributeNames).toMatchObject({ "#o0": "email" });
+    expect(input.ExpressionAttributeValues).toMatchObject({
+      ":o0": { NULL: true },
+    });
+  });
+
+  it.each([
+    ["boolean", "maybe", /Boolean value for "field"/],
+    ["binary", "0xZZ", /Binary value for "field"/],
+    ["map", '{"a":1', /JSON object/],
+    ["string set", "abc", /String Set value for "field"/],
+  ])("rejects invalid %s cell input instead of storing a string", (nativeType, input, error) => {
+    const { driver } = createDriver();
+    const column: ColumnTypeMeta = {
+      ...createMapColumn(),
+      name: "field",
+      type: nativeType,
+      nativeType,
+    };
+
+    expect(() => driver.coerceInputValue(input, column)).toThrow(error);
+  });
+
+  it("caches described columns until the table read cache is cleared", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    delete (driver as unknown as { describeColumns?: unknown }).describeColumns;
+    queueResponses({ Items: [] }, { Items: [] });
+
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+    expect(commandInputs(clientSend, "DescribeTableCommand")).toHaveLength(3);
+
+    driver.clearTableReadCache();
+    queueResponses({ Items: [] }, { Items: [] });
+    await driver.readTablePage({ ...pageRequest, filters: [] });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(4);
+    expect(commandInputs(clientSend, "DescribeTableCommand")).toHaveLength(5);
+  });
+
+  it("retries throttled reads but never retries writes", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    const throttled = () =>
+      Object.assign(new Error("Rate exceeded"), {
+        name: "ProvisionedThroughputExceededException",
+      });
+    clientSend.mockRejectedValueOnce(throttled());
+    queueResponses({ Items: [marshall({ tenant_id: "t", user_id: "1" })] });
+
+    const result = await driver.query(JSON.stringify({ TableName: "users" }));
+    expect(result.rowCount).toBe(1);
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+
+    clientSend.mockRejectedValueOnce(throttled());
+    await expect(
+      driver.query(
+        JSON.stringify({
+          TableName: "users",
+          Item: marshall({ tenant_id: "t", user_id: "1" }),
+        }),
+      ),
+    ).rejects.toThrow("Rate exceeded");
+    expect(commandInputs(clientSend, "PutItemCommand")).toHaveLength(1);
+  });
+
+  it("does not send an insert when the key schema is unavailable", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockRejectedValueOnce(
+      Object.assign(new Error("not authorized"), {
+        name: "AccessDeniedException",
+      }),
+    );
+
+    await expect(
+      driver.insertRow({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        values: { tenant_id: "t", user_id: "1" },
+      }),
+    ).rejects.toMatchObject({
+      name: "MutationNotExecutedError",
+      message:
+        "DynamoDB key schema is unavailable (DescribeTable denied or table missing); insert was not sent.",
+    });
+    expect(commandInputs(clientSend, "PutItemCommand")).toHaveLength(0);
+  });
+
+  it("does not hide DescribeTable failures other than a missing or denied table", async () => {
+    const { driver, clientSend, queueResponses } = createDriver();
+    clientSend.mockRejectedValueOnce(
+      Object.assign(new Error("bad credentials"), {
+        name: "UnrecognizedClientException",
+      }),
+    );
+
+    await expect(
+      driver.readTablePage({ ...pageRequest, filters: [] }),
+    ).rejects.toThrow("bad credentials");
+
+    clientSend.mockRejectedValueOnce(
+      Object.assign(new Error("not authorized"), {
+        name: "AccessDeniedException",
+      }),
+    );
+    queueResponses({ Items: [marshall({ tenant_id: "t", user_id: "1" })] });
+    await expect(
+      driver.readTablePage({ ...pageRequest, filters: [] }),
+    ).resolves.toMatchObject({ rows: [expect.any(Object)] });
+
+    clientSend.mockRejectedValueOnce(
+      Object.assign(new Error("missing"), {
+        name: "ResourceNotFoundException",
+      }),
+    );
+    await expect(
+      driver.updateRows({
+        database: "us-east-1",
+        schema: "us-east-1",
+        table: "users",
+        updates: [
+          {
+            primaryKeys: { tenant_id: "t", user_id: "1" },
+            changes: { email: "x" },
+          },
+        ],
+      }),
+    ).rejects.toThrow("DynamoDB update requires a table partition key.");
   });
 });

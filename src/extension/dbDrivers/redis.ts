@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { createClient, ErrorReply, RESP_TYPES } from "redis";
-import { isRedisBinaryValueSnapshot } from "../../shared/redisValueSnapshot";
+import {
+  isRedisBinaryCollectionValueSnapshot,
+  isRedisBinaryValueSnapshot,
+  isRedisNotLoadedValueSnapshot,
+  isRedisOversizedValueSnapshot,
+  type RedisOversizedValueSnapshot,
+  redisOversizedValueSnapshot,
+} from "../../shared/redisValueSnapshot";
 import {
   type OperationCancellationContext,
   REDIS_READ_BUDGET,
@@ -15,7 +22,10 @@ import {
   resolveConnectionTlsSettings,
 } from "../services/connectionTls";
 import { pMapWithLimit } from "../utils/concurrency";
-import { parseJsonForWrite } from "../utils/jsonWriteSafety";
+import {
+  isRoundTripJsonNumberToken,
+  parseJsonForWrite,
+} from "../utils/jsonWriteSafety";
 import { logger } from "../utils/logger";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
@@ -54,6 +64,7 @@ import type {
   DriverInsertRowRequest,
   DriverMutationResult,
   DriverOperationContext,
+  DriverTableExportChunk,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowOutcome,
@@ -101,6 +112,10 @@ const REDIS_READ_ONLY_QUERY_REASON =
 
 const REDIS_MAX_TTL_SECONDS = Math.floor(Number.MAX_SAFE_INTEGER / 1000);
 
+const REDIS_SCAN_COUNT = 1000;
+
+const REDIS_EDIT_NOT_APPLIED_REPLY = /^(?:ERR )?RAPIDB_NOT_APPLIED (.*)$/s;
+
 const REDIS_ATOMIC_EDIT_SCRIPT = `
 local source = KEYS[1]
 local target = KEYS[2]
@@ -146,41 +161,34 @@ local expiry = nil
 if ARGV[5] == 'set' then
   local seconds = tonumber(ARGV[6])
   if not string.match(ARGV[6], '^%d+$') or not seconds or seconds < 1 or seconds > ${REDIS_MAX_TTL_SECONDS} or seconds ~= math.floor(seconds) then
-    return redis.error_reply('Redis edit TTL is outside the supported integer range.')
+    return redis.error_reply('RAPIDB_NOT_APPLIED Redis edit TTL is outside the supported integer range.')
   end
-  -- Passing a Lua number can produce scientific notation, which PEXPIRE
-  -- rejects as a non-integer. Always pass an exact decimal string instead.
   expiry = string.format('%.0f', seconds * 1000)
 elseif ARGV[5] ~= 'keep' and ARGV[5] ~= 'persist' then
-  return redis.error_reply('Redis edit TTL mode is invalid.')
+  return redis.error_reply('RAPIDB_NOT_APPLIED Redis edit TTL mode is invalid.')
 end
+local denied = nil
 local function requirePermission(command, ...)
-  if not redis.acl_check_cmd(command, ...) then
-    error('Redis edit requires ' .. command .. ' permission on its keys.')
+  if not denied and not redis.acl_check_cmd(command, ...) then
+    denied = 'RAPIDB_NOT_APPLIED Redis edit requires ' .. command .. ' permission on its keys.'
   end
 end
 if ARGV[3] == '1' then
-  -- Lua errors do not roll back writes. Decode and build the entire replacement
-  -- away from the source, including its TTL, before committing it.
   local value = cjson.decode(ARGV[4])
   if kind ~= 'string' and kind ~= 'hash' and kind ~= 'list' and kind ~= 'set' and kind ~= 'zset' then return -2 end
   if staging == source or staging == target or redis.call('EXISTS', staging) ~= 0 then
-    return redis.error_reply('Redis edit staging key already exists.')
+    return redis.error_reply('RAPIDB_NOT_APPLIED Redis edit staging key already exists.')
   end
-  -- Empty collections only need one DEL, with no partial-commit risk.
   if kind ~= 'string' and next(value) == nil then
     redis.call('DEL', source)
     return 1
   end
-  -- Redis 6 cannot inspect command ACLs without executing commands. Fail
-  -- closed for staged replacements rather than discovering a denied final
-  -- command after writes. Single-command rename/TTL edits still work below.
   if not redis.acl_check_cmd then
-    return redis.error_reply('Redis value replacements require Redis 7 or newer for ACL-safe edits.')
+    return redis.error_reply('RAPIDB_NOT_APPLIED Redis value replacements require Redis 7 or newer for ACL-safe edits.')
   end
   if ARGV[5] == 'keep' and ttl >= 0 then
     if ttl > 9007199254740991 then
-      return redis.error_reply('Redis edit TTL is too large to preserve safely.')
+      return redis.error_reply('RAPIDB_NOT_APPLIED Redis edit TTL is too large to preserve safely.')
     end
     expiry = string.format('%.0f', ttl)
   end
@@ -192,13 +200,12 @@ if ARGV[3] == '1' then
     elseif kind == 'zset' then for _, entry in ipairs(value) do call('ZADD', staging, entry.score, entry.value) end
     end
   end
-  -- Redis 7 ACL selectors can allow EVAL but deny a command on a particular
-  -- key. Preflight every write, including cleanup, before creating staging.
   requirePermission('DEL', staging)
   if source ~= target then requirePermission('DEL', source) end
   requirePermission('RENAME', staging, target)
   buildReplacement(requirePermission)
   if expiry then requirePermission('PEXPIRE', staging, expiry) end
+  if denied then return redis.error_reply(denied) end
   local ok, err = pcall(function()
     buildReplacement(redis.call)
     if expiry then redis.call('PEXPIRE', staging, expiry) end
@@ -212,17 +219,14 @@ if ARGV[3] == '1' then
   return 1
 end
 if source ~= target and ARGV[5] ~= 'keep' and not redis.acl_check_cmd then
-  return redis.error_reply('Combined Redis rename and TTL edits require Redis 7 or newer for ACL-safe edits.')
+  return redis.error_reply('RAPIDB_NOT_APPLIED Combined Redis rename and TTL edits require Redis 7 or newer for ACL-safe edits.')
 end
 if redis.acl_check_cmd then
   if source ~= target then requirePermission('RENAME', source, target) end
   if expiry then requirePermission('PEXPIRE', target, expiry)
   elseif ARGV[5] == 'persist' then requirePermission('PERSIST', target) end
+  if denied then return redis.error_reply(denied) end
 end
--- RENAME preserves expiration inherently. In keep mode it is the only write;
--- re-expiring would add a needless command that could fail after the rename.
--- ACL/argument preflight prevents those known failures, not arbitrary server
--- failures: Lua errors never roll back earlier writes.
 if source ~= target then redis.call('RENAME', source, target) end
 if ARGV[5] == 'set' then
   redis.call('PEXPIRE', target, expiry)
@@ -273,6 +277,13 @@ const READ_ONLY_REDIS_COMMANDS = new Set([
   "ZSCAN",
 ]);
 
+interface RedisKeyMetadata {
+  type: string;
+  size: number;
+  memoryBytes: number | null;
+  ttl: number;
+}
+
 interface RedisSampleRow {
   redisType: string;
   row: Record<string, unknown>;
@@ -281,6 +292,18 @@ interface RedisSampleRow {
 type RedisHashEntries = Record<string, string>;
 
 type RedisClient = ReturnType<typeof createClient>;
+
+type RedisKeyLimitPurpose = "paging" | "filtering";
+
+function redisMemberClient(client: RedisClient) {
+  return client.withTypeMapping({
+    [RESP_TYPES.BLOB_STRING]: Buffer,
+    [RESP_TYPES.MAP]: Array,
+    [RESP_TYPES.DOUBLE]: String,
+  });
+}
+
+type RedisMemberClient = ReturnType<typeof redisMemberClient>;
 
 type RedisInsertPlan = {
   command: "set";
@@ -301,9 +324,30 @@ interface RedisConnectionAttempt {
 }
 
 type RedisSortedSetEntry = {
-  score: number;
+  score: number | string;
   value: string;
 };
+
+function assertRedisLosslessUtf8Value(value: unknown): void {
+  if (typeof value === "string") {
+    if (Buffer.from(value, "utf8").toString("utf8") !== value) {
+      throw new Error(
+        "Redis value must be losslessly UTF-8 encodable text; it contains an unpaired UTF-16 surrogate.",
+      );
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) assertRedisLosslessUtf8Value(entry);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [field, entry] of Object.entries(value)) {
+      assertRedisLosslessUtf8Value(field);
+      assertRedisLosslessUtf8Value(entry);
+    }
+  }
+}
 
 function isDisplayableRedisText(bytes: Buffer): boolean {
   const text = bytes.toString("utf8");
@@ -328,16 +372,78 @@ function formatRedisBlobString(bytes: Buffer): string {
   return `RedisBinary(0x${bytes.toString("hex")})`;
 }
 
+function formatRedisSortedSetScore(score: unknown): number | string {
+  const text = String(score).trim();
+  const parsed = /^[+-]?inf(?:inity)?$/i.test(text)
+    ? text.startsWith("-")
+      ? Number.NEGATIVE_INFINITY
+      : Number.POSITIVE_INFINITY
+    : Number(text);
+  return parsed === Number.POSITIVE_INFINITY
+    ? "+inf"
+    : parsed === Number.NEGATIVE_INFINITY
+      ? "-inf"
+      : parsed;
+}
+
+function redisReplyPairs(reply: unknown): Array<[unknown, unknown]> {
+  if (Array.isArray(reply)) {
+    const pairs: Array<[unknown, unknown]> = [];
+    for (let index = 0; index + 1 < reply.length; index += 2) {
+      pairs.push([reply[index], reply[index + 1]]);
+    }
+    return pairs;
+  }
+  if (reply instanceof Map) return [...reply];
+  return reply && typeof reply === "object" ? Object.entries(reply) : [];
+}
+
+class RedisCollectionDecoder {
+  binary = false;
+
+  text(value: unknown): string {
+    if (!Buffer.isBuffer(value)) return String(value);
+    if (isDisplayableRedisText(value)) return value.toString("utf8");
+    this.binary = true;
+    return formatRedisBlobString(value);
+  }
+
+  record(reply: unknown): Record<string, string> {
+    return Object.fromEntries(
+      redisReplyPairs(reply).map(([field, entry]) => [
+        this.text(field),
+        this.text(entry),
+      ]),
+    );
+  }
+}
+
+function redisRowValueBytes(value: unknown): number {
+  if (typeof value === "string") return Buffer.byteLength(value);
+  if (isRedisBinaryCollectionValueSnapshot(value))
+    return Buffer.byteLength(value.displayValue);
+  return isRedisBinaryValueSnapshot(value)
+    ? Buffer.byteLength(value.displayValue) * 2
+    : 0;
+}
+
 function redisComparisonRow(
   row: Record<string, unknown>,
 ): Record<string, unknown> {
-  return isRedisBinaryValueSnapshot(row.value)
+  return isRedisBinaryValueSnapshot(row.value) ||
+    isRedisBinaryCollectionValueSnapshot(row.value) ||
+    isRedisOversizedValueSnapshot(row.value)
     ? { ...row, value: row.value.displayValue }
     : row;
 }
 
 function formatRedisReplyValue(value: unknown): unknown {
   if (Buffer.isBuffer(value)) return formatRedisBlobString(value);
+  if (value instanceof ErrorReply) return `(error) ${value.message}`;
+  if (typeof value === "string" && /^-?\d+$/.test(value)) {
+    const integer = Number(value);
+    return Number.isSafeInteger(integer) ? integer : value;
+  }
   if (Array.isArray(value)) return value.map(formatRedisReplyValue);
   if (value instanceof Map) {
     return Object.fromEntries(
@@ -382,8 +488,6 @@ function compareRedisValueTypes(left: string, right: string): number {
 }
 
 function compareRedisKeys(left: string, right: string): number {
-  // Locale collation can equate distinct UTF-8 identities (e.g. NFC/NFD).
-  // A total order is required because each exported page starts a fresh SCAN.
   return (
     left.localeCompare(right) || (left < right ? -1 : left > right ? 1 : 0)
   );
@@ -415,7 +519,6 @@ function splitRedisStatements(input: string): string[] {
   const statements: string[] = [];
   let current = "";
   let quote: '"' | "'" | null = null;
-  let escaping = false;
 
   const pushCurrent = () => {
     const trimmed = current.trim();
@@ -425,16 +528,15 @@ function splitRedisStatements(input: string): string[] {
     current = "";
   };
 
-  for (const char of input) {
-    if (escaping) {
-      current += char;
-      escaping = false;
-      continue;
-    }
-
-    if (char === "\\") {
-      current += char;
-      escaping = true;
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+    if (
+      char === "\\" &&
+      index + 1 < input.length &&
+      (quote === '"' || (quote === "'" && input[index + 1] === "'"))
+    ) {
+      current += char + input[index + 1];
+      index += 1;
       continue;
     }
 
@@ -464,10 +566,6 @@ function splitRedisStatements(input: string): string[] {
     throw new Error("Redis query has an unterminated quoted argument.");
   }
 
-  if (escaping) {
-    current += "\\";
-  }
-
   pushCurrent();
   return statements;
 }
@@ -479,70 +577,94 @@ function formatRedisPreviewCommand(
   return [command, ...args.map((arg) => JSON.stringify(String(arg)))].join(" ");
 }
 
-function tokenizeRedisCommand(input: string): string[] {
-  const tokens: string[] = [];
+function tokenizeRedisCommand(input: string): Array<string | Buffer> {
+  const tokens: Array<string | Buffer> = [];
   let current = "";
+  let bytes: Buffer[] | null = null;
   let quote: '"' | "'" | null = null;
-  let escaping = false;
   let tokenStarted = false;
+
+  const encodeCurrent = () => {
+    const encoded = Buffer.from(current, "utf8");
+    if (encoded.toString("utf8") !== current) {
+      throw new Error(
+        "Redis query has invalid Unicode that cannot be encoded as UTF-8 without data loss.",
+      );
+    }
+    current = "";
+    return encoded;
+  };
 
   const pushCurrent = () => {
     if (tokenStarted) {
-      // node-redis encodes string arguments as UTF-8, replacing lone UTF-16
-      // surrogates with U+FFFD. A malformed key must never address a different
-      // stored key (and values must not be silently corrupted either).
-      if (Buffer.from(current, "utf8").toString("utf8") !== current) {
-        throw new Error(
-          "Redis query has invalid Unicode that cannot be encoded as UTF-8 without data loss.",
-        );
+      if (bytes) {
+        bytes.push(encodeCurrent());
+        tokens.push(Buffer.concat(bytes));
+      } else {
+        const text = current;
+        encodeCurrent();
+        tokens.push(text);
       }
-      tokens.push(current);
     }
     current = "";
+    bytes = null;
     tokenStarted = false;
   };
 
   for (let index = 0; index < input.length; index += 1) {
     const char = input[index];
-    if (escaping) {
-      if (quote === '"' && char === "u") {
+    const next = input[index + 1];
+    if (char === "\\" && quote === "'" && next === "'") {
+      current += "'";
+      index += 1;
+      continue;
+    }
+
+    if (char === "\\" && quote === '"' && next !== undefined) {
+      index += 1;
+      if (next === "u") {
         const hex = input.slice(index + 1, index + 5);
         if (!/^[\da-fA-F]{4}$/.test(hex)) {
           throw new Error("Redis query has an invalid Unicode escape.");
         }
         current += String.fromCharCode(Number.parseInt(hex, 16));
         index += 4;
-      } else if (quote === '"') {
-        switch (char) {
-          case "n":
-            current += "\n";
-            break;
-          case "r":
-            current += "\r";
-            break;
-          case "t":
-            current += "\t";
-            break;
-          case "b":
-            current += "\b";
-            break;
-          case "f":
-            current += "\f";
-            break;
-          default:
-            current += char;
-        }
-      } else {
-        current += char;
+        continue;
       }
-      tokenStarted = true;
-      escaping = false;
-      continue;
-    }
-
-    if (char === "\\") {
-      escaping = true;
-      tokenStarted = true;
+      const hex = input.slice(index + 1, index + 3);
+      if (next === "x" && /^[\da-fA-F]{2}$/.test(hex)) {
+        const byte = Number.parseInt(hex, 16);
+        if (byte < 0x80) {
+          current += String.fromCharCode(byte);
+        } else {
+          bytes ??= [];
+          bytes.push(encodeCurrent(), Buffer.from([byte]));
+        }
+        index += 2;
+        continue;
+      }
+      switch (next) {
+        case "n":
+          current += "\n";
+          break;
+        case "r":
+          current += "\r";
+          break;
+        case "t":
+          current += "\t";
+          break;
+        case "b":
+          current += "\b";
+          break;
+        case "a":
+          current += "\x07";
+          break;
+        case "f":
+          current += "\f";
+          break;
+        default:
+          current += next;
+      }
       continue;
     }
 
@@ -572,11 +694,6 @@ function tokenizeRedisCommand(input: string): string[] {
     tokenStarted = true;
   }
 
-  if (escaping) {
-    current += "\\";
-    tokenStarted = true;
-  }
-
   if (quote) {
     throw new Error("Redis query has an unterminated quoted argument.");
   }
@@ -586,7 +703,7 @@ function tokenizeRedisCommand(input: string): string[] {
 }
 
 function decideRedisReadOnlyQuery(queryText: string) {
-  const trimmed = queryText.trim().replace(/;+$/, "");
+  const trimmed = queryText.trim();
   if (!trimmed) {
     return denyReadOnlyQuery(REDIS_READ_ONLY_QUERY_REASON);
   }
@@ -598,8 +715,10 @@ function decideRedisReadOnlyQuery(queryText: string) {
     }
 
     return statements.every((statement) => {
-      const command = tokenizeRedisCommand(statement)[0]?.toUpperCase();
-      return command ? READ_ONLY_REDIS_COMMANDS.has(command) : false;
+      const command = tokenizeRedisCommand(statement)[0];
+      return typeof command === "string" && command
+        ? READ_ONLY_REDIS_COMMANDS.has(command.toUpperCase())
+        : false;
     })
       ? allowReadOnlyQuery()
       : denyReadOnlyQuery(REDIS_READ_ONLY_QUERY_REASON);
@@ -754,8 +873,6 @@ export class RedisDriver implements IDBDriver {
       username: username || undefined,
       password: this.config.password,
     });
-    // Surface the original AUTH/SELECT/TLS/TCP error during connection setup.
-    // Once established, retain native reconnects for temporary outages.
     client.on("ready", () => {
       hasBeenReady = true;
     });
@@ -935,6 +1052,9 @@ export class RedisDriver implements IDBDriver {
       client,
       "*",
       REDIS_READ_BUDGET.maxScanKeys,
+      false,
+      undefined,
+      { skipBinaryKeys: true },
     );
     const prefixedNames = new Set<string>();
     let hasUnprefixedKeys = false;
@@ -976,6 +1096,7 @@ export class RedisDriver implements IDBDriver {
       type: column.nativeType,
       nullable: column.nullable,
       defaultValue: undefined,
+      ...(column.isReadOnly ? { isReadOnly: true } : {}),
       isPrimaryKey: column.isPrimaryKey,
       primaryKeyOrdinal: column.primaryKeyOrdinal,
       isForeignKey: false,
@@ -1054,8 +1175,8 @@ export class RedisDriver implements IDBDriver {
     options?: QueryExecutionOptions,
     signal?: AbortSignal,
   ): Promise<QueryResult> {
-    const trimmed = sql.trim().replace(/;+$/, "");
-    if (!trimmed) {
+    const statements = splitRedisStatements(sql.trim());
+    if (statements.length === 0) {
       return {
         columns: [],
         rows: [],
@@ -1065,9 +1186,6 @@ export class RedisDriver implements IDBDriver {
     }
 
     const startedAt = Date.now();
-    const statements = splitRedisStatements(trimmed);
-    // Finish syntax/encoding validation before a preceding DEL or other write
-    // can run. Parsing a later SET only after DEL succeeds can destroy data.
     const commands = statements.map(tokenizeRedisCommand);
     const results: unknown[] = [];
     const abort = new AbortController();
@@ -1102,31 +1220,64 @@ export class RedisDriver implements IDBDriver {
         options?.requestToken !== undefined || externalSignal
           ? baseClient.withAbortSignal(querySignal)
           : baseClient;
-      for (const parts of commands) {
+      let partialError: string | undefined;
+      for (const [index, parts] of commands.entries()) {
         querySignal.throwIfAborted();
         if (epoch !== this.epoch)
           throw new Error("Redis query was cancelled by disconnect.");
         const [command, ...args] = parts;
-        const result = await this.waitForResult(
-          client.sendCommand([command.toUpperCase(), ...args], {
-            typeMapping: {
-              [RESP_TYPES.BLOB_STRING]: Buffer,
-              [RESP_TYPES.DOUBLE]: String,
-            },
-          }),
-          querySignal,
-        );
+        let result: unknown;
+        try {
+          result = await this.waitForResult(
+            client.sendCommand(
+              [
+                typeof command === "string" ? command.toUpperCase() : command,
+                ...args,
+              ],
+              {
+                typeMapping: {
+                  [RESP_TYPES.SIMPLE_STRING]: Buffer,
+                  [RESP_TYPES.BLOB_STRING]: Buffer,
+                  [RESP_TYPES.VERBATIM_STRING]: Buffer,
+                  [RESP_TYPES.DOUBLE]: String,
+                  [RESP_TYPES.NUMBER]: String,
+                  [RESP_TYPES.BIG_NUMBER]: String,
+                  [RESP_TYPES.MAP]: Map,
+                },
+              },
+            ),
+            querySignal,
+          );
+        } catch (error) {
+          if (!(error instanceof ErrorReply) || results.length === 0)
+            throw error;
+          partialError = `Redis statement ${index + 1} of ${commands.length} failed: ${error.message}. Earlier statements completed; later statements were not run.`;
+          results.push(formatRedisReplyValue(error));
+          break;
+        }
         results.push(formatRedisReplyValue(result));
       }
+      const queryValue = statements.length === 1 ? results[0] : results;
       const row = flattenRootRecord(
-        statements.length === 1 ? { result: results[0] } : { results },
+        statements.length === 1
+          ? { result: queryValue }
+          : { results: queryValue },
       );
       const columns = Object.keys(row);
       return {
         columns,
+        columnMeta: [
+          {
+            category:
+              queryValue !== null && typeof queryValue === "object"
+                ? "json"
+                : null,
+          },
+        ],
         rows: [this.mapRowToQueryRow(row, columns)],
         rowCount: 1,
         executionTimeMs: Date.now() - startedAt,
+        ...(partialError ? { error: partialError } : {}),
       };
     } finally {
       if (onAbort) querySignal.removeEventListener("abort", onAbort);
@@ -1151,6 +1302,91 @@ export class RedisDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
+    const plan = await this.planTablePage(request);
+    if ("rows" in plan) {
+      return {
+        columns: plan.columns,
+        rows: plan.rows,
+        totalCount: request.skipCount ? 0 : plan.totalCount,
+        executionTimeMs: Math.round(performance.now() - startTime),
+      };
+    }
+    const rows = await this.readRowsForKeys(plan.client, plan.keys, request);
+    throwIfQueryCancelled(request);
+    return {
+      columns: this.inferRedisColumns(rows),
+      rows: rows.map((entry) => entry.row),
+      totalCount: request.skipCount ? 0 : plan.totalCount,
+      executionTimeMs: Math.round(performance.now() - startTime),
+    };
+  }
+
+  async *readTablePageChunks(
+    request: DriverTablePageRequest,
+  ): AsyncGenerator<DriverTableExportChunk> {
+    const plan = await this.planTablePage(request);
+    if ("rows" in plan) {
+      yield { columns: plan.columns, rows: plan.rows };
+      return;
+    }
+    const { keys } = plan;
+    if (keys.length === 0) {
+      yield { columns: this.inferRedisColumns([]), rows: [] };
+      return;
+    }
+    const metadata = new Map<string, RedisKeyMetadata>();
+    const held = new Map<string, RedisSampleRow>();
+    let heldBytes = 0;
+    let columns: ColumnTypeMeta[] | undefined;
+    let start = 0;
+    while (start < keys.length) {
+      const pending = keys.slice(start).filter((key) => !held.has(key));
+      const rows = await this.readRowsForKeys(plan.client, pending, request, {
+        metadata,
+        initialBytes: heldBytes,
+        stopWhenBudgetSpent: true,
+      });
+      throwIfQueryCancelled(request);
+      columns ??= this.inferRedisColumns(rows);
+      rows.forEach((entry, index) => {
+        if (isRedisNotLoadedValueSnapshot(entry.row.value)) return;
+        held.set(pending[index], entry);
+        heldBytes += redisRowValueBytes(entry.row.value);
+      });
+      let end = start;
+      while (end < keys.length && held.has(keys[end])) end += 1;
+      if (end === start) {
+        held.clear();
+        const [single] = await this.readRowsForKeys(
+          plan.client,
+          [keys[start]],
+          request,
+          { metadata },
+        );
+        throwIfQueryCancelled(request);
+        held.set(keys[start], single);
+        heldBytes = redisRowValueBytes(single.row.value);
+        end = start + 1;
+      }
+      const ready = keys.slice(start, end).map((key) => {
+        const entry = held.get(key) as RedisSampleRow;
+        held.delete(key);
+        heldBytes -= redisRowValueBytes(entry.row.value);
+        return entry.row;
+      });
+      yield { columns, rows: ready };
+      start = end;
+    }
+  }
+
+  private async planTablePage(request: DriverTablePageRequest): Promise<
+    | { client: RedisClient; keys: string[]; totalCount: number }
+    | {
+        columns: ColumnTypeMeta[];
+        rows: Record<string, unknown>[];
+        totalCount: number;
+      }
+  > {
     throwIfQueryCancelled(request);
     const baseClient = await this.getDatabaseClient(
       request.database,
@@ -1167,40 +1403,70 @@ export class RedisDriver implements IDBDriver {
           client,
           request.table,
           REDIS_READ_BUDGET.maxScanKeys,
-          true,
+          "paging",
           request,
         )
       ).sort(compareRedisKeys);
       if (request.sort?.direction === "desc") keys.reverse();
-      const pageKeys = keys.slice(offset, offset + request.pageSize);
-      const rows = await this.readRowsForKeys(client, pageKeys, request);
-      throwIfQueryCancelled(request);
       return {
-        columns: this.inferRedisColumns(rows),
-        rows: rows.map((entry) => entry.row),
-        totalCount: request.skipCount ? 0 : keys.length,
-        executionTimeMs: Math.round(performance.now() - startTime),
+        client,
+        keys: keys.slice(offset, offset + request.pageSize),
+        totalCount: keys.length,
       };
     }
 
-    const fallbackReadLimit = Math.max(
-      request.page * request.pageSize * 2,
-      request.pageSize * 10,
-    );
-    const boundedReadLimit = Math.min(
-      REDIS_READ_BUDGET.maxValueReads,
-      fallbackReadLimit,
-    );
+    const boundedReadLimit = REDIS_READ_BUDGET.maxValueReads;
+    const valueQuery =
+      request.sort?.column === "value" ||
+      request.filters.some((filter) => filter.column === "value");
+    if (!valueQuery) {
+      const keys = (
+        await this.scanTableKeys(
+          client,
+          request.table,
+          boundedReadLimit,
+          "filtering",
+          request,
+        )
+      ).sort(compareRedisKeys);
+      const metadata = await this.readRowMetadata(client, keys, request);
+      const metadataRows = metadata.map((entry) => entry.row);
+      const filtered = applyFilters(
+        metadataRows,
+        request.filters,
+        this.inferRedisColumns(metadata),
+      );
+      const sorted = applySort(
+        filtered,
+        request.sort,
+        this.inferRedisColumns(metadata),
+      );
+      return {
+        client,
+        keys: pageRows(sorted, request.page, request.pageSize).map((row) =>
+          String(row.key),
+        ),
+        totalCount: sorted.length,
+      };
+    }
     const rows = await this.readRows(
       client,
       request.table,
       boundedReadLimit,
-      true,
+      "filtering",
       request,
     );
     const displayToOriginal = new Map(
       rows.map((entry) => [redisComparisonRow(entry.row), entry.row]),
     );
+    const omittedValueRow = rows.find((entry) =>
+      isRedisOversizedValueSnapshot(entry.row.value),
+    );
+    if (omittedValueRow) {
+      throw new Error(
+        `Redis key '${String(omittedValueRow.row.key)}' has a value beyond the table viewer read limit (${REDIS_READ_BUDGET.maxValueEntries} entries or ${REDIS_READ_BUDGET.maxValueBytes} bytes per value, ${REDIS_READ_BUDGET.maxTotalValueBytes} bytes per read), so filtering or sorting by value is unavailable. Narrow the keyspace or filter by key, type, or TTL.`,
+      );
+    }
     const rowRecords = [...displayToOriginal.keys()];
     const columns = this.inferRedisColumns(rows);
     const filtered = applyFilters(rowRecords, request.filters, columns);
@@ -1209,8 +1475,7 @@ export class RedisDriver implements IDBDriver {
     return {
       columns,
       rows: paged.map((row) => displayToOriginal.get(row) ?? row),
-      totalCount: request.skipCount ? 0 : sorted.length,
-      executionTimeMs: Math.round(performance.now() - startTime),
+      totalCount: sorted.length,
     };
   }
 
@@ -1245,7 +1510,7 @@ export class RedisDriver implements IDBDriver {
       try {
         context?.signal.throwIfAborted();
         const sourceKey = this.resolveStoredKey(update.primaryKeys.key);
-        if (!sourceKey) {
+        if (sourceKey === null) {
           updateRowOutcomes.push({ rowIndex, status: "not_applied" });
           continue;
         }
@@ -1254,8 +1519,8 @@ export class RedisDriver implements IDBDriver {
         const targetKey = hasKeyChange
           ? this.resolveStoredKey(update.changes.key)
           : sourceKey;
-        if (!targetKey) {
-          throw new Error("Redis key updates require a non-empty 'key' value.");
+        if (targetKey === null) {
+          throw new Error("Redis key updates require a string 'key' value.");
         }
 
         const keyChanged = sourceKey !== targetKey;
@@ -1274,6 +1539,32 @@ export class RedisDriver implements IDBDriver {
         if (currentType === "stream" && hasValueChange) {
           throw new Error(
             "Redis stream values are read-only in the table viewer.",
+          );
+        }
+        const originalSnapshot = update.originalValues?.value;
+        if (
+          hasValueChange &&
+          isRedisBinaryCollectionValueSnapshot(originalSnapshot)
+        ) {
+          throw new Error(
+            `Redis ${currentType} values with binary members are read-only in the table viewer. Rename, TTL changes, and deletion remain available.`,
+          );
+        }
+        if (hasValueChange && isRedisNotLoadedValueSnapshot(originalSnapshot)) {
+          throw new Error(
+            "This Redis value was not loaded because the page reached its total read limit. Reload with a smaller page size or a narrower filter before editing it.",
+          );
+        }
+        if (
+          hasValueChange &&
+          (isRedisOversizedValueSnapshot(originalSnapshot) ||
+            this.exceedsRedisValueLimit(
+              currentType,
+              await this.readRedisValueSize(client, sourceKey, currentType),
+            ))
+        ) {
+          throw new Error(
+            "Redis values larger than the table viewer read limit are read-only. Rename, TTL changes, and deletion remain available.",
           );
         }
         if (currentType === "string" && hasValueChange) {
@@ -1297,10 +1588,9 @@ export class RedisDriver implements IDBDriver {
         const ttlSeconds = hasTtlChange
           ? this.parseRedisTtlInput(update.changes.ttl, "Redis TTL updates")
           : undefined;
-        const hasOriginalValue = Object.hasOwn(
-          update.originalValues ?? {},
-          "value",
-        );
+        const hasOriginalValue =
+          Object.hasOwn(update.originalValues ?? {}, "value") &&
+          !isRedisOversizedValueSnapshot(update.originalValues?.value);
         const originalValue = hasOriginalValue
           ? currentType === "string"
             ? isRedisBinaryValueSnapshot(update.originalValues?.value)
@@ -1314,7 +1604,7 @@ export class RedisDriver implements IDBDriver {
           : "";
         writeMayHaveApplied = true;
         const result = Number(
-          await client.sendCommand([
+          await this.sendRedisEdit(client, [
             "EVAL",
             REDIS_ATOMIC_EDIT_SCRIPT,
             "3",
@@ -1372,6 +1662,22 @@ export class RedisDriver implements IDBDriver {
     return completeDriverUpdateRowsResult(affectedRows, updateRowOutcomes);
   }
 
+  private async sendRedisEdit(
+    client: RedisClient,
+    args: Array<string | Buffer>,
+  ): Promise<unknown> {
+    try {
+      return await client.sendCommand(args);
+    } catch (error) {
+      const notApplied =
+        error instanceof ErrorReply
+          ? REDIS_EDIT_NOT_APPLIED_REPLY.exec(error.message)
+          : null;
+      if (notApplied) throw new MutationNotExecutedError(notApplied[1], error);
+      throw error;
+    }
+  }
+
   async insertRow(
     request: DriverInsertRowRequest,
     context?: DriverOperationContext,
@@ -1415,7 +1721,8 @@ export class RedisDriver implements IDBDriver {
       context,
       (entry) => {
         const key = this.resolveStoredKey(entry.key);
-        if (!key) throw new Error("Redis delete requires a non-empty key.");
+        if (key === null)
+          throw new Error("Redis delete requires a string key.");
         return async () =>
           (await client.del(key)) > 0 ? "deleted" : "notfound";
       },
@@ -1440,67 +1747,19 @@ export class RedisDriver implements IDBDriver {
       );
     }
     if (operation === "update") {
-      const sourceKey = this.resolveStoredKey(data.primaryKeys?.key);
-      if (!sourceKey) {
-        return "GET <key>";
-      }
-
-      const hasKeyChange = Object.hasOwn(data.changes ?? {}, "key");
-      const targetKey = hasKeyChange
-        ? this.resolveStoredKey(data.changes?.key)
-        : sourceKey;
-      if (!targetKey) {
-        throw new Error("Redis key updates require a non-empty 'key' value.");
-      }
-      const keyChanged = sourceKey !== targetKey;
-
-      const ttlSeconds = Object.hasOwn(data.changes ?? {}, "ttl")
-        ? this.parseRedisTtlInput(data.changes?.ttl, "Redis TTL updates")
-        : undefined;
-      const newValue =
-        data.changes?.value ?? data.changes?.json ?? data.changes?.text;
-      if (newValue !== undefined) {
-        const setPreview = formatRedisPreviewCommand("SET", [
-          targetKey,
-          this.normalizeStoredValue(newValue),
-        ]);
-        const commands: string[] = [];
-        if (keyChanged) {
-          commands.push(
-            formatRedisPreviewCommand("RENAME", [sourceKey, targetKey]),
-          );
-        }
-        commands.push(setPreview);
-        if (ttlSeconds !== undefined) {
-          commands.push(
-            this.buildRedisTtlPreviewStatement(targetKey, ttlSeconds),
-          );
-        }
-        return commands.join("; ");
-      }
-
-      const commands: string[] = [];
-      if (keyChanged) {
-        commands.push(
-          formatRedisPreviewCommand("RENAME", [sourceKey, targetKey]),
-        );
-      }
-      if (ttlSeconds !== undefined) {
-        commands.push(
-          this.buildRedisTtlPreviewStatement(targetKey, ttlSeconds),
-        );
-      }
-
-      return commands.length > 0
-        ? commands.join("; ")
-        : formatRedisPreviewCommand("GET", [sourceKey]);
+      return this.buildRedisUpdatePreview(data);
     }
     const keys = (
       data.primaryKeyValuesList ?? (data.primaryKeys ? [data.primaryKeys] : [])
     )
       .map((entry) => entry.key)
       .filter((k) => k !== undefined)
-      .map((key) => String(key));
+      .map((key) => {
+        const resolved = this.resolveStoredKey(key);
+        if (resolved === null)
+          throw new Error("Redis delete requires a string key.");
+        return resolved;
+      });
     return keys.length > 0
       ? formatRedisPreviewCommand("DEL", keys)
       : "DEL <key>";
@@ -1525,7 +1784,12 @@ export class RedisDriver implements IDBDriver {
       )
         .map((entry) => entry.key)
         .filter((key): key is unknown => key !== undefined)
-        .map((key) => String(key));
+        .map((key) => {
+          const resolved = this.resolveStoredKey(key);
+          if (resolved === null)
+            throw new Error("Redis delete requires a string key.");
+          return resolved;
+        });
       return keys.length > 0
         ? [formatRedisPreviewCommand("DEL", keys)]
         : ["DEL <key>"];
@@ -1537,58 +1801,26 @@ export class RedisDriver implements IDBDriver {
       ];
     }
 
-    const key = data.primaryKeys?.key;
-    if (key === undefined) {
-      return ["GET <key>"];
-    }
-    const sourceKey = this.resolveStoredKey(key);
-    if (!sourceKey) {
-      return ["GET <key>"];
-    }
-    const hasKeyChange = Object.hasOwn(data.changes ?? {}, "key");
-    const targetKey = hasKeyChange
-      ? this.resolveStoredKey(data.changes?.key)
-      : sourceKey;
-    if (!targetKey) {
-      throw new Error("Redis key updates require a non-empty 'key' value.");
-    }
-    const keyChanged = sourceKey !== targetKey;
-
-    const value =
-      data.changes?.value ?? data.changes?.json ?? data.changes?.text;
-    const ttlSeconds = Object.hasOwn(data.changes ?? {}, "ttl")
-      ? this.parseRedisTtlInput(data.changes?.ttl, "Redis TTL updates")
-      : undefined;
-    const statements: string[] = [];
-    if (keyChanged) {
-      statements.push(
-        formatRedisPreviewCommand("RENAME", [sourceKey, targetKey]),
+    const changes = data.changes ?? {};
+    const hasValueChange = ["value", "json", "text"].some((key) =>
+      Object.hasOwn(changes, key),
+    );
+    const sourceKey = this.resolveStoredKey(data.primaryKeys?.key);
+    if (sourceKey !== null && hasValueChange) {
+      const redisType = await (await this.getDatabaseClient(database)).type(
+        sourceKey,
       );
-    }
-
-    if (value === undefined) {
-      if (ttlSeconds !== undefined) {
-        statements.push(
-          this.buildRedisTtlPreviewStatement(targetKey, ttlSeconds),
+      if (redisType === "stream") {
+        throw new Error(
+          "Redis stream values are read-only in the table viewer.",
         );
-        return statements;
       }
-      return statements.length > 0
-        ? statements
-        : [formatRedisPreviewCommand("GET", [sourceKey])];
-    }
-    const redisType = await (await this.getDatabaseClient(database)).type(
-      sourceKey,
-    );
-    statements.push(
-      ...this.buildRedisPreviewStatementsForType(targetKey, redisType, value),
-    );
-    if (ttlSeconds !== undefined) {
-      statements.push(
-        this.buildRedisTtlPreviewStatement(targetKey, ttlSeconds),
+      this.encodeRedisLuaValue(
+        redisType,
+        changes.value ?? changes.json ?? changes.text,
       );
     }
-    return statements;
+    return [this.buildRedisUpdatePreview(data)];
   }
 
   async runTransaction(
@@ -1802,7 +2034,7 @@ export class RedisDriver implements IDBDriver {
     client: RedisClient,
     table: string,
     maxRows: number,
-    failOnTruncation = false,
+    failOnTruncation: RedisKeyLimitPurpose | false = false,
     context?: QueryExecutionOptions,
   ): Promise<RedisSampleRow[]> {
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
@@ -1822,111 +2054,282 @@ export class RedisDriver implements IDBDriver {
     client: RedisClient,
     table: string,
     limit: number,
-    failOnTruncation = false,
+    failOnTruncation: RedisKeyLimitPurpose | false = false,
     context?: QueryExecutionOptions,
   ): Promise<string[]> {
-    const unprefixed = isRedisUnprefixedKeysTable(table);
-    const keys = await this.scanKeys(
+    return this.scanKeys(
       client,
       redisKeyspacePattern(table),
-      unprefixed ? REDIS_READ_BUDGET.maxScanKeys : limit,
+      limit,
       failOnTruncation,
       context,
+      isRedisUnprefixedKeysTable(table)
+        ? { matches: (bytes) => !bytes.includes(0x3a) }
+        : {},
     );
-    const scopedKeys = unprefixed
-      ? keys.filter((key) => !key.includes(":"))
-      : keys;
-    if (failOnTruncation && scopedKeys.length > limit) {
-      throw new Error(
-        `Redis data exceeds the ${limit}-key safety limit. Narrow the filter before continuing or exporting.`,
-      );
-    }
-    return scopedKeys.slice(0, limit);
   }
 
   private async readRowsForKeys(
     client: RedisClient,
     keys: readonly string[],
     context?: QueryExecutionOptions,
+    options: {
+      metadata?: Map<string, RedisKeyMetadata>;
+      initialBytes?: number;
+      stopWhenBudgetSpent?: boolean;
+    } = {},
   ): Promise<RedisSampleRow[]> {
-    // Check both sides of each await: cancellation must also fence late SDK
-    // replies, rather than merely rejecting the caller's timeout wrapper.
     const read = async <T>(operation: () => Promise<T>): Promise<T> => {
       throwIfQueryCancelled(context);
       const result = await this.waitForResult(operation(), context?.signal);
       throwIfQueryCancelled(context);
       return result;
     };
+    const { maxValueBytes, maxTotalValueBytes } = REDIS_READ_BUDGET;
+    let spentBytes = options.initialBytes ?? 0;
+    let inFlightReads = 0;
+    let budgetSpent = false;
+    const budgetWaiters: Array<() => void> = [];
     return pMapWithLimit(
       [...keys],
       REDIS_READ_BUDGET.parallelValueReads,
       async (key) => {
-        const type = await read(() => client.type(key));
+        let metadata = options.metadata?.get(key);
+        const refreshSize =
+          metadata?.type === "hash" || metadata?.type === "set";
+        if (!metadata) {
+          const type = await read(() => client.type(key));
+          const [size, memoryBytes, ttl] = await read(() =>
+            Promise.all([
+              this.readRedisValueSize(client, key, type),
+              this.readRedisMemoryUsage(client, key, type),
+              typeof client.ttl === "function"
+                ? client.ttl(key)
+                : Promise.resolve(-1),
+            ]),
+          );
+          metadata = { type, size, memoryBytes, ttl };
+          options.metadata?.set(key, metadata);
+        }
+        const { type, size, memoryBytes, ttl } = metadata;
+        const stopped = () => options.stopWhenBudgetSpent && budgetSpent;
+        const estimatedBytes =
+          type === "string"
+            ? 4 * size + 2 * "RedisBinary(0x)".length
+            : (memoryBytes ?? maxValueBytes);
+        let omitted: RedisOversizedValueSnapshot | undefined =
+          this.exceedsRedisValueLimit(type, size)
+            ? redisOversizedValueSnapshot(type, size)
+            : memoryBytes !== null && memoryBytes > maxValueBytes
+              ? redisOversizedValueSnapshot(type, memoryBytes, "bytes")
+              : undefined;
+        if (!omitted) {
+          while (
+            !stopped() &&
+            spentBytes + estimatedBytes > maxTotalValueBytes &&
+            inFlightReads > 0
+          ) {
+            await new Promise<void>((resolve) => budgetWaiters.push(resolve));
+            throwIfQueryCancelled(context);
+          }
+          if (stopped() || spentBytes + estimatedBytes > maxTotalValueBytes) {
+            budgetSpent = true;
+            omitted = redisOversizedValueSnapshot(type, size, undefined, true);
+          }
+        }
         let value: unknown = null;
         let binarySnapshot: unknown;
-        switch (type) {
-          case "string":
-            {
-              const bytes = await read(() =>
-                client
-                  .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
-                  .get(key),
-              );
-              value = Buffer.isBuffer(bytes)
-                ? formatRedisBlobString(bytes)
-                : null;
-              if (Buffer.isBuffer(bytes) && !isDisplayableRedisText(bytes)) {
-                binarySnapshot = {
-                  __rapidbRedisBinary: 1,
-                  displayValue: value,
-                  binaryHex: bytes.toString("hex"),
-                };
-              }
-            }
-            break;
-          case "hash":
-            value = await read(() => client.hGetAll(key));
-            break;
-          case "list":
-            value = await read(() => client.lRange(key, 0, -1));
-            break;
-          case "set":
-            value = await read(() => client.sMembers(key));
-            break;
-          case "zset":
-            value = (
-              await read(() =>
-                client
-                  .withTypeMapping({ [RESP_TYPES.DOUBLE]: String })
-                  .zRangeWithScores(key, 0, -1),
-              )
-            ).map((entry) => ({
-              ...entry,
-              score: Number(entry.score),
-            }));
-            break;
-          case "stream":
-            value = await read(() => this.readStreamEntries(client, key));
-            break;
-          default:
-            value = null;
+        if (!omitted) {
+          spentBytes += estimatedBytes;
+          inFlightReads += 1;
+          try {
+            const currentSize = refreshSize
+              ? await read(() => this.readRedisValueSize(client, key, type))
+              : size;
+            ({ value, binarySnapshot, omitted } = this.exceedsRedisValueLimit(
+              type,
+              currentSize,
+            )
+              ? {
+                  value: null,
+                  binarySnapshot: undefined,
+                  omitted: redisOversizedValueSnapshot(type, currentSize),
+                }
+              : await this.readBoundedRedisValue(
+                  client,
+                  key,
+                  type,
+                  currentSize,
+                  read,
+                ));
+          } finally {
+            spentBytes -= estimatedBytes;
+            inFlightReads -= 1;
+            for (const resolve of budgetWaiters.splice(0)) resolve();
+          }
         }
 
-        const ttl =
-          typeof client.ttl === "function"
-            ? await read(() => client.ttl(key))
-            : -1;
-
+        const row = flattenRootRecord({
+          key,
+          value: omitted ? null : value,
+          ttl: ttl >= 0 ? ttl : null,
+          type,
+        });
+        if (!omitted) {
+          const actualBytes =
+            typeof row.value === "string"
+              ? Buffer.byteLength(row.value) *
+                (isRedisBinaryValueSnapshot(binarySnapshot) ? 2 : 1)
+              : 0;
+          if (type !== "string" && actualBytes > maxValueBytes) {
+            omitted = redisOversizedValueSnapshot(type, actualBytes, "bytes");
+          } else if (spentBytes + actualBytes > maxTotalValueBytes) {
+            budgetSpent = true;
+            omitted = redisOversizedValueSnapshot(type, size, undefined, true);
+          } else {
+            spentBytes += actualBytes;
+          }
+        }
         return {
           redisType: type,
           row: {
-            ...flattenRootRecord({
-              key,
-              value,
-              ttl: ttl >= 0 ? ttl : null,
-            }),
-            ...(binarySnapshot ? { value: binarySnapshot } : {}),
+            ...row,
+            ...(omitted
+              ? { value: omitted }
+              : binarySnapshot
+                ? { value: binarySnapshot }
+                : {}),
           },
+        };
+      },
+      context?.signal,
+    );
+  }
+
+  private async readBoundedRedisValue(
+    client: RedisClient,
+    key: string,
+    type: string,
+    size: number,
+    read: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<{
+    value: unknown;
+    binarySnapshot?: unknown;
+    omitted?: RedisOversizedValueSnapshot;
+  }> {
+    const { maxValueEntries, maxValueBytes } = REDIS_READ_BUDGET;
+    let value: unknown = null;
+    let binarySnapshot: unknown;
+    const decoder = new RedisCollectionDecoder();
+    const members = redisMemberClient(client);
+    switch (type) {
+      case "string":
+        {
+          const bytes = await read(() =>
+            client
+              .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
+              .getRange(key, 0, maxValueBytes),
+          );
+          if (Buffer.isBuffer(bytes) && bytes.length > maxValueBytes) {
+            return {
+              value: null,
+              omitted: redisOversizedValueSnapshot(
+                type,
+                Math.max(size, bytes.length),
+              ),
+            };
+          }
+          value = Buffer.isBuffer(bytes) ? formatRedisBlobString(bytes) : null;
+          if (Buffer.isBuffer(bytes) && !isDisplayableRedisText(bytes)) {
+            binarySnapshot = {
+              __rapidbRedisBinary: 1,
+              displayValue: value,
+              binaryHex: bytes.toString("hex"),
+            };
+          }
+        }
+        break;
+      case "hash":
+        value = decoder.record(await read(() => members.hGetAll(key)));
+        break;
+      case "list":
+        value = (await read(() => members.lRange(key, 0, maxValueEntries))).map(
+          (entry) => decoder.text(entry),
+        );
+        break;
+      case "set":
+        value = (await read(() => members.sMembers(key))).map((entry) =>
+          decoder.text(entry),
+        );
+        break;
+      case "zset":
+        value = (
+          await read(() => members.zRangeWithScores(key, 0, maxValueEntries))
+        ).map((entry) => ({
+          value: decoder.text(entry.value),
+          score: formatRedisSortedSetScore(entry.score),
+        }));
+        break;
+      case "stream": {
+        const entries = await read(() =>
+          this.readStreamEntries(members, key, maxValueEntries + 1),
+        );
+        value = Array.isArray(entries)
+          ? entries.map((entry) => {
+              const [id, message] = Array.isArray(entry)
+                ? entry
+                : [entry?.id, entry?.message];
+              return { id: decoder.text(id), message: decoder.record(message) };
+            })
+          : entries;
+        break;
+      }
+      default:
+        value = null;
+    }
+    const entries = Array.isArray(value)
+      ? value.length
+      : type === "hash" && value
+        ? Object.keys(value).length
+        : 0;
+    if (type !== "string" && entries > maxValueEntries) {
+      return {
+        value: null,
+        omitted: redisOversizedValueSnapshot(type, Math.max(size, entries)),
+      };
+    }
+    if (decoder.binary) {
+      binarySnapshot = {
+        __rapidbRedisBinaryCollection: 1,
+        displayValue: JSON.stringify(value),
+      };
+    }
+    return { value, binarySnapshot };
+  }
+
+  private async readRowMetadata(
+    client: RedisClient,
+    keys: readonly string[],
+    context?: QueryExecutionOptions,
+  ): Promise<RedisSampleRow[]> {
+    return pMapWithLimit(
+      [...keys],
+      REDIS_READ_BUDGET.parallelValueReads,
+      async (key) => {
+        throwIfQueryCancelled(context);
+        const [type, ttl] = await this.waitForResult(
+          Promise.all([
+            client.type(key),
+            typeof client.ttl === "function"
+              ? client.ttl(key)
+              : Promise.resolve(-1),
+          ]),
+          context?.signal,
+        );
+        throwIfQueryCancelled(context);
+        return {
+          redisType: type,
+          row: { key, value: null, ttl: ttl >= 0 ? ttl : null, type },
         };
       },
       context?.signal,
@@ -1935,7 +2338,11 @@ export class RedisDriver implements IDBDriver {
 
   private inferRedisColumns(rows: readonly RedisSampleRow[]): ColumnTypeMeta[] {
     const columns = inferColumnsFromRows(
-      rows.map((entry) => redisComparisonRow(entry.row)),
+      rows.map((entry) =>
+        isRedisOversizedValueSnapshot(entry.row.value)
+          ? { ...entry.row, value: null }
+          : redisComparisonRow(entry.row),
+      ),
       "key",
       {
         nullableMode: "schemaLess",
@@ -1961,20 +2368,34 @@ export class RedisDriver implements IDBDriver {
               type: valueTypeLabel,
               nativeType: valueTypeLabel,
             }
-          : column.name === "ttl"
+          : column.name === "type"
             ? {
                 ...column,
-                type: "integer",
-                nativeType: "ttl_seconds",
-                category: "integer",
+                type: "string",
+                nativeType: "redis_type",
+                category: "text",
+                isReadOnly: true,
                 filterable: true,
-                filterOperators: resolveFilterOperators("integer", {
+                filterOperators: resolveFilterOperators("text", {
                   filterable: true,
-                  nullable: true,
+                  nullable: false,
                 }),
                 valueSemantics: "plain",
               }
-            : column,
+            : column.name === "ttl"
+              ? {
+                  ...column,
+                  type: "integer",
+                  nativeType: "ttl_seconds",
+                  category: "integer",
+                  filterable: true,
+                  filterOperators: resolveFilterOperators("integer", {
+                    filterable: true,
+                    nullable: true,
+                  }),
+                  valueSemantics: "plain",
+                }
+              : column,
     );
   }
 
@@ -2034,31 +2455,65 @@ export class RedisDriver implements IDBDriver {
     throw new Error(`${source} require an integer TTL in seconds.`);
   }
 
-  private buildRedisTtlPreviewStatement(
-    key: string,
-    ttlSeconds: number | null,
-  ): string {
-    return ttlSeconds === null
-      ? formatRedisPreviewCommand("PERSIST", [key])
-      : formatRedisPreviewCommand("EXPIRE", [key, ttlSeconds]);
+  private buildRedisUpdatePreview(data: {
+    primaryKeys?: Record<string, unknown>;
+    changes?: Record<string, unknown>;
+  }): string {
+    const changes = data.changes ?? {};
+    const source = this.resolveStoredKey(data.primaryKeys?.key);
+    const target = Object.hasOwn(changes, "key")
+      ? this.resolveStoredKey(changes.key)
+      : source;
+    if (source !== null && target === null) {
+      throw new Error("Redis key updates require a string 'key' value.");
+    }
+    const hasValue = ["value", "json", "text"].some((key) =>
+      Object.hasOwn(changes, key),
+    );
+    const ttl = Object.hasOwn(changes, "ttl")
+      ? this.parseRedisTtlInput(changes.ttl, "Redis TTL updates")
+      : undefined;
+    return JSON.stringify({
+      preview: "Redis update description only; not an executable command",
+      source: source ?? "<missing key>",
+      target: target ?? "<missing key>",
+      conditions:
+        "Source must exist; a different target must not exist; the type must match the type read during execution. When an eligible original value is supplied, string, hash, list, set and zset values are checked for changes. Stream contents are not checked for changes. Other safety checks may reject the edit.",
+      value: hasValue
+        ? {
+            action:
+              "replace using the existing Redis type (empty collections delete the source)",
+            input: changes.value ?? changes.json ?? changes.text ?? null,
+          }
+        : { action: "unchanged" },
+      ttl:
+        ttl === undefined
+          ? "keep existing TTL"
+          : ttl === null
+            ? "persist"
+            : `set to ${ttl} seconds`,
+      execution:
+        "The application executes a conditional Lua script, not this description.",
+    });
   }
 
   private buildRedisInsertPlan(
     values: Record<string, unknown> = {},
   ): RedisInsertPlan {
     const key = this.resolveStoredKey(values.key);
-    if (!key) {
+    if (key === null) {
       throw new Error("Redis insert requires a 'key' field.");
     }
     const ttlSeconds = Object.hasOwn(values, "ttl")
       ? this.parseRedisTtlInput(values.ttl, "Redis TTL inserts")
       : undefined;
+    const value = this.normalizeStoredValue(
+      values.value ?? values.json ?? values.text,
+    );
+    assertRedisLosslessUtf8Value(value);
     return {
       command: "set",
-      args: [
-        key,
-        this.normalizeStoredValue(values.value ?? values.json ?? values.text),
-      ],
+      args: [key, value],
       options:
         ttlSeconds !== undefined && ttlSeconds !== null
           ? { NX: true, EX: ttlSeconds }
@@ -2083,92 +2538,22 @@ export class RedisDriver implements IDBDriver {
     validatePrecision = true,
   ): string {
     if (["hash", "list", "set", "zset"].includes(redisType)) {
-      // Redis members are strings, but JSON.parse can round a numeric literal
-      // before it is converted to that string. Originals are display snapshots,
-      // not new writes, and must remain usable for optimistic checks/repairs.
       value = this.parseRedisJsonValue(
         value,
         `${redisType} value`,
         validatePrecision,
       );
     }
-    switch (redisType) {
-      case "hash":
-        return JSON.stringify(this.parseRedisHashEntries(value));
-      case "list":
-        return JSON.stringify(this.parseRedisSequenceElements(value, "list"));
-      case "set":
-        return JSON.stringify(this.parseRedisSequenceElements(value, "set"));
-      case "zset":
-        return JSON.stringify(this.parseRedisSortedSetEntries(value));
-      default:
-        return JSON.stringify(this.normalizeStoredValue(value));
-    }
-  }
-
-  private buildRedisPreviewStatementsForType(
-    key: string,
-    redisType: string,
-    value: unknown,
-  ): string[] {
-    switch (redisType) {
-      case "hash": {
-        const entries = this.parseRedisHashEntries(value);
-        const preview = [formatRedisPreviewCommand("DEL", [key])];
-        if (Object.keys(entries).length > 0) {
-          preview.push(
-            formatRedisPreviewCommand("HSET", [
-              key,
-              ...Object.entries(entries).flatMap(([field, fieldValue]) => [
-                field,
-                fieldValue,
-              ]),
-            ]),
-          );
-        }
-        return preview;
-      }
-      case "list": {
-        const elements = this.parseRedisSequenceElements(value, "list");
-        const preview = [formatRedisPreviewCommand("DEL", [key])];
-        if (elements.length > 0) {
-          preview.push(formatRedisPreviewCommand("RPUSH", [key, ...elements]));
-        }
-        return preview;
-      }
-      case "set": {
-        const elements = this.parseRedisSequenceElements(value, "set");
-        const preview = [formatRedisPreviewCommand("DEL", [key])];
-        if (elements.length > 0) {
-          preview.push(formatRedisPreviewCommand("SADD", [key, ...elements]));
-        }
-        return preview;
-      }
-      case "zset": {
-        const entries = this.parseRedisSortedSetEntries(value);
-        const preview = [formatRedisPreviewCommand("DEL", [key])];
-        if (entries.length > 0) {
-          preview.push(
-            formatRedisPreviewCommand("ZADD", [
-              key,
-              ...entries.flatMap((entry) => [entry.score, entry.value]),
-            ]),
-          );
-        }
-        return preview;
-      }
-      case "stream":
-        throw new Error(
-          "Redis stream values are read-only in the table viewer.",
-        );
-      default:
-        return [
-          formatRedisPreviewCommand("SET", [
-            key,
-            this.normalizeStoredValue(value),
-          ]),
-        ];
-    }
+    const encoded =
+      redisType === "hash"
+        ? this.parseRedisHashEntries(value)
+        : redisType === "list" || redisType === "set"
+          ? this.parseRedisSequenceElements(value, redisType)
+          : redisType === "zset"
+            ? this.parseRedisSortedSetEntries(value)
+            : this.normalizeStoredValue(value);
+    assertRedisLosslessUtf8Value(encoded);
+    return JSON.stringify(encoded);
   }
 
   private parseRedisSequenceElements(
@@ -2215,10 +2600,14 @@ export class RedisDriver implements IDBDriver {
         typeof rawScore === "number"
           ? rawScore
           : typeof rawScore === "string"
-            ? Number(rawScore)
+            ? /^[+-]?inf$/i.test(rawScore.trim())
+              ? formatRedisSortedSetScore(rawScore)
+              : Number(rawScore)
             : Number.NaN;
-      if (!Number.isFinite(score)) {
-        throw new Error("Redis sorted set scores must be finite numbers.");
+      if (typeof score === "number" && !Number.isFinite(score)) {
+        throw new Error(
+          'Redis sorted set scores must be finite numbers, "+inf", or "-inf".',
+        );
       }
       if (!("value" in entry)) {
         throw new Error(
@@ -2243,7 +2632,9 @@ export class RedisDriver implements IDBDriver {
       return value;
     }
     try {
-      return validatePrecision ? parseJsonForWrite(value) : JSON.parse(value);
+      return validatePrecision
+        ? parseJsonForWrite(value, isRoundTripJsonNumberToken)
+        : JSON.parse(value);
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
       throw new Error(`Redis ${label} must be valid JSON.`);
@@ -2260,19 +2651,78 @@ export class RedisDriver implements IDBDriver {
     return JSON.stringify(value);
   }
 
-  private async readStreamEntries(
+  private async readRedisValueSize(
     client: RedisClient,
     key: string,
-  ): Promise<unknown> {
-    if (typeof client.xRange === "function") {
-      return client.xRange(key, "-", "+");
+    type: string,
+  ): Promise<number> {
+    switch (type) {
+      case "string":
+        return client.strLen(key);
+      case "hash":
+        return client.hLen(key);
+      case "list":
+        return client.lLen(key);
+      case "set":
+        return client.sCard(key);
+      case "zset":
+        return client.zCard(key);
+      case "stream":
+        return client.xLen(key);
+      default:
+        return 0;
     }
-    return client.sendCommand(["XRANGE", key, "-", "+"]);
   }
 
-  private resolveStoredKey(rawKey: unknown): string {
-    if (typeof rawKey !== "string" || rawKey.length === 0) {
-      return "";
+  private async readRedisMemoryUsage(
+    client: RedisClient,
+    key: string,
+    type: string,
+  ): Promise<number | null> {
+    if (
+      !["hash", "list", "set", "zset", "stream"].includes(type) ||
+      typeof client.memoryUsage !== "function"
+    ) {
+      return null;
+    }
+    try {
+      return await client.memoryUsage(key, {
+        SAMPLES: REDIS_READ_BUDGET.maxValueEntries,
+      });
+    } catch (error) {
+      if (error instanceof ErrorReply) return null;
+      throw error;
+    }
+  }
+
+  private exceedsRedisValueLimit(type: string, size: number): boolean {
+    return type === "string"
+      ? size > REDIS_READ_BUDGET.maxValueBytes
+      : size > REDIS_READ_BUDGET.maxValueEntries;
+  }
+
+  private async readStreamEntries(
+    client: RedisMemberClient,
+    key: string,
+    count: number,
+  ): Promise<unknown> {
+    if (typeof client.xRange === "function") {
+      return client.xRange(key, "-", "+", { COUNT: count });
+    }
+    return client.sendCommand([
+      "XRANGE",
+      key,
+      "-",
+      "+",
+      "COUNT",
+      String(count),
+    ]);
+  }
+
+  private resolveStoredKey(rawKey: unknown): string | null {
+    if (typeof rawKey !== "string") return null;
+    if (Buffer.from(rawKey, "utf8").toString("utf8") !== rawKey) {
+      throw new Error("Redis key must be a losslessly UTF-8 encodable string.");
     }
     return rawKey;
   }
@@ -2281,11 +2731,13 @@ export class RedisDriver implements IDBDriver {
     client: RedisClient,
     pattern: string,
     limit = Number.POSITIVE_INFINITY,
-    failOnTruncation = false,
+    failOnTruncation: RedisKeyLimitPurpose | false = false,
     context?: QueryExecutionOptions,
+    options: {
+      matches?: (bytes: Buffer) => boolean;
+      skipBinaryKeys?: boolean;
+    } = {},
   ): Promise<string[]> {
-    // SCAN may repeat keys even within a complete iteration. Repeated replies
-    // must not become duplicate row identities or consume the unique-key budget.
     const keys = new Set<string>();
     const seenCursors = new Set<string>();
     let cursor = "0";
@@ -2296,37 +2748,41 @@ export class RedisDriver implements IDBDriver {
         seenCursors.size >= REDIS_READ_BUDGET.maxScanIterations
       ) {
         throw new Error(
-          "Redis SCAN did not complete within its safety budget. The keyspace may be changing; narrow the keyspace and retry.",
+          `Redis SCAN did not complete within its safety budget of ${REDIS_READ_BUDGET.maxScanIterations} iterations (about ${REDIS_READ_BUDGET.maxScanIterations * REDIS_SCAN_COUNT} keys examined). The keyspace may be very large or changing; narrow the keyspace and retry.`,
         );
       }
       seenCursors.add(cursor);
-      const count = Number.isFinite(limit)
-        ? Math.min(500, Math.max(1, limit - keys.size))
-        : 500;
       const response = await this.waitForResult(
         client
           .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
           .scan(cursor, {
             MATCH: pattern,
-            COUNT: count,
+            COUNT: REDIS_SCAN_COUNT,
           }),
         context?.signal,
       );
       throwIfQueryCancelled(context);
       cursor = response.cursor.toString();
       for (const bytes of response.keys) {
+        if (options.matches && !options.matches(bytes)) continue;
         const key = bytes.toString("utf8");
         if (!Buffer.from(key, "utf8").equals(bytes)) {
+          if (options.skipBinaryKeys) continue;
           throw new Error(
             "Redis keyspace contains a non-UTF-8 key. The table viewer cannot safely display or edit binary keys. Use a binary-safe Redis client or narrow the keyspace.",
           );
         }
         keys.add(key);
       }
-    } while (cursor !== "0" && keys.size < limit);
-    if (failOnTruncation && (cursor !== "0" || keys.size > limit)) {
+    } while (
+      cursor !== "0" &&
+      (failOnTruncation ? keys.size <= limit : keys.size < limit)
+    );
+    if (failOnTruncation && keys.size > limit) {
       throw new Error(
-        `Redis data exceeds the ${limit}-key safety limit. Narrow the filter before continuing or exporting.`,
+        failOnTruncation === "filtering"
+          ? `Redis filtering and non-key sorting read at most ${limit} keys (the ${limit}-key safety limit), and this keyspace has more. Open a narrower key prefix, or clear filters and non-key sorting to page through all keys.`
+          : `Redis key paging reads at most ${limit} keys (the ${limit}-key safety limit), and this keyspace has more. Open a narrower key prefix before continuing or exporting.`,
       );
     }
     return Number.isFinite(limit) ? [...keys].slice(0, limit) : [...keys];

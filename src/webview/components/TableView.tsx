@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ColumnTypeMeta as ColumnMeta,
   MongoValueTypeHint,
@@ -72,7 +72,7 @@ export function TableView({
   const columnsRef = useRef<ColumnMeta[]>([]);
   const rowsRef = useRef<Row[]>([]);
   const mongoIdTypesRef = useRef<Array<"objectId" | "string" | null>>([]);
-  const mongoValueTypesRef = useRef<Array<Record<string, MongoValueTypeHint>>>(
+  const rowValueTypesRef = useRef<Array<Record<string, MongoValueTypeHint>>>(
     [],
   );
   const pkColsRef = useRef<string[]>([]);
@@ -87,9 +87,12 @@ export function TableView({
       primaryKeyColumns: readonly string[],
       previousMongoIdTypes: readonly ("objectId" | "string" | null)[],
       mongoIdTypes: readonly ("objectId" | "string" | null)[],
+      previousRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
+      nextRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
     ) => void;
     resetForTableInit: () => void;
     handleReadFailed: () => void;
+    isFilterNavigationBlocked: () => boolean;
     getMetadataRefreshState: () => {
       busy: boolean;
       hasWork: boolean;
@@ -99,6 +102,7 @@ export function TableView({
     handleRowsCommitted: () => undefined,
     resetForTableInit: () => undefined,
     handleReadFailed: () => undefined,
+    isFilterNavigationBlocked: () => false,
     getMetadataRefreshState: () => ({ busy: false, hasWork: false }),
   });
 
@@ -108,6 +112,7 @@ export function TableView({
   );
   const columnOrderRef = useRef<string[]>([]);
   const hiddenColumnIdsRef = useRef<Set<string>>(new Set());
+  const pasteStructureEpochRef = useRef(0);
   const getExportColumnOrder = () =>
     columnOrderRef.current.filter(
       (id) =>
@@ -116,13 +121,14 @@ export function TableView({
     );
 
   const data = useTableDataController({
+    pasteStructureEpochRef,
     initialPageSize,
     initialView: restoredState.view,
     readOnlyTable: effectiveReadOnly,
     columnsRef,
     rowsRef,
     mongoIdTypesRef,
-    mongoValueTypesRef,
+    rowValueTypesRef,
     pkColsRef,
     scrollRef,
     fetchPageRef,
@@ -130,13 +136,24 @@ export function TableView({
     onTableInit: () => mutationBridgeRef.current.resetForTableInit(),
     getMetadataRefreshState: () =>
       mutationBridgeRef.current.getMetadataRefreshState(),
+    isFilterNavigationBlocked: () =>
+      mutationBridgeRef.current.isFilterNavigationBlocked(),
     onReadFailed: () => mutationBridgeRef.current.handleReadFailed(),
-    onRowsCommitted: (rows, primaryKeyColumns, previousTypes, nextTypes) =>
+    onRowsCommitted: (
+      rows,
+      primaryKeyColumns,
+      previousTypes,
+      nextTypes,
+      previousRowTypes,
+      nextRowTypes,
+    ) =>
       mutationBridgeRef.current.handleRowsCommitted(
         rows,
         primaryKeyColumns,
         previousTypes,
         nextTypes,
+        previousRowTypes,
+        nextRowTypes,
       ),
   });
 
@@ -145,6 +162,7 @@ export function TableView({
   const canSelectAndDeleteRows = !data.readOnlyTable && hasPrimaryKey;
 
   const mutation = useTableMutationController({
+    pasteStructureEpochRef,
     initialDraft: restoredState.draft,
     tableDraftKey,
     mongoRowIdentity,
@@ -158,15 +176,19 @@ export function TableView({
     preserveScrollPositionRef,
     rowsRef,
     mongoIdTypesRef,
-    mongoValueTypesRef,
+    rowValueTypesRef,
     selected,
   });
 
   mutationBridgeRef.current.resetForTableInit = mutation.resetForTableInit;
   mutationBridgeRef.current.handleRowsCommitted = mutation.handleRowsCommitted;
   mutationBridgeRef.current.handleReadFailed = mutation.handleReadFailed;
+  mutationBridgeRef.current.isFilterNavigationBlocked =
+    mutation.isFilterNavigationBlocked;
   mutationBridgeRef.current.getMetadataRefreshState =
     mutation.getMetadataRefreshState;
+  const { setEditCell } = mutation;
+  const cancelCellEdit = useCallback(() => setEditCell(null), [setEditCell]);
 
   useEffect(() => {
     if (!data.hasCommittedData) return;
@@ -191,6 +213,7 @@ export function TableView({
 
   useEffect(() => {
     void data.metadataTick;
+    void data.loading;
     void mutation.pendingEdits;
     void mutation.newRows;
     void mutation.applying;
@@ -199,10 +222,14 @@ export function TableView({
     void mutation.structuredCellDialog;
     void mutation.canUndo;
     void mutation.canRedo;
+    void mutation.reconciliationRequired;
     data.retryMetadataRefresh();
+    data.retryPendingFilter();
   }, [
     data.metadataTick,
     data.retryMetadataRefresh,
+    data.retryPendingFilter,
+    data.loading,
     mutation.pendingEdits,
     mutation.newRows,
     mutation.applying,
@@ -211,6 +238,7 @@ export function TableView({
     mutation.structuredCellDialog,
     mutation.canUndo,
     mutation.canRedo,
+    mutation.reconciliationRequired,
   ]);
 
   useEffect(() => {
@@ -227,6 +255,9 @@ export function TableView({
       ]),
     ),
   ];
+  const unmatchablePendingCount = mutation.unresolvedPendingEdits.filter(
+    (entry) => entry.baselineMissing,
+  ).length;
   const pendingCount = mutation.pendingEdits.size + unresolvedPendingCount;
   const unsavedRowCount = pendingCount + mutation.newRows.length;
   const insertValueCount = mutation.newRows.reduce(
@@ -244,7 +275,11 @@ export function TableView({
     !hasPrimaryKey;
   const mutationBusy = data.loading || mutation.applying || mutation.deleting;
   const canLoadDifferentRows =
-    unsavedRowCount === 0 && !mutationBusy && !mutation.reconciliationRequired;
+    unsavedRowCount === 0 &&
+    !mutationBusy &&
+    !mutation.reconciliationRequired &&
+    !mutation.editCell &&
+    !mutation.structuredCellDialog;
   const guardRowNavigation = (action: () => void) => {
     if (data.loadingRef.current) return;
     if (!canLoadDifferentRows) {
@@ -316,7 +351,7 @@ export function TableView({
         filterError={data.filterError}
         readError={data.readError}
         showMissingPrimaryKeyNotice={showMissingPrimaryKeyNotice}
-        onDismissFilterError={() => data.setFilterError(null)}
+        onDismissFilterError={data.clearFilterError}
         onDismissReadError={() => data.setReadError(null)}
       />
 
@@ -378,12 +413,14 @@ export function TableView({
         unsavedRowCount={unsavedRowCount}
         unresolvedPendingCount={unresolvedPendingCount}
         unresolvedPendingColumns={unresolvedPendingColumns}
+        unmatchablePendingCount={unmatchablePendingCount}
         canUndo={mutation.canUndo}
         canRedo={mutation.canRedo}
         onApplyChanges={mutation.applyChanges}
         onDismissApplyStatus={mutation.dismissApplyStatus}
         onDismissMutationError={mutation.dismissMutationError}
         onRevertChanges={mutation.revertChanges}
+        onDiscardUnresolved={mutation.discardUnresolvedPendingEdits}
         onUndo={mutation.undoAction}
         onRedo={mutation.redoAction}
       />
@@ -392,6 +429,8 @@ export function TableView({
         key={JSON.stringify(data.columns.map((column) => column.name))}
         columnOrderRef={columnOrderRef}
         hiddenColumnIdsRef={hiddenColumnIdsRef}
+        pasteStructureEpochRef={pasteStructureEpochRef}
+        mongoColumnTypes={mongoRowIdentity}
         canEditRows={
           canEditRows &&
           !mutationBusy &&
@@ -401,11 +440,11 @@ export function TableView({
         getRowMutationBlockReason={mutation.getRowMutationBlockReason}
         canSelectAndDeleteRows={
           canSelectAndDeleteRows &&
-          !mutationBusy &&
           !data.schemaWarning &&
           !mutation.reconciliationRequired &&
           unresolvedPendingCount === 0
         }
+        rowSelectionDisabled={mutationBusy}
         colSizes={data.colSizes}
         columns={data.columns}
         editCell={mutation.editCell}
@@ -414,7 +453,7 @@ export function TableView({
         loadingRef={data.loadingRef}
         fetchEpochRef={data.fetchEpochRef}
         newRows={mutation.newRows}
-        onCancelEdit={() => mutation.setEditCell(null)}
+        onCancelEdit={cancelCellEdit}
         onBatchCellEdit={mutation.commitBatchCellEdits}
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
@@ -425,6 +464,7 @@ export function TableView({
           )
         }
         onOpenStructuredCell={mutation.openStructuredCellDialog}
+        getRowCellColumn={mutation.getRowCellColumn}
         onSelectionChange={setSelected}
         onSort={(column) => guardRowNavigation(() => data.handleSort(column))}
         onStartDraftEdit={mutation.handleStartDraftEdit}

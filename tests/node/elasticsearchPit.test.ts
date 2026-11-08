@@ -257,16 +257,75 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
         ),
       ),
     ).rejects.toThrow("requires reading the entire index");
-    expect(exportHook).not.toHaveBeenCalled();
+    expect(exportHook).toHaveBeenCalledOnce();
     expect(client.search).toHaveBeenCalledWith(
-      expect.objectContaining({ size: 10000, track_total_hits: true }),
+      expect.objectContaining({ size: 500, track_total_hits: true }),
       {
         signal: expect.any(AbortSignal),
         requestTimeout: expect.any(Number),
-        maxRetries: 0,
       },
     );
-    expect(client.openPointInTime).not.toHaveBeenCalled();
+    expect(client.openPointInTime).toHaveBeenCalledOnce();
+    expect(client.closePointInTime).toHaveBeenCalledOnce();
+  });
+
+  it("exports filtered and sorted rows from one PIT snapshot through the service", async () => {
+    const { driver, service, client, documents, snapshots } =
+      createElasticsearchPitMock(1200);
+    const readPage = vi.spyOn(driver, "readTablePage");
+    const realSearch = required(client.search.getMockImplementation());
+    client.search.mockImplementation(async (...args) => {
+      const response = await realSearch(...args);
+      documents.splice(0, 50);
+      return response;
+    });
+    const chunks: DriverTableExportChunk[] = [];
+    for await (const chunk of service.exportAll(
+      "es-pit",
+      "default",
+      "indices",
+      "records",
+      100,
+      { column: "_id", direction: "desc" },
+      [{ column: "_id", operator: "like", value: "doc-1" }],
+    ))
+      chunks.push(chunk);
+    const expected = Array.from(
+      { length: 1200 },
+      (_, ordinal) => `doc-${ordinal}`,
+    )
+      .filter((id) => id.includes("doc-1"))
+      .sort()
+      .reverse();
+    const rows = chunks.flatMap((chunk) => chunk.rows);
+    expect(rows.map((row) => row._id)).toEqual(expected);
+    expect(chunks.every((chunk) => chunk.rows.length <= 100)).toBe(true);
+    expect(readPage).not.toHaveBeenCalled();
+    expect(client.openPointInTime).toHaveBeenCalledOnce();
+    expect(client.search).toHaveBeenCalledTimes(3);
+    expect(snapshots.size).toBe(0);
+  });
+
+  it("yields columns for a filtered export without matches", async () => {
+    const { service } = createElasticsearchPitMock(5);
+    const chunks: DriverTableExportChunk[] = [];
+    for await (const chunk of service.exportAll(
+      "es-pit",
+      "default",
+      "indices",
+      "records",
+      100,
+      null,
+      [{ column: "_id", operator: "like", value: "missing" }],
+    ))
+      chunks.push(chunk);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].rows).toEqual([]);
+    expect(chunks[0].columns.map((column) => column.name)).toEqual([
+      "_id",
+      "_identity",
+      "_source",
+    ]);
   });
 
   it.each(

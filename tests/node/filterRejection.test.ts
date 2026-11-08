@@ -50,6 +50,18 @@ describe.each([
     () => new MySQLDriver({ id: "filters", name: "filters", type: "mysql" }),
   ],
 ] as const)("%s filter rejection", (_name, createDriver) => {
+  it("drops In list drafts with no nonempty values", () => {
+    const meta = column("integer", "int");
+    expect(meta.filterOperators).toContain("in");
+    for (const value of ["", " , ", " , , "]) {
+      expect(
+        serializeFilterDrafts([meta], {
+          value: { operator: "in", value },
+        }),
+      ).toEqual([]);
+    }
+  });
+
   it.each([
     "eq",
     "neq",

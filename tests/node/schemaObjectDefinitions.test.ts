@@ -280,9 +280,66 @@ describe("schema object definitions", () => {
     );
   });
 
+  it("preserves Postgres DOMAIN CHECK constraints in Show DDL", async () => {
+    const driver = new PostgresDriver(postgresConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes("format_type(t.typbasetype")) {
+        expect(params).toEqual(["public", "manual_qa_domain_20261025"]);
+        return {
+          rows: [
+            {
+              type_oid: "16384",
+              typtype: "d",
+              typnotnull: true,
+              typdefault: "0",
+              base_type: "integer",
+            },
+          ],
+        };
+      }
+      if (sql.includes("con.contypid = $1::oid")) {
+        expect(params).toEqual(["16384"]);
+        return {
+          rows: [
+            {
+              constraint_name: "manual_qa_domain_20261025_check",
+              definition: "CHECK ((VALUE >= 0) AND (VALUE <= 10))",
+              is_validated: true,
+            },
+            {
+              constraint_name: "manual_qa_domain_20261025_not_five",
+              definition: "CHECK (VALUE <> 5) NOT VALID",
+              is_validated: false,
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    (driver as unknown as { pool: { query: typeof query } }).pool = {
+      query,
+    } as never;
+
+    await expect(
+      driver.getObjectDefinition(
+        "rapidb",
+        "public",
+        "manual_qa_domain_20261025",
+        "type",
+      ),
+    ).resolves.toBe(
+      'CREATE DOMAIN "public"."manual_qa_domain_20261025" AS integer DEFAULT 0 NOT NULL;\nALTER DOMAIN "public"."manual_qa_domain_20261025" ADD CONSTRAINT "manual_qa_domain_20261025_check" CHECK ((VALUE >= 0) AND (VALUE <= 10));\nALTER DOMAIN "public"."manual_qa_domain_20261025" ADD CONSTRAINT "manual_qa_domain_20261025_not_five" CHECK (VALUE <> 5) NOT VALID;',
+    );
+  });
+
   it("lists MSSQL sequences and user-defined types and renders their DDL", async () => {
     const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    let sequenceIsCached = 1;
+    let sequenceCacheSize: number | null = 20;
     const query = vi.fn((sql: string) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return Promise.resolve({ recordset: [{ major_version: 11 }] });
+      }
       if (sql.includes("INFORMATION_SCHEMA.TABLES")) {
         return Promise.resolve({
           recordset: [{ name: "users", type: "BASE TABLE" }],
@@ -314,7 +371,8 @@ describe("schema object definitions", () => {
               minimum_value: 10,
               maximum_value: 1000,
               is_cycling: 0,
-              cache_size: 20,
+              is_cached: sequenceIsCached,
+              cache_size: sequenceCacheSize,
             },
           ],
         });
@@ -323,6 +381,7 @@ describe("schema object definitions", () => {
         sql.includes("FROM [rapidb].sys.types t") &&
         sql.includes("t.name = @name")
       ) {
+        expect(sql).not.toContain("tt.is_memory_optimized");
         return Promise.resolve({
           recordset: [
             {
@@ -356,9 +415,685 @@ describe("schema object definitions", () => {
     ).resolves.toBe(
       "CREATE SEQUENCE [dbo].[users_id_seq] START WITH 10 INCREMENT BY 5 MINVALUE 10 MAXVALUE 1000 NO CYCLE CACHE 20;",
     );
+    sequenceCacheSize = null;
+    await expect(
+      driver.getObjectDefinition("rapidb", "dbo", "users_id_seq", "sequence"),
+    ).resolves.toBe(
+      "CREATE SEQUENCE [dbo].[users_id_seq] START WITH 10 INCREMENT BY 5 MINVALUE 10 MAXVALUE 1000 NO CYCLE CACHE;",
+    );
+    sequenceIsCached = 0;
+    await expect(
+      driver.getObjectDefinition("rapidb", "dbo", "users_id_seq", "sequence"),
+    ).resolves.toBe(
+      "CREATE SEQUENCE [dbo].[users_id_seq] START WITH 10 INCREMENT BY 5 MINVALUE 10 MAXVALUE 1000 NO CYCLE NO CACHE;",
+    );
     await expect(
       driver.getObjectDefinition("rapidb", "dbo", "user_status", "type"),
     ).resolves.toBe("CREATE TYPE [dbo].[user_status] FROM nvarchar(20) NULL;");
+  });
+
+  it("lists MSSQL table-valued types and renders their table metadata as DDL", async () => {
+    const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string, inputs: Map<string, unknown>) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return { recordset: [{ major_version: 16 }] };
+      }
+      if (sql.includes("INFORMATION_SCHEMA.TABLES")) {
+        return { recordset: [] };
+      }
+      if (sql.includes("sys.objects o")) {
+        return { recordset: [] };
+      }
+      if (sql.includes("sys.sequences seq")) {
+        return { recordset: [] };
+      }
+      if (sql.includes("sys.types t") && sql.includes("ORDER BY t.name")) {
+        return { recordset: [{ name: "manual_pair_type" }] };
+      }
+      if (sql.includes("sys.types t") && sql.includes("t.name = @name")) {
+        expect(inputs.get("name")).toBe("manual_pair_type");
+        return {
+          recordset: [
+            {
+              is_table_type: 1,
+              type_table_object_id: 700,
+              is_memory_optimized: 0,
+              base_type: null,
+              max_length: 0,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+            },
+          ],
+        };
+      }
+      if (
+        sql.includes("sys.columns c") &&
+        sql.includes("c.object_id = @objectId")
+      ) {
+        expect(sql).toContain("[rapidb].sys.schemas us");
+        expect(sql).not.toContain("TYPE_SCHEMA_NAME(c.user_type_id)");
+        expect(inputs.get("objectId")).toBe(700);
+        return {
+          recordset: [
+            {
+              column_name: "id",
+              data_type: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              is_nullable: 0,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 1,
+              identity_seed: "1",
+              identity_increment: "1",
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: null,
+            },
+            {
+              column_name: "label",
+              data_type: "nvarchar",
+              max_length: 100,
+              precision: 0,
+              scale: 0,
+              is_nullable: 1,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: "Latin1_General_100_CI_AS",
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: "(N'label')",
+            },
+            {
+              column_name: "label_upper",
+              data_type: "nvarchar",
+              max_length: 100,
+              precision: 0,
+              scale: 0,
+              is_nullable: 1,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 1,
+              computed_definition: "upper([label])",
+              is_persisted: 1,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: null,
+            },
+            {
+              column_name: "nonpersisted_nn",
+              data_type: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              is_nullable: 0,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 1,
+              computed_definition: "isnull([id], 0)",
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              xml_collection_id: 0,
+              is_xml_document: 0,
+              default_object_id: 0,
+              column_default: null,
+            },
+            {
+              column_name: "payload",
+              data_type: "xml",
+              max_length: -1,
+              precision: 0,
+              scale: 0,
+              is_nullable: 1,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: "dbo",
+              xml_collection_name: "Payload",
+              xml_collection_id: 23,
+              is_xml_document: 1,
+              column_default: null,
+            },
+            {
+              column_name: "guid_col",
+              data_type: "uniqueidentifier",
+              max_length: 16,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 1,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: null,
+            },
+            {
+              column_name: "alias_col",
+              data_type: "manual_alias",
+              max_length: 32,
+              precision: 0,
+              scale: 0,
+              is_nullable: 1,
+              is_user_defined: 1,
+              type_schema: "types",
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.indexes i")) {
+        return {
+          recordset: [
+            {
+              index_id: 1,
+              index_name: "PK_manual_pair_type",
+              is_primary_key: 1,
+              is_unique_constraint: 0,
+              is_unique: 1,
+              ignore_dup_key: 0,
+              type_desc: "CLUSTERED",
+              is_hash: 0,
+              bucket_count: null,
+              column_name: "id",
+              key_ordinal: 1,
+              is_descending_key: 0,
+              is_included_column: 0,
+            },
+            {
+              index_id: 2,
+              index_name: "IX_label",
+              is_primary_key: 0,
+              is_unique_constraint: 0,
+              is_unique: 0,
+              ignore_dup_key: 0,
+              type_desc: "NONCLUSTERED",
+              is_hash: 0,
+              bucket_count: null,
+              column_name: "label",
+              key_ordinal: 1,
+              is_descending_key: 0,
+              is_included_column: 0,
+            },
+            {
+              index_id: 2,
+              index_name: "IX_label",
+              is_primary_key: 0,
+              is_unique_constraint: 0,
+              is_unique: 0,
+              ignore_dup_key: 0,
+              type_desc: "NONCLUSTERED",
+              is_hash: 0,
+              bucket_count: null,
+              column_name: "id",
+              key_ordinal: 0,
+              is_descending_key: 0,
+              is_included_column: 1,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.check_constraints")) {
+        return {
+          recordset: [
+            {
+              name: "CK_manual_pair_type_id",
+              definition: "([id] > 0)",
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const request = vi.fn(() => {
+      const inputs = new Map<string, unknown>();
+      const requestObject = {
+        input: vi.fn((key: string, _type: unknown, value: unknown) => {
+          inputs.set(key, value);
+          return requestObject;
+        }),
+        query: (sql: string) => query(sql, inputs),
+      };
+      return requestObject;
+    });
+    (driver as unknown as { pool: { request: typeof request } }).pool = {
+      request,
+      close: vi.fn(),
+      on: vi.fn(),
+    } as never;
+
+    await expect(driver.listObjects("rapidb", "dbo")).resolves.toEqual(
+      expect.arrayContaining([
+        { schema: "dbo", name: "manual_pair_type", type: "type" },
+      ]),
+    );
+    await expect(
+      driver.getObjectDefinition("rapidb", "dbo", "manual_pair_type", "type"),
+    ).resolves.toBe(
+      "CREATE TYPE [dbo].[manual_pair_type] AS TABLE (\n" +
+        "  [id] int NOT NULL IDENTITY (1, 1),\n" +
+        "  [label] nvarchar(50) COLLATE [Latin1_General_100_CI_AS] NULL DEFAULT (N'label'),\n" +
+        "  [label_upper] AS upper([label]) PERSISTED,\n" +
+        "  [nonpersisted_nn] AS isnull([id], 0),\n" +
+        "  [payload] xml (DOCUMENT [dbo].[Payload]) NULL,\n" +
+        "  [guid_col] uniqueidentifier NOT NULL ROWGUIDCOL,\n" +
+        "  [alias_col] [types].[manual_alias] NULL,\n" +
+        "PRIMARY KEY CLUSTERED ([id] ASC),\n" +
+        "INDEX [IX_label] NONCLUSTERED ([label] ASC) INCLUDE ([id]),\n" +
+        "  CHECK ([id] > 0)\n" +
+        ");",
+    );
+  });
+
+  it("renders memory-optimized MSSQL table types with hash index metadata", async () => {
+    const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return { recordset: [{ major_version: 16 }] };
+      }
+      if (sql.includes("t.name = @name")) {
+        return {
+          recordset: [
+            {
+              is_table_type: 1,
+              type_table_object_id: 701,
+              is_memory_optimized: 1,
+              base_type: null,
+              max_length: 0,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+            },
+          ],
+        };
+      }
+      if (
+        sql.includes("sys.columns c") &&
+        sql.includes("ORDER BY c.column_id")
+      ) {
+        return {
+          recordset: [
+            {
+              column_name: "id",
+              data_type: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              is_nullable: 0,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              is_xml_document: 0,
+              column_default: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.indexes i")) {
+        expect(sql).toContain("sys.hash_indexes hi");
+        expect(sql).toContain("i.type = 7");
+        return {
+          recordset: [
+            {
+              index_id: 1,
+              index_name: "PK_manual_hash_type",
+              is_primary_key: 1,
+              is_unique_constraint: 0,
+              is_unique: 1,
+              ignore_dup_key: 0,
+              type_desc: "NONCLUSTERED HASH",
+              is_hash: 1,
+              bucket_count: 1024,
+              column_name: "id",
+              key_ordinal: 1,
+              is_descending_key: 0,
+              is_included_column: 0,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.check_constraints")) {
+        return { recordset: [] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const request = vi.fn(() => {
+      const requestObject = {
+        input: vi.fn().mockReturnThis(),
+        query: (sql: string) => query(sql),
+      };
+      return requestObject;
+    });
+    (driver as unknown as { pool: { request: typeof request } }).pool = {
+      request,
+      close: vi.fn(),
+      on: vi.fn(),
+    } as never;
+
+    const ddl = await driver.getObjectDefinition(
+      "rapidb",
+      "dbo",
+      "manual_hash_type",
+      "type",
+    );
+    expect(ddl).toBe(
+      "CREATE TYPE [dbo].[manual_hash_type] AS TABLE (\n" +
+        "  [id] int NOT NULL,\n" +
+        "PRIMARY KEY NONCLUSTERED HASH ([id]) WITH (BUCKET_COUNT = 1024)\n" +
+        ") WITH (MEMORY_OPTIMIZED = ON);",
+    );
+  });
+
+  it("uses legacy MSSQL catalog queries before SQL Server 2014", async () => {
+    const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return { recordset: [{ major_version: 11 }] };
+      }
+      if (sql.includes("t.name = @name")) {
+        expect(sql).not.toContain("tt.is_memory_optimized");
+        return {
+          recordset: [
+            {
+              is_table_type: 1,
+              type_table_object_id: 702,
+              is_memory_optimized: 0,
+              base_type: null,
+              max_length: 0,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+            },
+          ],
+        };
+      }
+      if (
+        sql.includes("sys.columns c") &&
+        sql.includes("ORDER BY c.column_id")
+      ) {
+        return {
+          recordset: [
+            {
+              column_name: "value",
+              data_type: "int",
+              max_length: 4,
+              precision: 10,
+              scale: 0,
+              is_nullable: 0,
+              is_user_defined: 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              xml_collection_id: 0,
+              is_xml_document: 0,
+              default_object_id: 0,
+              column_default: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.indexes i")) {
+        expect(sql).not.toContain("sys.hash_indexes");
+        expect(sql).not.toContain("i.type = 7");
+        return {
+          recordset: [
+            {
+              index_id: 1,
+              index_name: "PK_manual_legacy_type",
+              is_primary_key: 1,
+              is_unique_constraint: 0,
+              is_unique: 1,
+              ignore_dup_key: 0,
+              type_desc: "CLUSTERED",
+              is_hash: 0,
+              bucket_count: null,
+              column_name: "value",
+              key_ordinal: 1,
+              is_descending_key: 0,
+              is_included_column: 0,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.check_constraints")) {
+        return { recordset: [] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const request = vi.fn(() => {
+      const requestObject = {
+        input: vi.fn().mockReturnThis(),
+        query: (sql: string) => query(sql),
+      };
+      return requestObject;
+    });
+    (driver as unknown as { pool: { request: typeof request } }).pool = {
+      request,
+      close: vi.fn(),
+      on: vi.fn(),
+    } as never;
+
+    await expect(
+      driver.getObjectDefinition("rapidb", "dbo", "manual_legacy_type", "type"),
+    ).resolves.toBe(
+      "CREATE TYPE [dbo].[manual_legacy_type] AS TABLE (\n" +
+        "  [value] int NOT NULL,\n" +
+        "PRIMARY KEY CLUSTERED ([value] ASC)\n" +
+        ");",
+    );
+  });
+
+  it("does not fabricate MSSQL table-type DDL when referenced metadata is missing", async () => {
+    const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    let metadataCase: "xml" | "udt" | "default" | "unknown-version" = "xml";
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return {
+          recordset: [
+            {
+              major_version: metadataCase === "unknown-version" ? null : 16,
+            },
+          ],
+        };
+      }
+      if (sql.includes("t.name = @name")) {
+        return {
+          recordset: [
+            {
+              is_table_type: 1,
+              type_table_object_id: 703,
+              is_memory_optimized: 0,
+              base_type: null,
+              max_length: 0,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+            },
+          ],
+        };
+      }
+      if (
+        sql.includes("sys.columns c") &&
+        sql.includes("ORDER BY c.column_id")
+      ) {
+        const isXml = metadataCase === "xml";
+        const isUdt = metadataCase === "udt";
+        return {
+          recordset: [
+            {
+              column_name: "value",
+              data_type: isXml ? "xml" : isUdt ? "manual_alias" : "int",
+              max_length: isXml ? -1 : 4,
+              precision: 10,
+              scale: 0,
+              is_nullable: 1,
+              is_user_defined: isUdt ? 1 : 0,
+              type_schema: null,
+              is_computed: 0,
+              computed_definition: null,
+              is_persisted: 0,
+              is_identity: 0,
+              identity_seed: null,
+              identity_increment: null,
+              is_rowguidcol: 0,
+              collation_name: null,
+              xml_collection_schema: null,
+              xml_collection_name: null,
+              xml_collection_id: isXml ? 42 : 0,
+              is_xml_document: 0,
+              default_object_id: metadataCase === "default" ? 99 : 0,
+              column_default: null,
+            },
+          ],
+        };
+      }
+      if (sql.includes("sys.indexes i")) {
+        return { recordset: [] };
+      }
+      if (sql.includes("sys.check_constraints")) {
+        return { recordset: [] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const request = vi.fn(() => {
+      const requestObject = {
+        input: vi.fn().mockReturnThis(),
+        query: (sql: string) => query(sql),
+      };
+      return requestObject;
+    });
+    (driver as unknown as { pool: { request: typeof request } }).pool = {
+      request,
+      close: vi.fn(),
+      on: vi.fn(),
+    } as never;
+
+    const metadataCases: Array<"xml" | "udt" | "default" | "unknown-version"> =
+      ["xml", "udt", "default", "unknown-version"];
+    for (const testCase of metadataCases) {
+      metadataCase = testCase;
+      await expect(
+        driver.getObjectDefinition(
+          "rapidb",
+          "dbo",
+          "manual_missing_meta",
+          "type",
+        ),
+      ).resolves.toBeNull();
+    }
+  });
+
+  it("does not fabricate DDL for MSSQL CLR types without a native base type", async () => {
+    const driver = new MSSQLDriver(mssqlConfig as ConnectionConfig);
+    const query = vi.fn(async (sql: string) => {
+      if (sql.includes("SERVERPROPERTY('ProductVersion')")) {
+        return { recordset: [{ major_version: 16 }] };
+      }
+      if (sql.includes("t.name = @name")) {
+        return {
+          recordset: [
+            {
+              is_table_type: 0,
+              type_table_object_id: null,
+              is_memory_optimized: 0,
+              base_type: null,
+              max_length: 16,
+              precision: 0,
+              scale: 0,
+              is_nullable: 0,
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+    const request = vi.fn(() => {
+      const requestObject = {
+        input: vi.fn().mockReturnThis(),
+        query: (sql: string) => query(sql),
+      };
+      return requestObject;
+    });
+    (driver as unknown as { pool: { request: typeof request } }).pool = {
+      request,
+      close: vi.fn(),
+      on: vi.fn(),
+    } as never;
+
+    await expect(
+      driver.getObjectDefinition("rapidb", "dbo", "manual_clr_type", "type"),
+    ).resolves.toBeNull();
   });
 
   it("keeps MySQL limited to tables, views, and routines", async () => {
@@ -596,24 +1331,79 @@ describe("schema object definitions", () => {
     );
   });
 
+  it("preserves exact Oracle quoted identifiers while hiding only matching materialized-view storage tables", async () => {
+    const driver = new OracleDriver(oracleConfig as ConnectionConfig);
+    const close = vi.fn(async () => undefined);
+    const execute = vi.fn(async (sql: string, _binds?: unknown[]) => {
+      if (sql.includes("FROM all_mviews"))
+        return {
+          rows: [
+            { MVIEW_NAME: "ORDERS", COMPILE_STATE: "VALID" },
+            { MVIEW_NAME: "QuotedMv ", COMPILE_STATE: "VALID" },
+            { MVIEW_NAME: "BAD_MV", COMPILE_STATE: "NEEDS_COMPILE" },
+          ],
+        };
+      if (sql.includes("FROM all_objects"))
+        return {
+          rows: [
+            { OBJECT_NAME: "ORDERS", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "ORDERS", OBJECT_TYPE: "MATERIALIZED VIEW" },
+            { OBJECT_NAME: "orders", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "ORDERS ", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: " Orders", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "QuotedMv ", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "QuotedMv", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "quotedmv ", OBJECT_TYPE: "TABLE" },
+            { OBJECT_NAME: "BAD_MV", OBJECT_TYPE: "TABLE" },
+          ],
+        };
+      throw Error(`Unexpected SQL: ${sql}`);
+    });
+    Object.assign(driver, { getConnection: async () => ({ execute, close }) });
+    expect(await driver.listObjects("FREEPDB1", "app")).toEqual([
+      { schema: "app", name: "orders", type: "table" },
+      { schema: "app", name: "ORDERS ", type: "table" },
+      { schema: "app", name: " Orders", type: "table" },
+      { schema: "app", name: "QuotedMv", type: "table" },
+      { schema: "app", name: "quotedmv ", type: "table" },
+      { schema: "app", name: "ORDERS", type: "materializedView" },
+      { schema: "app", name: "QuotedMv ", type: "materializedView" },
+      { schema: "app", name: "BAD_MV", type: "materializedView" },
+    ]);
+    expect(execute.mock.calls[0][0]).not.toMatch(/compile_state\s*=/i);
+    expect(close).toHaveBeenCalledOnce();
+    expect(execute.mock.calls.map(([, binds]) => binds)).toEqual([
+      ["app"],
+      ["app"],
+    ]);
+  });
+
   it("lists Oracle materialized views, sequences, and types and renders metadata DDL", async () => {
     const driver = new OracleDriver(oracleConfig as ConnectionConfig);
     const execute = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM all_mviews") && sql.includes("mview_name = :2")) {
+        return { rows: [{ MVIEW_NAME: "DAILY_USERS" }] };
+      }
+      if (sql.includes("FROM all_mviews")) {
+        return {
+          rows: [{ MVIEW_NAME: "DAILY_USERS", COMPILE_STATE: "VALID" }],
+        };
+      }
       if (
         sql.includes("FROM all_objects") &&
-        sql.includes("status = 'VALID'")
+        sql.includes("SELECT object_name, object_type")
       ) {
         return {
           rows: [
             { OBJECT_NAME: "USERS", OBJECT_TYPE: "TABLE" },
-            { OBJECT_NAME: "DAILY_USERS", OBJECT_TYPE: "MATERIALIZED VIEW" },
+            { OBJECT_NAME: "DAILY_USERS", OBJECT_TYPE: "TABLE" },
             { OBJECT_NAME: "USERS_ID_SEQ", OBJECT_TYPE: "SEQUENCE" },
             { OBJECT_NAME: "USER_STATUS", OBJECT_TYPE: "TYPE" },
           ],
         };
       }
       if (sql.includes("SELECT object_type FROM all_objects")) {
-        return { rows: [{ OBJECT_TYPE: "MATERIALIZED VIEW" }] };
+        return { rows: [{ OBJECT_TYPE: "TABLE" }] };
       }
       if (sql.includes("DBMS_METADATA.SET_TRANSFORM_PARAM")) {
         return { rows: [] };
@@ -656,7 +1446,8 @@ describe("schema object definitions", () => {
       close: async () => undefined,
     });
 
-    await expect(driver.listObjects("rapidb", "app")).resolves.toEqual(
+    const objects = await driver.listObjects("rapidb", "app");
+    expect(objects).toEqual(
       expect.arrayContaining([
         { schema: "app", name: "USERS", type: "table" },
         {
@@ -668,6 +1459,9 @@ describe("schema object definitions", () => {
         { schema: "app", name: "USER_STATUS", type: "type" },
       ]),
     );
+    expect(objects.filter((object) => object.name === "DAILY_USERS")).toEqual([
+      { schema: "app", name: "DAILY_USERS", type: "materializedView" },
+    ]);
     await expect(
       driver.getCreateTableDDL("rapidb", "app", "daily_users"),
     ).resolves.toBe(
@@ -680,6 +1474,84 @@ describe("schema object definitions", () => {
       driver.getObjectDefinition("rapidb", "app", "user_status", "type"),
     ).resolves.toBe(
       'CREATE TYPE "APP"."USER_STATUS" AS OBJECT (STATUS VARCHAR2(32));',
+    );
+  });
+
+  it("does not report TABLE DDL when materialized view metadata is unavailable", async () => {
+    const driver = new OracleDriver(oracleConfig as ConnectionConfig);
+    const execute = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM all_mviews")) {
+        return { rows: [{ MVIEW_NAME: "DAILY_USERS" }] };
+      }
+      if (sql.includes("DBMS_METADATA.SET_TRANSFORM_PARAM")) {
+        return { rows: [] };
+      }
+      if (sql.includes("DBMS_METADATA.GET_DDL('MATERIALIZED_VIEW'")) {
+        throw new Error("metadata unavailable");
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+
+    (
+      driver as unknown as {
+        getConnection: () => Promise<{
+          execute: typeof execute;
+          close(): Promise<void>;
+        }>;
+      }
+    ).getConnection = async () => ({
+      execute,
+      close: async () => undefined,
+    });
+
+    await expect(
+      driver.getCreateTableDDL("rapidb", "APP", "DAILY_USERS"),
+    ).resolves.toBe(
+      '-- Materialized view DDL not available for "APP"."DAILY_USERS"',
+    );
+    expect(execute).not.toHaveBeenCalledWith(
+      expect.stringContaining("DBMS_METADATA.GET_DDL('TABLE'"),
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("fails closed when Oracle cannot check whether an object is a materialized view", async () => {
+    const driver = new OracleDriver(oracleConfig as ConnectionConfig);
+    const execute = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM all_mviews")) {
+        throw new Error("ALL_MVIEWS unavailable");
+      }
+      if (sql.includes("SELECT object_type FROM all_objects")) {
+        return { rows: [{ OBJECT_TYPE: "TABLE" }] };
+      }
+      throw new Error(`Unexpected SQL: ${sql}`);
+    });
+
+    (
+      driver as unknown as {
+        getConnection: () => Promise<{
+          execute: typeof execute;
+          close(): Promise<void>;
+        }>;
+      }
+    ).getConnection = async () => ({
+      execute,
+      close: async () => undefined,
+    });
+
+    await expect(
+      driver.getCreateTableDDL("rapidb", "APP", "DAILY_USERS"),
+    ).resolves.toBe('-- DDL not available for "APP"."DAILY_USERS"');
+    expect(execute).not.toHaveBeenCalledWith(
+      expect.stringContaining("DBMS_METADATA.GET_DDL('TABLE'"),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(execute).not.toHaveBeenCalledWith(
+      expect.stringContaining("FROM all_tables"),
+      expect.anything(),
+      expect.anything(),
     );
   });
 

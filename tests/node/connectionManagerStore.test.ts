@@ -883,6 +883,69 @@ describe("VSCodeConnectionManagerStore", () => {
     });
   });
 
+  it("drops the removed legacy sqliteWalMode field from stored SQLite connections", async () => {
+    vi.resetModules();
+
+    const storedConnections = [
+      {
+        id: "sqlite-1",
+        name: "Legacy SQLite",
+        type: "sqlite",
+        filePath: "/tmp/legacy.sqlite",
+        sqliteWalMode: "off",
+      },
+    ];
+    const update = vi.fn(async () => undefined);
+    const get = vi.fn((section: string, fallback?: unknown) => {
+      if (section === "connections") {
+        return storedConnections;
+      }
+      return fallback;
+    });
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get,
+          update,
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    const expected = [
+      {
+        id: "sqlite-1",
+        name: "Legacy SQLite",
+        type: "sqlite",
+        filePath: "/tmp/legacy.sqlite",
+      },
+    ];
+    expect(store.getConnections()).toStrictEqual(expected);
+    await vi.waitFor(() => {
+      expect(update).toHaveBeenCalledWith("connections", expected, 1);
+    });
+  });
+
   it("migrates ssl=true rejectUnauthorized=false to tls requireTrustServerCertificate", async () => {
     vi.resetModules();
 
@@ -1101,6 +1164,153 @@ describe("VSCodeConnectionManagerStore", () => {
     ]);
 
     expect(update).toHaveBeenCalledWith("connections", expect.any(Array), 2);
+  });
+
+  it.each([
+    {
+      name: "password",
+      connection: { type: "pg", host: "db", password: "hand-password" },
+    },
+    {
+      name: "API key",
+      connection: {
+        type: "elasticsearch",
+        endpoint: "https://es",
+        apiKey: "hand-key",
+      },
+    },
+    {
+      name: "AWS credentials",
+      connection: {
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "hand-access",
+        awsSecretAccessKey: "hand-secret",
+        awsSessionToken: "hand-token",
+      },
+    },
+    {
+      name: "SSH secrets",
+      connection: {
+        type: "mysql",
+        host: "db",
+        ssh: {
+          host: "bastion",
+          username: "tunnel",
+          authMethod: "privateKey",
+          privateKey: "hand-private-key",
+          passphrase: "hand-passphrase",
+        },
+      },
+    },
+    {
+      name: "SSH password",
+      connection: {
+        type: "pg",
+        host: "db",
+        ssh: {
+          host: "bastion",
+          username: "tunnel",
+          authMethod: "password",
+          password: "hand-ssh-password",
+        },
+      },
+    },
+    {
+      name: "TLS key passphrase",
+      connection: {
+        type: "pg",
+        host: "db",
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/cert",
+          keyFilePath: "/key",
+          keyPassphrase: "hand-tls",
+        },
+      },
+    },
+    {
+      name: "credential URI",
+      connection: {
+        type: "mongodb",
+        connectionUri: "mongodb://user:hand-uri@db/app",
+      },
+    },
+    {
+      name: "ambiguous credential URI",
+      connection: {
+        type: "mongodb",
+        connectionUri: "mongodb://admin:pa/ss@db/app",
+      },
+    },
+  ])("marks hand-written $name as plaintext in the scope it came from", async ({
+    connection,
+  }) => {
+    for (const [scope, target] of [
+      ["globalValue", 1],
+      ["workspaceValue", 2],
+      ["workspaceFolderValue", 3],
+    ] as const) {
+      vi.resetModules();
+      const handWritten = {
+        id: "hand",
+        name: "Hand",
+        ...connection,
+      } as unknown as StoredConnectionConfig;
+      const untouched = [
+        { id: "flag-true", name: "T", type: "pg", useSecretStorage: true },
+        {
+          id: "flag-false",
+          name: "F",
+          type: "pg",
+          password: "plain",
+          useSecretStorage: false,
+        },
+        { id: "no-secret", name: "N", type: "elasticsearch" },
+      ] as StoredConnectionConfig[];
+      let connections: StoredConnectionConfig[] = [
+        structuredClone(handWritten),
+        ...structuredClone(untouched),
+      ];
+      const update = vi.fn(
+        async (_key: string, value: StoredConnectionConfig[]) => {
+          connections = JSON.parse(JSON.stringify(value));
+        },
+      );
+      vi.doMock("vscode", () => ({
+        workspace: {
+          getConfiguration: vi.fn(() => ({
+            get: vi.fn(() => connections),
+            inspect: vi.fn(() => ({ [scope]: connections })),
+            update,
+          })),
+          onDidChangeConfiguration: vi.fn(),
+        },
+        ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+      }));
+      const { VSCodeConnectionManagerStore } = await import(
+        "../../src/extension/connectionManagerStore"
+      );
+      const secrets = { get: vi.fn(), store: vi.fn(), delete: vi.fn() };
+      const store = new VSCodeConnectionManagerStore({
+        globalState: { get: vi.fn(), update: vi.fn() },
+        secrets,
+      } as never);
+
+      const expected = [
+        { ...handWritten, useSecretStorage: false },
+        ...untouched,
+      ];
+      expect(store.getConnections()).toEqual(expected);
+      await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+      expect(update).toHaveBeenCalledWith("connections", expected, target);
+      expect(connections).toEqual(expected);
+      expect(store.getConnections()).toEqual(expected);
+      await store.mutateConnections(() => ({ result: undefined }));
+      expect(update).toHaveBeenCalledOnce();
+      expect(secrets.store).not.toHaveBeenCalled();
+      expect(secrets.delete).not.toHaveBeenCalled();
+    }
   });
 
   it("serializes concurrent mutations so neither connection is lost", async () => {

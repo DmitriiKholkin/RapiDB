@@ -33,8 +33,6 @@ function column(
   };
 }
 
-// Only the transport is mocked: the planner, binding, driver transaction,
-// verification, commit/rollback and Apply outcomes are the production paths.
 function harness(
   engine: "mssql" | "oracle",
   temporal: ColumnTypeMeta,

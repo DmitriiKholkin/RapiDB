@@ -126,4 +126,63 @@ describe("literal table column names", () => {
       ],
     });
   });
+
+  it("adds read-only page columns sent with table data and exports them", () => {
+    const base: ColumnTypeMeta = {
+      name: "id",
+      type: "text",
+      nativeType: "text",
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+      isForeignKey: false,
+      filterable: true,
+      filterOperators: ["eq"],
+      valueSemantics: "plain",
+    };
+    const late: ColumnTypeMeta = {
+      ...base,
+      name: "late",
+      type: "mixed",
+      nativeType: "mixed",
+      category: "other",
+      nullable: true,
+      isPrimaryKey: false,
+      filterable: false,
+      filterOperators: [],
+      isReadOnly: true,
+    };
+    render(
+      <TableView
+        connectionId="c"
+        database="db"
+        schema="public"
+        table="records"
+      />,
+    );
+    act(() =>
+      dispatchIncomingMessage("tableInit", {
+        columns: [base],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    const request = getPostedMessages()
+      .filter((message) => message.type === "fetchPage")
+      .at(-1)?.payload as { fetchId: number };
+    act(() =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: request.fetchId,
+        extraColumns: [late],
+        rows: [{ id: "1", late: "found later" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.getByText("found later")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(
+      getPostedMessages()
+        .filter((message) => message.type === "exportJSON")
+        .at(-1)?.payload,
+    ).toMatchObject({ columnOrder: ["id", "late"] });
+  });
 });

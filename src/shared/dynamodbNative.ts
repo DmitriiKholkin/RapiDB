@@ -46,9 +46,6 @@ export function inferDynamoDbNativeOperationName(
     return inferBatchOperation(value.RequestItems);
   }
 
-  // Legacy AWS UpdateItem requests use AttributeUpdates instead of an
-  // expression. Classify even malformed update fields as updates: falling
-  // through to Key + Expected/ReturnValues would execute a DELETE instead.
   if (
     value.UpdateExpression !== undefined ||
     value.AttributeUpdates !== undefined
@@ -60,7 +57,11 @@ export function inferDynamoDbNativeOperationName(
     return "PutItem";
   }
 
-  if (typeof value.KeyConditionExpression === "string") {
+  if (
+    typeof value.KeyConditionExpression === "string" ||
+    value.KeyConditions !== undefined ||
+    value.QueryFilter !== undefined
+  ) {
     return "Query";
   }
 
@@ -163,19 +164,6 @@ export function looksLikeLegacyDynamoPartiql(queryText: string): boolean {
   return /^\s*(select|insert|update|delete)\b/i.test(queryText);
 }
 
-export function parseDynamoDbNativeQueryInput(
-  queryText: string,
-): DynamoDbNativeQueryInput {
-  const parsedInputs = parseDynamoDbNativeQueryInputs(queryText);
-  if (parsedInputs.length !== 1) {
-    throw new Error(
-      "DynamoDB native query text must be a single JSON object matching the AWS request syntax.",
-    );
-  }
-
-  return parsedInputs[0] as DynamoDbNativeQueryInput;
-}
-
 export function parseDynamoDbNativeQueryInputs(
   queryText: string,
 ): DynamoDbNativeQueryInput[] {
@@ -186,7 +174,7 @@ export function parseDynamoDbNativeQueryInputs(
 
   if (looksLikeLegacyDynamoPartiql(trimmed)) {
     throw new Error(
-      'Saved DynamoDB PartiQL is no longer supported. Choose a DynamoDB action and use the official JSON request body, for example {"TableName":"Users","KeyConditionExpression":"PK = :pk","ExpressionAttributeValues":{":pk":{"S":"USER#1"}}}.',
+      'DynamoDB PartiQL is no longer supported. Use an unambiguous official JSON request body, for example {"TableName":"Users","KeyConditionExpression":"PK = :pk","ExpressionAttributeValues":{":pk":{"S":"USER#1"}}}.',
     );
   }
 

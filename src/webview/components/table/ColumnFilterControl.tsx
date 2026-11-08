@@ -1,4 +1,4 @@
-import React, { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import {
   buildFilterExpressionFromDraft,
   type ColumnTypeMeta as ColumnMeta,
@@ -9,6 +9,7 @@ import {
 } from "../../../shared/tableTypes";
 import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
+import { isImeComposing } from "../../utils/ime";
 
 const CLEAR_FILTER = "__clear__";
 
@@ -360,8 +361,7 @@ export function ColumnFilterControl({
             aria-label={`${column.name} filter start`}
             value={betweenValue[0]}
             onKeyDown={(event) => {
-              if (event.key !== "Enter" || event.nativeEvent.isComposing)
-                return;
+              if (event.key !== "Enter" || isImeComposing(event)) return;
               event.preventDefault();
               event.stopPropagation();
               onChange(
@@ -385,8 +385,7 @@ export function ColumnFilterControl({
             aria-label={`${column.name} filter end`}
             value={betweenValue[1]}
             onKeyDown={(event) => {
-              if (event.key !== "Enter" || event.nativeEvent.isComposing)
-                return;
+              if (event.key !== "Enter" || isImeComposing(event)) return;
               event.preventDefault();
               event.stopPropagation();
               onChange(
@@ -414,7 +413,7 @@ export function ColumnFilterControl({
             if (
               !scalarOperator ||
               event.key !== "Enter" ||
-              event.nativeEvent.isComposing
+              isImeComposing(event)
             )
               return;
             event.preventDefault();

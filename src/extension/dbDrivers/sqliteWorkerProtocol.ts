@@ -37,6 +37,7 @@ export interface SQLiteWorkerResponse {
     message: string;
     name: string;
     verificationFailure?: TransactionVerificationFailure;
+    rollbackConfirmed?: boolean;
     executionState?: "not-executed" | "unknown";
   };
 }

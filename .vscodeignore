@@ -1,25 +1,22 @@
-# Source & build tooling — not needed at runtime
-src/
-esbuild.config.mjs
-esbuild.config.d.ts
-esbuild.config.d.mts
-tsconfig*.json
-biome.json
-compose.yaml
-vitest.config.ts
-vitest.workspace.ts
-tests/
-dist/*.tsbuildinfo
-logs
+# Fail closed: local .env files, credentials, keys, and unexpected artifacts
+# must never become extension assets just because they exist in the workspace.
+**
+!package.json
+!README.md
+!LICENSE.md
+!CHANGELOG.md
+!dist/extension.js
+!dist/sqliteWorker.js
+!dist/webview.js
+!dist/webview.css
+!media/icon-app.png
+!media/icon-market.png
 
-# Dev environment
-.vscode/
-.git/
-.gitignore
-.github
-docs
-
-node_modules/**
+# Preserve the existing external dependency/runtime closure, including any
+# package-owned certificates or keys. These are trusted dependency roots, not
+# locations for local credentials. Do not broaden the application paths above.
+# vsce negations override exclusions regardless of order: a broad !dist/** or
+# !media/** cannot be made safe by appending .env / *.key exclusion patterns.
 !node_modules/oracledb/**
 !.rapidb-runtime/node_modules/better-sqlite3/**
 !.rapidb-runtime/node_modules/bindings/**
@@ -41,19 +38,7 @@ node_modules/**
 !node_modules/tweetnacl/package.json
 !node_modules/tweetnacl/LICENSE
 !node_modules/tweetnacl/nacl-fast.js
-node_modules/oracledb/build/**
-node_modules/oracledb/examples/**
-node_modules/oracledb/package/**
-node_modules/oracledb/**/*-buildinfo.txt
-node_modules/oracledb/CHANGELOG.md
-node_modules/oracledb/README.md
-node_modules/oracledb/SECURITY.md
-scripts/**
-sample.db
-sample.db-shm
-sample.db-wal
-media/img-readme-*.png
 
-# Misc
-**/*.map
-**/.DS_Store
+# Because negations win, Oracle thick-mode leftovers (build/, examples/,
+# package/, *-buildinfo.txt, docs, .DS_Store) cannot be excluded here; they are
+# removed by scripts/prepare-vscode-package.mjs before packaging.

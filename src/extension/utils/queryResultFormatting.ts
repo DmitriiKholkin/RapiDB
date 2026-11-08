@@ -1,4 +1,5 @@
 import type { QueryColumnMeta } from "../../shared/tableTypes";
+import type { QueryResultSet } from "../../shared/webviewContracts";
 import {
   formatDatetimeForDisplay,
   hexFromBuffer,
@@ -14,6 +15,14 @@ export interface FormattedQueryResult extends QueryResult {
   rows: Record<string, unknown>[];
   truncated: boolean;
   truncatedAt: number;
+  resultSets?: FormattedQueryResultSet[];
+}
+
+export interface FormattedQueryResultSet extends QueryResultSet {
+  columnMeta: QueryColumnMeta[];
+  rows: Record<string, unknown>[];
+  truncated: boolean;
+  truncatedAt: number;
 }
 
 export function formatQueryResult(
@@ -23,9 +32,18 @@ export function formatQueryResult(
   const truncated = result.truncated === true || result.rows.length > rowLimit;
   const sampledRows = truncated ? result.rows.slice(0, rowLimit) : result.rows;
   const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta);
+  let remainingRows = rowLimit;
+  const resultSets = result.resultSets?.map((resultSet) => {
+    const formatted = formatQueryResultSet(resultSet, remainingRows);
+    remainingRows = Math.max(0, remainingRows - formatted.rows.length);
+    return formatted;
+  });
 
   return {
     ...result,
+    ...(result.exportRows
+      ? { exportRows: result.exportRows.slice(0, sampledRows.length) }
+      : {}),
     ...(result.missingCells
       ? {
           missingCells: result.missingCells.filter(
@@ -33,6 +51,23 @@ export function formatQueryResult(
           ),
         }
       : {}),
+    columnMeta,
+    rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
+    truncated,
+    truncatedAt: sampledRows.length,
+    resultSets,
+  };
+}
+
+function formatQueryResultSet(
+  result: QueryResultSet,
+  rowLimit: number,
+): FormattedQueryResultSet {
+  const truncated = result.truncated === true || result.rows.length > rowLimit;
+  const sampledRows = truncated ? result.rows.slice(0, rowLimit) : result.rows;
+  const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta);
+  return {
+    ...result,
     columnMeta,
     rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
     truncated,
@@ -93,6 +128,9 @@ const INTERVAL_FIELDS = [
 ] as const;
 
 const INTERVAL_KEY_SET: ReadonlySet<string> = new Set(INTERVAL_FIELDS);
+
+const NUMERIC_ARRAY_NATIVE_TYPE_RE =
+  /^(?:pg_catalog\.)?(?:smallint|integer|bigint|int[248]|numeric|decimal|real|double precision|float[48]|oid)(?:\[\])+$/i;
 
 type IntervalFieldValues = Record<(typeof INTERVAL_FIELDS)[number], number>;
 
@@ -203,26 +241,32 @@ function normalizeQueryRows(
         !(value instanceof Date) &&
         !Buffer.isBuffer(value)
       ) {
-        if (isCircleLike(value)) {
+        if (category === "spatial" && isCircleLike(value)) {
           normalized[normalizedKey] =
             `<(${String(value.x)},${String(value.y)}),${String(value.radius)}>`;
           continue;
         }
 
-        if (isPointLike(value)) {
+        if (category === "spatial" && isPointLike(value)) {
           normalized[normalizedKey] =
             `(${String(value.x)}, ${String(value.y)})`;
           continue;
         }
 
-        const intervalLike = formatIntervalLikeObject(value);
+        const intervalLike =
+          category === "interval" ? formatIntervalLikeObject(value) : null;
         if (intervalLike !== null) {
           normalized[normalizedKey] = intervalLike;
           continue;
         }
 
         if (Array.isArray(value)) {
-          normalized[normalizedKey] = serializeArrayPreservingRawTokens(value);
+          const nativeType = columnMeta[index]?.nativeType;
+          normalized[normalizedKey] = serializeArrayPreservingRawTokens(
+            value,
+            nativeType === undefined ||
+              NUMERIC_ARRAY_NATIVE_TYPE_RE.test(nativeType.trim()),
+          );
           continue;
         }
 
@@ -230,7 +274,13 @@ function normalizeQueryRows(
         continue;
       }
 
-      const formattedDatetime = formatDatetimeForDisplay(value);
+      const formattedDatetime =
+        value instanceof Date ||
+        category === "date" ||
+        category === "datetime" ||
+        category === "time"
+          ? formatDatetimeForDisplay(value)
+          : null;
       normalized[normalizedKey] =
         formattedDatetime !== null ? formattedDatetime : value;
     }
@@ -243,7 +293,11 @@ function resolveQueryColumnMeta(
   columns: string[],
   rawMeta: QueryColumnMeta[] | undefined,
 ): QueryColumnMeta[] {
-  return columns.map((_, index) => ({
-    category: rawMeta?.[index]?.category ?? null,
-  }));
+  return columns.map((_, index) => {
+    const nativeType = rawMeta?.[index]?.nativeType;
+    return {
+      category: rawMeta?.[index]?.category ?? null,
+      ...(nativeType !== undefined ? { nativeType } : {}),
+    };
+  });
 }

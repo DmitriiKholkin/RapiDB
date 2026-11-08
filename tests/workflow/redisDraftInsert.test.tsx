@@ -41,7 +41,6 @@ vi.doMock("../../src/webview/components/MonacoEditor", () => ({
       onChange={(event) => onChange?.(event.target.value)}
     />
   ),
-  connTypeToDialect: () => "javascript",
 }));
 
 const bulk = (value: string) => `$${Buffer.byteLength(value)}\r\n${value}\r\n`;
@@ -99,6 +98,14 @@ class InsertRespServer {
         return `+${Array.isArray(row?.value) ? "list" : "string"}\r\n`;
       case "GET":
         return row ? bulk(String(row.value)) : "$-1\r\n";
+      case "GETRANGE":
+        return bulk(
+          Buffer.from(row ? String(row.value) : "")
+            .subarray(Number(args[2]), Number(args[3]) + 1)
+            .toString(),
+        );
+      case "STRLEN":
+        return `:${row ? Buffer.byteLength(String(row.value)) : 0}\r\n`;
       case "LRANGE":
         return array(row?.value as string[]);
       case "TTL":
@@ -223,6 +230,8 @@ async function editCell(
   }
   const inline = screen.queryByLabelText("Cell value");
   const editor = inline ?? screen.getByLabelText("Cell data");
+  if ((editor as HTMLInputElement | HTMLTextAreaElement).value === value)
+    fireEvent.change(editor, { target: { value: `${value}x` } });
   fireEvent.change(editor, { target: { value } });
   if (inline) fireEvent.keyDown(editor, { key: "Enter" });
   else await session.user.click(screen.getByRole("button", { name: "Apply" }));

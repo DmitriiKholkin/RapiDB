@@ -11,7 +11,10 @@ import {
   getDeleteEvidence,
 } from "../dbDrivers/deleteOutcomes";
 import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
-import { isPostgresStatementRejection } from "../dbDrivers/postgresStatementRejection";
+import {
+  isPostgresStatementRejectedAndRolledBack,
+  isPostgresStatementRejection,
+} from "../dbDrivers/postgresStatementRejection";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import {
   executeAtomicSqlApplyPlan,
@@ -25,6 +28,7 @@ import { normalizeUnknownError } from "../utils/errorHandling";
 import { formatMutationPreviewSql } from "../utils/mutationPreview";
 
 const MAX_PENDING_MUTATION_PREVIEWS = 50;
+const MAX_EXECUTED_OPERATION_IDS = 1000;
 
 function resolvePreviewContentType(
   editorPresentation:
@@ -154,6 +158,10 @@ export class TableMutationPreviewController {
 
     this.pendingMutationPreviews.delete(previewToken);
     if (this.executedOperationIds.has(preview.operationId)) return null;
+    if (this.executedOperationIds.size >= MAX_EXECUTED_OPERATION_IDS) {
+      const oldest = this.executedOperationIds.values().next().value;
+      if (oldest !== undefined) this.executedOperationIds.delete(oldest);
+    }
     this.executedOperationIds.add(preview.operationId);
 
     if (preview.kind === "applyChanges") {
@@ -187,10 +195,12 @@ export class TableMutationPreviewController {
           const normalized = normalizeUnknownError(error);
           const definitelyNoChanges =
             isMutationNotExecutedError(error) ||
-            error instanceof TransactionVerificationError ||
+            (error instanceof TransactionVerificationError &&
+              error.rollbackConfirmed) ||
             (this.connectionManager.getConnection?.(this.connectionId)?.type ===
               "pg" &&
-              isPostgresStatementRejection(error));
+              (isPostgresStatementRejection(error) ||
+                isPostgresStatementRejectedAndRolledBack(error)));
           changesPossible ||= !definitelyNoChanges;
           outcomeUnknown ||= !definitelyNoChanges;
           errors.push(normalized.message);
@@ -259,7 +269,7 @@ export class TableMutationPreviewController {
           type: "deleteResult",
           payload: {
             ...buildDeleteResult(identities, {
-              affectedRows: identities.length,
+              affectedRows: preview.plan.verificationCriteriaList.length,
               rowOutcomes: identities.map((primaryKeys, rowIndex) => ({
                 rowIndex,
                 primaryKeys,
@@ -299,10 +309,15 @@ export class TableMutationPreviewController {
       const normalized = normalizeUnknownError(error);
       const outcomeUnknown =
         !isMutationNotExecutedError(error) &&
-        !(error instanceof TransactionVerificationError) &&
+        !(
+          error instanceof TransactionVerificationError &&
+          error.rollbackConfirmed
+        ) &&
         !(
           this.connectionManager.getConnection?.(this.connectionId)?.type ===
-            "pg" && isPostgresStatementRejection(error)
+            "pg" &&
+          (isPostgresStatementRejection(error) ||
+            isPostgresStatementRejectedAndRolledBack(error))
         );
       return {
         type: "insertResult",

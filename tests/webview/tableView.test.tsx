@@ -9,7 +9,11 @@ import {
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import {
+  type ColumnTypeMeta,
+  type MongoValueTypeHint,
+  NULL_SENTINEL,
+} from "../../src/shared/tableTypes";
 
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
@@ -102,6 +106,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 import { TableView } from "../../src/webview/components/TableView";
 import {
   DEBOUNCE,
+  INSERT_DEFAULT_SENTINEL,
   parsePersistedTableDraft,
   parsePersistedTableViewState,
   serializeTableDraft,
@@ -134,7 +139,7 @@ describe("table draft persistence", () => {
     const serialized = serializeTableDraft(tableKey, source, [
       {
         name: { value: "new item" },
-        id: { value: "__RAPIDB_INSERT_DEFAULT__" },
+        id: { value: INSERT_DEFAULT_SENTINEL },
       },
     ]);
     const jsonSafe = JSON.parse(JSON.stringify(serialized)) as unknown;
@@ -146,7 +151,7 @@ describe("table draft persistence", () => {
     expect(restored?.newRows).toEqual([
       {
         name: { value: "new item" },
-        id: { value: "__RAPIDB_INSERT_DEFAULT__" },
+        id: { value: INSERT_DEFAULT_SENTINEL },
       },
     ]);
     expect(parsePersistedTableDraft(jsonSafe, "another-table")).toBeNull();
@@ -601,6 +606,7 @@ async function initializeCommittedTableData(overrides?: {
   primaryKeyColumns?: string[];
   dataRows?: readonly Record<string, unknown>[];
   mongoIdTypes?: Array<"objectId" | "string" | null | undefined> | null;
+  rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   renderOverrides?: {
     mongoRowIdentity?: boolean;
     connectionReadOnly?: boolean;
@@ -641,6 +647,9 @@ async function initializeCommittedTableData(overrides?: {
       fetchId: initialFetch.fetchId,
       rows: committedRows,
       totalCount: committedCount,
+      ...(overrides?.rowValueTypes
+        ? { rowValueTypes: overrides.rowValueTypes }
+        : {}),
       ...(overrides && Object.hasOwn(overrides, "mongoIdTypes")
         ? { mongoIdTypes: overrides.mongoIdTypes }
         : {}),
@@ -680,6 +689,183 @@ afterEach(() => {
 });
 
 describe("TableView", () => {
+  it("stages explicit NULL for a missing persisted field through the cell editor", async () => {
+    const user = userEvent.setup();
+    const optionalColumn: ColumnTypeMeta = {
+      ...columns[1],
+      name: "optional",
+    };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, optionalColumn],
+      dataRows: [{ id: 1, name: "Alice" }],
+    });
+
+    expect(getBodyCell("optional").textContent).toBe("MISSING");
+    clearPostedMessages();
+    await user.dblClick(getBodyCell("optional"));
+    await user.click(screen.getByTitle("Set field to NULL"));
+
+    expect(getBodyCell("optional").textContent).toBe("NULL");
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(postedMessagesOfType("applyChanges")).toEqual([]);
+
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(getBodyCell("optional").textContent).toBe("MISSING");
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(postedMessagesOfType("applyChanges")).toEqual([]);
+  });
+
+  it("sends a Mongo missing-field type guard when applying explicit NULL", async () => {
+    const user = userEvent.setup();
+    const idColumn: ColumnTypeMeta = {
+      ...columns[0],
+      name: "_id",
+      nativeType: "string",
+      type: "string",
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+    };
+    const optionalColumn: ColumnTypeMeta = {
+      ...columns[1],
+      name: "optional",
+      nullable: true,
+    };
+    await initializeCommittedTableData({
+      columnDefs: [idColumn, optionalColumn],
+      primaryKeyColumns: ["_id"],
+      dataRows: [{ _id: "missing-to-null" }],
+      mongoIdTypes: ["string"],
+      renderOverrides: { mongoRowIdentity: true },
+    });
+
+    await user.dblClick(getBodyCell("optional"));
+    await user.click(screen.getByTitle("Set field to NULL"));
+    expect(getBodyCell("optional").textContent).toBe("NULL");
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    const payload = getLastPostedMessage()?.payload as {
+      updates: Array<{
+        changes: Record<string, unknown>;
+        originalValues?: Record<string, unknown>;
+        originalTypes?: Record<
+          string,
+          { category: string; nativeType: string }
+        >;
+      }>;
+    };
+    expect(payload.updates[0].changes).toEqual({ optional: null });
+    expect(
+      Object.hasOwn(payload.updates[0].originalValues ?? {}, "optional"),
+    ).toBe(true);
+    expect(payload.updates[0].originalValues?.optional).toBeUndefined();
+    expect(payload.updates[0].originalTypes?.optional).toEqual({
+      category: "other",
+      nativeType: "missing",
+    });
+  });
+
+  it.each([
+    "single",
+    "batch",
+    "mixed",
+  ] as const)("stages NULL for a missing persisted field through %s edits", (mode) => {
+    const optionalColumn: ColumnTypeMeta = {
+      ...columns[1],
+      name: "optional",
+    };
+    const { result } = renderHook(() =>
+      useTableMutationController({
+        canEditRows: true,
+        loadingRef: { current: false },
+        columnsRef: { current: [...columns, optionalColumn] },
+        fetchPageRef: { current: vi.fn() },
+        pkColsRef: { current: ["id"] },
+        preserveScrollPositionRef: { current: vi.fn() },
+        rowsRef: { current: [{ id: 1 }] },
+        mongoIdTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
+        selected: new Set<number>(),
+      }),
+    );
+    const edit = {
+      rowIdx: 0,
+      column: optionalColumn,
+      newVal: NULL_SENTINEL,
+      originalVal: undefined,
+    };
+
+    act(() => {
+      if (mode === "single") {
+        result.current.commitCellEdit(
+          edit.rowIdx,
+          edit.column,
+          edit.newVal,
+          edit.originalVal,
+        );
+      } else if (mode === "batch") {
+        result.current.commitBatchCellEdits([edit]);
+      } else {
+        result.current.commitMixedBatchEdits([], [edit]);
+      }
+    });
+
+    expect(result.current.pendingEdits).toEqual(
+      new Map([[0, new Map([["optional", null]])]]),
+    );
+  });
+
+  it.each([
+    "single",
+    "batch",
+    "mixed",
+  ] as const)("clears a persisted %s edit when restored to its original NULL", (mode) => {
+    const optionalColumn: ColumnTypeMeta = {
+      ...columns[1],
+      name: "optional",
+    };
+    const { result } = renderHook(() =>
+      useTableMutationController({
+        canEditRows: true,
+        loadingRef: { current: false },
+        columnsRef: { current: [...columns, optionalColumn] },
+        fetchPageRef: { current: vi.fn() },
+        pkColsRef: { current: ["id"] },
+        preserveScrollPositionRef: { current: vi.fn() },
+        rowsRef: { current: [{ id: 1, optional: null }] },
+        mongoIdTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
+        selected: new Set<number>(),
+      }),
+    );
+    const commit = (newVal: string) => {
+      const edit = {
+        rowIdx: 0,
+        column: optionalColumn,
+        newVal,
+        originalVal: null,
+      };
+      if (mode === "single") {
+        result.current.commitCellEdit(
+          edit.rowIdx,
+          edit.column,
+          edit.newVal,
+          edit.originalVal,
+        );
+      } else if (mode === "batch") {
+        result.current.commitBatchCellEdits([edit]);
+      } else {
+        result.current.commitMixedBatchEdits([], [edit]);
+      }
+    };
+
+    act(() => commit("changed"));
+    expect(result.current.pendingEdits.get(0)?.get("optional")).toBe("changed");
+
+    act(() => commit(NULL_SENTINEL));
+    expect(result.current.pendingEdits).toEqual(new Map());
+  });
+
   it("uses the display name throughout loading and committed accessible labels", async () => {
     renderTableView({
       table: "__rapidb:all-keys",
@@ -788,7 +974,7 @@ describe("TableView", () => {
           current: [{ _id: "507f1f77bcf86cd799439011", name: "Ambiguous" }],
         },
         mongoIdTypesRef: { current: [] },
-        mongoValueTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
         selected: new Set([0]),
       }),
     );
@@ -1100,6 +1286,36 @@ describe("TableView", () => {
     });
   });
 
+  it("keeps the row selection column disabled instead of removing it while a page loads", async () => {
+    await initializeCommittedTableData();
+    const headerIds = () =>
+      Array.from(
+        screen
+          .getByRole("table")
+          .querySelectorAll("thead tr:first-child th[data-column-id]"),
+      ).map((th) => th.getAttribute("data-column-id"));
+    const initialHeaders = headerIds();
+    expect(initialHeaders[0]).toBe("__sel");
+    clearPostedMessages();
+    fireEvent.click(
+      screen
+        .getByRole("table")
+        .querySelector(
+          'thead tr:first-child th[data-column-id="name"]',
+        ) as HTMLElement,
+    );
+    await waitFor(() => {
+      expect(getLastPostedMessage()?.type).toBe("fetchPage");
+    });
+    expect(headerIds()).toEqual(initialHeaders);
+    const checkbox = screen
+      .getByRole("table")
+      .querySelector<HTMLInputElement>(
+        'input[type="checkbox"][aria-label="Select row 1"]',
+      );
+    expect(checkbox?.disabled).toBe(true);
+  });
+
   it("rejects a whole batch paste spanning a NULL-key row without staging its safe prefix", async () => {
     await initializeCommittedTableData({
       dataRows: [
@@ -1147,7 +1363,7 @@ describe("TableView", () => {
           ],
         },
         mongoIdTypesRef: { current: [] },
-        mongoValueTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
         selected: new Set([0, 1]),
       }),
     );
@@ -2324,7 +2540,6 @@ describe("TableView", () => {
   it.each([
     "new-column",
     "rectangle",
-    "draft-to-persisted",
     "refresh-during-request",
   ])("reports unread-column paste atomically through TableView: %s", async (scenario) => {
     const user = await stageMetadataWork();
@@ -2338,12 +2553,7 @@ describe("TableView", () => {
         primaryKeyColumns: ["id"],
       });
     if (scenario !== "refresh-during-request") await act(async () => refresh());
-    const cell = getBodyCell(
-      scenario === "new-column" || scenario === "draft-to-persisted"
-        ? "extra"
-        : "name",
-      scenario === "draft-to-persisted" ? 0 : 1,
-    );
+    const cell = getBodyCell(scenario === "new-column" ? "extra" : "name", 1);
     fireEvent.mouseDown(cell, { button: 0 });
     fireEvent.mouseUp(cell);
     const selectionClass = cell.className;
@@ -2354,12 +2564,7 @@ describe("TableView", () => {
     await act(async () =>
       dispatchIncomingMessage("clipboardText", {
         ...(request?.payload as object),
-        text:
-          scenario === "draft-to-persisted"
-            ? "41\n42"
-            : scenario === "new-column"
-              ? "42"
-              : "Overwritten\t42",
+        text: scenario === "new-column" ? "42" : "Overwritten\t42",
       }),
     );
     if (scenario === "refresh-during-request") {
@@ -2374,6 +2579,51 @@ describe("TableView", () => {
     await user.click(screen.getByRole("button", { name: "Undo" }));
     expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
     await user.click(screen.getByRole("button", { name: "Redo" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            changes: { name: "Edited Alice" },
+            originalValues: { name: "Alice" },
+          },
+        ],
+        insertValues: [{ name: "Draft name" }],
+      },
+    });
+  });
+
+  it("rejects a draft paste that would continue into persisted rows after a metadata refresh", async () => {
+    const user = await stageMetadataWork();
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [
+          ...columns,
+          { ...columns[0], name: "extra", isPrimaryKey: false },
+        ],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    const cell = getBodyCell("extra", 0);
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(cell);
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+    await act(async () =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "41\n42",
+      }),
+    );
+    expect(screen.getByText(/Paste failed: 1 error/)).toBeTruthy();
+    expect(
+      screen.getByText(/cannot continue into existing rows: 1 more pasted row/),
+    ).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Edited Alice");
+    expect(getBodyCell("extra", 0).textContent).toContain("DEFAULT");
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(getLastPostedMessage()).toMatchObject({
       type: "applyChanges",
@@ -2457,7 +2707,7 @@ describe("TableView", () => {
         preserveScrollPositionRef: { current: vi.fn() },
         rowsRef: { current: rows },
         mongoIdTypesRef: { current: [] },
-        mongoValueTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
         selected: new Set(),
       }),
     );
@@ -3886,7 +4136,7 @@ describe("TableView", () => {
           preserveScrollPositionRef: { current: vi.fn() },
           rowsRef,
           mongoIdTypesRef: { current: [] },
-          mongoValueTypesRef: { current: [] },
+          rowValueTypesRef: { current: [] },
           selected,
         }),
       { initialProps: { selected: new Set([0]) } },
@@ -3959,7 +4209,7 @@ describe("TableView", () => {
         preserveScrollPositionRef: { current: vi.fn() },
         rowsRef,
         mongoIdTypesRef,
-        mongoValueTypesRef: { current: [] },
+        rowValueTypesRef: { current: [] },
         selected: new Set([0]),
       }),
     );
@@ -4627,6 +4877,102 @@ describe("TableView", () => {
     });
   });
 
+  it.each([
+    "cancel",
+    "commit",
+  ] as const)("defers a pending filter while a cell editor is open, then handles %s", async (outcome) => {
+    await initializeCommittedTableData();
+    clearPostedMessages();
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "ali" },
+    });
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Unfinished text" },
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+    });
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe("Unfinished text");
+    expect(
+      (screen.getByLabelText("name filter value") as HTMLInputElement).value,
+    ).toBe("ali");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: outcome === "cancel" ? "Cancel" : "Apply",
+      }),
+    );
+    if (outcome === "commit") {
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+      expect(screen.getByText("Unfinished text")).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
+    }
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(lastFetchPayload()).toEqual(
+      expect.objectContaining({
+        filters: [{ column: "name", operator: "like", value: "ali" }],
+      }),
+    );
+  });
+
+  it("keeps a pending filter and an inserted row draft until the draft is reverted", async () => {
+    await initializeCommittedTableData();
+    clearPostedMessages();
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "ali" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.doubleClick(getBodyCell("name"));
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "New draft" },
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+    });
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(
+      (screen.getByLabelText("Cell value") as HTMLInputElement).value,
+    ).toBe("New draft");
+    fireEvent.blur(screen.getByLabelText("Cell value"));
+    expect(screen.getByText("New draft")).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(lastFetchPayload()).toEqual(
+      expect.objectContaining({
+        filters: [{ column: "name", operator: "like", value: "ali" }],
+      }),
+    );
+  });
+
+  it("disables next page for a single matching row", async () => {
+    renderTableView();
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+    });
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    const fetch = lastFetchPayload();
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: fetch.fetchId,
+        rows: rows.slice(0, 1),
+        totalCount: 1,
+      });
+    });
+    expect(screen.getByText("1 rows total")).toBeTruthy();
+    expect(screen.getByText("Page 1 of 1")).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "Next →" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+  });
+
   it("requests pages, debounces filter application, and renders filter errors", async () => {
     renderTableView();
 
@@ -4744,6 +5090,171 @@ describe("TableView", () => {
     fireEvent.click(screen.getByTitle("Dismiss"));
 
     expect(screen.queryByText("Bad filter expression")).toBeNull();
+  });
+
+  it("warns when a restored incomplete Between filter is excluded from the query", async () => {
+    if (!window.__vscode) throw new Error("VS Code API is unavailable");
+    vi.mocked(window.__vscode.getState).mockReturnValue({
+      tableView: {
+        tableKey: JSON.stringify(["conn-1", "main", "public", "users"]),
+        page: 1,
+        pageSize: 25,
+        sort: null,
+        filters: { id: { operator: "between", value: ["25", ""] } },
+      },
+    });
+    await initializeCommittedTableData({
+      columnDefs: [
+        {
+          ...columns[0],
+          filterOperators: [...columns[0].filterOperators, "between"],
+        },
+        columns[1],
+      ],
+    });
+    expect(
+      screen.getByRole("textbox", { name: "id filter start" }),
+    ).toHaveProperty("value", "25");
+    expect(screen.getByText(/requires both bounds/)).toBeTruthy();
+  });
+
+  it("does not dismiss a new incomplete filter when closing an old server error", async () => {
+    await initializeCommittedTableData({
+      columnDefs: [
+        {
+          ...columns[0],
+          filterOperators: [...columns[0].filterOperators, "between"],
+        },
+        columns[1],
+      ],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Between/ }));
+    const start = screen.getByRole("textbox", { name: "id filter start" });
+    const end = screen.getByRole("textbox", { name: "id filter end" });
+    fireEvent.change(start, { target: { value: "1" } });
+    fireEvent.change(end, { target: { value: "5" } });
+    fireEvent.keyDown(end, { key: "Enter" });
+    await waitFor(() =>
+      expect(lastFetchPayload()).toMatchObject({
+        filters: [{ column: "id", operator: "between", value: ["1", "5"] }],
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: lastFetchPayload().fetchId,
+        error: "Old server filter error",
+        isFilterError: true,
+      }),
+    );
+    fireEvent.change(end, { target: { value: "" } });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Dismiss filter error" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/requires both bounds/)).toBeTruthy(),
+    );
+  });
+
+  it("shows validation for incomplete Between filters and recovers when completed", async () => {
+    const filterColumns: ColumnTypeMeta[] = [
+      {
+        ...columns[0],
+        filterOperators: [...columns[0].filterOperators, "between", "in"],
+      },
+      columns[1],
+    ];
+    await initializeCommittedTableData({ columnDefs: filterColumns });
+    clearPostedMessages();
+
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Between/ }));
+    const start = screen.getByRole("textbox", { name: "id filter start" });
+    const end = screen.getByRole("textbox", { name: "id filter end" });
+    fireEvent.change(start, { target: { value: "25" } });
+    fireEvent.keyDown(start, { key: "Enter" });
+
+    expect(screen.getByText(/requires both bounds/)).toBeTruthy();
+    expect(screen.getByText("2 rows total")).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+
+    fireEvent.change(end, { target: { value: "35" } });
+    fireEvent.keyDown(end, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(lastFetchPayload()).toMatchObject({
+        filters: [{ column: "id", operator: "between", value: ["25", "35"] }],
+      });
+    });
+    expect(screen.queryByText(/requires both bounds/)).toBeNull();
+  });
+
+  it("validates empty In lists, keeps dismissed errors dismissed, and applies valid lists", async () => {
+    const filterColumns: ColumnTypeMeta[] = [
+      {
+        ...columns[0],
+        filterOperators: [...columns[0].filterOperators, "between", "in"],
+      },
+      columns[1],
+    ];
+    await initializeCommittedTableData({ columnDefs: filterColumns });
+    clearPostedMessages();
+
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /In list/ }));
+    const input = screen.getByRole("textbox", { name: "id filter value" });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.getByText(/requires at least one value/)).toBeTruthy();
+    expect(screen.getByText("2 rows total")).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+
+    fireEvent.click(screen.getByTitle("Dismiss"));
+    expect(screen.queryByText(/requires at least one value/)).toBeNull();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+    });
+    expect(screen.queryByText(/requires at least one value/)).toBeNull();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+
+    fireEvent.change(input, { target: { value: ", ," } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByText(/requires at least one value/)).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+    });
+    expect(screen.getByText(/requires at least one value/)).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+
+    fireEvent.change(input, { target: { value: "1, 2" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => {
+      expect(lastFetchPayload()).toMatchObject({
+        filters: [{ column: "id", operator: "in", value: "1, 2" }],
+      });
+    });
+    expect(screen.queryByText(/requires at least one value/)).toBeNull();
+    const filteredFetch = lastFetchPayload();
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: filteredFetch.fetchId,
+        rows,
+        totalCount: rows.length,
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    expect(
+      screen
+        .getByRole("button", { name: "id filter operator" })
+        .getAttribute("title"),
+    ).toBe("In list");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /No filter/ }));
+    await waitFor(() => {
+      expect(lastFetchPayload()).toMatchObject({ filters: [] });
+    });
   });
 
   it("does not refetch on duplicate tableInit and preserves committed data", async () => {
@@ -4967,6 +5478,47 @@ describe("TableView", () => {
     });
 
     expect(getPostedMessages()).toEqual([]);
+  });
+
+  it("does not replay an immediately applied filter after navigating to another page", async () => {
+    await initializeCommittedTableData({ totalCount: 51 });
+    clearPostedMessages();
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "ali" },
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Equals/i }));
+    expect(lastFetchPayload()).toEqual(
+      expect.objectContaining({
+        page: 1,
+        filters: [{ column: "name", operator: "eq", value: "ali" }],
+      }),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: 51,
+      }),
+    );
+    clearPostedMessages();
+    fireEvent.click(screen.getByRole("button", { name: "Next →" }));
+    expect(lastFetchPayload()).toEqual(expect.objectContaining({ page: 2 }));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: 51,
+      }),
+    );
+    clearPostedMessages();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, DEBOUNCE + 50));
+    });
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByText("Page 2 of 3")).toBeTruthy();
   });
 
   it("refetches immediately when changing a value-based operator with an existing value", async () => {
@@ -5570,6 +6122,104 @@ describe("TableView", () => {
     });
   });
 
+  it("preserves a confirmed rejected draft on Refresh", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+
+    fireEvent.doubleClick(getBodyCell("name", 1));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Alice" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(getBodyCell("name", 1).textContent).toBe("Alice");
+    expect(screen.getByText(/1 row with unsaved changes/)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error:
+          "Transaction was not executed; no changes were made. UNIQUE constraint failed: users.name",
+        changesPossible: false,
+        outcomeUnknown: false,
+        rowOutcomes: [
+          {
+            rowIndex: 1,
+            success: false,
+            status: "skipped",
+            message: "Transaction was not executed; no changes were made.",
+          },
+        ],
+      }),
+    );
+
+    expect(
+      screen.getByText(/UNIQUE constraint failed: users\.name/),
+    ).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Alice");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(screen.getByText(/1 row with unsaved changes/)).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Alice");
+  });
+
+  it("preserves a rolled-back verification failure draft on Refresh", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+
+    fireEvent.doubleClick(getBodyCell("name", 1));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Edited Bob" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+
+    await act(async () =>
+      dispatchIncomingMessage("applyResult", {
+        success: false,
+        error:
+          "UPDATE verification failed; the transaction was not committed. The persisted value differs.",
+        changesPossible: false,
+        outcomeUnknown: false,
+        failedRows: [1],
+        rowOutcomes: [
+          {
+            rowIndex: 1,
+            success: false,
+            status: "verification_failed",
+            columns: ["name"],
+            message: "The persisted value differs.",
+          },
+        ],
+      }),
+    );
+
+    expect(screen.getByText(/transaction was not committed/i)).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Edited Bob");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Apply Changes",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(screen.getByText(/1 row with unsaved changes/)).toBeTruthy();
+    expect(getBodyCell("name", 1).textContent).toBe("Edited Bob");
+  });
+
   it("retains failed edits across previewed apply flows", async () => {
     const user = userEvent.setup();
 
@@ -6111,6 +6761,41 @@ describe("TableView", () => {
     expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
   });
 
+  it.each([
+    ["list", "json"],
+    ["string", "text"],
+    ["mixed(hash, set)", "other"],
+  ] as const)("shows an oversized Redis value under a %s label as a readonly placeholder", async (nativeType, category) => {
+    const user = userEvent.setup();
+    const value = {
+      __rapidbRedisOversized: 1,
+      displayValue: "RedisValueTooLarge(list, 5000 entries)",
+    };
+    await initializeCommittedTableData({
+      columnDefs: [
+        columns[0],
+        {
+          ...columns[1],
+          name: "value",
+          nativeType,
+          type: nativeType,
+          category,
+        },
+      ],
+      dataRows: [{ id: 1, value }],
+    });
+    expect(getBodyCell("value").textContent).toBe(
+      "RedisValueTooLarge(list, 5000 entries)",
+    );
+    await user.dblClick(getBodyCell("value"));
+    const editor = screen.getByLabelText("Cell data") as HTMLTextAreaElement;
+    expect(editor.readOnly).toBe(true);
+    expect(editor.value).toBe("RedisValueTooLarge(list, 5000 entries)");
+    expect(screen.queryByRole("button", { name: "NULL" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Close cell data" }));
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+  });
+
   it("keeps explicitly supplied identity values pasteable into insert drafts", async () => {
     const user = userEvent.setup();
     const identityColumns = columns.map((column) =>
@@ -6345,6 +7030,45 @@ describe("TableView", () => {
     });
   });
 
+  it("edits Oracle BLOB IS JSON as hex and sends the original bytes for conflict detection", async () => {
+    const user = userEvent.setup();
+    const original = "0x7b226e223a317d";
+    const changed = "0x7b226e223a327d";
+    await initializeCommittedTableData({
+      columnDefs: [
+        columns[0],
+        {
+          ...columns[1],
+          name: "payload",
+          type: "BLOB IS JSON",
+          nativeType: "BLOB IS JSON",
+          category: "binary",
+          filterOperators: ["like", "is_null", "is_not_null"],
+        },
+      ],
+      dataRows: [{ id: 1, payload: original }],
+    });
+    clearPostedMessages();
+    await user.dblClick(getBodyCell("payload"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const input = screen.getByLabelText("Cell value");
+    fireEvent.change(input, { target: { value: changed } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "applyChanges",
+      payload: {
+        updates: [
+          {
+            primaryKeys: { id: 1 },
+            changes: { payload: changed },
+            originalValues: { payload: original },
+          },
+        ],
+      },
+    });
+  });
+
   it("opens structured JSON cells in the large modal and marks persisted edits as pending on apply", async () => {
     const user = userEvent.setup();
 
@@ -6379,7 +7103,9 @@ describe("TableView", () => {
     expect(getBodyCell("payload").style.background).toContain(
       "rgba(200, 150, 0, 0.23)",
     );
-    expect(getPostedMessages()).toEqual([]);
+    expect(getPostedMessages()).toEqual([
+      { type: "unsavedChangesState", payload: { hasUnsavedChanges: true } },
+    ]);
   });
 
   it("focuses the structured editor instead of the close button when the modal opens", async () => {
@@ -6697,6 +7423,39 @@ describe("TableView", () => {
         ],
       },
     });
+  });
+
+  it.each([
+    "persisted",
+    "draft",
+  ] as const)("accepts native PostgreSQL array literals in %s cell dialogs and preserves their bounds", async (rowKind) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: structuredColumns,
+      primaryKeyColumns: ["id"],
+      dataRows: structuredRows,
+    });
+    if (rowKind === "draft")
+      await user.click(screen.getByRole("button", { name: "Add Row" }));
+    await user.dblClick(getBodyCell("tags"));
+    const editor = screen.getByLabelText("Cell data");
+    fireEvent.change(editor, { target: { value: "[0:2]={one,two}" } });
+    expect(
+      (screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.change(editor, { target: { value: "[0:1]={one,two}" } });
+    expect(
+      (screen.getByRole("button", { name: "Apply" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const message = getLastPostedMessage();
+    expect(message?.type).toBe("applyChanges");
+    expect(JSON.stringify(message)).toContain("[0:1]={one,two}");
   });
 
   it("opens xml-like structured cells in readonly mode without posting mutations", async () => {
@@ -7154,6 +7913,17 @@ describe("TableView", () => {
     expect(screen.getByRole("button", { name: "DEF" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "NULL" })).toBeTruthy();
 
+    fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
+    expect(screen.queryByLabelText("Cell value")).toBeNull();
+    expect(nameCell.textContent ?? "").toContain("DEFAULT");
+
+    fireEvent.doubleClick(nameCell);
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "x" },
+    });
+    fireEvent.change(screen.getByLabelText("Cell value"), {
+      target: { value: "" },
+    });
     fireEvent.keyDown(screen.getByLabelText("Cell value"), { key: "Enter" });
 
     expect(
@@ -8060,5 +8830,169 @@ describe("TableView", () => {
     await waitFor(() => {
       expect(screen.getByText("Database offline")).toBeTruthy();
     });
+  });
+});
+
+it.each([
+  ["number set", "array", "<<1, 2>>", "<<1, 2, 3>>"],
+  ["string set", "array", "<<'a', 'b'>>", "<<'a', 'b', 'c'>>"],
+  ["binary set", "array", "<<0x01, 0x02>>", "<<0x01, 0x02, 0x03>>"],
+  [
+    "map",
+    "json",
+    'DynamoDB native value (nested sets/binary): {"M":{"bytes":{"B":"AQ=="}}}',
+    'DynamoDB native value (nested sets/binary): {"M":{"bytes":{"B":"Ag=="}}}',
+  ],
+  [
+    "list",
+    "array",
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"AQ=="}]}',
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"Ag=="}]}',
+  ],
+] as const)("stages supported native DynamoDB %s through the structured dialog", async (nativeType, category, display, edited) => {
+  const user = userEvent.setup();
+  await initializeCommittedTableData({
+    columnDefs: [
+      columns[0],
+      { ...columns[1], name: "value", type: nativeType, nativeType, category },
+    ],
+    dataRows: [{ id: 1, value: display }],
+  });
+  await user.dblClick(getBodyCell("value"));
+  const dialog = screen.getByRole("dialog");
+  fireEvent.change(screen.getByLabelText("Cell data"), {
+    target: { value: edited },
+  });
+  const apply = within(dialog).getByRole("button", {
+    name: "Apply",
+  }) as HTMLButtonElement;
+  expect(apply.disabled).toBe(false);
+  await user.click(apply);
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+  expect(getBodyCell("value").textContent).toContain(edited);
+});
+
+it.each([
+  [
+    "map",
+    "json",
+    "list",
+    "array",
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"AQ=="}]}',
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"Ag=="}]}',
+  ],
+  [
+    "list",
+    "array",
+    "map",
+    "json",
+    'DynamoDB native value (nested sets/binary): {"M":{"bytes":{"B":"AQ=="}}}',
+    'DynamoDB native value (nested sets/binary): {"M":{"bytes":{"B":"Ag=="}}}',
+  ],
+  ["string set", "array", "number set", "array", "<<1, 2>>", "<<1, 2, 3>>"],
+  ["number set", "array", "string set", "array", "<<'a'>>", "<<'a', 'b'>>"],
+  ["map", "json", "string", "text", '{ "literal" : 1 }', "ordinary text"],
+  [
+    "boolean",
+    "boolean",
+    "map",
+    "json",
+    'DynamoDB native value (nested sets/binary): {"M":{"x":{"B":"AQ=="}}}',
+    'DynamoDB native value (nested sets/binary): {"M":{"x":{"B":"Ag=="}}}',
+  ],
+  [
+    "number",
+    "decimal",
+    "list",
+    "array",
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"AQ=="}]}',
+    'DynamoDB native value (nested sets/binary): {"L":[{"B":"Ag=="}]}',
+  ],
+] as const)("uses actual row %s to %s metadata for structured cell edits", async (sampledType, sampledCategory, nativeType, category, display, edited) => {
+  const user = userEvent.setup();
+  const sample =
+    sampledType === "map"
+      ? 'DynamoDB native value (nested sets/binary): {"M":{"sample":{"S":"one"}}}'
+      : sampledType === "list"
+        ? 'DynamoDB native value (nested sets/binary): {"L":[{"S":"one"}]}'
+        : sampledType === "string set"
+          ? "<<'sample'>>"
+          : "<<7>>";
+  await initializeCommittedTableData({
+    columnDefs: [
+      columns[0],
+      {
+        ...columns[1],
+        name: "value",
+        type: sampledType,
+        nativeType: sampledType,
+        category: sampledCategory,
+      },
+    ],
+    dataRows: [
+      { id: 1, value: sample },
+      { id: 2, value: display },
+    ],
+    rowValueTypes: [
+      { value: { nativeType: sampledType, category: sampledCategory } },
+      { value: { nativeType, category } },
+    ],
+  });
+  if (sampledType === "number") {
+    await user.click(getBodyCell("value", 1));
+    await user.keyboard("{F2}");
+  } else {
+    await user.dblClick(getBodyCell("value", 1));
+  }
+  const editor = screen.getByLabelText("Cell data") as HTMLTextAreaElement;
+  expect(editor.value).toBe(display);
+  const apply = within(screen.getByRole("dialog")).getByRole("button", {
+    name: "Apply",
+  }) as HTMLButtonElement;
+  if (nativeType === "list") {
+    fireEvent.change(editor, { target: { value: sample } });
+    expect(apply.disabled).toBe(true);
+  }
+  fireEvent.change(editor, { target: { value: edited } });
+  expect(apply.disabled).toBe(false);
+  await user.click(apply);
+  await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+  expect(getLastPostedMessage()).toMatchObject({
+    type: "applyChanges",
+    payload: {
+      updates: [
+        {
+          primaryKeys: { id: 2 },
+          changes: { value: edited },
+          originalValues: { value: display },
+          originalTypes: { value: { nativeType, category } },
+        },
+      ],
+    },
+  });
+});
+
+it.each([
+  "blur",
+  "Enter",
+])("keeps an untouched MISSING field absent on %s, while explicit NULL remains editable", async (action) => {
+  const user = userEvent.setup();
+  await initializeCommittedTableData({
+    columnDefs: [columns[0], { ...columns[1], name: "optional" }],
+    dataRows: [{ id: 1 }],
+  });
+  await user.dblClick(getBodyCell("optional"));
+  if (action === "blur") await user.click(getBodyCell("id"));
+  else await user.keyboard("{Enter}");
+  expect(getBodyCell("optional").textContent).toContain("MISSING");
+  expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+  await user.dblClick(getBodyCell("optional"));
+  await user.click(screen.getByRole("button", { name: /^NULL$/ }));
+  expect(getBodyCell("optional").textContent).toContain("NULL");
+  await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+  expect(getLastPostedMessage()).toMatchObject({
+    type: "applyChanges",
+    payload: { updates: [{ changes: { optional: null } }] },
   });
 });

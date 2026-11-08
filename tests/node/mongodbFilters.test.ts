@@ -67,6 +67,14 @@ const rows: Row[] = [
   },
 ];
 
+function forceClientSideFiltering(driver: MongoDBDriver): void {
+  Object.assign(driver, {
+    buildMongoFilterCriteria: () => {
+      throw new Error("untranslatable filter");
+    },
+  });
+}
+
 function createDriverWithRows(sampleRows: Row[]): MongoDBDriver {
   const driver = new MongoDBDriver({
     id: "mongodb-filter-coverage",
@@ -84,6 +92,7 @@ function createDriverWithRows(sampleRows: Row[]): MongoDBDriver {
   (
     driver as unknown as { readSchemaDocuments: typeof readSchemaDocuments }
   ).readSchemaDocuments = readSchemaDocuments;
+  forceClientSideFiltering(driver);
   return driver;
 }
 
@@ -400,6 +409,7 @@ describe("MongoDBDriver schema type inference", () => {
       port: 27017,
       database: "test",
     });
+    forceClientSideFiltering(driver);
 
     const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
       {
@@ -495,6 +505,7 @@ describe("MongoDBDriver schema type inference", () => {
       port: 27017,
       database: "test",
     });
+    forceClientSideFiltering(driver);
 
     const readSchemaDocumentsMock = vi.fn().mockResolvedValue([
       {

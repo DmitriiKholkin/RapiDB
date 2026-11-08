@@ -79,7 +79,6 @@ describe("date filter timezone normalization", () => {
     ["PostgreSQL", postgresDriver],
     ["MySQL", mysqlDriver],
     ["MSSQL", mssqlDriver],
-    ["Oracle", oracleDriver],
   ] as const;
 
   it("treats +HH and +HHMM as explicit timezone", () => {
@@ -196,6 +195,125 @@ describe("date filter timezone normalization", () => {
         process.env.TZ = originalTz;
       }
     }
+  });
+
+  it("preserves Oracle DATE wall time while accepting all numeric offset forms", () => {
+    for (const suffix of ["+14", "+1400", "+14:00", " +1400"]) {
+      const input = `2024-03-10T00:30:00${suffix}`;
+      const value = oracleDriver.normalizeFilterValue(dateColumn, "eq", input);
+      expect(value).toBe("2024-03-10 00:30:00");
+      expect(
+        oracleDriver.buildFilterCondition(dateColumn, "eq", value, 1)?.params,
+      ).toEqual(["2024-03-10 00:30:00"]);
+    }
+    expect(
+      oracleDriver.normalizeFilterValue(
+        dateColumn,
+        "eq",
+        "2024-03-10T02:30:00",
+      ),
+    ).toBe("2024-03-10 02:30:00");
+  });
+
+  it("normalizes compact Oracle offsets for comparisons, ranges, IN and temporal binds", () => {
+    for (const suffix of ["Z", "z"]) {
+      expect(
+        oracleDriver.buildFilterCondition(
+          datetimeColumn,
+          "eq",
+          `2024-03-10T00:30:00${suffix}`,
+          1,
+        )?.params,
+      ).toEqual(["2024-03-10 00:30:00"]);
+    }
+    for (const [nativeType, category] of [
+      ["DATE", "date"],
+      ["TIMESTAMP(9)", "datetime"],
+      ["TIMESTAMP(9) WITH TIME ZONE", "datetime"],
+      ["TIMESTAMP(9) WITH LOCAL TIME ZONE", "datetime"],
+    ] as const) {
+      const meta = { ...datetimeColumn, nativeType, category };
+      for (const [compact, canonical] of [
+        ["+1400", "+14:00"],
+        ["-0330", "-03:30"],
+        ["+0545", "+05:45"],
+        ["+0000", "+00:00"],
+      ]) {
+        const raw = `2024-03-10T00:30:00.123456789${compact}`;
+        const full = `2024-03-10T00:30:00.123456789${canonical}`;
+        for (const op of [
+          "eq",
+          "neq",
+          "gt",
+          "gte",
+          "lt",
+          "lte",
+          "in",
+          "between",
+        ] as const) {
+          const input =
+            op === "between"
+              ? ([raw, raw] as [string, string])
+              : op === "in"
+                ? `${raw},${raw}`
+                : raw;
+          const expectedInput =
+            op === "between"
+              ? ([full, full] as [string, string])
+              : op === "in"
+                ? `${full},${full}`
+                : full;
+          const normalized = oracleDriver.normalizeFilterValue(meta, op, input);
+          const expected = oracleDriver.normalizeFilterValue(
+            meta,
+            op,
+            expectedInput,
+          );
+          expect(normalized).toEqual(expected);
+          expect(
+            oracleDriver.buildFilterCondition(meta, op, normalized, 1),
+          ).toEqual(oracleDriver.buildFilterCondition(meta, op, expected, 1));
+          expect(oracleDriver.buildFilterCondition(meta, op, input, 1)).toEqual(
+            oracleDriver.buildFilterCondition(meta, op, expectedInput, 1),
+          );
+        }
+        expect(oracleDriver.coerceInputValue(raw, meta)).toBe(
+          oracleDriver.coerceInputValue(full, meta),
+        );
+      }
+      for (const offset of [
+        "+1460",
+        "+2400",
+        "+9999",
+        "+123",
+        "+1:30",
+        "+12345",
+      ]) {
+        expect(() =>
+          oracleDriver.normalizeFilterValue(
+            meta,
+            "eq",
+            `2024-03-10T00:30:00${offset}`,
+          ),
+        ).toThrow("valid Oracle temporal value");
+      }
+    }
+    expect(
+      oracleDriver.buildFilterCondition(
+        datetimeColumn,
+        "eq",
+        "2024-03-10T00:30:00.123456789+1400",
+        1,
+      )?.params,
+    ).toEqual(["2024-03-09 10:30:00.123456789"]);
+    expect(
+      oracleDriver.buildFilterCondition(
+        datetimeColumn,
+        "eq",
+        "2024-03-10T00:30:00.123456789-0330",
+        1,
+      )?.params,
+    ).toEqual(["2024-03-10 04:00:00.123456789"]);
   });
 
   it("builds PostgreSQL LIKE filter for date from copied datetime+timezone", () => {

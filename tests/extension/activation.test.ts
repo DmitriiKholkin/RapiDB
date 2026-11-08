@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   REDIS_ALL_KEYS_TABLE,
@@ -52,6 +53,7 @@ describe("extension activation", () => {
   let tablePanelRegisterSerializer: ReturnType<typeof vi.fn>;
   let erdPanelCreateOrShow: ReturnType<typeof vi.fn>;
   let erdPanelDisposeAll: ReturnType<typeof vi.fn>;
+  let erdPanelRegisterSerializer: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.resetModules();
@@ -66,6 +68,7 @@ describe("extension activation", () => {
     tablePanelRegisterSerializer = vi.fn(() => ({ dispose: vi.fn() }));
     erdPanelCreateOrShow = vi.fn();
     erdPanelDisposeAll = vi.fn();
+    erdPanelRegisterSerializer = vi.fn(() => ({ dispose: vi.fn() }));
 
     const vscodeMock = createMockVscodeModule();
     vscodeState = vscodeMock.state;
@@ -192,6 +195,7 @@ describe("extension activation", () => {
       ErdPanel: {
         createOrShow: erdPanelCreateOrShow,
         disposeAll: erdPanelDisposeAll,
+        registerSerializer: erdPanelRegisterSerializer,
       },
     }));
     vi.doMock(
@@ -236,6 +240,7 @@ describe("extension activation", () => {
     expect(connectionProviderInstances).toHaveLength(1);
     expect(queryPanelRegisterSerializer).toHaveBeenCalledOnce();
     expect(tablePanelRegisterSerializer).toHaveBeenCalledOnce();
+    expect(erdPanelRegisterSerializer).toHaveBeenCalledOnce();
     expect(vscodeState.createTreeView).toHaveBeenCalledWith(
       "rapidb-explorer",
       expect.objectContaining({
@@ -244,6 +249,32 @@ describe("extension activation", () => {
         showCollapseAll: true,
       }),
     );
+  });
+
+  it("declares restoration activation events for the real serializers registered during activation", async () => {
+    vi.doUnmock("../../src/extension/panels/queryPanel");
+    vi.doUnmock("../../src/extension/panels/tablePanel");
+    vi.doUnmock("../../src/extension/panels/erdPanel");
+    const extension = await import("../../src/extension/extension");
+    const context = createExtensionContextStub();
+    const manifest = JSON.parse(
+      readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+    ) as { activationEvents: string[] };
+
+    extension.activate(context as never);
+    extension.activate(context as never);
+
+    const registrations = vscodeState.registerWebviewPanelSerializer.mock.calls;
+    expect(registrations.map(([viewType]) => viewType).sort()).toEqual([
+      "rapidb.erdPanel",
+      "rapidb.queryPanel",
+      "rapidb.tablePanel",
+    ]);
+    for (const [viewType, serializer] of registrations) {
+      expect(manifest.activationEvents).toContain(`onWebviewPanel:${viewType}`);
+      expect(serializer.deserializeWebviewPanel).toBeTypeOf("function");
+    }
+    expect(manifest.activationEvents).toContain("onStartupFinished");
   });
 
   it("copies Redis display names without exposing routing IDs or renaming columns", async () => {
@@ -633,7 +664,12 @@ describe("extension activation", () => {
     );
   });
 
-  it("opens ERD with selected node scope", async () => {
+  it.each([
+    { database: "app_db", schema: "public" },
+    { database: "sales", schema: "sales" },
+    { database: " sales ", schema: " sales " },
+    { database: "   ", schema: "   " },
+  ])("opens ERD with exact selected node scope: %j", async (scope) => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };
 
@@ -659,8 +695,7 @@ describe("extension activation", () => {
 
     await openErdCommand({
       connectionId: "conn-1",
-      database: "app_db",
-      schema: "public",
+      ...scope,
     });
 
     expect(erdPanelCreateOrShow).toHaveBeenCalledWith(
@@ -668,8 +703,7 @@ describe("extension activation", () => {
       connectionManagerInstance,
       {
         connectionId: "conn-1",
-        database: "app_db",
-        schema: "public",
+        ...scope,
       },
     );
   });

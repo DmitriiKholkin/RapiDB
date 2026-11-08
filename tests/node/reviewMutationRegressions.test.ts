@@ -113,8 +113,6 @@ describe("review mutation regressions", () => {
           batch: vi.fn(
             async () =>
               await new Promise((resolve, reject) => {
-                // Like node-mssql: acquire/release through the Request's parent,
-                // which the query-session lease replaces before dispatch.
                 request.parent.acquire({}, (error, session) => {
                   if (error) return reject(error);
                   borrowedSessions.push(session);

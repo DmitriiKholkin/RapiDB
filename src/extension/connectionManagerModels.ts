@@ -12,6 +12,7 @@ import type {
 export type { ConnectionConfig } from "../shared/connectionConfig";
 export interface TestConnectionResult {
   success: boolean;
+  message?: string;
   error?: string;
   validation?: ConnectionValidationResult;
 }

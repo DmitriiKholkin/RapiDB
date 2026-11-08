@@ -33,6 +33,8 @@ export type {
   QueryInitialState,
   QueryPanelMessage,
   QueryResultExportPayload,
+  QueryResultSet,
+  QuerySchemaPayload,
 } from "./query";
 export { parseBookmarkSavedPayload, parseQueryPanelMessage } from "./query";
 export type {

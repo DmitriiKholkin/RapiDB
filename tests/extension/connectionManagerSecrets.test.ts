@@ -7,6 +7,7 @@ import { createExtensionContextStub } from "../support/fakeConnectionManagerStor
 const configuration = vi.hoisted(() => ({
   connections: [] as ConnectionConfig[],
   rejectAfterApply: false,
+  writes: 0,
 }));
 
 vi.mock("vscode", async () => {
@@ -19,6 +20,7 @@ vi.mock("vscode", async () => {
     inspect: () => ({ globalValue: configuration.connections }),
     update: vi.fn(async (_key: string, value: ConnectionConfig[]) => {
       configuration.connections = JSON.parse(JSON.stringify(value));
+      configuration.writes += 1;
       if (configuration.rejectAfterApply)
         throw new Error("acknowledgement failed");
     }),
@@ -27,6 +29,166 @@ vi.mock("vscode", async () => {
 });
 
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it.each([
+    {
+      name: "password",
+      config: {
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "hand-password",
+      },
+      expected: { password: "hand-password" },
+    },
+    {
+      name: "API key",
+      config: {
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        apiKey: "hand-key",
+      },
+      expected: { apiKey: "hand-key" },
+    },
+    {
+      name: "AWS credentials",
+      config: {
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "hand-access",
+        awsSecretAccessKey: "hand-secret",
+        awsSessionToken: "hand-token",
+      },
+      expected: {
+        awsAccessKeyId: "hand-access",
+        awsSecretAccessKey: "hand-secret",
+        awsSessionToken: "hand-token",
+      },
+    },
+    {
+      name: "TLS key passphrase",
+      config: {
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "hand-tls",
+        },
+      },
+      expected: { tls: expect.objectContaining({ keyPassphrase: "hand-tls" }) },
+    },
+    {
+      name: "credential URI",
+      config: {
+        type: "redis",
+        connectionUri: "redis://user:hand-uri@localhost:6379/0",
+      },
+      expected: { connectionUri: "redis://user:hand-uri@localhost:6379/0" },
+    },
+  ] as Array<{
+    name: string;
+    config: Partial<ConnectionConfig>;
+    expected: Partial<ConnectionConfig>;
+  }>)("keeps a hand-written $name in settings.json and marks it plaintext", async ({
+    config: partial,
+    expected,
+  }) => {
+    const config = {
+      ...partial,
+      id: "hand-written",
+      name: "Hand written",
+    } as ConnectionConfig;
+    configuration.connections = [structuredClone(config)];
+    configuration.writes = 0;
+    const context = createExtensionContextStub();
+    const stores = vi.spyOn(context.secrets, "store");
+    const deletes = vi.spyOn(context.secrets, "delete");
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+      _migrateAllStoredConnectionSecrets(): Promise<void>;
+    };
+    let connected = false;
+    const factory = vi.spyOn(state, "createDriver").mockReturnValue({
+      connect: vi.fn(async () => {
+        connected = true;
+      }),
+      disconnect: vi.fn(async () => {
+        connected = false;
+      }),
+      isConnected: () => connected,
+    } as unknown as IDBDriver);
+    try {
+      expect(manager.getConnections()).toEqual([
+        { ...config, useSecretStorage: false },
+      ]);
+      await state._migrateAllStoredConnectionSecrets();
+      await manager.connectTo(config.id);
+      expect(factory).toHaveBeenCalledWith(expect.objectContaining(expected));
+      expect(configuration.connections).toEqual([
+        { ...config, useSecretStorage: false },
+      ]);
+      expect(configuration.writes).toBe(1);
+      await state._migrateAllStoredConnectionSecrets();
+      await manager.saveConnection({
+        id: "other",
+        name: "Other",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "other",
+        useSecretStorage: true,
+      });
+      expect(configuration.connections[0]).toEqual({
+        ...config,
+        useSecretStorage: false,
+      });
+      expect(configuration.writes).toBe(2);
+      expect(stores).toHaveBeenCalledTimes(1);
+      expect(stores).toHaveBeenCalledWith(
+        "other",
+        JSON.stringify({ password: "other" }),
+      );
+      expect(deletes).not.toHaveBeenCalled();
+      await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("still migrates legacy plaintext stored alongside useSecretStorage true", async () => {
+    const config: ConnectionConfig = {
+      id: "legacy-true",
+      name: "Legacy",
+      type: "pg",
+      host: "localhost",
+      password: "legacy-password",
+      useSecretStorage: true,
+    };
+    configuration.connections = [structuredClone(config)];
+    const context = createExtensionContextStub();
+    const manager = new ConnectionManager(context as never);
+    try {
+      await (
+        manager as unknown as {
+          _migrateAllStoredConnectionSecrets(): Promise<void>;
+        }
+      )._migrateAllStoredConnectionSecrets();
+      expect(configuration.connections[0].password).toBeUndefined();
+      expect(configuration.connections[0].useSecretStorage).toBe(true);
+      expect(
+        JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
+      ).toEqual({ password: "legacy-password" });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it("moves Elasticsearch URI credentials into the canonical endpoint secret on edit", async () => {
     configuration.connections = [];
     const context = createExtensionContextStub();
@@ -99,6 +261,13 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
         }
         const saved = await manager.saveConnection(config);
         expect(saved.connectionUri).toBe(redacted);
+        if (useSecretStorage === undefined) {
+          expect(configuration.connections).toEqual([
+            { ...config, useSecretStorage: false },
+          ]);
+          expect(await context.secrets.get(config.id)).toBeUndefined();
+          continue;
+        }
         expect(configuration.connections[0].connectionUri).toBe(redacted);
         expect(configuration.connections[0].useSecretStorage).toBe(true);
         expect(
@@ -158,7 +327,9 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
           "Ambiguous URI credentials",
         );
         expect(factory).not.toHaveBeenCalled();
-        expect(configuration.connections).toEqual([config]);
+        expect(configuration.connections).toEqual([
+          { ...config, useSecretStorage: useSecretStorage ?? false },
+        ]);
         await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
       } finally {
         await legacyManager.dispose();
@@ -464,6 +635,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       database: "app",
       username: "postgres",
       password,
+      useSecretStorage: true,
     };
     configuration.connections = [config];
     await context.secrets.store(config.id, rawSecret);

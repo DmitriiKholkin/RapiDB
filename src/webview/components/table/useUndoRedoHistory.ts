@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import type { MutationSnapshot } from "../../types";
 
 export interface UndoRedoHistory {
@@ -82,14 +82,17 @@ export function useUndoRedoHistory(): UndoRedoHistory {
     [],
   );
 
-  return {
-    push,
-    undo,
-    redo,
-    canUndo,
-    canRedo,
-    clear,
-    remap,
-    hasUnresolvedEdits,
-  };
+  return useMemo(
+    () => ({
+      push,
+      undo,
+      redo,
+      canUndo,
+      canRedo,
+      clear,
+      remap,
+      hasUnresolvedEdits,
+    }),
+    [push, undo, redo, canUndo, canRedo, clear, remap, hasUnresolvedEdits],
+  );
 }

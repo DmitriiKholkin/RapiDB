@@ -29,9 +29,17 @@ export function unknownSqlMutationColumns(
   values: Record<string, unknown>,
   colMap: Map<string, ColumnTypeMeta>,
 ): string[] {
-  if (driver.getCapabilities?.().tabularRead !== "sql") return [];
+  const capabilities = driver.getCapabilities?.();
+  const rejectsUnknown =
+    capabilities?.tabularRead === "sql"
+      ? () => true
+      : capabilities?.rejectsUnknownMutationColumn;
+  if (!rejectsUnknown) return [];
   return Object.entries(values)
-    .filter(([name, value]) => value !== undefined && !colMap.has(name))
+    .filter(
+      ([name, value]) =>
+        value !== undefined && !colMap.has(name) && rejectsUnknown(name),
+    )
     .map(([name]) => name);
 }
 

@@ -29,8 +29,6 @@ function sortDocuments(
   });
 }
 
-// Unlike a fixed mockResolvedValue(), this cursor models MongoDB's dangerous
-// limit(0) == unlimited behavior and records the documents actually fetched.
 class MemoryFindCursor {
   private limitValue = 0;
   private offset = 0;
@@ -269,13 +267,15 @@ describe.each(READ_METHODS)("MongoDB %s query budgets", (method) => {
     expect(harness.aggregate).not.toHaveBeenCalled();
   });
 
-  it("uses the last repeated limit modifier", async () => {
+  it("applies repeated limit modifiers like the native cursor", async () => {
     const harness = createHarness(makeDocuments(12_001));
     const result = await harness.driver.query(
-      `${readQuery(method)}.limit(0).limit(3).limit(5)`,
+      method === "find"
+        ? `${readQuery(method)}.limit(0).limit(3).limit(5)`
+        : `${readQuery(method)}.limit(5).limit(10)`,
     );
 
-    expectFetchLimit(harness, method, 5);
+    expectFetchLimit(harness, method, method === "find" ? 5 : 10);
     expect(result.rows).toHaveLength(5);
     expect(result.truncated === true).toBe(false);
   });
@@ -379,7 +379,7 @@ describe("MongoDB find and aggregate limit semantics", () => {
     );
     expect(harness.find).toHaveBeenCalledWith(
       {},
-      { projection: { value: 1 }, promoteValues: false, bsonRegExp: false },
+      { projection: { value: 1 }, promoteValues: false, bsonRegExp: true },
     );
     expect(harness.cursors[0].sort).toHaveBeenCalledWith({ _id: 1 });
     expect(harness.cursors[0].skip).toHaveBeenCalledWith(4);

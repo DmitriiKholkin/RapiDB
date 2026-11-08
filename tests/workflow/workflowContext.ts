@@ -23,7 +23,7 @@ import {
   createWorkflowVscodeState,
   type WorkflowVscodeState,
 } from "./bridge/workflowVscode";
-import { type EngineScenario } from "./scenarios/types";
+import type { EngineScenario } from "./scenarios/types";
 import { getSharedWorkflowState } from "./sharedState";
 
 export interface OpenFormResult {

@@ -41,7 +41,10 @@
   ],
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onWebviewPanel:rapidb.queryPanel",
+    "onWebviewPanel:rapidb.tablePanel",
+    "onWebviewPanel:rapidb.erdPanel"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -329,6 +332,11 @@
           "group": "2_conn"
         },
         {
+          "command": "rapidb.disconnect",
+          "when": "view == rapidb-explorer && viewItem == connectionNode_connecting",
+          "group": "2_conn"
+        },
+        {
           "command": "rapidb.editConnection",
           "when": "view == rapidb-explorer && viewItem == connectionNode_connected",
           "group": "3_manage"
@@ -558,6 +566,10 @@
                 "type": "string",
                 "description": "Login password for the database connection."
               },
+              "useSecretStorage": {
+                "type": "boolean",
+                "description": "Store secrets in VS Code Secret Storage. When false, secrets stay in settings.json. Set automatically to false when secrets are written here by hand."
+              },
               "filePath": {
                 "type": "string",
                 "description": "SQLite only: absolute path to the .db file"
@@ -565,7 +577,7 @@
               "ssl": {
                 "type": "boolean",
                 "default": false,
-                "description": "Enable SSL/TLS encryption. Not applicable to SQLite."
+                "description": "Legacy TLS flag. Continues to be read and migrated to tls.mode."
               },
               "rejectUnauthorized": {
                 "type": "boolean",
@@ -583,7 +595,7 @@
               },
               "serviceName": {
                 "type": "string",
-                "description": "Oracle service name (e.g. XEPDB1). Preferred over SID. If omitted, the database field is used."
+                "description": "Oracle service name (e.g. XEPDB1). If omitted, the legacy database field is used as the service name; SID is not supported."
               },
               "connectionUri": {
                 "type": "string",
@@ -595,7 +607,7 @@
               },
               "apiKey": {
                 "type": "string",
-                "description": "Elasticsearch API key used instead of basic auth."
+                "description": "Elasticsearch API key. Legacy profiles with username use basic authentication; the form provides an explicit authentication choice."
               },
               "cloudId": {
                 "type": "string",
@@ -668,6 +680,40 @@
               "mongoUriHasCredentials": {
                 "type": "boolean",
                 "description": "Whether the MongoDB URI has credentials stored separately in Secret Storage."
+              },
+              "tls": {
+                "type": "object",
+                "description": "TLS settings. Explicit disabled overrides PostgreSQL environment defaults. HTTPS and rediss URIs always enable TLS.",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "disabled",
+                      "requireTrustServerCertificate",
+                      "requireVerifyCa",
+                      "requireVerifyFull",
+                      "mutualTls"
+                    ]
+                  },
+                  "caFilePath": {
+                    "type": "string"
+                  },
+                  "certFilePath": {
+                    "type": "string"
+                  },
+                  "keyFilePath": {
+                    "type": "string"
+                  },
+                  "keyPassphrase": {
+                    "type": "string"
+                  },
+                  "serverNameOverride": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
               }
             }
           },
@@ -777,21 +823,21 @@
     "test:workflow:sqlite": "vitest run --project db-workflow -t \"sqlite\"",
     "test:workflow:sqlite:run": "vitest run --project db-workflow -t \"sqlite\"",
     "test:workflow:postgres": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:postgres:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:postgres:run": "RAPIDB_WORKFLOW_ENGINES=postgres vitest run --project db-workflow -t \"postgres\"",
+    "test:workflow:postgres:run": "node ./tests/scripts/run-workflow-vitest.mjs postgres",
     "test:workflow:mysql": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:mysql:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:mysql:run": "RAPIDB_WORKFLOW_ENGINES=mysql vitest run --project db-workflow -t \"mysql\"",
+    "test:workflow:mysql:run": "node ./tests/scripts/run-workflow-vitest.mjs mysql",
     "test:workflow:mssql": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:mssql:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:mssql:run": "RAPIDB_WORKFLOW_ENGINES=mssql vitest run --project db-workflow -t \"mssql\"",
+    "test:workflow:mssql:run": "node ./tests/scripts/run-workflow-vitest.mjs mssql",
     "test:workflow:oracle": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:oracle:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:oracle:run": "RAPIDB_WORKFLOW_ENGINES=oracle vitest run --project db-workflow -t \"oracle\"",
+    "test:workflow:oracle:run": "node ./tests/scripts/run-workflow-vitest.mjs oracle",
     "test:workflow:mongodb": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:mongodb:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:mongodb:run": "RAPIDB_WORKFLOW_ENGINES=mongodb vitest run --project db-workflow -t \"mongodb\"",
+    "test:workflow:mongodb:run": "node ./tests/scripts/run-workflow-vitest.mjs mongodb",
     "test:workflow:redis": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:redis:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:redis:run": "RAPIDB_WORKFLOW_ENGINES=redis vitest run --project db-workflow -t \"redis\"",
+    "test:workflow:redis:run": "node ./tests/scripts/run-workflow-vitest.mjs redis",
     "test:workflow:elasticsearch": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:elasticsearch:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:elasticsearch:run": "RAPIDB_WORKFLOW_ENGINES=elasticsearch vitest run --project db-workflow -t \"elasticsearch\"",
+    "test:workflow:elasticsearch:run": "node ./tests/scripts/run-workflow-vitest.mjs elasticsearch",
     "test:workflow:dynamodb": "node ./tests/scripts/run-npm-scripts.mjs db:check db:up db:prepare test:workflow:dynamodb:run --finally db:down --finally-if-env-not RAPIDB_KEEP_TEST_SERVICES",
-    "test:workflow:dynamodb:run": "RAPIDB_WORKFLOW_ENGINES=dynamodb vitest run --project db-workflow -t \"dynamodb\"",
+    "test:workflow:dynamodb:run": "node ./tests/scripts/run-workflow-vitest.mjs dynamodb",
     "db:check": "node ./tests/scripts/db-check.mjs",
     "db:up": "npm run db:check && docker compose -f ./compose.yaml up -d --build ssh-bastion postgres mysql mssql oracle redis mongo elasticsearch dynamodb",
     "db:wait": "tsx ./tests/scripts/db-wait.ts",
@@ -819,6 +865,7 @@
     "axe-core": "4.11.4",
     "esbuild": "0.28.1",
     "jsdom": "29.1.1",
+    "tar-stream": "2.2.0",
     "tsx": "4.22.3",
     "typescript": "6.0.3",
     "vitest": "4.1.12",

@@ -21,10 +21,12 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { verifyTransaction } from "../../src/extension/dbDrivers/transactionVerification";
 import {
+  type ColumnMeta,
   type ColumnTypeMeta,
   type FilterExpression,
   NULL_SENTINEL,
 } from "../../src/extension/dbDrivers/types";
+import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableReadService } from "../../src/extension/table/tableReadService";
@@ -52,7 +54,13 @@ function column(
     valueSemantics: "plain",
   };
 }
-const oracle = new OracleDriver({
+class InspectableOracleDriver extends OracleDriver {
+  enrichColumnForTest(column: ColumnMeta): ColumnTypeMeta {
+    return this.enrichColumn(column);
+  }
+}
+
+const oracle = new InspectableOracleDriver({
   id: "offline-review",
   name: "Review",
   type: "oracle",
@@ -135,6 +143,208 @@ describe("manual review: exact exports and user documents", () => {
 });
 
 describe("manual review: Oracle exact objects and temporal writes", () => {
+  it("keeps SDO_GEOMETRY spatial when catalog object attributes are available", () => {
+    const geometry = oracle.enrichColumnForTest({
+      ...column("GEOM", "SDO_GEOMETRY", "other"),
+      objectTypeOwner: "MDSYS",
+      objectTypeName: "SDO_GEOMETRY",
+      objectAttributes: [
+        { name: "SDO_GTYPE", nativeType: "NUMBER" },
+        { name: "SDO_SRID", nativeType: "NUMBER" },
+        { name: "SDO_POINT", nativeType: "SDO_POINT_TYPE" },
+        { name: "SDO_ELEM_INFO", nativeType: "SDO_ELEM_INFO_ARRAY" },
+        { name: "SDO_ORDINATES", nativeType: "SDO_ORDINATE_ARRAY" },
+      ],
+    });
+    expect(geometry.category).toBe("spatial");
+    expect(geometry.filterable).toBe(true);
+    expect(geometry.filterOperators).toEqual([
+      "eq",
+      "neq",
+      "is_null",
+      "is_not_null",
+    ]);
+    expect(geometry.objectAttributes).toBeUndefined();
+    expect(geometry.objectTypeOwner).toBeUndefined();
+    expect(geometry.objectTypeName).toBeUndefined();
+    expect(oracle.buildVerificationValueExpr(geometry)).toBe('"GEOM"');
+    expect(oracle.buildTableDataProjection([geometry])).toBe(
+      '"GEOM" AS "GEOM"',
+    );
+    for (const operator of ["eq", "neq"] as const) {
+      expect(
+        oracle.buildFilterCondition(geometry, operator, "POINT (1 2)", 2),
+      ).toEqual({
+        sql: `NVL(DBMS_LOB.COMPARE(SDO_UTIL.TO_WKTGEOMETRY("GEOM"), TO_CLOB(:2)), 1) ${operator === "eq" ? "=" : "!="} 0`,
+        params: ["POINT (1 2)"],
+      });
+    }
+    expect(oracle.buildOriginalValueComparison(geometry, 2)).toBe(
+      'DBMS_LOB.COMPARE(SDO_UTIL.TO_WKTGEOMETRY("GEOM"), TO_CLOB(:2)) = 0',
+    );
+    expect(
+      oracle.buildMutationValueExpr(
+        geometry,
+        "POINT (1 2)",
+        "update",
+        undefined,
+        2,
+      ),
+    ).toBeNull();
+  });
+
+  it("exports Oracle JSON, object, and collection values as typed JSON", () => {
+    const jsonColumn = oracle.enrichColumnForTest(
+      column("JSON_COL", "JSON", "other"),
+    );
+    const jsonText = '{"message":"Привет 😀","n":9007199254740993}';
+    expect(jsonColumn.category).toBe("json");
+    expect(
+      serializeJsonExportRecord([
+        {
+          key: jsonColumn.name,
+          sourceKey: jsonColumn.name,
+          category: jsonColumn.category,
+          nativeType: jsonColumn.nativeType,
+          value: oracle.formatOutputValue(jsonText, jsonColumn),
+        },
+      ]),
+    ).toBe(`{"JSON_COL":${jsonText}}`);
+
+    const enrichedObject = oracle.enrichColumnForTest(objectColumn);
+    const objectText = '{"N":9007199254740993,"TXT":"edited"}';
+    expect(enrichedObject.category).toBe("json");
+    expect(oracle.buildVerificationValueExpr(enrichedObject)).toContain(
+      "JSON_OBJECT",
+    );
+    expect(
+      oracle.buildFilterCondition(enrichedObject, "like", "needle", 1)?.sql,
+    ).toContain(
+      'DBMS_LOB.INSTR(UPPER(JSON_OBJECT("OBJ" RETURNING CLOB)), UPPER(:1)) > 0',
+    );
+    expect(
+      serializeJsonExportRecord([
+        {
+          key: enrichedObject.name,
+          sourceKey: enrichedObject.name,
+          category: enrichedObject.category,
+          nativeType: enrichedObject.nativeType,
+          value: oracle.formatOutputValue(objectText, enrichedObject),
+        },
+      ]),
+    ).toBe(`{"OBJ":${objectText}}`);
+
+    const arrayColumn = oracle.enrichColumnForTest({
+      ...column("ARRAY_COL", "REVIEW_ARRAY", "other"),
+      collectionKind: "varray",
+      collectionElementType: "VARCHAR2",
+      collectionTypeOwner: "QA",
+      collectionTypeName: "REVIEW_ARRAY",
+    });
+    const arrayText = '["a","b",null]';
+    expect(arrayColumn.category).toBe("array");
+    expect(
+      oracle.buildFilterCondition(arrayColumn, "like", "a", 1)?.sql,
+    ).toContain('EXISTS (SELECT 1 FROM TABLE("ARRAY_COL")');
+    expect(
+      serializeJsonExportRecord([
+        {
+          key: arrayColumn.name,
+          sourceKey: arrayColumn.name,
+          category: arrayColumn.category,
+          nativeType: arrayColumn.nativeType,
+          value: oracle.formatOutputValue(["a", "b", null], arrayColumn),
+        },
+      ]),
+    ).toBe(`{"ARRAY_COL":${arrayText}}`);
+  });
+
+  it("marks Oracle JSON constraints and nested tables without invalid filters or writes", () => {
+    const constrainedJsonColumn = oracle.enrichColumnForTest(
+      column("JSON_CLOB", "CLOB IS JSON", "text"),
+    );
+    expect(constrainedJsonColumn.category).toBe("json");
+    expect(
+      oracle.buildFilterCondition(constrainedJsonColumn, "like", "needle", 1)
+        ?.sql,
+    ).toContain('DBMS_LOB.INSTR(UPPER("JSON_CLOB"), UPPER(:1)) > 0');
+    expect(oracle.buildVerificationValueExpr(constrainedJsonColumn)).toBe(
+      '"JSON_CLOB"',
+    );
+    expect(
+      oracle.buildOriginalValueComparisonWithParams(
+        constrainedJsonColumn,
+        '{"n":1}',
+        2,
+      ),
+    ).toEqual({
+      sql: 'JSON_EQUAL("JSON_CLOB", :2 ERROR ON ERROR)',
+      params: ['{"n":1}'],
+    });
+    expect(
+      oracle.checkPersistedEdit(
+        constrainedJsonColumn,
+        '{"n":9007199254740993}',
+        { persistedValue: '{ "n": 9007199254740993 }' },
+      )?.ok,
+    ).toBe(true);
+    expect(
+      oracle.checkPersistedEdit(
+        constrainedJsonColumn,
+        '{"n":9007199254740993}',
+        { persistedValue: '{"n":9007199254740992}' },
+      )?.ok,
+    ).toBe(false);
+
+    const nestedTableColumn = oracle.enrichColumnForTest({
+      ...column("NESTED_COL", "REVIEW_NT", "other"),
+      collectionKind: "nestedTable",
+      collectionElementType: "VARCHAR2",
+      collectionTypeOwner: "QA",
+      collectionTypeName: "REVIEW_NT",
+    });
+    expect(nestedTableColumn.category).toBe("array");
+    expect(nestedTableColumn.isReadOnly).toBe(true);
+    expect(nestedTableColumn.filterable).toBe(false);
+    expect(nestedTableColumn.filterOperators).toEqual([
+      "is_null",
+      "is_not_null",
+    ]);
+  });
+
+  it("serializes BLOB IS JSON to a CLOB before literal case-insensitive Contains", () => {
+    for (const nativeType of ["BLOB IS JSON", "blob is json", "JSON"]) {
+      const json = oracle.enrichColumnForTest(
+        column('J"BLOB', nativeType, "other"),
+      );
+      expect(json.category).toBe(
+        nativeType.toUpperCase().startsWith("BLOB") ? "binary" : "json",
+      );
+      expect(json.filterOperators).toEqual(["like", "is_null", "is_not_null"]);
+      for (const operator of ["like", "ilike"] as const) {
+        expect(
+          oracle.buildFilterCondition(json, operator, "  Привет%_!  ", 2),
+        ).toEqual({
+          sql: 'DBMS_LOB.INSTR(UPPER(JSON_SERIALIZE("J""BLOB" RETURNING CLOB)), UPPER(:2)) > 0',
+          params: ["Привет%_!"],
+        });
+      }
+      expect(oracle.buildFilterCondition(json, "like", "  ", 1)).toBeNull();
+    }
+    const binary = oracle.enrichColumnForTest(
+      column("RAW_BLOB", "BLOB", "other"),
+    );
+    expect(binary.category).toBe("binary");
+    expect(binary.filterOperators).not.toContain("like");
+    expect(() =>
+      buildWhere(
+        oracle,
+        [{ column: "RAW_BLOB", operator: "like", value: "needle" }],
+        [binary],
+      ),
+    ).toThrow("does not support like");
+  });
+
   it("reads native JSON through text to preserve exact numeric tokens", () => {
     const jsonColumn = column("JSON_DOC", "JSON", "json");
     expect(oracle.buildVerificationValueExpr(jsonColumn)).toBe(
@@ -618,7 +828,11 @@ describe("manual review: sql_variant writes", () => {
         ],
         async () => [{ __col_0: JSON.stringify(snapshot()) }],
       ),
-    ).rejects.toThrow("not committed");
+    ).rejects.toMatchObject({
+      name: "TransactionVerificationError",
+      message: 'UPDATE verification failed. V stored "abc" instead of "abcdef"',
+      verificationFailure: { rowIndex: 0, columns: ["V"] },
+    });
     expect(
       mssql.checkPersistedEdit(variant, "abc", {
         persistedValue: JSON.stringify(snapshot()),
@@ -764,6 +978,7 @@ describe("manual review: catalog and projection collisions", () => {
     const client = {
       type: async () => "string",
       get: async () => Buffer.from([255]),
+      strLen: async () => 1,
       withTypeMapping: () => client,
       sendCommand,
     };
@@ -1076,7 +1291,7 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
       oracle.buildFilterCondition(col, "between", [input, input], 1)?.params,
     ).toEqual([exact, exact]);
     expect(oracle.buildFilterCondition(col, "like", input, 1)?.params).toEqual([
-      `%${exact}%`,
+      `%${input}%`,
     ]);
     if (zoned)
       expect(

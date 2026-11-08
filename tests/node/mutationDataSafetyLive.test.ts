@@ -474,6 +474,50 @@ describe.runIf(live)("MongoDB integer mutation data safety (live BSON)", () => {
       ).affectedRows,
     ).toBe(1);
   });
+  it("persists explicit BSON null for a field that was missing and rejects a stale missing baseline", async () => {
+    const collection = admin.db(database).collection(table);
+    await collection.insertOne({ _id: "missing-to-null" } as never);
+    const update = {
+      primaryKeys: { _id: "missing-to-null" },
+      changes: { payload: null },
+      originalValues: { payload: undefined },
+      originalTypes: {
+        payload: { category: "other" as const, nativeType: "missing" },
+      },
+    };
+
+    expect(
+      await collection.findOne({ _id: "missing-to-null" } as never),
+    ).not.toHaveProperty("payload");
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(1);
+
+    const saved = await collection.findOne({ _id: "missing-to-null" } as never);
+    expect(Object.hasOwn(saved ?? {}, "payload")).toBe(true);
+    expect(saved?.payload).toBeNull();
+
+    expect(
+      (
+        await driver.updateRows({
+          database,
+          schema: "",
+          table,
+          updates: [update],
+        })
+      ).affectedRows,
+    ).toBe(0);
+    expect(
+      await collection.findOne({ _id: "missing-to-null" } as never),
+    ).toMatchObject({ _id: "missing-to-null", payload: null });
+  });
   it.each([
     ["int", "-2147483648", "2147483647", "2147483648", Int32],
     [

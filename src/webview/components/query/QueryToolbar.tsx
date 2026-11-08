@@ -16,6 +16,7 @@ interface QueryToolbarProps {
   connectionId: string;
   connections: readonly ConnectionEntry[];
   formatButtonTitle: string;
+  schemaError?: string | null;
   schemaLoading: boolean;
   selectedConnectionId: string;
   status: QueryStatus;
@@ -34,6 +35,7 @@ export function QueryToolbar({
   connectionId,
   connections,
   formatButtonTitle,
+  schemaError,
   schemaLoading,
   selectedConnectionId,
   status,
@@ -45,15 +47,21 @@ export function QueryToolbar({
   onRun,
 }: QueryToolbarProps): React.ReactElement {
   const noConnection = !selectedConnectionId;
-  const runDisabled = status === "running" || !selectedConnectionId;
-  const bookmarkDisabled = bookmarked || bookmarking || !selectedConnectionId;
+  const queryRunning = status === "running";
+  const runDisabled = queryRunning || noConnection;
+  const connectionDisabled =
+    queryRunning || (connections.length === 0 && !selectedConnectionId);
+  const bookmarkDisabled =
+    bookmarked || bookmarking || noConnection || queryRunning;
+  const clearDisabled = noConnection || queryRunning;
+  const formatDisabled = noConnection || !canFormat || queryRunning;
   return (
     <div style={queryToolbarStyle}>
       <select
         aria-label="Active connection"
         style={querySelectStyle}
         value={selectedConnectionId}
-        disabled={connections.length === 0 && !selectedConnectionId}
+        disabled={connectionDisabled}
         onChange={(event) => onConnectionChange(event.target.value)}
       >
         {connections.length === 0 ? (
@@ -111,8 +119,8 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryGhostButtonStyle(noConnection)}
-        disabled={noConnection}
+        style={buildQueryGhostButtonStyle(clearDisabled)}
+        disabled={clearDisabled}
         onClick={onClear}
         title="Clear query"
       >
@@ -122,8 +130,8 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryGhostButtonStyle(noConnection || !canFormat)}
-        disabled={noConnection || !canFormat}
+        style={buildQueryGhostButtonStyle(formatDisabled)}
+        disabled={formatDisabled}
         onClick={onFormat}
         title={formatButtonTitle}
       >
@@ -165,6 +173,24 @@ export function QueryToolbar({
         >
           <Icon name="sync" size={11} spin />
           Indexing schema…
+        </span>
+      )}
+
+      {!schemaLoading && schemaError && (
+        <span
+          role="status"
+          title={`Schema autocomplete unavailable: ${schemaError}`}
+          style={{
+            fontSize: 11,
+            opacity: 0.6,
+            display: "flex",
+            alignItems: "center",
+            gap: 4,
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="warning" size={11} />
+          Schema unavailable
         </span>
       )}
 

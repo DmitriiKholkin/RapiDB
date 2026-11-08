@@ -54,6 +54,9 @@ export interface RedisReadBudget {
   maxScanIterations: number;
   maxValueReads: number;
   parallelValueReads: number;
+  maxValueEntries: number;
+  maxValueBytes: number;
+  maxTotalValueBytes: number;
 }
 
 export const REDIS_READ_BUDGET: RedisReadBudget = Object.freeze({
@@ -61,13 +64,7 @@ export const REDIS_READ_BUDGET: RedisReadBudget = Object.freeze({
   maxScanIterations: 5000,
   maxValueReads: 2000,
   parallelValueReads: 24,
+  maxValueEntries: 1000,
+  maxValueBytes: 4 * 1024 * 1024,
+  maxTotalValueBytes: 64 * 1024 * 1024,
 });
-
-export interface ProblemDetails {
-  type: string;
-  title: string;
-  status: number;
-  detail?: string;
-  instance?: string;
-  [key: string]: unknown;
-}

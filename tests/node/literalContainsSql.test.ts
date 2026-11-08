@@ -1,7 +1,6 @@
 import mysql from "mysql2";
 import { describe, expect, it, vi } from "vitest";
 import { BaseDBDriver } from "../../src/extension/dbDrivers/BaseDBDriver";
-import { FilterBuilder } from "../../src/extension/dbDrivers/filterBuilder";
 import { literalContainsPattern } from "../../src/extension/dbDrivers/literalContains";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
@@ -59,6 +58,10 @@ const values = [
   String.raw`!%_\!_%%\\`,
   "ordinary string",
   "雪😀",
+  "🍀",
+  "[",
+  "]",
+  "a[b]",
   "x' OR 1=1 --",
   "2026-10-05T10:20:30Z",
 ];
@@ -72,6 +75,10 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
     expect(defaultFilterOperator(meta)).toBe("like");
     expect(meta.filterOperators).toContain("like");
     vi.spyOn(driver, "describeColumns").mockResolvedValue([meta]);
+    Object.assign(driver, {
+      getIndexes: async () => [],
+      getTableRowIdentityOrderExpressions: async () => [],
+    });
     const query = vi.spyOn(driver, "query").mockResolvedValue({
       columns: [],
       rows: [],
@@ -88,8 +95,10 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
     expect(query).toHaveBeenCalledTimes(2);
     for (const [sql, params] of query.mock.calls) {
       if (name === "MSSQL") {
-        expect(sql).toContain("CHARINDEX(");
-        expect(params?.[0]).toBe(value);
+        expect(sql).toContain("LIKE ? ESCAPE '!'");
+        expect(params?.[0]).toBe(
+          literalContainsPattern(value).replace(/\[/g, "[[]"),
+        );
       } else {
         expect(sql).toContain("ESCAPE '!'");
         const pattern =
@@ -125,7 +134,8 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
           ? Buffer.from(String(param), "hex").toString("utf8")
           : param,
       ).toBe(
-        name === "MSSQL" || (name === "Oracle" && category === "json")
+        (name === "MSSQL" && category === "array") ||
+          (name === "Oracle" && category === "json")
           ? value
           : literalContainsPattern(value),
       );
@@ -140,14 +150,66 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
 });
 
 describe("H1 shared builders and dialect edge cases", () => {
-  it("escapes %, _, and the chosen escape character, but not backslash", () => {
-    expect(literalContainsPattern("!%_\\")).toBe("%!!!%!_\\%");
+  it.each([
+    "like",
+    "ilike",
+  ] as const)("preserves SQL Server literal Contains after LIKE escaping exceeds its pattern budget (%s)", (operator) => {
+    const driver = new MSSQLDriver({ ...config, type: "mssql" });
+    for (const value of [
+      "[".repeat(1300),
+      "%".repeat(1950),
+      "x".repeat(3899),
+      "x".repeat(4000),
+      "😀".repeat(2000),
+    ]) {
+      expect(driver.buildFilterCondition(column(), operator, value, 1)).toEqual(
+        {
+          sql: "CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST([value] AS NVARCHAR(MAX))) > 0",
+          params: [value],
+        },
+      );
+    }
   });
 
   it.each([
     "text",
     "array",
-  ] as const)("keeps BaseDBDriver and standalone FilterBuilder %s Contains consistent", (category) => {
+  ] as const)("rejects an over-limit SQL Server %s Contains value instead of replacing it with equality", (category) => {
+    const driver = new MSSQLDriver({ ...config, type: "mssql" });
+    for (const value of ["x".repeat(4001), "😀".repeat(2001)]) {
+      expect(() =>
+        driver.buildFilterCondition(column(category), "like", value, 1),
+      ).toThrow(/\[RapiDB Filter\].*4000/);
+    }
+    expect(
+      driver.buildFilterCondition(column(category), "like", "x".repeat(4000), 1)
+        ?.params,
+    ).toEqual(["x".repeat(4000)]);
+  });
+
+  it("escapes %, _, and the chosen escape character, but not backslash", () => {
+    expect(literalContainsPattern("!%_\\")).toBe("%!!!%!_\\%");
+  });
+
+  it.each([
+    ["[", "%[[]%"],
+    ["]", "%]%"],
+    ["a[b]", "%a[[]b]%"],
+    ["![%_]", "%!![[]!%!_]%"],
+  ])("keeps SQL Server LIKE bracket input %j literal", (value, expected) => {
+    const driver = new MSSQLDriver({ ...config, type: "mssql" });
+    const condition = driver.buildFilterCondition(column(), "like", value, 1);
+
+    expect(condition).toEqual({
+      sql: "CAST([value] AS NVARCHAR(MAX)) LIKE ? ESCAPE '!'",
+      params: [expected],
+    });
+  });
+
+  it.each([
+    "text",
+    "array",
+  ] as const)("keeps BaseDBDriver %s Contains literal", (category) => {
     const driver = new MySQLDriver({ ...config, type: "mysql" });
     const meta = column(category);
     const value = "!%_\\";
@@ -162,11 +224,6 @@ describe("H1 shared builders and dialect edge cases", () => {
         "like",
         value,
         1,
-      ),
-    ).toEqual(expected);
-    expect(
-      new FilterBuilder().buildFilterCondition(meta, "like", value, 1, (id) =>
-        driver.quoteIdentifier(id),
       ),
     ).toEqual(expected);
   });

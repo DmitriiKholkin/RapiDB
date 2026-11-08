@@ -218,6 +218,59 @@ function plan(
 }
 
 describe("B12 service and preview results", () => {
+  it("keeps colliding-looking composite identities distinct and deduplicates only exact repeats", async () => {
+    const keys = [
+      { a: 'x|"b"=string:y', b: "z" },
+      { a: "x", b: 'y|"b"=string:z' },
+    ];
+    const deleteRows = vi.fn<NonNullable<IDBDriver["deleteRows"]>>(
+      async ({ primaryKeyValuesList }) => ({
+        affectedRows: primaryKeyValuesList.length,
+        rowOutcomes: primaryKeyValuesList.map((primaryKeys, rowIndex) => ({
+          rowIndex,
+          primaryKeys,
+          success: true,
+          status: "deleted" as const,
+        })),
+      }),
+    );
+    await service({
+      deleteRows,
+      runTransaction: vi.fn(),
+    }).executePreparedDeletePlan(plan([...keys, keys[0]]));
+    expect(deleteRows).toHaveBeenCalledExactlyOnceWith({
+      database: "db",
+      schema: "",
+      table: "items",
+      primaryKeyValuesList: keys,
+    });
+  });
+
+  it("expands different delete outcomes to the correct composite identities and repeats", async () => {
+    const keys = [
+      { a: 'x|"b"=string:y', b: "z" },
+      { a: "x", b: 'y|"b"=string:z' },
+    ];
+    const rowOutcomes = keys.map((primaryKeys, rowIndex) => ({
+      rowIndex,
+      primaryKeys,
+      success: rowIndex === 0,
+      status: rowIndex === 0 ? ("deleted" as const) : ("failed" as const),
+    }));
+    await expect(
+      service({
+        deleteRows: async () => ({ affectedRows: 1, rowOutcomes }),
+        runTransaction: vi.fn(),
+      }).executePreparedDeletePlan(plan([...keys, keys[0]])),
+    ).rejects.toMatchObject({
+      deleteResult: {
+        affectedRows: 1,
+        outcomeUnknown: false,
+        rowOutcomes: [...rowOutcomes, { ...rowOutcomes[0], rowIndex: 2 }],
+      },
+    });
+  });
+
   it.each([
     "redis",
     "dynamodb",
@@ -279,7 +332,7 @@ describe("B12 service and preview results", () => {
 
   it("keeps duplicate IDs unknown when an aggregate delete races with reinsertion", async () => {
     const identities = [{ id: 1 }, { id: 1 }];
-    let rows = ["selected row"];
+    const rows = ["selected row"];
     let signalFirstDelete!: () => void;
     let releaseSecondDelete!: () => void;
     const firstDelete = new Promise<void>((resolve) => {

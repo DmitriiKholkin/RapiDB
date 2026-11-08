@@ -34,6 +34,8 @@ function fixture() {
     scan,
     type: vi.fn(async () => "string"),
     get: vi.fn(async () => Buffer.from("value")),
+    getRange: vi.fn(async () => Buffer.from("value")),
+    strLen: vi.fn(async () => 5),
     ttl: vi.fn(async () => -1),
     withTypeMapping: vi.fn(),
     withAbortSignal: vi.fn(),
@@ -190,7 +192,7 @@ describe("Redis table read cancellation", () => {
     expect(h.client.type).not.toHaveBeenCalled();
     const retry = await wrapped.readTablePage(request);
     expect(retry.rows).toEqual([
-      { key: "audit:one", value: "value", ttl: null },
+      { key: "audit:one", value: "value", ttl: null, type: "string" },
     ]);
   });
 });

@@ -7,6 +7,7 @@ import {
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
   isColumnReadOnly,
+  type MongoValueTypeHint,
   NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ApplyResultPayload } from "../../../shared/webviewContracts";
@@ -23,6 +24,9 @@ import { TOOLBAR_H } from "../../utils/layout";
 
 export type PendingRestoreEntry = BasePendingRestoreEntry & {
   originalValues?: Map<string, unknown>;
+  originalMissingFields?: Set<string>;
+  originalTypes?: Map<string, MongoValueTypeHint>;
+  baselinePresenceVersion?: 1;
   baselineMissing?: boolean;
 };
 export { TOOLBAR_H };
@@ -33,7 +37,8 @@ export const ROW_H = 26;
 export const HEADER_H = 28;
 export const FILTER_H = 30;
 export const PREVIEW_DIALOG_EDITOR_H = "min(42vh, 360px)";
-export const INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
+export const INSERT_DEFAULT_SENTINEL = "\x00__RAPIDB_INSERT_DEFAULT__\x00";
+const LEGACY_INSERT_DEFAULT_SENTINEL = "__RAPIDB_INSERT_DEFAULT__";
 export const MAX_DRAFT_ROWS = 100;
 export const SR_ONLY_STYLE: React.CSSProperties = {
   position: "absolute",
@@ -88,13 +93,19 @@ export interface PersistedTableViewState {
   filters: FilterDraftMap;
 }
 
+const TABLE_DRAFT_VERSION = 2;
+
 interface SerializedTableDraft {
+  draftVersion: typeof TABLE_DRAFT_VERSION;
   tableKey: string;
   restoreState: {
     entries: Array<{
       originalSignature: string;
       changes: Array<[string, unknown]>;
       originalValues?: Array<[string, unknown] | [string]>;
+      originalMissingFields?: string[];
+      originalTypes?: Array<[string, MongoValueTypeHint]>;
+      baselinePresenceVersion?: 1;
     }>;
   };
   newRows: Array<Record<string, { value: unknown } | { valueUndefined: true }>>;
@@ -113,6 +124,7 @@ export function serializeTableDraft(
   mutation?: PersistedTableMutation,
 ): SerializedTableDraft {
   return {
+    draftVersion: TABLE_DRAFT_VERSION,
     tableKey,
     restoreState: {
       entries: restoreState.entries.map((entry) => ({
@@ -125,6 +137,22 @@ export function serializeTableDraft(
                   value === undefined ? [name] : [name, value],
               ),
             }
+          : {}),
+        ...(entry.originalMissingFields
+          ? { originalMissingFields: [...entry.originalMissingFields] }
+          : {}),
+        ...(entry.originalTypes
+          ? {
+              originalTypes: [...entry.originalTypes].map(
+                ([name, hint]): [string, MongoValueTypeHint] => [
+                  name,
+                  { ...hint },
+                ],
+              ),
+            }
+          : {}),
+        ...(entry.baselinePresenceVersion === 1
+          ? { baselinePresenceVersion: 1 as const }
           : {}),
       })),
     },
@@ -145,6 +173,12 @@ export function parsePersistedTableDraft(
   expectedTableKey: string,
 ): PersistedTableDraft | null {
   if (!isRecord(value) || value.tableKey !== expectedTableKey) return null;
+  if (
+    value.draftVersion !== undefined &&
+    value.draftVersion !== TABLE_DRAFT_VERSION
+  )
+    return null;
+  const migrateLegacyDefault = value.draftVersion === undefined;
   const state = value.restoreState;
   const newRows = value.newRows;
   if (
@@ -190,10 +224,60 @@ export function parsePersistedTableDraft(
         originalValues.set(original[0], original[1]);
       }
     }
+    let originalMissingFields: Set<string> | undefined;
+    if (
+      entry.baselinePresenceVersion !== undefined &&
+      entry.baselinePresenceVersion !== 1
+    )
+      return null;
+    if (entry.originalMissingFields !== undefined) {
+      if (!Array.isArray(entry.originalMissingFields) || !originalValues)
+        return null;
+      originalMissingFields = new Set();
+      for (const name of entry.originalMissingFields) {
+        if (
+          typeof name !== "string" ||
+          !changes.has(name) ||
+          !originalValues.has(name) ||
+          originalValues.get(name) !== undefined ||
+          originalMissingFields.has(name)
+        )
+          return null;
+        originalMissingFields.add(name);
+      }
+    }
+    if (entry.baselinePresenceVersion === 1 && !originalMissingFields)
+      return null;
+    let originalTypes: Map<string, MongoValueTypeHint> | undefined;
+    if (entry.originalTypes !== undefined) {
+      if (!Array.isArray(entry.originalTypes) || !originalValues) return null;
+      originalTypes = new Map();
+      for (const original of entry.originalTypes) {
+        if (
+          !Array.isArray(original) ||
+          original.length !== 2 ||
+          typeof original[0] !== "string" ||
+          !changes.has(original[0]) ||
+          originalTypes.has(original[0]) ||
+          !isRecord(original[1]) ||
+          typeof original[1].category !== "string" ||
+          typeof original[1].nativeType !== "string" ||
+          (original[1].bsonSubtype !== undefined &&
+            typeof original[1].bsonSubtype !== "number")
+        )
+          return null;
+        originalTypes.set(original[0], {
+          ...(original[1] as unknown as MongoValueTypeHint),
+        });
+      }
+    }
     entries.push({
       originalSignature: entry.originalSignature,
       changes,
       originalValues,
+      originalMissingFields,
+      originalTypes,
+      baselinePresenceVersion: entry.baselinePresenceVersion as 1 | undefined,
       baselineMissing: originalValues === undefined,
     });
   }
@@ -205,7 +289,16 @@ export function parsePersistedTableDraft(
     for (const [name, cell] of Object.entries(row)) {
       if (!isRecord(cell)) return null;
       if (Object.hasOwn(cell, "value")) {
-        cells.push([name, { value: cell.value }]);
+        cells.push([
+          name,
+          {
+            value:
+              migrateLegacyDefault &&
+              cell.value === LEGACY_INSERT_DEFAULT_SENTINEL
+                ? INSERT_DEFAULT_SENTINEL
+                : cell.value,
+          },
+        ]);
       } else if (
         Object.hasOwn(cell, "valueUndefined") &&
         cell.valueUndefined === true
@@ -404,6 +497,38 @@ export function buildActiveFilterDrafts(
   return deriveApplicableFilterDrafts(columns, drafts);
 }
 
+export function getFilterDraftValidationError(
+  columns: readonly (Pick<ColumnMeta, "name" | "filterable"> & {
+    filterOperators: readonly FilterOperator[];
+  })[],
+  drafts: FilterDraftMap | null | undefined,
+): string | null {
+  if (!drafts) return null;
+
+  for (const column of columns) {
+    const draft = drafts[column.name];
+    if (!draft || !column.filterable) continue;
+
+    if (
+      draft.operator === "between" &&
+      column.filterOperators.includes("between") &&
+      (!draft.value[0].trim() || !draft.value[1].trim())
+    ) {
+      return `The Between filter for ${JSON.stringify(column.name)} requires both bounds; incomplete criteria are ignored.`;
+    }
+
+    if (
+      draft.operator === "in" &&
+      column.filterOperators.includes("in") &&
+      !draft.value.split(",").some((value) => value.trim().length > 0)
+    ) {
+      return `The In list filter for ${JSON.stringify(column.name)} requires at least one value; incomplete criteria are ignored.`;
+    }
+  }
+
+  return null;
+}
+
 export function buildInsertValues(
   draft: InsertDraftRow,
 ): Record<string, unknown> {
@@ -513,6 +638,7 @@ export function buildPendingRestoreState(
   mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
   mongoRowIdentity = false,
   preservedEntries: readonly PendingRestoreEntry[] = [],
+  rowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
 ): PendingRestoreState {
   const entries: PendingRestoreEntry[] = [];
 
@@ -527,6 +653,11 @@ export function buildPendingRestoreState(
       rowHasMongoIdentity,
     );
     if (!signature) {
+      entries.push({
+        originalSignature: `unresolved-row:${rowIdx}`,
+        changes: new Map(columnMap),
+        baselineMissing: true,
+      });
       continue;
     }
 
@@ -534,8 +665,27 @@ export function buildPendingRestoreState(
       originalSignature: signature,
       changes: new Map(columnMap),
       originalValues: new Map(
-        [...columnMap.keys()].map((name) => [name, row[name]]),
+        [...columnMap.keys()].map((name) => [
+          name,
+          Object.hasOwn(row, name) ? row[name] : undefined,
+        ]),
       ),
+      originalMissingFields: new Set(
+        [...columnMap.keys()].filter((name) => !Object.hasOwn(row, name)),
+      ),
+      ...(rowValueTypes?.[rowIdx]
+        ? {
+            originalTypes: new Map(
+              [...columnMap.keys()].map((name) => [
+                name,
+                rowValueTypeHint(rowValueTypes[rowIdx], name),
+              ]),
+            ),
+          }
+        : {}),
+      ...(!rowHasMongoIdentity || rowValueTypes?.[rowIdx]
+        ? { baselinePresenceVersion: 1 as const }
+        : {}),
     });
   }
 
@@ -546,8 +696,26 @@ export function buildPendingRestoreState(
       ...(entry.originalValues
         ? { originalValues: new Map(entry.originalValues) }
         : {}),
+      ...(entry.originalMissingFields
+        ? { originalMissingFields: new Set(entry.originalMissingFields) }
+        : {}),
+      ...(entry.originalTypes
+        ? { originalTypes: new Map(entry.originalTypes) }
+        : {}),
     })),
   };
+}
+
+function rowValueTypeHint(
+  types: Record<string, MongoValueTypeHint> | undefined,
+  name: string,
+): MongoValueTypeHint {
+  return (
+    (types && Object.hasOwn(types, name) ? types[name] : undefined) ?? {
+      category: "other",
+      nativeType: "missing",
+    }
+  );
 }
 
 export function restorePendingEditsSafely(
@@ -556,6 +724,7 @@ export function restorePendingEditsSafely(
   primaryKeyColumns: readonly string[],
   mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
   mongoRowIdentity = false,
+  rowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
 ): PendingRestoreResult {
   if (!restoreState || restoreState.entries.length === 0) {
     return { pendingEdits: new Map(), unresolved: [] };
@@ -593,10 +762,30 @@ export function restorePendingEditsSafely(
           [...entry.changes.keys()].some(
             (name) =>
               !entry.originalValues?.has(name) ||
-              !Object.hasOwn(rows[rowIdx], name) ||
-              JSON.stringify(
-                stablePrimaryKeyPart(entry.originalValues.get(name)),
-              ) !== JSON.stringify(stablePrimaryKeyPart(rows[rowIdx][name])),
+              (entry.baselinePresenceVersion !== 1 &&
+                entry.originalValues.get(name) === null) ||
+              (entry.originalValues.get(name) === undefined &&
+                (entry.baselinePresenceVersion !== 1 ||
+                  ((mongoRowIdentity || mongoIdTypes[rowIdx] !== undefined) &&
+                    !rowValueTypes?.[rowIdx]))) ||
+              (entry.originalMissingFields?.has(name)
+                ? Object.hasOwn(rows[rowIdx], name)
+                : !Object.hasOwn(rows[rowIdx], name) ||
+                  JSON.stringify(
+                    stablePrimaryKeyPart(entry.originalValues.get(name)),
+                  ) !==
+                    JSON.stringify(stablePrimaryKeyPart(rows[rowIdx][name]))) ||
+              ((entry.originalTypes || rowValueTypes?.[rowIdx]) &&
+                (!entry.originalTypes?.has(name) ||
+                  !rowValueTypes?.[rowIdx] ||
+                  JSON.stringify(
+                    stablePrimaryKeyPart(entry.originalTypes.get(name)),
+                  ) !==
+                    JSON.stringify(
+                      stablePrimaryKeyPart(
+                        rowValueTypeHint(rowValueTypes[rowIdx], name),
+                      ),
+                    ))),
           ))
       ) {
         unresolved.push(entry);
@@ -610,22 +799,6 @@ export function restorePendingEditsSafely(
   }
 
   return { pendingEdits: restored, unresolved };
-}
-
-export function restorePendingEdits(
-  restoreState: PendingRestoreState | null,
-  rows: readonly Row[],
-  primaryKeyColumns: readonly string[],
-  mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
-  mongoRowIdentity = false,
-): PendingEdits {
-  return restorePendingEditsSafely(
-    restoreState,
-    rows,
-    primaryKeyColumns,
-    mongoIdTypes,
-    mongoRowIdentity,
-  ).pendingEdits;
 }
 
 export function getRetainedPendingEdits(
@@ -681,6 +854,12 @@ export function buildUndoRedoSnapshot(
       changes: new Map(entry.changes),
       ...(entry.originalValues
         ? { originalValues: new Map(entry.originalValues) }
+        : {}),
+      ...(entry.originalMissingFields
+        ? { originalMissingFields: new Set(entry.originalMissingFields) }
+        : {}),
+      ...(entry.originalTypes
+        ? { originalTypes: new Map(entry.originalTypes) }
         : {}),
     })),
     newRows: newRows.map((row) => ({ ...row })),

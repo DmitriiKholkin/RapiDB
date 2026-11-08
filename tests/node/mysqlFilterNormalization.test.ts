@@ -45,8 +45,193 @@ describe("mysql filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "`amount` = ?",
-      params: ["9999999.1234567890"],
+      sql: "`amount` = CAST(? AS DECIMAL(65,9))",
+      params: ["9999999.123456789"],
+    });
+  });
+
+  it("compares large DECIMAL filters and keys exactly instead of as DOUBLE", () => {
+    const id = buildColumn("id", "decimal(20,0)", "decimal");
+
+    expect(
+      driver.buildFilterCondition(id, "eq", "9007199254740993", 1),
+    ).toEqual({
+      sql: "`id` = CAST(? AS DECIMAL(65,0))",
+      params: ["9007199254740993"],
+    });
+    expect(
+      driver.buildFilterCondition(
+        id,
+        "between",
+        ["9007199254740993", "9007199254740995"],
+        1,
+      ),
+    ).toEqual({
+      sql: "`id` BETWEEN CAST(? AS DECIMAL(65,0)) AND CAST(? AS DECIMAL(65,0))",
+      params: ["9007199254740993", "9007199254740995"],
+    });
+    expect(
+      driver.buildFilterCondition(id, "in", "9007199254740993, 1.5", 1),
+    ).toEqual({
+      sql: "`id` IN (CAST(? AS DECIMAL(65,0)), CAST(? AS DECIMAL(65,1)))",
+      params: ["9007199254740993", "1.5"],
+    });
+    expect(driver.buildInsertValueExpr(id, 1)).toBe("CAST(? AS DECIMAL(20,0))");
+    expect(
+      driver.buildOriginalValueComparison(
+        buildColumn("amount", "decimal(18,10) unsigned", "decimal"),
+        1,
+      ),
+    ).toBe("`amount` = CAST(? AS DECIMAL(18,10))");
+    expect(
+      driver.buildMutationValueExpr(id, "9007199254740993", "insert"),
+    ).toEqual({ sql: "?", params: ["9007199254740993"] });
+  });
+
+  it("keeps MariaDB DECIMAL scales above 30 and plain SET assignments", () => {
+    const amount = buildColumn("amount", "decimal(65,38)", "decimal");
+
+    expect(driver.buildInsertValueExpr(amount, 1)).toBe(
+      "CAST(? AS DECIMAL(65,38))",
+    );
+    expect(driver.buildSetExpr(amount, 1)).toBe("`amount` = ?");
+    expect(
+      driver.buildFilterCondition(amount, "eq", `0.${"1".repeat(35)}`, 1),
+    ).toEqual({
+      sql: "`amount` = CAST(? AS DECIMAL(65,35))",
+      params: [`0.${"1".repeat(35)}`],
+    });
+  });
+
+  it("converts offset-bearing TIMESTAMP inputs from UTC into the session time zone", () => {
+    const timestamp = buildColumn("seen_at", "timestamp(3)", "datetime");
+    const datetime = buildColumn("created_at", "datetime", "datetime");
+    const coerced = driver.coerceInputValue(
+      "2024-06-15T12:30:00.125+03:00",
+      timestamp,
+    );
+
+    expect(coerced).toBe("2024-06-15 09:30:00.125+00:00");
+    expect(driver.coerceInputValue(coerced, timestamp)).toBe(coerced);
+    expect(driver.buildMutationValueExpr(timestamp, coerced, "update")).toEqual(
+      {
+        sql: "CONVERT_TZ(?, '+00:00', @@session.time_zone)",
+        params: ["2024-06-15 09:30:00.125"],
+      },
+    );
+    expect(driver.coerceInputValue("2024-06-15 12:30:00", timestamp)).toBe(
+      "2024-06-15 12:30:00",
+    );
+    expect(
+      driver.buildMutationValueExpr(timestamp, "2024-06-15 12:30:00", "insert"),
+    ).toBeNull();
+    expect(driver.coerceInputValue("2024-06-15T12:30:00+03:00", datetime)).toBe(
+      "2024-06-15 09:30:00",
+    );
+    expect(driver.coerceOriginalValue("2024-06-15 12:30:00", timestamp)).toBe(
+      "2024-06-15 12:30:00",
+    );
+    expect(
+      driver.buildFilterCondition(
+        timestamp,
+        "between",
+        ["2024-06-15T00:00:00Z", "2024-06-16 00:00:00"],
+        1,
+      ),
+    ).toEqual({
+      sql: "(UNIX_TIMESTAMP(`seen_at`) >= CAST(? AS DECIMAL(20,6)) AND `seen_at` <= ?)",
+      params: ["1718409600", "2024-06-16 00:00:00"],
+    });
+    expect(
+      driver.buildFilterCondition(datetime, "gte", "2024-06-15T00:00:00Z", 1),
+    ).toEqual({ sql: "`created_at` >= ?", params: ["2024-06-15 00:00:00"] });
+  });
+
+  it("binds DATETIME filter operands uncast so invalid values are not turned into NULL", () => {
+    const column = buildColumn("created_at", "datetime(6)", "datetime");
+
+    expect(
+      driver.buildFilterCondition(column, "gte", "2024-01-02 03:04:05", 1),
+    ).toEqual({ sql: "`created_at` >= ?", params: ["2024-01-02 03:04:05"] });
+    expect(
+      driver.buildFilterCondition(
+        column,
+        "between",
+        ["2024-01-02 03:04:05", "not-a-datetime"],
+        1,
+      ),
+    ).toEqual({
+      sql: "`created_at` BETWEEN ? AND ?",
+      params: ["2024-01-02 03:04:05", "not-a-datetime"],
+    });
+  });
+
+  it("converts original text values to the column character set before binary comparison", () => {
+    const column = {
+      ...buildColumn("name", "varchar(20)", "text"),
+      characterSet: "latin1",
+      collation: "latin1_swedish_ci",
+    };
+
+    expect(driver.buildOriginalValueComparison(column, 1)).toBe(
+      "CAST(`name` AS BINARY) = CAST(CONVERT(? USING latin1) AS BINARY)",
+    );
+    expect(
+      driver.buildOriginalValueComparison(
+        { ...column, characterSet: "latin1) OR (1" },
+        1,
+      ),
+    ).toBe("CAST(`name` AS BINARY) = CAST(? AS BINARY)");
+  });
+
+  it("passes zero and legacy temporal original values through unchanged", () => {
+    const datetime = buildColumn("created_at", "datetime", "datetime");
+    const date = buildColumn("born_on", "date", "date");
+
+    expect(driver.coerceOriginalValue("0000-00-00 00:00:00", datetime)).toBe(
+      "0000-00-00 00:00:00",
+    );
+    expect(() =>
+      driver.coerceInputValue("0000-00-00 00:00:00", datetime),
+    ).toThrow(/valid DATETIME/);
+    expect(driver.coerceOriginalValue("0000-00-00", date)).toBe("0000-00-00");
+    expect(() => driver.coerceInputValue("0000-00-00", date)).toThrow(
+      /valid DATE/,
+    );
+    expect(driver.coerceInputValue("0050-02-28", date)).toBe("0050-02-28");
+    expect(() => driver.coerceInputValue("0050-02-29", date)).toThrow(
+      /valid DATE/,
+    );
+    expect(driver.coerceInputValue("0099-12-31T23:30:00-01:00", datetime)).toBe(
+      "0100-01-01 00:30:00",
+    );
+  });
+
+  it("leaves DATE filter operands uncast so MySQL reports invalid values", () => {
+    const dateColumn = buildColumn("event_date", "date", "date");
+
+    expect(
+      driver.buildFilterCondition(dateColumn, "eq", "not-a-date", 1),
+    ).toEqual({
+      sql: "`event_date` = ?",
+      params: ["not-a-date"],
+    });
+    expect(
+      driver.buildFilterCondition(
+        dateColumn,
+        "between",
+        ["2024-02-29", "not-a-date"],
+        1,
+      ),
+    ).toEqual({
+      sql: "`event_date` BETWEEN ? AND ?",
+      params: ["2024-02-29", "not-a-date"],
+    });
+    expect(
+      driver.buildFilterCondition(dateColumn, "in", "2024-02-29,not-a-date", 1),
+    ).toEqual({
+      sql: "`event_date` IN (?, ?)",
+      params: ["2024-02-29", "not-a-date"],
     });
   });
 

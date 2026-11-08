@@ -6,7 +6,11 @@ import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
-import { loadDatabaseScope } from "../../src/extension/schema/schemaLoaders";
+import { getConfiguredDefaultDatabaseName as getSchemaDefaultDatabaseName } from "../../src/extension/schema/schemaHelpers";
+import {
+  loadConnectionRootCatalog,
+  loadDatabaseScope,
+} from "../../src/extension/schema/schemaLoaders";
 import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 vi.mock("redis", async (importOriginal) => {
@@ -20,6 +24,36 @@ function withClient<T>(driver: T, client: unknown): T {
 }
 
 describe("driver schema discovery error boundaries", () => {
+  it("merges Redis configured DB aliases with the driver catalog canonically", async () => {
+    const config = {
+      id: "redis-db-alias",
+      name: "Redis DB alias",
+      type: "redis",
+      database: "0",
+    } as const;
+    const driver = {
+      listDatabases: vi.fn().mockResolvedValue([
+        { name: "db0", schemas: [] },
+        { name: "db1", schemas: [] },
+      ]),
+    };
+
+    expect(getSchemaDefaultDatabaseName(config)).toBe("db0");
+    const unsupportedUppercaseAlias = { ...config, database: "DB0" };
+    expect(getSchemaDefaultDatabaseName(unsupportedUppercaseAlias)).toBe("DB0");
+    await expect(
+      loadConnectionRootCatalog(driver as never, config),
+    ).resolves.toEqual({
+      catalogSnapshot: {
+        databases: [
+          { name: "db0", schemas: [] },
+          { name: "db1", schemas: [] },
+        ],
+      },
+      defaultDatabaseName: "db0",
+    });
+  });
+
   it("propagates MongoDB collection and sampling failures instead of reporting an empty schema", async () => {
     const denied = new Error("not authorized on app");
     const collections = vi.fn().mockRejectedValue(denied);

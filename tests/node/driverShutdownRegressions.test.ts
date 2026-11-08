@@ -98,6 +98,23 @@ describe("MySQL native shutdown", () => {
         Reflect.set(connection, "connectTimeout", null);
         Reflect.set(connection, "_command", null);
         Reflect.set(connection, "_handshakePacket", {});
+        const query = Reflect.get(connection, "query") as (
+          ...args: unknown[]
+        ) => unknown;
+        Reflect.set(connection, "query", (...args: unknown[]) => {
+          const callback = args.at(-1);
+          if (
+            typeof args[0] === "string" &&
+            /^(?:SET SESSION autocommit = 1|SELECT CONNECTION_ID\(\))/.test(
+              args[0],
+            ) &&
+            typeof callback === "function"
+          ) {
+            callback(null);
+            return undefined;
+          }
+          return query.apply(connection, args);
+        });
         nativeConnection = connection;
         connection.emit("connect", connection);
       });

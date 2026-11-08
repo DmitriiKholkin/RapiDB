@@ -2,6 +2,7 @@ import type {
   DeleteResultPayload,
   DeleteRowOutcome,
 } from "../../shared/webviewContracts";
+import { isMutationNotExecutedError } from "./mutationExecutionState";
 import { throwIfTransactionCancelled } from "./timeout";
 import type { DriverMutationResult, DriverOperationContext } from "./types";
 
@@ -161,6 +162,9 @@ export async function deleteRowsSequentially(
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (row.status === "unknown" && isMutationNotExecutedError(error)) {
+        row.status = "failed";
+      }
       row.message = message;
       report();
       throw new DeleteMutationError(message, snapshot());

@@ -117,8 +117,10 @@ describe("MongoDB Table Viewer literal field edit safety", () => {
       toArray: async () => [],
     });
     if (clientFallback)
-      s.cursor.sort.mockImplementation(() => {
-        throw new Error("server unavailable");
+      Object.assign(s.driver, {
+        buildMongoFilterCriteria: () => {
+          throw new Error("untranslatable filter");
+        },
       });
     const page = await s.driver.readTablePage({
       database: "db",

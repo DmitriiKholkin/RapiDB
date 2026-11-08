@@ -25,20 +25,20 @@ import {
   buildActiveFilterDrafts,
   DEBOUNCE,
   type FetchSnapshot,
+  getFilterDraftValidationError,
   type PersistedTableViewState,
   type TableSortState,
 } from "./tableViewHelpers";
 
 interface UseTableDataControllerParams {
+  pasteStructureEpochRef: MutableRefObject<number>;
   initialPageSize: number;
   initialView?: PersistedTableViewState | null;
   readOnlyTable: boolean;
   columnsRef: MutableRefObject<ColumnMeta[]>;
   rowsRef: MutableRefObject<Row[]>;
   mongoIdTypesRef: MutableRefObject<Array<"objectId" | "string" | null>>;
-  mongoValueTypesRef: MutableRefObject<
-    Array<Record<string, MongoValueTypeHint>>
-  >;
+  rowValueTypesRef: MutableRefObject<Array<Record<string, MongoValueTypeHint>>>;
   pkColsRef: MutableRefObject<string[]>;
   scrollRef: RefObject<HTMLDivElement | null>;
   fetchPageRef: MutableRefObject<
@@ -51,12 +51,15 @@ interface UseTableDataControllerParams {
     hasWork: boolean;
     reconciliationPending?: boolean;
   };
+  isFilterNavigationBlocked: () => boolean;
   onReadFailed: () => void;
   onRowsCommitted: (
     rows: readonly Row[],
     primaryKeyColumns: readonly string[],
     previousMongoIdTypes: readonly ("objectId" | "string" | null)[],
     mongoIdTypes: readonly ("objectId" | "string" | null)[],
+    previousRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
+    nextRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
   ) => void;
 }
 
@@ -92,6 +95,14 @@ function buildTableInitSignature(
   });
 }
 
+function hasFilterDraftInput(draft: FilterDraft | undefined): boolean {
+  if (!draft) return false;
+  if (!("value" in draft)) return true;
+  return (typeof draft.value === "string" ? [draft.value] : draft.value).some(
+    (value) => value.trim() !== "",
+  );
+}
+
 function reserveTableReadEpoch(previousEpoch: number): number {
   const vscode = window.__vscode;
   if (!vscode) throw new Error("Table read identity could not be saved.");
@@ -114,19 +125,21 @@ function reserveTableReadEpoch(previousEpoch: number): number {
 }
 
 export function useTableDataController({
+  pasteStructureEpochRef,
   initialPageSize,
   initialView,
   readOnlyTable: initialReadOnlyTable,
   columnsRef,
   rowsRef,
   mongoIdTypesRef,
-  mongoValueTypesRef,
+  rowValueTypesRef,
   pkColsRef,
   scrollRef,
   fetchPageRef,
   preserveScrollPositionRef,
   onTableInit,
   getMetadataRefreshState,
+  isFilterNavigationBlocked,
   onReadFailed,
   onRowsCommitted,
 }: UseTableDataControllerParams) {
@@ -140,6 +153,8 @@ export function useTableDataController({
   const [error, setError] = useState<string | null>(null);
   const [readError, setReadError] = useState<string | null>(null);
   const [filterError, setFilterError] = useState<string | null>(null);
+  const [filterDraftError, setFilterDraftError] = useState<string | null>(null);
+  const [filterNotice, setFilterNotice] = useState<string | null>(null);
   const [page, setPage] = useState(initialView?.page ?? 1);
   const [pageSize, setPageSize] = useState(
     initialView?.pageSize ?? initialPageSize,
@@ -181,6 +196,10 @@ export function useTableDataController({
   const fetchEpochRef = useRef(0);
   const readIdentityFailedRef = useRef(false);
   const previousFilterDraftsRef = useRef(filterDrafts);
+  const filterDraftsRef = useRef(filterDrafts);
+  const filterDraftRevisionRef = useRef(0);
+  const visibleFilterDraftRevisionRef = useRef<number | null>(null);
+  const dismissedFilterDraftRevisionRef = useRef<number | null>(null);
   const [initTick, setInitTick] = useState(0);
   const readOnlyTableRef = useRef(initialReadOnlyTable);
   const initialPageSizeRef = useRef(initialPageSize);
@@ -193,15 +212,38 @@ export function useTableDataController({
   const tableInitSignatureRef = useRef<string | null>(null);
   const metadataStateRef = useRef(getMetadataRefreshState);
   metadataStateRef.current = getMetadataRefreshState;
+  const filterNavigationBlockedRef = useRef(isFilterNavigationBlocked);
+  filterNavigationBlockedRef.current = isFilterNavigationBlocked;
+  const readyFilterDraftsRef = useRef<FilterDraftMap | null>(null);
   const queuedMetadataRef = useRef<TableInitPayload | null>(null);
   const [metadataTick, setMetadataTick] = useState(0);
   const [schemaWarning, setSchemaWarning] = useState<string | null>(null);
   const metadataBlockedRef = useRef(false);
   const committedColumnNamesRef = useRef<ReadonlySet<string>>(new Set());
+  const pageDiscoveredColumnNamesRef = useRef<ReadonlySet<string>>(new Set());
   const metadataNeedsReadRef = useRef(false);
+  const refreshRefetchRef = useRef(false);
+  const fetchHadFiltersRef = useRef(false);
   const connectionInvalidatedRef = useRef(false);
   const deferredReadRef = useRef(false);
   const reconciliationFetchIdRef = useRef<number | null>(null);
+
+  const getVisibleFilterDraftError = useCallback(
+    (drafts: FilterDraftMap) => {
+      if (
+        dismissedFilterDraftRevisionRef.current ===
+        filterDraftRevisionRef.current
+      ) {
+        return null;
+      }
+      const error = getFilterDraftValidationError(columnsRef.current, drafts);
+      visibleFilterDraftRevisionRef.current = error
+        ? filterDraftRevisionRef.current
+        : null;
+      return error;
+    },
+    [columnsRef],
+  );
 
   const advanceFetchEpoch = useCallback(() => {
     try {
@@ -241,6 +283,15 @@ export function useTableDataController({
       }
       return;
     }
+    const metadataColumnNames = new Set(
+      metadata.columns.map((column) => column.name),
+    );
+    const retainedColumns = columnsRef.current.filter(
+      (column) =>
+        pageDiscoveredColumnNamesRef.current.has(column.name) &&
+        !metadataColumnNames.has(column.name),
+    );
+    const nextColumns = [...metadata.columns, ...retainedColumns];
     const incompatible =
       JSON.stringify(
         hasCommittedDataRef.current
@@ -248,7 +299,7 @@ export function useTableDataController({
           : pendingPrimaryKeyColumnsRef.current,
       ) !== JSON.stringify(metadata.primaryKeyColumns) ||
       columnsRef.current.some((column) => {
-        const next = metadata.columns.find(
+        const next = nextColumns.find(
           (candidate) => candidate.name === column.name,
         );
         if (!next) return true;
@@ -279,23 +330,27 @@ export function useTableDataController({
       return;
     }
 
+    pasteStructureEpochRef.current++;
     queuedMetadataRef.current = null;
     metadataBlockedRef.current = false;
     setSchemaWarning(null);
     metadataNeedsReadRef.current = hasWork;
-    columnsRef.current = metadata.columns;
+    columnsRef.current = nextColumns;
+    pageDiscoveredColumnNamesRef.current = new Set(
+      retainedColumns.map((column) => column.name),
+    );
     pkColsRef.current = metadata.primaryKeyColumns;
     pendingPrimaryKeyColumnsRef.current = metadata.primaryKeyColumns;
     tableInitSignatureRef.current = buildTableInitSignature(
       metadata.columns,
       metadata.primaryKeyColumns,
     );
-    setColumns(metadata.columns);
+    setColumns(nextColumns);
     setPkCols(metadata.primaryKeyColumns);
     setColSizes((previous) => {
-      const defaults = calcColWidths(metadata.columns, rowsRef.current);
+      const defaults = calcColWidths(nextColumns, rowsRef.current);
       return Object.fromEntries(
-        metadata.columns.map((column) => [
+        nextColumns.map((column) => [
           column.name,
           previous[column.name] ?? defaults[column.name],
         ]),
@@ -310,11 +365,12 @@ export function useTableDataController({
       setHasCommittedData(false);
       setRows([]);
       mongoIdTypesRef.current = [];
-      mongoValueTypesRef.current = [];
+      rowValueTypesRef.current = [];
       setError(null);
+      refreshRefetchRef.current = true;
       const nextSort =
         requestedSortRef.current &&
-        metadata.columns.some(
+        nextColumns.some(
           (column) => column.name === requestedSortRef.current?.column,
         )
           ? requestedSortRef.current
@@ -326,6 +382,18 @@ export function useTableDataController({
         metadata.columns,
         debouncedFilterDraftsRef.current,
       );
+      const clearedFilterColumns = retainedColumns
+        .map((column) => column.name)
+        .filter(
+          (name) =>
+            debouncedFilterDraftsRef.current[name] ||
+            hasFilterDraftInput(filterDraftsRef.current[name]),
+        );
+      if (clearedFilterColumns.length > 0) {
+        setFilterNotice(
+          `Cleared the ${clearedFilterColumns.length === 1 ? "filter" : "filters"} on ${clearedFilterColumns.map((name) => JSON.stringify(name)).join(", ")}: fields found only in loaded documents cannot be filtered after a schema refresh.`,
+        );
+      }
       debouncedFilterDraftsRef.current = nextFilters;
       setFilterDrafts((drafts) =>
         buildActiveFilterDrafts(metadata.columns, drafts),
@@ -333,19 +401,28 @@ export function useTableDataController({
       setDebouncedFilterDrafts(nextFilters);
       setInitTick((tick) => tick + 1);
     }
-  }, [columnsRef, pkColsRef, rowsRef, mongoIdTypesRef, mongoValueTypesRef]);
+  }, [columnsRef, pkColsRef, rowsRef, mongoIdTypesRef, rowValueTypesRef]);
 
   const syncRequestedFilterState = useCallback(
     (nextDrafts: FilterDraftMap) => {
+      readyFilterDraftsRef.current = null;
       setFilterError(null);
+      setFilterDraftError(getVisibleFilterDraftError(nextDrafts));
       setFilterDraftPending(false);
       setRequestedPage(1);
       setDebouncedFilterDrafts(
         buildActiveFilterDrafts(columnsRef.current, nextDrafts),
       );
     },
-    [columnsRef],
+    [columnsRef, getVisibleFilterDraftError],
   );
+
+  const retryPendingFilter = useCallback(() => {
+    const drafts = readyFilterDraftsRef.current;
+    if (!drafts || loadingRef.current || filterNavigationBlockedRef.current())
+      return;
+    syncRequestedFilterState(drafts);
+  }, [syncRequestedFilterState]);
 
   initialPageSizeRef.current = initialPageSize;
   requestedSortRef.current = requestedSort;
@@ -353,6 +430,7 @@ export function useTableDataController({
   requestedPageRef.current = requestedPage;
   requestedPageSizeRef.current = requestedPageSize;
   debouncedFilterDraftsRef.current = debouncedFilterDrafts;
+  filterDraftsRef.current = filterDrafts;
   readOnlyTableRef.current = readOnlyTable;
   onTableInitRef.current = onTableInit;
   onReadFailedRef.current = onReadFailed;
@@ -394,6 +472,7 @@ export function useTableDataController({
         columnsRef.current,
         debouncedFilterDraftsRef.current,
       );
+      fetchHadFiltersRef.current = activeFilters.length > 0;
 
       postMessage("fetchPage", {
         fetchId: epoch,
@@ -421,10 +500,14 @@ export function useTableDataController({
   }, [initialReadOnlyTable]);
 
   useEffect(() => {
-    const clearErrors = () => {
+    const clearErrors = (preserveFilterDraftError = false) => {
       setError(null);
       setReadError(null);
       setFilterError(null);
+      if (!preserveFilterDraftError) {
+        dismissedFilterDraftRevisionRef.current = null;
+        setFilterDraftError(null);
+      }
     };
 
     const unInit = onMessage<TableInitPayload>(
@@ -479,6 +562,7 @@ export function useTableDataController({
         }
 
         columnsRef.current = nextColumns;
+        pageDiscoveredColumnNamesRef.current = new Set();
         connectionInvalidatedRef.current = false;
         pendingPrimaryKeyColumnsRef.current = primaryKeyColumns;
 
@@ -490,6 +574,8 @@ export function useTableDataController({
         tableInitSignatureRef.current = nextInitSignature;
         queuedMetadataRef.current = null;
         metadataNeedsReadRef.current = false;
+        refreshRefetchRef.current = false;
+        setFilterNotice(null);
         deferredReadRef.current = false;
         reconciliationFetchIdRef.current = null;
         metadataBlockedRef.current = false;
@@ -509,7 +595,7 @@ export function useTableDataController({
         setPkCols([]);
         setRows([]);
         mongoIdTypesRef.current = [];
-        mongoValueTypesRef.current = [];
+        rowValueTypesRef.current = [];
         committedColumnNamesRef.current = new Set();
         setTotalCount(0);
         clearErrors();
@@ -550,6 +636,8 @@ export function useTableDataController({
         requestedSortRef.current = nextSort;
         debouncedFilterDraftsRef.current = nextActiveFilters;
         previousFilterDraftsRef.current = nextFilters;
+        readyFilterDraftsRef.current = null;
+        setFilterDraftError(getVisibleFilterDraftError(nextFilters));
         setPage(nextPage);
         setPageSize(nextPageSize);
         setRequestedPage(nextPage);
@@ -588,18 +676,22 @@ export function useTableDataController({
 
     const unData = onMessage<{
       fetchId?: number;
+      extraColumns?: ColumnMeta[];
       rows: Row[];
       mongoIdTypes?: Array<"objectId" | "string" | null>;
       mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
+      rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
       totalCount: number;
       executionTimeMs?: number;
     }>(
       "tableData",
       ({
         fetchId,
-        rows: nextRows,
+        extraColumns,
+        rows: receivedRows,
         mongoIdTypes,
         mongoValueTypes,
+        rowValueTypes,
         totalCount: nextTotalCount,
         executionTimeMs: nextExecutionTimeMs,
       }) => {
@@ -619,6 +711,33 @@ export function useTableDataController({
           return;
         }
 
+        const nextRowValueTypes = Array.isArray(rowValueTypes)
+          ? rowValueTypes
+          : Array.isArray(mongoValueTypes)
+            ? mongoValueTypes
+            : [];
+        const nextRows = receivedRows.map((row, index) => {
+          const hints = nextRowValueTypes[index];
+          const missingUndefined = hints
+            ? Object.keys(hints).filter(
+                (name) =>
+                  hints[name]?.nativeType === "undefined" &&
+                  !Object.hasOwn(row, name),
+              )
+            : [];
+          if (missingUndefined.length === 0) return row;
+          const copy = { ...row };
+          for (const name of missingUndefined) {
+            Object.defineProperty(copy, name, {
+              value: undefined,
+              enumerable: true,
+              writable: true,
+              configurable: true,
+            });
+          }
+          return copy;
+        });
+
         const snapshot = (fetchId !== undefined
           ? fetchSnapshotsRef.current.get(fetchId)
           : fetchSnapshotsRef.current.get(fetchEpochRef.current)) ?? {
@@ -626,6 +745,20 @@ export function useTableDataController({
           pageSize: requestedPageSizeRef.current,
           sort: requestedSortRef.current,
         };
+
+        const knownColumnNames = new Set(
+          columnsRef.current.map((column) => column.name),
+        );
+        const addedColumns = (extraColumns ?? []).filter(
+          (column) => !knownColumnNames.has(column.name),
+        );
+        if (addedColumns.length > 0) {
+          columnsRef.current = [...columnsRef.current, ...addedColumns];
+          pageDiscoveredColumnNamesRef.current = new Set([
+            ...pageDiscoveredColumnNamesRef.current,
+            ...addedColumns.map((column) => column.name),
+          ]);
+        }
 
         if (!colSizesInitedRef.current && columnsRef.current.length > 0) {
           colSizesInitedRef.current = true;
@@ -646,20 +779,21 @@ export function useTableDataController({
 
         setColumns(columnsRef.current);
         metadataNeedsReadRef.current = false;
+        refreshRefetchRef.current = false;
         committedColumnNamesRef.current = new Set(
           columnsRef.current.map((column) => column.name),
         );
         setPkCols(pendingPrimaryKeyColumnsRef.current);
         setReadOnlyTable(pendingReadOnlyTableRef.current);
         const previousMongoIdTypes = mongoIdTypesRef.current;
+        const previousRowValueTypes = rowValueTypesRef.current;
         const nextMongoIdTypes = Array.isArray(mongoIdTypes)
           ? mongoIdTypes
           : [];
+        pasteStructureEpochRef.current++;
         setRows(nextRows);
         mongoIdTypesRef.current = nextMongoIdTypes;
-        mongoValueTypesRef.current = Array.isArray(mongoValueTypes)
-          ? mongoValueTypes
-          : [];
+        rowValueTypesRef.current = nextRowValueTypes;
         setTotalCount(nextTotalCount);
         setExecutionTimeMs(nextExecutionTimeMs);
         setPage(snapshot.page);
@@ -668,13 +802,15 @@ export function useTableDataController({
         loadingRef.current = false;
         setLoading(false);
         setHasCommittedData(true);
-        clearErrors();
+        clearErrors(true);
 
         onRowsCommittedRef.current(
           nextRows,
           pendingPrimaryKeyColumnsRef.current,
           previousMongoIdTypes,
           nextMongoIdTypes,
+          previousRowValueTypes,
+          nextRowValueTypes,
         );
         fetchSnapshotsRef.current.delete(fetchId ?? fetchEpochRef.current);
 
@@ -706,24 +842,33 @@ export function useTableDataController({
         return;
       }
 
-      if (isFilterError) {
+      const keepFilterControls =
+        !hasCommittedDataRef.current &&
+        refreshRefetchRef.current &&
+        fetchHadFiltersRef.current;
+      if (isFilterError || keepFilterControls) {
         setError(null);
-        setFilterError(nextError);
+        if (isFilterError) setFilterError(nextError);
+        else setReadError(nextError);
         if (!hasCommittedDataRef.current) {
           setColumns(columnsRef.current);
           setPkCols(pendingPrimaryKeyColumnsRef.current);
           setReadOnlyTable(true);
           setHasCommittedData(true);
         }
-        setRows([]);
-        setTotalCount(0);
-        setExecutionTimeMs(undefined);
-        if (requestedPageRef.current !== 1) {
-          skipNextFetchRef.current = true;
-          requestedPageRef.current = 1;
-          setRequestedPage(1);
+        const { busy, hasWork } = metadataStateRef.current();
+        if (!hasCommittedDataRef.current || (!busy && !hasWork)) {
+          pasteStructureEpochRef.current++;
+          setRows([]);
+          setTotalCount(0);
+          setExecutionTimeMs(undefined);
+          if (requestedPageRef.current !== 1) {
+            skipNextFetchRef.current = true;
+            requestedPageRef.current = 1;
+            setRequestedPage(1);
+          }
+          setPage(1);
         }
-        setPage(1);
       } else if (!hasCommittedDataRef.current) {
         setError(nextError);
       } else {
@@ -748,7 +893,7 @@ export function useTableDataController({
     columnsRef,
     initialView,
     mongoIdTypesRef,
-    mongoValueTypesRef,
+    rowValueTypesRef,
     scrollRef,
   ]);
 
@@ -785,22 +930,53 @@ export function useTableDataController({
   }, [fetchPage, fetchTrigger]);
 
   useEffect(() => {
+    if (
+      loading ||
+      !hasCommittedData ||
+      rows.length > 0 ||
+      page <= 1 ||
+      requestedPage !== page ||
+      requestedPageSize !== pageSize
+    )
+      return;
+    const lastPage = Math.max(1, Math.ceil(totalCount / pageSize));
+    if (page <= lastPage || filterNavigationBlockedRef.current()) return;
+    setRequestedPage((current) => (current === page ? lastPage : current));
+  }, [
+    hasCommittedData,
+    loading,
+    page,
+    pageSize,
+    requestedPage,
+    requestedPageSize,
+    rows,
+    totalCount,
+  ]);
+
+  useEffect(() => {
     if (previousFilterDraftsRef.current === filterDrafts) {
       return;
     }
     previousFilterDraftsRef.current = filterDrafts;
+    readyFilterDraftsRef.current = null;
 
     const timeoutId = setTimeout(() => {
-      setFilterError(null);
-      setFilterDraftPending(false);
-      setRequestedPage(1);
-      setDebouncedFilterDrafts(
-        buildActiveFilterDrafts(columnsRef.current, filterDrafts),
-      );
+      readyFilterDraftsRef.current = filterDrafts;
+      retryPendingFilter();
     }, DEBOUNCE);
 
     return () => clearTimeout(timeoutId);
-  }, [columnsRef, filterDrafts]);
+  }, [filterDrafts, retryPendingFilter]);
+
+  const clearFilterError = useCallback(() => {
+    setFilterError(null);
+    setFilterNotice(null);
+    if (!filterError && filterDraftError) {
+      dismissedFilterDraftRevisionRef.current =
+        visibleFilterDraftRevisionRef.current;
+    }
+    setFilterDraftError(null);
+  }, [filterError, filterDraftError]);
 
   const handleSort = useCallback((column: string) => {
     setRequestedPage(1);
@@ -821,6 +997,7 @@ export function useTableDataController({
       nextDraft: FilterDraft | undefined,
       options?: { applyImmediately?: boolean },
     ) => {
+      setFilterNotice(null);
       setFilterDrafts((currentDrafts) => {
         let nextDrafts = currentDrafts;
 
@@ -838,8 +1015,13 @@ export function useTableDataController({
           };
         }
 
+        if (nextDrafts !== currentDrafts) {
+          filterDraftRevisionRef.current += 1;
+        }
+
         setFilterDraftPending(true);
         if (options?.applyImmediately) {
+          previousFilterDraftsRef.current = nextDrafts;
           syncRequestedFilterState(nextDrafts);
         }
 
@@ -854,6 +1036,7 @@ export function useTableDataController({
     metadataBlockedRef,
     metadataTick,
     retryMetadataRefresh,
+    retryPendingFilter,
     schemaWarning,
     loadingRef,
     fetchEpochRef,
@@ -864,7 +1047,7 @@ export function useTableDataController({
     executionTimeMs,
     fetchPage,
     filterDrafts,
-    filterError,
+    filterError: filterError ?? filterDraftError ?? filterNotice,
     hasCommittedData,
     isInitialized,
     intendedPage,
@@ -882,6 +1065,7 @@ export function useTableDataController({
     totalCount,
     handleSort,
     setFilterError,
+    clearFilterError,
     setReadError,
     setRequestedPage,
     setRequestedPageSize,

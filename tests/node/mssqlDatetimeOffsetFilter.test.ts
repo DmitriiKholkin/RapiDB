@@ -84,7 +84,7 @@ describe("MSSQL datetimeoffset filter", () => {
     });
   });
 
-  it("uses textual date comparison for date equality filters", () => {
+  it("casts date equality inputs to SQL Server DATE", () => {
     const driver = makeDriver();
 
     const condition = driver.buildFilterCondition(
@@ -95,7 +95,7 @@ describe("MSSQL datetimeoffset filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: "CONVERT(CHAR(10), [created_on], 23) = ?",
+      sql: "[created_on] = CAST(? AS date)",
       params: ["2024-02-28"],
     });
   });
@@ -185,7 +185,7 @@ describe("MSSQL datetimeoffset filter", () => {
     });
   });
 
-  it("uses CHARINDEX with NVARCHAR(MAX) for long varchar(max) filters", () => {
+  it("uses escaped LIKE with NVARCHAR(MAX) for long varchar(max) filters", () => {
     const driver = makeDriver();
     const longText = "x".repeat(3000);
 
@@ -197,25 +197,24 @@ describe("MSSQL datetimeoffset filter", () => {
     );
 
     expect(condition).toEqual({
-      sql: "CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST([payload] AS NVARCHAR(MAX))) > 0",
-      params: [longText],
+      sql: "CAST([payload] AS NVARCHAR(MAX)) LIKE ? ESCAPE '!'",
+      params: [`%${longText}%`],
     });
   });
 
-  it("falls back to exact NVARCHAR(MAX) comparison for oversized text filters", () => {
+  it("rejects oversized Contains instead of replacing substring search with equality", () => {
     const driver = makeDriver();
     const hugeText = "x".repeat(12000);
 
-    const condition = driver.buildFilterCondition(
-      varcharMaxColumn,
-      "like",
-      hugeText,
-      1,
-    );
-
-    expect(condition).toEqual({
-      sql: "CAST([payload] AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))",
-      params: [hugeText],
+    expect(() =>
+      driver.buildFilterCondition(varcharMaxColumn, "like", hugeText, 1),
+    ).toThrow("Contains supports at most 4000 UTF-16 code units");
+    const supported = "x".repeat(4000);
+    expect(
+      driver.buildFilterCondition(varcharMaxColumn, "like", supported, 1),
+    ).toEqual({
+      sql: "CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST([payload] AS NVARCHAR(MAX))) > 0",
+      params: [supported],
     });
   });
 

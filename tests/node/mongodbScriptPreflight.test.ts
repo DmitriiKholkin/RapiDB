@@ -62,9 +62,13 @@ describe("MongoDB validates the whole script before destructive statements", () 
     find.mockImplementation(() => {
       throw new Error("Server unavailable");
     });
-    await expect(
-      driver.query('db.items.deleteMany({_id:"remove"}); db.items.find({})'),
-    ).rejects.toThrow("Server unavailable");
+    const partial = await driver.query(
+      'db.items.deleteMany({_id:"remove"}); db.items.find({})',
+    );
+    expect(partial.affectedRows).toBe(1);
+    expect(partial.error).toBe(
+      "MongoDB statement 2 of 2 failed: Server unavailable. Earlier statements completed; later statements were not run.",
+    );
     expect(deleteMany).toHaveBeenCalledTimes(2);
   });
 });

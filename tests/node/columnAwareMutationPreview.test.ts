@@ -131,7 +131,7 @@ describe.each([
       operationIndex: 0,
       parameterIndexes: [0],
     });
-    const previewSql = `INSERT INTO ${qualified} (${names}) VALUES (7, 'value ${marker}2', NULL)`;
+    const previewSql = `INSERT INTO ${qualified} (${names}) VALUES (7, 'value ${marker}2', NULL)${identityClause}`;
     expect(plan.previewStatements).toEqual([previewSql]);
     const payload = controller.createInsertPreview("insert", plan);
     expect(payload.statementCount).toBe(1);
@@ -147,13 +147,21 @@ describe.each([
       [{ [key]: 7 }, { [key]: 8 }],
     );
     if (!plan) throw new Error("Expected delete plan");
-    expect(plan.operations[0].params).toEqual([7, 8]);
-    expect(plan.operations[0].sql).toBe(
-      `DELETE FROM ${qualified} WHERE "id""${marker}1" IN (${marker}1, ${marker}2)`,
-    );
-    const previewSql = `DELETE FROM ${qualified} WHERE "id""${marker}1" IN (7, 8)`;
+    const quotedKey = `"id""${marker}1"`;
+    const guardedDelete = (values: string) =>
+      `DELETE FROM ${qualified} WHERE ${quotedKey} IN (SELECT ${quotedKey} FROM ${qualified} WHERE ${quotedKey} IN (${values}) GROUP BY ${quotedKey} HAVING COUNT(*) = 1)`;
+    expect(plan.operations).toEqual([
+      {
+        sql: guardedDelete(`${marker}1, ${marker}2`),
+        params: [7, 8],
+        expectedAffectedRows: 2,
+      },
+    ]);
+    const previewSql = guardedDelete("7, 8");
     expect(plan.previewStatements).toEqual([previewSql]);
     const payload = controller.createDeleteRowsPreview("delete", plan);
-    expect(payload.text.replace(/\s+/g, " ")).toBe(`${previewSql};`);
+    expect(payload.text.replace(/\s+/g, "")).toBe(
+      `${previewSql};`.replace(/\s+/g, ""),
+    );
   });
 });

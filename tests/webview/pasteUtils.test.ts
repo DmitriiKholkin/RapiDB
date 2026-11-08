@@ -180,13 +180,20 @@ describe("TSV clipboard format", () => {
         ["first\r\nsecond", "value"],
         ["next", 'say "hello"'],
       ],
+      quoted: [
+        [true, false],
+        [false, true],
+      ],
     });
   });
 
   it("preserves empty and whitespace-only rows but ignores a final row delimiter", () => {
-    expect(parseTsv("a\n\n   \n\t\n")).toEqual({
-      rows: [["a"], [""], ["   "], ["", ""]],
-    });
+    expect(parseTsv("a\n\n   \n\t\n").rows).toEqual([
+      ["a"],
+      [""],
+      ["   "],
+      ["", ""],
+    ]);
   });
 
   it("round-trips a single empty cell and a trailing empty row", () => {
@@ -198,7 +205,7 @@ describe("TSV clipboard format", () => {
   });
 
   it("keeps empty bytes, empty text, and NULL distinct through clipboard TSV", () => {
-    const payload = serializeTsv([["0x", "", "NULL"]]);
+    const payload = serializeTsv([["0x", "", null]]);
     expect(payload).toBe('0x\t""\tNULL');
     const [emptyBytes, emptyText, nullText] = parseTsv(payload).rows[0];
     const binary = makeColumn({ name: "payload", category: "binary" });
@@ -226,21 +233,60 @@ describe("TSV clipboard format", () => {
   });
 
   it("keeps legacy unquoted TSV compatible", () => {
-    expect(parseTsv("a\tb\nc\td")).toEqual({
-      rows: [
-        ["a", "b"],
-        ["c", "d"],
-      ],
-    });
+    expect(parseTsv("a\tb\nc\td").rows).toEqual([
+      ["a", "b"],
+      ["c", "d"],
+    ]);
   });
 
   it("preserves malformed leading quotes instead of swallowing delimiters", () => {
-    expect(parseTsv('"unterminated\nnext\tvalue')).toEqual({
-      rows: [['"unterminated'], ["next", "value"]],
+    expect(parseTsv('"unterminated\nnext\tvalue').rows).toEqual([
+      ['"unterminated'],
+      ["next", "value"],
+    ]);
+    expect(parseTsv('"abc"x\tvalue').rows).toEqual([['"abc"x', "value"]]);
+  });
+
+  it("serializes SQL NULL as the bare marker and quotes literal NULL text", () => {
+    const payload = serializeTsv([[null, "NULL", "null"]]);
+    expect(payload).toBe('NULL\t"NULL"\tnull');
+    const parsed = parseTsv(payload);
+    expect(parsed).toEqual({
+      rows: [["NULL", "NULL", "null"]],
+      quoted: [[false, true, false]],
     });
-    expect(parseTsv('"abc"x\tvalue')).toEqual({
-      rows: [['"abc"x', "value"]],
+    const text = makeColumn({ name: "label", category: "text" });
+    const [[sqlNull, literalNull]] = parsed.rows;
+    expect(validatePasteValue(sqlNull, text, parsed.quoted?.[0][0])).toEqual({
+      valid: true,
+      coercedValue: null,
     });
+    const literal = validatePasteValue(
+      literalNull,
+      text,
+      parsed.quoted?.[0][1],
+    );
+    expect(literal).toEqual({ valid: true, coercedValue: "NULL" });
+    expect(formatNormalizedPasteValue(literalNull, literal.coercedValue)).toBe(
+      "NULL",
+    );
+  });
+
+  it("keeps quoted literal NULL text distinct in bulk validation", () => {
+    const text = makeColumn({ name: "label", category: "text" });
+    const result = validatePasteData(
+      parseTsv('NULL\t"NULL"'),
+      0,
+      0,
+      [text, { ...text, name: "other" }],
+      1,
+      () => true,
+    );
+    expect(result.errors).toEqual([]);
+    expect(result.rows[0].map((cell) => cell.normalized)).toEqual([
+      null,
+      "NULL",
+    ]);
   });
 });
 
@@ -365,10 +411,10 @@ describe("validatePasteValue — money formats across drivers", () => {
 });
 
 describe("validatePasteValue — NULL handling", () => {
-  it("returns empty string for empty input on nullable column", () => {
-    const result = validatePasteValue("", NUMERIC_COLUMN);
-    expect(result.valid).toBe(true);
-    expect(result.coercedValue).toBe("");
+  it("rejects quoted empty input on a nullable numeric column", () => {
+    const result = validatePasteValue("", NUMERIC_COLUMN, true);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("Empty value");
   });
 
   it("returns null for NULL sentinel on nullable column", () => {
@@ -377,15 +423,26 @@ describe("validatePasteValue — NULL handling", () => {
     expect(result.coercedValue).toBe(null);
   });
 
-  it("accepts empty string on non-nullable column (empty string is not NULL)", () => {
+  it("rejects empty string on a non-nullable numeric column", () => {
     const column = makeColumn({
       name: "col_not_null",
       category: "decimal",
       nullable: false,
     });
     const result = validatePasteValue("", column);
-    expect(result.valid).toBe(true);
-    expect(result.coercedValue).toBe("");
+    expect(result.valid).toBe(false);
+  });
+
+  it("accepts empty string on a text column (empty string is not NULL)", () => {
+    const column = makeColumn({
+      name: "col_text",
+      category: "text",
+      nullable: false,
+    });
+    expect(validatePasteValue("", column)).toEqual({
+      valid: true,
+      coercedValue: "",
+    });
   });
 });
 
@@ -500,9 +557,13 @@ describe("validatePasteData — bulk paste with money literals", () => {
 });
 
 describe("formatNormalizedPasteValue", () => {
-  it("returns empty string for empty input (empty string is not NULL)", () => {
-    const result = formatNormalizedPasteValue("", null);
+  it("returns empty string for empty text input (empty string is not NULL)", () => {
+    const result = formatNormalizedPasteValue("", "");
     expect(result).toBe("");
+  });
+
+  it("returns NULL_SENTINEL for a blank value normalized to NULL", () => {
+    expect(formatNormalizedPasteValue("", null)).toBe("\x00__NULL__\x00");
   });
 
   it("returns NULL_SENTINEL for NULL keyword input", () => {

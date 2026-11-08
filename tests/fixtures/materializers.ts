@@ -3,7 +3,6 @@ import {
   type DbEngineId,
 } from "../contracts/testingContracts.ts";
 import {
-  CANONICAL_FIXTURE_DATASET,
   CHILD_RECORD_ROWS,
   COMPOSITE_LINK_ROWS,
   EXACT_NUMERIC_SAMPLE_ROWS,

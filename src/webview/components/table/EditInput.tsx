@@ -16,8 +16,10 @@ import { placeholderForCategory } from "../../types";
 import { buildSmallGhostButtonStyle } from "../../utils/buttonStyles";
 import { buildTextInputStyle } from "../../utils/controlStyles";
 import { cssVar } from "../../utils/cssVar";
+import { isImeComposing } from "../../utils/ime";
 import { onMessage, postMessage } from "../../utils/messaging";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
+import { ROW_H } from "./tableViewHelpers";
 
 function normalizeEditInitialValue(
   value: string,
@@ -31,6 +33,7 @@ function normalizeEditInitialValue(
 
 export function EditInput({
   initial,
+  initialMissing = false,
   nullable,
   category,
   suppressPlaceholder = false,
@@ -41,6 +44,7 @@ export function EditInput({
   onCancel,
 }: {
   initial: string;
+  initialMissing?: boolean;
   nullable: boolean;
   category?: TypeCategory;
   suppressPlaceholder?: boolean;
@@ -60,7 +64,10 @@ export function EditInput({
     y: number;
     hasSelection: boolean;
   } | null>(null);
-  const ref = useRef<HTMLInputElement>(null);
+  const multiline =
+    category === "text" || category === "lob" || category === "other";
+  const ref = useRef<HTMLInputElement | HTMLTextAreaElement>(null);
+  const editedRef = useRef(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const editorClosedRef = useRef(false);
   const pasteUnsubscribeRef = useRef<(() => void) | null>(null);
@@ -80,10 +87,11 @@ export function EditInput({
 
   useLayoutEffect(() => {
     editorClosedRef.current = false;
-    if (ref.current instanceof HTMLInputElement) {
-      ref.current.focus({ preventScroll: true });
-      ref.current.setSelectionRange(0, ref.current.value.length);
-      ref.current.scrollLeft = 0;
+    const input = ref.current;
+    if (input) {
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(0, input.value.length);
+      input.scrollLeft = 0;
     }
     return () => {
       editorClosedRef.current = true;
@@ -124,7 +132,7 @@ export function EditInput({
   }, []);
 
   useEffect(() => {
-    const input = ref.current;
+    const input: HTMLElement | null = ref.current;
     if (!input) return;
     input.addEventListener("contextmenu", handleContextMenu);
     return () => {
@@ -164,7 +172,9 @@ export function EditInput({
           return;
         invalidatePaste();
 
-        const { text } = payload;
+        const text = multiline
+          ? payload.text.replace(/\r\n?/g, "\n")
+          : payload.text;
         const input = ref.current;
         if (!text || !input || input.readOnly || editorClosedRef.current)
           return;
@@ -183,6 +193,7 @@ export function EditInput({
         } else {
           pasteCursorRef.current = cursor;
         }
+        editedRef.current = true;
         setIsNull(false);
         setVal(newVal);
       },
@@ -192,7 +203,7 @@ export function EditInput({
       requestId,
       recipient: clipboardRecipientRef.current,
     });
-  }, [category, closeContextMenu, invalidatePaste]);
+  }, [category, closeContextMenu, invalidatePaste, multiline]);
 
   useEffect(() => {
     if (!contextMenu) return;
@@ -218,6 +229,10 @@ export function EditInput({
   const normalizedValue = normalizeEditInitialValue(val, category);
   const commit = () => {
     finishEditing();
+    if (initialMissing && !editedRef.current) {
+      onCancel();
+      return;
+    }
     onCommit(isNull ? NULL_SENTINEL : normalizeEditInitialValue(val, category));
   };
   const inputStyle: React.CSSProperties = {
@@ -245,6 +260,43 @@ export function EditInput({
     border: "0px",
     letterSpacing: "0em",
   };
+  const fieldProps = {
+    "aria-label": "Cell value",
+    value: normalizedValue,
+    readOnly,
+    onChange: (
+      e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>,
+    ) => {
+      editedRef.current = true;
+      if (isNull) {
+        setIsNull(false);
+      }
+      setVal(e.target.value);
+    },
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (isImeComposing(e)) return;
+      if (e.key === "Enter") {
+        if (multiline && e.shiftKey) return;
+        e.preventDefault();
+        commit();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        finishEditing();
+        onCancel();
+      }
+    },
+    onBlur: commit,
+    onClick: (e: React.MouseEvent) => e.stopPropagation(),
+    onDoubleClick: (e: React.MouseEvent) => e.stopPropagation(),
+    placeholder: suppressPlaceholder
+      ? undefined
+      : isNull
+        ? "NULL"
+        : category
+          ? placeholderForCategory(category)
+          : undefined,
+  };
   return (
     <div
       style={{
@@ -255,42 +307,26 @@ export function EditInput({
         height: "100%",
       }}
     >
-      <input
-        ref={ref}
-        aria-label="Cell value"
-        value={normalizedValue}
-        readOnly={readOnly}
-        onChange={(e) => {
-          if (isNull) {
-            setIsNull(false);
-          }
-          setVal(e.target.value);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          }
-          if (e.key === "Escape") {
-            e.preventDefault();
-            finishEditing();
-            onCancel();
-          }
-        }}
-        onBlur={commit}
-        onClick={(e) => e.stopPropagation()}
-        onDoubleClick={(e) => e.stopPropagation()}
-        placeholder={
-          suppressPlaceholder
-            ? undefined
-            : isNull
-              ? "NULL"
-              : category
-                ? placeholderForCategory(category)
-                : undefined
-        }
-        style={inputStyle}
-      />
+      {multiline ? (
+        <textarea
+          ref={ref as React.RefObject<HTMLTextAreaElement>}
+          rows={1}
+          {...fieldProps}
+          style={{
+            ...inputStyle,
+            lineHeight: `${ROW_H - 2}px`,
+            resize: "none",
+            overflow: "hidden",
+            whiteSpace: "pre",
+          }}
+        />
+      ) : (
+        <input
+          ref={ref as React.RefObject<HTMLInputElement>}
+          {...fieldProps}
+          style={inputStyle}
+        />
+      )}
       {showDefaultButton && !readOnly && onSetDefault && (
         <button
           type="button"

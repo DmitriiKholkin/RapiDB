@@ -107,6 +107,20 @@ describe("inferColumnsFromRows", () => {
     ]);
   });
 
+  it("infers a field from its first non-null value", () => {
+    const columns = inferColumnsFromRows(
+      [
+        { _id: "row-1", score: null },
+        { _id: "row-2", score: 5 },
+      ],
+      "_id",
+    );
+
+    expect(columns.find((column) => column.name === "score")?.category).toBe(
+      "integer",
+    );
+  });
+
   it("supports schema inference without any primary keys", () => {
     const columns = inferColumnsFromRows(
       [{ _id: "row-1", status: "active" }],

@@ -85,21 +85,3 @@ export async function pMapWithLimit<T, R>(
 
   return results;
 }
-
-export async function pMapWithLimitAllSettled<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>,
-  signal?: AbortSignal,
-): Promise<Array<R | Error>> {
-  return runPool<T, R | Error>({
-    items,
-    limit,
-    fn,
-    signal,
-    onError: (results, index, error) => {
-      results[index] =
-        error instanceof Error ? error : new Error(String(error));
-    },
-  });
-}

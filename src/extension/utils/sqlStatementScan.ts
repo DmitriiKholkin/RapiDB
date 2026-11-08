@@ -1,7 +1,12 @@
 import type { ConnectionType } from "../../shared/connectionTypes";
 
-const POSTGRES_IDENTIFIER_CONTINUATION = /[\p{L}\p{M}\p{N}_$]/u;
-const POSTGRES_DOLLAR_QUOTE_TAG = /^(\$\$|\$[\p{L}_][\p{L}\p{M}\p{N}_]*\$)/u;
+const POSTGRES_IDENTIFIER_CONTINUATION = /[A-Za-z0-9_$\u0080-\u{10FFFF}]/u;
+const POSTGRES_DOLLAR_QUOTE_TAG =
+  /^(\$\$|\$[A-Za-z_\u0080-\u{10FFFF}][A-Za-z0-9_\u0080-\u{10FFFF}]*\$)/u;
+
+export function toPostgresWireText(sql: string): string {
+  return Buffer.from(sql, "utf8").toString("utf8");
+}
 
 export function readPostgresDollarQuoteTag(
   sql: string,
@@ -32,11 +37,92 @@ export function readPostgresDollarQuoteTag(
   return POSTGRES_DOLLAR_QUOTE_TAG.exec(sql.slice(start))?.[0] ?? null;
 }
 
-export function hasPostgresDollarQuoteTag(sql: string): boolean {
+export function hasPostgresDollarQuoteTag(rawSql: string): boolean {
+  const sql = toPostgresWireText(rawSql);
   for (let index = 0; index < sql.length; index += 1) {
     if (sql[index] === "$" && readPostgresDollarQuoteTag(sql, index)) {
       return true;
     }
+  }
+  return false;
+}
+
+const SQL_LEXER_WHITESPACE = /[ \t\n\r\f\v]/;
+
+export function isMysqlDashCommentStart(sql: string, index: number): boolean {
+  if (sql[index] !== "-" || sql[index + 1] !== "-") return false;
+  if (index + 2 >= sql.length) return true;
+  const following = sql.charCodeAt(index + 2);
+  return following <= 0x20 || following === 0x7f;
+}
+
+export function isAmbiguousMysqlDashComment(
+  sql: string,
+  index: number,
+): boolean {
+  return (
+    sql[index] === "-" &&
+    sql[index + 1] === "-" &&
+    sql.charCodeAt(index + 2) >= 0x80
+  );
+}
+
+export function hasExecutableMysqlComment(sql: string): boolean {
+  return (
+    scanForExecutableMysqlComment(sql, true, true) ||
+    scanForExecutableMysqlComment(sql, false, false) ||
+    scanForExecutableMysqlComment(sql, true, false)
+  );
+}
+
+function scanForExecutableMysqlComment(
+  sql: string,
+  backslashEscapesSingleQuotes: boolean,
+  backslashEscapesDoubleQuotes: boolean,
+): boolean {
+  let index = 0;
+  while (index < sql.length) {
+    const char = sql[index];
+    const next = sql[index + 1];
+    if (char === "'" || char === '"' || char === "`") {
+      index += 1;
+      while (index < sql.length) {
+        if (
+          sql[index] === "\\" &&
+          ((char === "'" && backslashEscapesSingleQuotes) ||
+            (char === '"' && backslashEscapesDoubleQuotes))
+        ) {
+          index += 2;
+          continue;
+        }
+        if (sql[index] === char) {
+          if (sql[index + 1] === char) {
+            index += 2;
+            continue;
+          }
+          index += 1;
+          break;
+        }
+        index += 1;
+      }
+      continue;
+    }
+
+    if (isMysqlDashCommentStart(sql, index) || char === "#") {
+      while (index < sql.length && sql[index] !== "\n" && sql[index] !== "\r") {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (char === "/" && next === "*") {
+      if (/^\/\*(?:!|M!)/i.test(sql.slice(index))) return true;
+      const end = sql.indexOf("*/", index + 2);
+      if (end < 0) return false;
+      index = end + 2;
+      continue;
+    }
+    index += 1;
   }
   return false;
 }
@@ -79,9 +165,10 @@ export function oracleAlternativeQuoteEnd(
 }
 
 export function scanSqlForCap(
-  sql: string,
+  rawSql: string,
   dialect: ConnectionType,
 ): SqlCapToken[] {
+  const sql = dialect === "pg" ? toPostgresWireText(rawSql) : rawSql;
   const tokens: SqlCapToken[] = [];
   let index = 0;
   let depth = 0;
@@ -92,14 +179,14 @@ export function scanSqlForCap(
     const start = index;
     const char = sql[index];
     const next = sql[index + 1];
-    if (/\s/.test(char)) {
+    if (SQL_LEXER_WHITESPACE.test(char)) {
       index++;
       continue;
     }
     const dashComment =
-      char === "-" &&
-      next === "-" &&
-      (dialect !== "mysql" || !sql[index + 2] || /\s/.test(sql[index + 2]));
+      dialect === "mysql"
+        ? isMysqlDashCommentStart(sql, index)
+        : char === "-" && next === "-";
     if (dashComment || (dialect === "mysql" && char === "#")) {
       while (
         index < sql.length &&

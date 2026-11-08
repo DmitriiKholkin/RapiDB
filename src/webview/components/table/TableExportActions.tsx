@@ -1,4 +1,4 @@
-import React from "react";
+import type React from "react";
 import { Icon } from "../Icon";
 import { tableButtonStyle } from "./tableViewHelpers";
 
@@ -44,7 +44,11 @@ export function TableExportActions({
           style={resolveButtonStyle(disabled)}
           disabled={disabled}
           onClick={() => onExport(format)}
-          title={titleByFormat?.[format]}
+          title={
+            format === "csv"
+              ? `${titleByFormat?.csv ?? "Export as CSV"}. NULL is (NULL); missing is MISSING. Identical literal markers can be ambiguous; use JSON for typed values.`
+              : titleByFormat?.[format]
+          }
         >
           <Icon
             name="export"

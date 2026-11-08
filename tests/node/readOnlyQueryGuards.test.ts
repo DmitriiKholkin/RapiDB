@@ -42,6 +42,51 @@ describe("readonly query guards", () => {
     ).toBe(true);
   });
 
+  it("detects table creation, attachment, foreign imports, and renames as schema changes", () => {
+    expect(
+      mayChangeDatabaseSchema(
+        "SELECT * INTO new_users FROM users",
+        "postgresql",
+      ),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema(
+        "WITH src AS (SELECT 1 AS id) SELECT id INTO new_users FROM src",
+        "transactsql",
+      ),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema("ATTACH DATABASE 'other.db' AS other", "sqlite"),
+    ).toBe(true);
+    expect(mayChangeDatabaseSchema("DETACH DATABASE other", "sqlite")).toBe(
+      true,
+    );
+    expect(
+      mayChangeDatabaseSchema(
+        "IMPORT FOREIGN SCHEMA remote FROM SERVER srv INTO public",
+        "postgresql",
+      ),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema(
+        "EXEC sp_rename 'dbo.users', 'members'",
+        "transactsql",
+      ),
+    ).toBe(true);
+    expect(
+      mayChangeDatabaseSchema(
+        "INSERT INTO users SELECT * FROM staged_users",
+        "postgresql",
+      ),
+    ).toBe(false);
+    expect(
+      mayChangeDatabaseSchema("SELECT 'INTO x' AS label", "transactsql"),
+    ).toBe(false);
+    expect(mayChangeDatabaseSchema("SELECT id INTO @id FROM t", "mysql")).toBe(
+      false,
+    );
+  });
+
   it("allows dialect-safe read-only SQL statements", () => {
     const driver = new PostgresDriver({
       id: "pg-readonly-guard",
@@ -60,6 +105,11 @@ describe("readonly query guards", () => {
     expect(guard("select 1")).toEqual({ allowed: true });
     expect(guard("show search_path")).toEqual({ allowed: true });
     expect(guard("table users")).toEqual({ allowed: true });
+    expect(guard("table public.users")).toEqual({ allowed: true });
+    expect(guard("table users for update").allowed).toBe(false);
+    expect(
+      guard("table pg_class order by pg_terminate_backend(123)").allowed,
+    ).toBe(false);
     expect(guard("values (1), (2)")).toEqual({ allowed: true });
     expect(guard("explain select * from users")).toEqual({ allowed: true });
     expect(guard("explain analyze select * from users")).toEqual({

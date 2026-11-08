@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import * as vscode from "vscode";
 import {
@@ -7,6 +9,14 @@ import {
 } from "../shared/connectionConfig";
 import { resolveMongoRemoteTarget } from "../shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../shared/mongoDatabase";
+import { getConfiguredRedisDatabaseName } from "../shared/redisDatabase";
+import { resolveUrlRemoteTarget } from "../shared/urlRemoteTarget";
+import {
+  type ConnectionSavePrecondition,
+  connectionEditState,
+  connectionEditStatesMatch,
+  preserveTrustedSshFingerprint,
+} from "./connectionEditState";
 import type {
   BookmarkEntry,
   ConnectAttempt,
@@ -30,23 +40,30 @@ import type {
   ScopeAwareConnectionManagerApi,
   ScopedSchemaCacheEntry,
   ScopedSchemaFragment,
-  StoredConnectionConfig,
   TableDetailRequest,
   TableDetailState,
   TableStructureSnapshot,
   TestConnectionResult,
 } from "./connectionManagerModels";
 import {
+  type ConnectionIdsByScope,
   type ConnectionManagerStore,
+  canonicalizeOracleServiceName,
+  connectionIdsMatch,
+  connectionSessionSettings,
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
 import {
   type ConnectionSecretClearOptions,
   hasPersistedConnectionConfigChanges,
+  omitAmbiguousCredentialBearingUris,
+  resolveStoredCredentialBearingUri,
   sanitizeConnectionConfigForResponse,
   sanitizePersistedConnectionConfig,
+  serializeConnectionSecretsForConfig,
   serializeConnectionSecretsForStoredConfig,
   shouldForceSecretStorage,
+  shouldKeepHandWrittenSecretsInSettings,
 } from "./connectionSecrets";
 import { parseStoredConnectionSecrets } from "./connectionSecretsData";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
@@ -62,11 +79,9 @@ import { createTimeoutAwareDriver } from "./dbDrivers/timeout";
 import {
   DEFAULT_DRIVER_ENTITY_MANIFEST,
   type DriverCapabilities,
-  type DriverEntityAvailability,
   type DriverEntityManifest,
   type DriverStaticMetadata,
   type IDBDriver,
-  resolveDriverTableSectionAvailability,
 } from "./dbDrivers/types";
 import type { DriverConnectionConfig } from "./driverRuntimeConfig";
 import {
@@ -75,6 +90,7 @@ import {
   loadConnectionRootCatalog,
   loadDatabaseScope,
   loadSchemaScope,
+  loadTableDetail,
   PartialSchemaLoadError,
 } from "./schema/schemaLoaders";
 import { ConnectionValidationService } from "./services/connectionValidationService";
@@ -85,6 +101,7 @@ import {
   type SshRuntime,
   type SshRuntimeRequest,
 } from "./services/sshRuntime";
+import { runAbortableFilesystemOperation } from "./utils/abortableFilesystem";
 import { normalizeUnknownError } from "./utils/errorHandling";
 import { logger } from "./utils/logger";
 
@@ -93,26 +110,10 @@ export type {
   ConnectAttempt,
   ConnectionConfig,
   ConnectionConnectIntent,
-  ConnectionManagerLifecycleApi,
-  DriverCapabilitiesApi,
-  DriverMetadataApi,
   ExplorerSchemaScope,
   HistoryEntry,
-  QueryEditorPresentationApi,
-  RefreshSchemaRequest,
-  SchemaLoadStatus,
-  SchemaObjectEntry,
-  SchemaScopeKey,
   SchemaSnapshot,
-  SchemaSnapshotDatabaseEntry,
-  SchemaSnapshotSchemaEntry,
-  SchemaSnapshotState,
   ScopeAwareConnectionManagerApi,
-  ScopedSchemaCacheEntry,
-  TableDetailRequest,
-  TableDetailState,
-  TableStructureSnapshot,
-  TestConnectionResult,
 } from "./connectionManagerModels";
 
 interface InternalScopedSchemaCacheEntry extends ScopedSchemaCacheEntry {
@@ -137,20 +138,8 @@ interface ConnectionSchemaCacheEntry extends SchemaSnapshotState {
 }
 
 const CONNECTION_ROOT_SCOPE: ExplorerSchemaScope = { kind: "connectionRoot" };
-
-function connectionSessionSettings(config: StoredConnectionConfig) {
-  const {
-    name: _name,
-    folder: _folder,
-    color: _color,
-    useSecretStorage: _storage,
-    ...settings
-  } = canonicalizeOracleServiceName({
-    ...config,
-    username: config.username ?? config.user,
-  });
-  return JSON.parse(JSON.stringify(settings));
-}
+const SECRET_STORAGE_READ_HINT =
+  "Secret Storage could not be read; saved credentials were not used. Unlock your keychain and retry.";
 
 function connectionSessionChanged(
   previous: ConnectionConfig,
@@ -159,7 +148,6 @@ function connectionSessionChanged(
   const before = connectionSessionSettings(previous);
   const after = connectionSessionSettings(next);
   if (isDeepStrictEqual(before, after)) return false;
-  // Moving existing credentials into Secret Storage does not change the session.
   if (next.useSecretStorage !== true) return true;
   try {
     const sanitizedAfter = connectionSessionSettings(
@@ -175,7 +163,6 @@ function connectionSessionChanged(
       )
     );
   } catch {
-    // Invalid edited credentials must invalidate the old session as well.
     return true;
   }
 }
@@ -530,28 +517,13 @@ function getConfiguredDefaultDatabaseName(config: ConnectionConfig): string {
     return config.serviceName || config.database || "";
   }
 
+  if (config.type === "redis") {
+    return getConfiguredRedisDatabaseName(config);
+  }
+
   return (
     config.database || config.serviceName || (config.filePath ? "main" : "")
   );
-}
-
-function canonicalizeOracleServiceName(
-  config: ConnectionConfig,
-): ConnectionConfig {
-  if (config.type !== "oracle") {
-    return config;
-  }
-
-  const rawServiceName =
-    (typeof config.serviceName === "string" && config.serviceName.trim()) ||
-    (typeof config.database === "string" && config.database.trim()) ||
-    undefined;
-
-  return {
-    ...config,
-    serviceName: rawServiceName,
-    database: undefined,
-  };
 }
 
 function isDescendantScope(
@@ -751,6 +723,7 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 
 const TEST_CONNECTION_ID = "__test__";
 const CONNECTION_CLEANUP_BUDGET_MS = 1_500;
+const ORPHANED_SECRET_CLEANUP_DELAY_MS = 5 * 60_000;
 
 async function awaitBoundedCleanup(
   label: string,
@@ -799,6 +772,7 @@ export class ConnectionManager
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly disposedSshRuntimes = new WeakSet<SshRuntime>();
   private readonly createSshRuntimeForConnection: typeof createSshRuntime;
+  private readonly _secretReadFailures = new Set<string>();
   private readonly _connectingMap = new Map<
     string,
     {
@@ -832,6 +806,10 @@ export class ConnectionManager
   private readonly _onDidRefreshSchemas = new vscode.EventEmitter<
     string | undefined
   >();
+  readonly onDidChangeConnectionSession: vscode.Event<string>;
+  private readonly _onDidChangeConnectionSession =
+    new vscode.EventEmitter<string>();
+  private readonly _connectionSessionGenerations = new Map<string, number>();
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _driverStaticMetadataCache = new Map<
     string,
@@ -856,6 +834,11 @@ export class ConnectionManager
     string,
     ConnectionConfig
   >();
+  private readonly orphanedSecretTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  private lastKnownUserScopeIds = new Set<string>();
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -874,6 +857,8 @@ export class ConnectionManager
     this.onDidSchemaLoad = this._onDidSchemaLoad.event;
     this.onDidChangeSchemaState = this._onDidChangeSchemaState.event;
     this.onDidRefreshSchemas = this._onDidRefreshSchemas.event;
+    this.onDidChangeConnectionSession =
+      this._onDidChangeConnectionSession.event;
     this.store.onDidChangeConfiguration(async (e) => {
       if (this._disposed) return;
       const previous = this.lastKnownConnections;
@@ -882,11 +867,10 @@ export class ConnectionManager
         const current = new Map(
           this.getConnections().map((config) => [config.id, config]),
         );
+        this.reconcileOrphanedSecretCleanup(false);
         for (const before of previous) {
           const next = current.get(before.id);
           const expected = this.pendingTrustedFingerprintWrites.get(before.id);
-          // Only the verified pin is owned by the handshake. A coalesced edit
-          // to the database target or other SSH settings must still fence it.
           if (
             next &&
             expected &&
@@ -903,6 +887,7 @@ export class ConnectionManager
           )
             continue;
           if (next && !connectionSessionChanged(before, next)) continue;
+          this.markConnectionSessionChanged(before.id);
           this.invalidateDriverStaticMetadata(before.id);
           if (this.driverMap.has(before.id) || this.isConnecting(before.id)) {
             void this.disconnectFrom(before.id).catch((error) => {
@@ -916,6 +901,228 @@ export class ConnectionManager
         await this._trimHistoryToLimit();
       }
     }, context.subscriptions);
+    void this.store.clearLegacyOrphanedSecretIds?.().catch((error) => {
+      logger.error("Could not clear legacy orphaned secret ids", error);
+    });
+    this.reconcileOrphanedSecretCleanup(true);
+  }
+
+  getConnectionSessionGeneration(id: string): number {
+    return this._connectionSessionGenerations.get(id) ?? 0;
+  }
+
+  getConnectionSessionNonce(id: string): string | undefined {
+    try {
+      return this.store.readConnectionSessionNonce?.(id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private markConnectionSessionChanged(id: string): void {
+    this._connectionSessionGenerations.set(
+      id,
+      this.getConnectionSessionGeneration(id) + 1,
+    );
+    void this.store
+      .writeConnectionSessionNonce?.(id, randomUUID())
+      .catch((error) => {
+        logger.error("Could not record connection session change", error);
+      });
+    this._onDidChangeConnectionSession.fire(id);
+  }
+
+  private isOrphanedSecretCleanupDisabled(): boolean {
+    try {
+      return this.store.isRemoteWindow?.() === true;
+    } catch {
+      return true;
+    }
+  }
+
+  private reconcileOrphanedSecretCleanup(startup: boolean): void {
+    let scopes: ConnectionIdsByScope | undefined;
+    try {
+      scopes = this.store.getConnectionIdsByScope?.();
+    } catch (error) {
+      logger.error("Could not read connection settings scopes", error);
+    }
+    if (!scopes) return;
+    const cleanupDisabled = this.isOrphanedSecretCleanupDisabled();
+    const previousUserIds = this.lastKnownUserScopeIds;
+    this.lastKnownUserScopeIds = new Set(scopes.user);
+    void this._recordWorkspaceScopedConnectionIds(
+      cleanupDisabled
+        ? [...scopes.workspace, ...scopes.user]
+        : scopes.workspace,
+    );
+    for (const id of this.store.readOrphanedSecretIds?.() ?? []) {
+      if (this.isConnectionIdInUse(id)) {
+        this.cancelOrphanedSecretCleanup(id);
+      } else if (startup && !cleanupDisabled) {
+        this.armOrphanedSecretTimer(id);
+      }
+    }
+    if (cleanupDisabled) return;
+    for (const id of previousUserIds) {
+      if (!this.lastKnownUserScopeIds.has(id)) {
+        void this._scheduleOrphanedSecretCleanupIfStored(id);
+      }
+    }
+  }
+
+  private isConnectionIdInUse(
+    id: string,
+    connections: readonly { id?: unknown }[] = [],
+  ): boolean {
+    if (
+      !this.store.hasConnectionIdInAnyScope ||
+      !this.store.readWorkspaceScopedConnectionIds
+    )
+      return true;
+    try {
+      return (
+        connections.some(
+          (connection) =>
+            typeof connection.id === "string" &&
+            connectionIdsMatch(connection.id, id),
+        ) ||
+        this.store.hasConnectionIdInAnyScope(id) ||
+        this.store
+          .readWorkspaceScopedConnectionIds()
+          .some((candidate) => connectionIdsMatch(candidate, id))
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  private isOrphanedSecretCleanupPending(id: string): boolean {
+    return this.store.readOrphanedSecretIds?.().includes(id) ?? false;
+  }
+
+  private async _recordWorkspaceScopedConnectionIds(
+    ids: string[],
+  ): Promise<void> {
+    if (
+      !this.store.readWorkspaceScopedConnectionIds ||
+      !this.store.writeWorkspaceScopedConnectionIds
+    )
+      return;
+    try {
+      const current = this.store.readWorkspaceScopedConnectionIds();
+      const missing = ids.filter((id) => !current.includes(id));
+      if (missing.length === 0) return;
+      await this.store.writeWorkspaceScopedConnectionIds([
+        ...current,
+        ...missing,
+      ]);
+    } catch (error) {
+      logger.error("Could not record workspace connection ids", error);
+    }
+  }
+
+  private async _scheduleOrphanedSecretCleanupIfStored(
+    id: string,
+  ): Promise<void> {
+    if (this.isConnectionIdInUse(id)) return;
+    let stored: string | undefined;
+    try {
+      stored = await this.store.getSecret(id);
+    } catch {
+      return;
+    }
+    if (
+      stored === undefined ||
+      this._disposed ||
+      this.isOrphanedSecretCleanupDisabled() ||
+      this.lastKnownUserScopeIds.has(id) ||
+      this.isConnectionIdInUse(id)
+    )
+      return;
+    this.armOrphanedSecretTimer(id);
+    void this._updateOrphanedSecretIds((ids) =>
+      ids.includes(id) ? ids : [...ids, id],
+    );
+  }
+
+  private armOrphanedSecretTimer(id: string): void {
+    if (!id || this._disposed || this.isOrphanedSecretCleanupDisabled()) return;
+    const pending = this.orphanedSecretTimers.get(id);
+    if (pending) clearTimeout(pending);
+    const timer = setTimeout(() => {
+      if (this.orphanedSecretTimers.get(id) !== timer) return;
+      this.orphanedSecretTimers.delete(id);
+      void this._deleteOrphanedConnectionSecret(id);
+    }, ORPHANED_SECRET_CLEANUP_DELAY_MS);
+    timer.unref?.();
+    this.orphanedSecretTimers.set(id, timer);
+  }
+
+  private cancelOrphanedSecretCleanup(id: string): void {
+    const pending = this.orphanedSecretTimers.get(id);
+    if (pending) clearTimeout(pending);
+    this.orphanedSecretTimers.delete(id);
+    void this._updateOrphanedSecretIds((ids) => ids.filter((x) => x !== id));
+  }
+
+  private async _updateOrphanedSecretIds(
+    update: (ids: string[]) => string[],
+  ): Promise<void> {
+    if (!this.store.readOrphanedSecretIds || !this.store.writeOrphanedSecretIds)
+      return;
+    try {
+      const current = this.store.readOrphanedSecretIds();
+      const next = update(current);
+      if (isDeepStrictEqual(current, next)) return;
+      await this.store.writeOrphanedSecretIds(next);
+    } catch (error) {
+      logger.error("Could not record orphaned connection secrets", error);
+    }
+  }
+
+  private async _deleteOrphanedConnectionSecret(id: string): Promise<void> {
+    if (
+      this._disposed ||
+      this.isOrphanedSecretCleanupDisabled() ||
+      !this.isOrphanedSecretCleanupPending(id)
+    )
+      return;
+    try {
+      await this.store.mutateConnections(async (connections) => {
+        const stillOrphaned = () =>
+          !this._disposed &&
+          !this.orphanedSecretTimers.has(id) &&
+          this.isOrphanedSecretCleanupPending(id) &&
+          !this.isConnectionIdInUse(id, connections);
+        if (!stillOrphaned()) return { result: undefined };
+        const previousSecret = await this.store.getSecret(id);
+        await this.store.deleteSecret(id);
+        if (
+          previousSecret !== undefined &&
+          !stillOrphaned() &&
+          (await this.store.getSecret(id).catch(() => undefined)) === undefined
+        ) {
+          await this.store.storeSecret(id, previousSecret);
+        }
+        return { result: undefined };
+      });
+    } catch (error) {
+      logger.error(
+        `Could not remove Secret Storage entry of deleted connection "${id}"`,
+        error,
+      );
+      if (
+        !this._disposed &&
+        !this.orphanedSecretTimers.has(id) &&
+        this.isOrphanedSecretCleanupPending(id)
+      ) {
+        this.armOrphanedSecretTimer(id);
+      }
+      return;
+    }
+    if (this._disposed || this.orphanedSecretTimers.has(id)) return;
+    await this._updateOrphanedSecretIds((ids) => ids.filter((x) => x !== id));
   }
   private getHistoryLimit(): number {
     return this.store.getHistoryLimit();
@@ -1006,12 +1213,13 @@ export class ConnectionManager
   private async _persistConnectionSecretsIfNeeded(
     config: ConnectionConfig,
     clearOptions: ConnectionSecretClearOptions = {},
+    ignorePreviousSecrets = false,
   ): Promise<(() => Promise<void>) | undefined> {
     const previousSecretSnapshot = await this.store.getSecret(config.id);
     const nextSecretSnapshot = shouldForceSecretStorage(config)
       ? serializeConnectionSecretsForStoredConfig(
           config,
-          previousSecretSnapshot,
+          ignorePreviousSecrets ? undefined : previousSecretSnapshot,
           clearOptions,
         )
       : undefined;
@@ -1048,10 +1256,54 @@ export class ConnectionManager
     return restore;
   }
 
+  private _withSecretReadHint(id: string, error: unknown): unknown {
+    if (!this._secretReadFailures.has(id)) return error;
+    const message = error instanceof Error ? error.message : String(error);
+    const hinted = new Error(`${message} ${SECRET_STORAGE_READ_HINT}`, {
+      cause: error,
+    });
+    if (error && typeof error === "object" && "code" in error) {
+      Object.assign(hinted, { code: (error as { code: unknown }).code });
+    }
+    return hinted;
+  }
+
+  private async _removeUnusedConnectionSecrets(id: string): Promise<void> {
+    try {
+      await this.store.mutateConnections(async (connections) => {
+        const current = connections.find((connection) => connection.id === id);
+        if (
+          current &&
+          (current.useSecretStorage === false || current.type === "sqlite") &&
+          (await this.store.getSecret(id)) !== undefined
+        ) {
+          await this.store.deleteSecret(id);
+        }
+        return { result: undefined };
+      });
+    } catch (error) {
+      logger.error(
+        `Could not remove unused Secret Storage entry for connection "${id}"`,
+        error,
+      );
+    }
+  }
+
+  private async _hasUnflaggedStoredSecrets(
+    config: ConnectionConfig,
+  ): Promise<boolean> {
+    return (
+      typeof config.useSecretStorage !== "boolean" &&
+      config.type !== "sqlite" &&
+      !shouldKeepHandWrittenSecretsInSettings(config) &&
+      (await this.store.getSecret(config.id)) !== undefined
+    );
+  }
+
   private async _migrateSingleConnectionSecretsIfNeeded(
     config: ConnectionConfig,
   ): Promise<void> {
-    if (!shouldForceSecretStorage(config)) {
+    if (config.type === "sqlite" || !shouldForceSecretStorage(config)) {
       return;
     }
     await this.store.mutateConnections(async (storedConnections) => {
@@ -1065,7 +1317,10 @@ export class ConnectionManager
       const liveConfig = canonicalizeOracleServiceName(
         storedConnections[index],
       );
-      const rollback = await this._persistConnectionSecretsIfNeeded(liveConfig);
+      const rollback = await this._persistConnectionSecretsIfNeeded(
+        liveConfig,
+        { retainCredentialBearingUris: true },
+      );
       const persisted = sanitizePersistedConnectionConfig(liveConfig);
       if (!hasPersistedConnectionConfigChanges(persisted, liveConfig)) {
         return { result: undefined, rollback };
@@ -1083,14 +1338,24 @@ export class ConnectionManager
         const next = [...storedConnections];
         const rollbacks: Array<() => Promise<void>> = [];
         let hasChanges = false;
-        try {
-          for (let index = 0; index < next.length; index += 1) {
-            const connection = canonicalizeOracleServiceName(next[index]);
-            if (!shouldForceSecretStorage(connection)) {
+        for (let index = 0; index < next.length; index += 1) {
+          const connection = canonicalizeOracleServiceName(next[index]);
+          try {
+            if (await this._hasUnflaggedStoredSecrets(connection)) {
+              next[index] = { ...next[index], useSecretStorage: true };
+              hasChanges = true;
               continue;
             }
-            const rollback =
-              await this._persistConnectionSecretsIfNeeded(connection);
+            if (
+              connection.type === "sqlite" ||
+              !shouldForceSecretStorage(connection)
+            ) {
+              continue;
+            }
+            const rollback = await this._persistConnectionSecretsIfNeeded(
+              connection,
+              { retainCredentialBearingUris: true },
+            );
             if (rollback) {
               rollbacks.push(rollback);
             }
@@ -1099,23 +1364,12 @@ export class ConnectionManager
               next[index] = persisted;
               hasChanges = true;
             }
-          }
-        } catch (migrationError) {
-          const rollbackErrors: unknown[] = [];
-          for (const rollback of rollbacks.reverse()) {
-            try {
-              await rollback();
-            } catch (error) {
-              rollbackErrors.push(error);
-            }
-          }
-          if (rollbackErrors.length > 0) {
-            throw new AggregateError(
-              [migrationError, ...rollbackErrors],
-              "Secret migration and rollback failed.",
+          } catch (error) {
+            logger.error(
+              `Skipped secret migration for connection "${connection.id}"`,
+              error,
             );
           }
-          throw migrationError;
         }
 
         const rollback = async (): Promise<void> => {
@@ -1175,6 +1429,7 @@ export class ConnectionManager
   async saveConnection(
     config: ConnectionConfig,
     clearOptions: ConnectionSecretClearOptions = {},
+    precondition?: ConnectionSavePrecondition,
   ): Promise<ConnectionConfig> {
     this._assertNotDisposed();
 
@@ -1191,34 +1446,115 @@ export class ConnectionManager
       throw new Error(validation.message ?? "Connection settings are invalid.");
     }
 
-    const persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
-    const isEdit = await this.store.mutateConnections(async (connections) => {
-      const idx = connections.findIndex((c) => c.id === canonicalConfig.id);
-      const rollback =
-        connections[idx]?.useSecretStorage === true ||
-        shouldForceSecretStorage(canonicalConfig)
-          ? await this._persistConnectionSecretsIfNeeded(
-              canonicalConfig,
-              clearOptions,
+    let persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
+    let replacesSecretProfileWithSqlite = false;
+    const sessionChanged = await this.store.mutateConnections(
+      async (connections) => {
+        const idx = connections.findIndex((c) => c.id === canonicalConfig.id);
+        const previous = connections[idx];
+        replacesSecretProfileWithSqlite =
+          canonicalConfig.type === "sqlite" &&
+          previous !== undefined &&
+          previous.type !== "sqlite" &&
+          previous.useSecretStorage !== false;
+        if (precondition?.kind === "create" && previous) {
+          throw new Error(
+            "A connection with this ID already exists. Reopen the form to create a new connection.",
+          );
+        }
+        if (precondition?.kind === "edit") {
+          if (precondition.id !== canonicalConfig.id || !previous) {
+            throw new Error(
+              "This connection was deleted. It was not recreated; close this editor.",
+            );
+          }
+          if (!precondition.state) {
+            throw new Error(
+              "Secret Storage was unavailable when the editor was opened. Reopen Edit Connection before saving.",
+            );
+          }
+          if (
+            !connectionEditStatesMatch(
+              precondition.state,
+              connectionEditState(
+                previous,
+                previous.useSecretStorage === false ||
+                  previous.type === "sqlite"
+                  ? {}
+                  : parseStoredConnectionSecrets(
+                      await this.store.getSecret(previous.id),
+                    ),
+              ),
             )
-          : undefined;
-      const next = [...connections];
-      if (idx >= 0) {
-        next[idx] = persistedConfig;
-      } else {
-        next.push(persistedConfig);
-      }
-      return {
-        connections: next,
-        result: idx >= 0,
-        rollback,
-      };
-    });
+          ) {
+            throw new Error(
+              "This connection changed since the editor was opened. Reopen Edit Connection before saving.",
+            );
+          }
+          persistedConfig = preserveTrustedSshFingerprint(
+            persistedConfig,
+            precondition.state,
+            previous,
+          );
+        }
+        let sessionChanged = false;
+        if (previous) {
+          const safePrevious = omitAmbiguousCredentialBearingUris(previous);
+          const hydratedPrevious = await this._hydratePassword(safePrevious);
+          const previousSecrets =
+            serializeConnectionSecretsForConfig(hydratedPrevious);
+          const nextSecrets = shouldForceSecretStorage(canonicalConfig)
+            ? serializeConnectionSecretsForStoredConfig(
+                canonicalConfig,
+                previousSecrets,
+                clearOptions,
+              )
+            : serializeConnectionSecretsForConfig(canonicalConfig);
+          sessionChanged =
+            connectionSessionChanged(
+              sanitizeConnectionConfigForResponse(safePrevious),
+              sanitizeConnectionConfigForResponse(persistedConfig),
+            ) ||
+            !isDeepStrictEqual(
+              parseStoredConnectionSecrets(previousSecrets),
+              parseStoredConnectionSecrets(nextSecrets),
+            );
+        }
+        const rollback =
+          canonicalConfig.type !== "sqlite" &&
+          shouldForceSecretStorage(canonicalConfig)
+            ? await this._persistConnectionSecretsIfNeeded(
+                canonicalConfig,
+                clearOptions,
+                previous?.useSecretStorage === false ||
+                  previous?.type === "sqlite",
+              )
+            : undefined;
+        const next = [...connections];
+        if (idx >= 0) {
+          next[idx] = persistedConfig;
+        } else {
+          next.push(persistedConfig);
+        }
+        return {
+          connections: next,
+          result: sessionChanged,
+          rollback,
+        };
+      },
+    );
     this._connectionsCache = null;
+    if (sessionChanged) this.markConnectionSessionChanged(canonicalConfig.id);
+    if (
+      persistedConfig.useSecretStorage === false ||
+      replacesSecretProfileWithSqlite
+    ) {
+      await this._removeUnusedConnectionSecrets(canonicalConfig.id);
+    }
     this.invalidateDriverStaticMetadata(canonicalConfig.id);
     if (
-      isEdit &&
-      (this.isConnected(canonicalConfig.id) ||
+      sessionChanged &&
+      (this.driverMap.has(canonicalConfig.id) ||
         this.isConnecting(canonicalConfig.id))
     ) {
       await this.disconnectFrom(canonicalConfig.id);
@@ -1353,10 +1689,29 @@ export class ConnectionManager
   }
 
   async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
-    if (!config.useSecretStorage) {
+    if (
+      config.useSecretStorage === false ||
+      config.type === "sqlite" ||
+      shouldKeepHandWrittenSecretsInSettings(config)
+    ) {
       return config;
     }
-    const stored = await this.store.getSecret(config.id);
+    let stored: string | undefined;
+    try {
+      stored = await this.store.getSecret(config.id);
+      this._secretReadFailures.delete(config.id);
+    } catch (error) {
+      if (config.useSecretStorage === true) throw error;
+      this._secretReadFailures.add(config.id);
+      logger.error(
+        `Could not read Secret Storage for connection "${config.id}"`,
+        error,
+      );
+      return config;
+    }
+    if (config.useSecretStorage !== true && stored === undefined) {
+      return config;
+    }
     const secrets = parseStoredConnectionSecrets(stored);
     const ssh = config.ssh
       ? {
@@ -1374,10 +1729,19 @@ export class ConnectionManager
       awsSecretAccessKey:
         secrets.awsSecretAccessKey ?? config.awsSecretAccessKey,
       awsSessionToken: secrets.awsSessionToken ?? config.awsSessionToken,
-      connectionUri: secrets.connectionUri ?? config.connectionUri,
-      uri: secrets.uri ?? config.uri,
-      endpoint: secrets.endpoint ?? config.endpoint,
-      awsEndpoint: secrets.awsEndpoint ?? config.awsEndpoint,
+      connectionUri: resolveStoredCredentialBearingUri(
+        config.connectionUri,
+        secrets.connectionUri,
+      ),
+      uri: resolveStoredCredentialBearingUri(config.uri, secrets.uri),
+      endpoint: resolveStoredCredentialBearingUri(
+        config.endpoint,
+        secrets.endpoint,
+      ),
+      awsEndpoint: resolveStoredCredentialBearingUri(
+        config.awsEndpoint,
+        secrets.awsEndpoint,
+      ),
       ssh,
       tls:
         config.tls !== undefined
@@ -1475,6 +1839,7 @@ export class ConnectionManager
     ) {
       throw new Error("[RapiDB] SSH settings are incomplete.");
     }
+    const readyTimeoutMs = this.store.getTimeoutSettings().connectionTimeoutMs;
 
     if (ssh.authMethod === "password") {
       if (!ssh.password) {
@@ -1487,6 +1852,7 @@ export class ConnectionManager
         username,
         hostVerificationMode,
         fingerprintSha256,
+        readyTimeoutMs,
         auth: {
           kind: "password",
           password: ssh.password,
@@ -1504,6 +1870,7 @@ export class ConnectionManager
       username,
       hostVerificationMode,
       fingerprintSha256,
+      readyTimeoutMs,
       auth: {
         kind: "privateKey",
         privateKey: ssh.privateKey,
@@ -1541,22 +1908,7 @@ export class ConnectionManager
     value: string | undefined,
     defaultPort: number,
   ): { host: string; port: number } | undefined {
-    if (!value) {
-      return undefined;
-    }
-
-    const url = new URL(value);
-    return {
-      host: url.hostname,
-      port:
-        url.port.length > 0
-          ? Number.parseInt(url.port, 10)
-          : url.protocol === "https:"
-            ? 443
-            : url.protocol === "http:"
-              ? 80
-              : defaultPort,
-    };
+    return resolveUrlRemoteTarget(value, defaultPort);
   }
 
   private resolveElasticsearchRemoteTarget(
@@ -1956,14 +2308,31 @@ export class ConnectionManager
   }> {
     const prepared = await this.prepareDriverConfig(config, signal);
     let driver: IDBDriver | undefined;
-    let rejectAbort: ((reason: DOMException) => void) | undefined;
+    let rejectAbort: ((reason: Error) => void) | undefined;
+    let tunnelClosedError: Error | undefined;
 
     const onAbort = () => {
       void driver?.disconnect().catch(() => undefined);
       rejectAbort?.(new DOMException("Aborted", "AbortError"));
     };
+    const tunnelCloseSubscription = prepared.runtime?.onDidClose?.((error) => {
+      tunnelClosedError ??= new Error(
+        "[RapiDB] SSH tunnel closed before the database connection was established.",
+        { cause: error },
+      );
+      void driver?.disconnect().catch(() => undefined);
+      rejectAbort?.(tunnelClosedError);
+    });
 
     try {
+      if (prepared.runtime && persistTrustedFingerprint) {
+        await this.persistTrustedSshFingerprintIfNeeded(
+          config,
+          prepared.runtime.verifiedFingerprintSha256,
+          signal,
+        );
+      }
+      if (tunnelClosedError) throw tunnelClosedError;
       driver = this.createDriver(prepared.config);
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
@@ -1973,7 +2342,7 @@ export class ConnectionManager
         rejectAbort = reject;
       });
       const pendingConnect = driver.connect().finally(async () => {
-        if (signal.aborted) {
+        if (signal.aborted || tunnelClosedError) {
           await this.disposeUnboundConnectionResources(
             driver,
             prepared.runtime,
@@ -1982,20 +2351,14 @@ export class ConnectionManager
       });
       await Promise.race([pendingConnect, abortPromise]);
       signal.throwIfAborted();
-      if (prepared.runtime && persistTrustedFingerprint) {
-        await this.persistTrustedSshFingerprintIfNeeded(
-          config,
-          prepared.runtime.verifiedFingerprintSha256,
-          signal,
-        );
-      }
-      signal.throwIfAborted();
+      if (tunnelClosedError) throw tunnelClosedError;
       return { driver, runtime: prepared.runtime };
     } catch (err) {
       await this.disposeUnboundConnectionResources(driver, prepared.runtime);
       throw normalizeUnknownError(err, config);
     } finally {
       signal.removeEventListener("abort", onAbort);
+      tunnelCloseSubscription?.dispose();
     }
   }
 
@@ -2012,6 +2375,33 @@ export class ConnectionManager
     if (runtime) {
       await this.disposeSshRuntime(runtime, "Unbound SSH runtime disposal");
     }
+  }
+
+  private watchSshRuntime(
+    id: string,
+    runtime: SshRuntime,
+    connectEpoch: number,
+  ): void {
+    runtime.onDidClose?.(() => {
+      if (
+        this._disposed ||
+        this.disposedSshRuntimes.has(runtime) ||
+        this.sshRuntimeMap.get(id) !== runtime ||
+        this._isStaleConnectEpoch(id, connectEpoch)
+      ) {
+        return;
+      }
+      logger.warn(
+        `SSH tunnel for connection "${id}" closed unexpectedly; disconnecting.`,
+      );
+      void this.disconnectFrom(id)
+        .then(() => {
+          if (!this._disposed) this._onDidChangeConnections.fire();
+        })
+        .catch((error) => {
+          logger.error("Failed to disconnect after SSH tunnel closed", error);
+        });
+    });
   }
 
   private async disposeSshRuntime(
@@ -2103,6 +2493,7 @@ export class ConnectionManager
     this._onDidInvalidateConnectionMetadata.fire(id);
     this._onDidChangeConnections.fire();
     void (async () => {
+      this._secretReadFailures.delete(id);
       try {
         if (this.driverMap.has(id)) {
           await this.disconnectRegisteredDriver(id, true);
@@ -2141,6 +2532,7 @@ export class ConnectionManager
         if (intent === "explicit") this.automaticReconnectBlocks.delete(id);
         if (runtime) {
           this.sshRuntimeMap.set(id, runtime);
+          this.watchSshRuntime(id, runtime, connectEpoch);
         }
         this._invalidateSchemaState(id);
         this._onDidInvalidateConnectionMetadata.fire(id);
@@ -2150,7 +2542,7 @@ export class ConnectionManager
         if (ac.signal.aborted && this._isStaleConnectEpoch(id, connectEpoch)) {
           resolveAttempt();
         } else {
-          rejectAttempt(err);
+          rejectAttempt(this._withSecretReadHint(id, err));
         }
       } finally {
         if (this._connectAbortControllerMap.get(id) === ac) {
@@ -2464,7 +2856,7 @@ export class ConnectionManager
           return;
         }
 
-        const nextState = await this._loadTableDetailInternal(driver, request);
+        const nextState = await loadTableDetail(driver, request);
         if (
           !this._isLiveTableDetailEntry(
             request.connectionId,
@@ -2561,7 +2953,10 @@ export class ConnectionManager
     scope: ExplorerSchemaScope,
   ): void {
     this.markSchemaScopeExpanded(connectionId, scope);
+    this.warmSchemaScope(connectionId, scope);
+  }
 
+  warmSchemaScope(connectionId: string, scope: ExplorerSchemaScope): void {
     const config = this.getConnection(connectionId);
     const configuredDefaultDatabase = config
       ? getConfiguredDefaultDatabaseName(config)
@@ -3404,122 +3799,6 @@ export class ConnectionManager
     return loadSchemaScope(driver, databaseName, schemaName);
   }
 
-  private async _loadTableDetailInternal(
-    driver: IDBDriver,
-    request: TableDetailRequest,
-  ): Promise<
-    Pick<TableDetailState, "snapshot" | "status" | "isPartial" | "error">
-  > {
-    const manifest = resolveDriverEntityManifest(driver);
-
-    const loadSection = async <T>(
-      availability: DriverEntityAvailability,
-      loader: () => Promise<T[] | null>,
-    ): Promise<{
-      status: SchemaLoadStatus;
-      items: T[];
-      error?: string;
-    }> => {
-      if (availability === "not_applicable") {
-        return {
-          status: "loaded",
-          items: [],
-        };
-      }
-
-      try {
-        const items = await loader();
-        if (items === null) {
-          return {
-            status: "loaded",
-            items: [],
-          };
-        }
-        return {
-          status: "loaded",
-          items,
-        };
-      } catch (error: unknown) {
-        return {
-          status: "error",
-          items: [],
-          error: normalizeUnknownError(error).message,
-        };
-      }
-    };
-
-    const [columns, constraints, indexes, triggers] = await Promise.all([
-      loadSection(
-        resolveDriverTableSectionAvailability(
-          manifest,
-          request.objectKind,
-          "columns",
-        ),
-        async () =>
-          driver.describeColumns(
-            request.database,
-            request.schema,
-            request.table,
-          ),
-      ),
-      loadSection(
-        resolveDriverTableSectionAvailability(
-          manifest,
-          request.objectKind,
-          "constraints",
-        ),
-        async () =>
-          driver.getConstraints(
-            request.database,
-            request.schema,
-            request.table,
-          ),
-      ),
-      loadSection(
-        resolveDriverTableSectionAvailability(
-          manifest,
-          request.objectKind,
-          "indexes",
-        ),
-        async () =>
-          driver.getIndexes(request.database, request.schema, request.table),
-      ),
-      loadSection(
-        resolveDriverTableSectionAvailability(
-          manifest,
-          request.objectKind,
-          "triggers",
-        ),
-        async () =>
-          driver.getTriggers(request.database, request.schema, request.table),
-      ),
-    ]);
-
-    const snapshot: TableStructureSnapshot = {
-      columns,
-      constraints,
-      indexes,
-      triggers,
-    };
-
-    const sectionStates = [
-      snapshot.columns,
-      snapshot.constraints,
-      snapshot.indexes,
-      snapshot.triggers,
-    ];
-    const allErrored = sectionStates.every((state) => state.status === "error");
-    const hasError = sectionStates.some((state) => state.status === "error");
-
-    return {
-      snapshot,
-      status: allErrored ? "error" : "loaded",
-      isPartial: hasError,
-      error: allErrored
-        ? sectionStates.find((state) => state.error)?.error
-        : undefined,
-    };
-  }
   async testConnection(
     config: Omit<ConnectionConfig, "id">,
     signal?: AbortSignal,
@@ -3540,14 +3819,118 @@ export class ConnectionManager
     let driver: IDBDriver | undefined;
     try {
       const testSignal = signal ?? new AbortController().signal;
+      let testConfig = configWithId;
+      let successMessage: string | undefined;
+      if (
+        configWithId.type === "sqlite" &&
+        configWithId.filePath &&
+        configWithId.filePath !== ":memory:" &&
+        !configWithId.readOnly
+      ) {
+        const target = path.resolve(configWithId.filePath);
+        let exists = true;
+        try {
+          await runAbortableFilesystemOperation(testSignal, () =>
+            fs.stat(target),
+          );
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOTDIR")
+            throw new Error(
+              `Directory does not exist: ${path.dirname(target)}`,
+            );
+          if (code !== "ENOENT") throw error;
+          exists = false;
+          try {
+            const link = await runAbortableFilesystemOperation(testSignal, () =>
+              fs.lstat(target),
+            );
+            if (link.isSymbolicLink())
+              throw new Error(
+                "SQLite test cannot safely verify a dangling symbolic link.",
+              );
+          } catch (linkError) {
+            if ((linkError as NodeJS.ErrnoException).code !== "ENOENT")
+              throw linkError;
+          }
+        }
+        if (exists) {
+          const file = await runAbortableFilesystemOperation(
+            testSignal,
+            () => fs.open(target, "r+"),
+            (handle) => handle.close(),
+          );
+          try {
+            testSignal.throwIfAborted();
+          } finally {
+            const closeFile = file.close();
+            void closeFile.catch(() => undefined);
+            await runAbortableFilesystemOperation(testSignal, () => closeFile);
+          }
+        }
+        testSignal.throwIfAborted();
+        const directory = exists
+          ? path.dirname(
+              await runAbortableFilesystemOperation(testSignal, () =>
+                fs.realpath(target),
+              ),
+            )
+          : path.dirname(target);
+        let probe: string;
+        try {
+          probe = await runAbortableFilesystemOperation(
+            testSignal,
+            () => fs.mkdtemp(path.join(directory, ".rapidb-test-")),
+            (dir) => fs.rmdir(dir),
+          );
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR")
+            throw new Error(`Directory does not exist: ${directory}`);
+          throw error;
+        }
+        const cleanupProbe = fs.rmdir(probe);
+        void cleanupProbe.catch(() => undefined);
+        await runAbortableFilesystemOperation(testSignal, () => cleanupProbe);
+        testSignal.throwIfAborted();
+        testConfig = exists
+          ? { ...configWithId, readOnly: true }
+          : { ...configWithId, filePath: ":memory:", readOnly: false };
+        successMessage = exists
+          ? "SQLite opened read-only; file and directory write permissions were checked."
+          : "SQLite runtime and directory write permissions verified; the database will be created when connecting.";
+      } else if (
+        configWithId.type === "sqlite" &&
+        configWithId.filePath !== ":memory:"
+      ) {
+        if (configWithId.filePath) {
+          const target = path.resolve(configWithId.filePath);
+          try {
+            await runAbortableFilesystemOperation(testSignal, () =>
+              fs.stat(target),
+            );
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code;
+            if (code === "ENOENT" || code === "ENOTDIR")
+              throw new Error(
+                "SQLite file does not exist; read-only connections do not create a database.",
+              );
+            throw error;
+          }
+        }
+        testConfig = { ...configWithId, readOnly: true };
+      }
       const prepared = await this.connectPreparedDriver(
-        configWithId,
+        testConfig,
         testSignal,
         false,
       );
       runtime = prepared.runtime;
       driver = prepared.driver;
-      return { success: true };
+      return {
+        success: true,
+        ...(successMessage ? { message: successMessage } : {}),
+      };
     } catch (err: unknown) {
       const error = normalizeUnknownError(err, configWithId);
       return { success: false, error: error.message };
@@ -3570,6 +3953,8 @@ export class ConnectionManager
     }
 
     this._disposed = true;
+    for (const timer of this.orphanedSecretTimers.values()) clearTimeout(timer);
+    this.orphanedSecretTimers.clear();
 
     for (const connectionId of this._connectingMap.keys()) {
       this._nextConnectionEpoch(connectionId);
@@ -3608,6 +3993,7 @@ export class ConnectionManager
     this._onDidSchemaLoad.dispose();
     this._onDidChangeSchemaState.dispose();
     this._onDidRefreshSchemas.dispose();
+    this._onDidChangeConnectionSession.dispose();
   }
   getHistory(connectionId?: string): HistoryEntry[] {
     const all = this.store.readHistory();

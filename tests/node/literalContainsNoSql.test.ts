@@ -71,7 +71,6 @@ describe("H1 NoSQL active Contains routes", () => {
     });
     const find = vi.fn(
       (criteria: { value: { $regex: string; $options?: string } }) => {
-        if (mode === "fallback") throw new Error("server unavailable");
         const regex = new RegExp(
           criteria.value.$regex,
           criteria.value.$options,
@@ -89,6 +88,13 @@ describe("H1 NoSQL active Contains routes", () => {
       describeSchemaColumns: vi.fn().mockResolvedValue(columns),
       requireDb: () => ({ collection: () => ({ find }) }),
       readRows: vi.fn().mockResolvedValue(rows),
+      ...(mode === "fallback"
+        ? {
+            buildMongoFilterCriteria: () => {
+              throw new Error("untranslatable filter");
+            },
+          }
+        : {}),
     });
     for (const needle of needles) {
       const page = await driver.readTablePage(request("value", needle));
@@ -97,7 +103,7 @@ describe("H1 NoSQL active Contains routes", () => {
         needle,
       ).toEqual(samples.filter((value) => value.includes(needle)));
     }
-    expect(find).toHaveBeenCalledTimes(needles.length);
+    expect(find).toHaveBeenCalledTimes(mode === "server" ? needles.length : 0);
     if (mode === "server") {
       expect(find.mock.calls[0]?.[0].value.$regex).toBe("%");
       expect(find.mock.calls[1]?.[0].value.$regex).toBe("_");
@@ -110,25 +116,34 @@ describe("H1 NoSQL active Contains routes", () => {
       name: "H1",
       type: "redis",
     });
+    const sampleRow = (key: string) => ({
+      redisType: "string",
+      row: { key, value: "value", ttl: null, type: "string" },
+    });
     Object.assign(driver, {
       getDatabaseClient: vi.fn().mockResolvedValue({}),
-      readRows: vi.fn().mockResolvedValue(
-        samples.map((key) => ({
-          type: "string",
-          row: { key, value: "value", ttl: null },
-        })),
+      scanTableKeys: vi.fn().mockResolvedValue([...samples]),
+      readRowMetadata: vi.fn(async (_client: unknown, keys: string[]) =>
+        keys.map(sampleRow),
+      ),
+      readRowsForKeys: vi.fn(async (_client: unknown, keys: string[]) =>
+        keys.map(sampleRow),
       ),
     });
+    const driverOrder = (left: string, right: string) =>
+      left.localeCompare(right) || (left < right ? -1 : left > right ? 1 : 0);
     for (const needle of needles) {
       const page = await driver.readTablePage(request("key", needle));
       expect(
         page.rows.map((row) => row.key),
         needle,
-      ).toEqual(samples.filter((value) => value.includes(needle)));
+      ).toEqual(
+        samples.filter((value) => value.includes(needle)).sort(driverOrder),
+      );
     }
   });
 
-  it("Elasticsearch active bounded-search filtering does not strip % from _id Contains", async () => {
+  it("Elasticsearch active bounded-PIT filtering does not strip % from _id Contains", async () => {
     const driver = new ElasticsearchDriver({
       id: "h1-es",
       name: "H1",
@@ -137,10 +152,22 @@ describe("H1 NoSQL active Contains routes", () => {
     const search = vi.fn().mockResolvedValue({
       hits: {
         total: { value: samples.length, relation: "eq" },
-        hits: samples.map((_id) => ({ _id, _source: { value: "value" } })),
+        hits: samples.map((_id, cursor) => ({
+          _id,
+          _source: { value: "value" },
+          sort: [cursor],
+        })),
       },
     });
-    Object.assign(driver, { connected: true, client: { search } });
+    Object.assign(driver, {
+      connected: true,
+      client: {
+        search,
+        indices: { getSettings: vi.fn().mockResolvedValue({}) },
+        openPointInTime: vi.fn().mockResolvedValue({ id: "contains-pit" }),
+        closePointInTime: vi.fn().mockResolvedValue({ succeeded: true }),
+      },
+    });
     for (const needle of needles) {
       const page = await driver.readTablePage(request("_id", needle));
       expect(

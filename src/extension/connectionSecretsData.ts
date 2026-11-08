@@ -96,15 +96,3 @@ export function parseStoredConnectionSecretDocument(
     isLegacy: true,
   };
 }
-
-export function serializeStoredConnectionSecrets(
-  secrets: StoredConnectionSecrets,
-): string | undefined {
-  const filtered = Object.fromEntries(
-    Object.entries(secrets).filter(([, value]) => typeof value === "string"),
-  );
-
-  return Object.keys(filtered).length > 0
-    ? JSON.stringify(filtered)
-    : undefined;
-}

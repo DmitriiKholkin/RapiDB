@@ -10,12 +10,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
 
 const formatMock = vi.hoisted(() => vi.fn((_dialect?: string) => null));
+const selectionOverride = vi.hoisted(() => ({
+  current: undefined as string | null | undefined,
+}));
 
 vi.mock("../../src/webview/components/MonacoEditor", async () => {
   const React = await import("react");
 
   interface MockMonacoEditorHandle {
-    getSelectionOrValue(): string;
+    getSelectionOrValue(): string | null;
     getValue(): string;
     setValue(value: string): void;
     clearValue(): void;
@@ -51,6 +54,9 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
       ref,
       () => ({
         getSelectionOrValue: () => {
+          if (selectionOverride.current !== undefined) {
+            return selectionOverride.current;
+          }
           const textarea = textareaRef.current;
           const start = textarea?.selectionStart ?? 0;
           const end = textarea?.selectionEnd ?? 0;
@@ -114,6 +120,9 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
           }}
           onSelect={() => props.onSelectionChange?.()}
           onKeyDown={(event) => {
+            if (props.readOnly) {
+              return;
+            }
             if (
               event.key === "F5" ||
               (event.key === "Enter" && (event.ctrlKey || event.metaKey))
@@ -128,22 +137,6 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 
   return {
     MonacoEditor,
-    connTypeToDialect: (type: string) => {
-      switch (type) {
-        case "mysql":
-          return "mysql";
-        case "pg":
-          return "postgresql";
-        case "sqlite":
-          return "sqlite";
-        case "mssql":
-          return "transactsql";
-        case "oracle":
-          return "plsql";
-        default:
-          return "sql";
-      }
-    },
   };
 });
 
@@ -185,7 +178,13 @@ describe("QueryView", () => {
   beforeEach(() => {
     clearPostedMessages();
     formatMock.mockClear();
-    useQueryStore.setState({ status: "idle", result: null });
+    selectionOverride.current = undefined;
+    useQueryStore.setState({
+      status: "idle",
+      result: null,
+      activeOperation: null,
+      operationSequence: 0,
+    });
     useConnectionStore.setState({ connections: [], activeConnectionId: "" });
     useSchemaStore.setState({ schemaByConnection: {} });
   });
@@ -303,10 +302,14 @@ describe("QueryView", () => {
       { ok: true },
       { ok: true, requestId: "other" },
       { ok: "yes", ...(first as object) },
+      { ok: false, error: "Uncorrelated failure" },
+      { ok: false, requestId: "other", error: "Wrong request" },
+      { ...(first as object), ok: false, error: 42 },
     ]) {
       receiveBookmark(payload);
       expect(button.disabled).toBe(true);
       expect(button.title).toBe("Add to Bookmarks");
+      expect(screen.queryByRole("alert")).toBeNull();
     }
     receiveBookmark({
       ...(first as object),
@@ -314,13 +317,173 @@ describe("QueryView", () => {
       error: "Storage failed",
     });
     expect(button.disabled).toBe(false);
+    expect(
+      screen.getByRole("alert", { name: "Bookmark error" }).textContent,
+    ).toBe("Failed to save bookmark: Storage failed");
+    const queryState = useQueryStore.getState();
+    expect(queryState.status).toBe("idle");
+    expect(queryState.result).toBeNull();
     await user.click(button);
     const retry = getLastPostedMessage()?.payload;
     expect(retry).not.toEqual(first);
-    receiveBookmark({ ...(first as object), ok: false });
+    expect(screen.queryByRole("alert")).toBeNull();
+    receiveBookmark({ ...(first as object), ok: false, error: "Late failure" });
     expect(button.disabled).toBe(true);
+    expect(screen.queryByRole("alert")).toBeNull();
     receiveBookmark({ ...(retry as object), ok: true });
     expect(button.title).toBe("Already bookmarked");
+    receiveBookmark({ ...(retry as object), ok: false, error: "Duplicate" });
+    expect(button.title).toBe("Already bookmarked");
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it.each([
+    undefined,
+    "",
+    "  \n ",
+  ])("shows a fallback for bookmark failure detail %j", async (error) => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <QueryView connectionId="conn-1" initialQueryText="select 1" />,
+    );
+    const button = screen.getByRole("button", { name: "Bookmark" });
+    await user.click(button);
+    receiveBookmark({
+      ...(getLastPostedMessage()?.payload as object),
+      ok: false,
+      ...(error !== undefined ? { error } : {}),
+    });
+    expect(
+      screen.getByRole("alert", { name: "Bookmark error" }).textContent,
+    ).toBe("Failed to save bookmark.");
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    await expectNoAxeViolations(container);
+  });
+
+  it.each([
+    "success",
+    "error",
+    "running",
+  ] as const)("keeps bookmark failures separate from SQL state (%s)", async (status) => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    const button = screen.getByRole("button", { name: "Bookmark" });
+    await user.click(button);
+    const request = getLastPostedMessage()?.payload;
+    act(() => {
+      useQueryStore.setState({
+        status,
+        result:
+          status === "running"
+            ? null
+            : {
+                columns: ["id"],
+                columnMeta: [],
+                rows: [{ id: 1 }],
+                rowCount: 1,
+                executionTimeMs: 5,
+                ...(status === "error" ? { error: "SQL syntax error" } : {}),
+              },
+      });
+    });
+    const queryState = useQueryStore.getState();
+    const resultsText = screen.getByTestId("results-panel").textContent;
+    receiveBookmark({ ...(request as object), ok: false, error: "Disk full" });
+    expect(
+      screen.getByRole("alert", { name: "Bookmark error" }).textContent,
+    ).toBe("Failed to save bookmark: Disk full");
+    expect(useQueryStore.getState()).toBe(queryState);
+    expect(screen.getByTestId("results-panel").textContent).toBe(resultsText);
+    if (status !== "running") {
+      await user.click(button);
+      const retry = getLastPostedMessage()?.payload;
+      expect(screen.queryByRole("alert")).toBeNull();
+      receiveBookmark({ ...(retry as object), ok: true });
+      expect(useQueryStore.getState()).toBe(queryState);
+    }
+  });
+
+  it.each([
+    "edit",
+    "clear",
+    "switch",
+    "external switch",
+    "removal",
+  ])("clears bookmark errors on %s and ignores stale failures", async (action) => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    act(() =>
+      dispatchIncomingMessage("connections", [
+        { id: "conn-1", name: "A", type: "pg" },
+        { id: "conn-2", name: "B", type: "pg" },
+      ]),
+    );
+    const button = screen.getByRole("button", { name: "Bookmark" });
+    await user.click(button);
+    const first = getLastPostedMessage()?.payload;
+    receiveBookmark({
+      ...(first as object),
+      ok: false,
+      error: "Storage failed",
+    });
+    expect(screen.queryByRole("alert")).not.toBeNull();
+
+    const changeContext = async () => {
+      if (action === "edit") {
+        fireEvent.change(screen.getByLabelText("SQL editor"), {
+          target: { value: "select 2" },
+        });
+      } else if (action === "clear") {
+        await user.click(screen.getByRole("button", { name: "Clear" }));
+      } else if (action === "switch") {
+        await user.selectOptions(
+          screen.getByLabelText("Active connection"),
+          "conn-2",
+        );
+      } else if (action === "external switch") {
+        act(() => useConnectionStore.getState().setActiveConnection("conn-2"));
+      } else {
+        act(() =>
+          dispatchIncomingMessage("connections", [
+            { id: "conn-2", name: "B", type: "pg" },
+          ]),
+        );
+      }
+    };
+    await changeContext();
+    expect(screen.queryByRole("alert")).toBeNull();
+    receiveBookmark({
+      ...(first as object),
+      ok: false,
+      error: "Duplicate failure",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("SQL editor"), {
+      target: { value: "select 3" },
+    });
+    if (action === "removal") {
+      await user.selectOptions(
+        screen.getByLabelText("Active connection"),
+        "conn-2",
+      );
+    }
+    await user.click(button);
+    const pending = getLastPostedMessage()?.payload;
+    expect(getLastPostedMessage()?.type).toBe("addBookmark");
+    if (action === "switch" || action === "external switch") {
+      act(() => useConnectionStore.getState().setActiveConnection("conn-1"));
+    } else if (action === "removal") {
+      act(() => dispatchIncomingMessage("connections", []));
+    } else {
+      await changeContext();
+    }
+    receiveBookmark({
+      ...(pending as object),
+      ok: false,
+      error: "Stale failure",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("resets an initially saved bookmark when switching connections", async () => {
@@ -642,7 +805,70 @@ describe("QueryView", () => {
     });
   });
 
-  it("resets running state on connection switch and ignores the old completion", async () => {
+  it("refuses to run several non-empty editor selections", async () => {
+    const user = userEvent.setup();
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "First", type: "pg" },
+    ]);
+    selectionOverride.current = null;
+
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    expect(
+      getPostedMessages().filter((message) => message.type === "executeQuery"),
+    ).toHaveLength(0);
+    expect(useQueryStore.getState()).toMatchObject({
+      status: "error",
+      result: {
+        error:
+          "Multiple selections cannot be run together. Select a single query to run.",
+      },
+    });
+  });
+
+  it("keeps a running query controllable after the view remounts", async () => {
+    const user = userEvent.setup();
+    const connections = [{ id: "conn-1", name: "First", type: "pg" }];
+    const { unmount } = render(
+      <QueryView connectionId="conn-1" initialQueryText="select 1" />,
+    );
+    dispatchIncomingMessage("connections", connections);
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    const request = getPostedMessages().find(
+      (message) => message.type === "executeQuery",
+    )?.payload as { operationId: string; connectionId: string };
+    unmount();
+
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    act(() => dispatchIncomingMessage("connections", connections));
+    expect(useQueryStore.getState().status).toBe("running");
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "cancelQuery",
+      payload: { operationId: request.operationId },
+    });
+
+    act(() =>
+      dispatchIncomingMessage("queryResult", {
+        ...request,
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+      }),
+    );
+    expect(useQueryStore.getState().status).toBe("success");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    const nextRequest = getLastPostedMessage();
+    expect(nextRequest?.type).toBe("executeQuery");
+    const newId = (nextRequest?.payload as { operationId: string }).operationId;
+    expect(newId).not.toBe(request.operationId);
+  });
+
+  it("locks the editor and connection while a query is running", async () => {
     const user = userEvent.setup();
     render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
     dispatchIncomingMessage("connections", [
@@ -658,22 +884,41 @@ describe("QueryView", () => {
       operationId: expect.any(String),
     });
     expect(useQueryStore.getState().status).toBe("running");
-    await user.selectOptions(
-      screen.getByRole("combobox", { name: "Active connection" }),
-      "conn-2",
-    );
-    expect(useQueryStore.getState().status).toBe("idle");
-    dispatchIncomingMessage("queryResult", {
-      ...(oldRequest as object),
-      connectionId: "conn-1",
-      columns: [],
-      rows: [],
-      rowCount: 0,
-      executionTimeMs: 0,
-    });
-    expect(useQueryStore.getState().status).toBe("idle");
-    await user.click(screen.getByRole("button", { name: "Run" }));
+    const editor = screen.getByLabelText("SQL editor") as HTMLTextAreaElement;
+    const connectionSelect = screen.getByRole("combobox", {
+      name: "Active connection",
+    }) as HTMLSelectElement;
+    expect(editor.readOnly).toBe(true);
+    expect(connectionSelect.disabled).toBe(true);
+    for (const name of ["Run", "Clear", "Format", "Bookmark"]) {
+      expect(
+        (screen.getByRole("button", { name }) as HTMLButtonElement).disabled,
+      ).toBe(true);
+    }
+    expect(
+      (screen.getByRole("button", { name: "Stop" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    fireEvent.keyDown(editor, { key: "F5" });
+    fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+    expect(
+      getPostedMessages().filter((message) => message.type === "executeQuery"),
+    ).toHaveLength(1);
     expect(useQueryStore.getState().status).toBe("running");
+
+    act(() =>
+      dispatchIncomingMessage("queryResult", {
+        ...(oldRequest as object),
+        connectionId: "conn-1",
+        columns: [],
+        rows: [],
+        rowCount: 0,
+        executionTimeMs: 0,
+      }),
+    );
+    expect(useQueryStore.getState().status).toBe("success");
+    expect(editor.readOnly).toBe(false);
+    expect(connectionSelect.disabled).toBe(false);
   });
 
   it("clears a removed connection without selecting another and ignores stale responses", async () => {
@@ -1208,6 +1453,72 @@ describe("QueryView", () => {
 
     await waitFor(() => {
       expect(screen.getByTestId("monaco-schema-count").textContent).toBe("1");
+    });
+  });
+
+  it("shows schema load failures and requests the schema again instead of treating it as loaded", async () => {
+    const user = userEvent.setup();
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialQueryText="select * from users"
+        editorPresentation={{
+          editorLanguage: "sql",
+          sqlDialect: "postgresql",
+        }}
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      { id: "conn-1", name: "Primary", type: "pg" },
+      { id: "conn-2", name: "Secondary", type: "pg" },
+    ]);
+    act(() =>
+      dispatchIncomingMessage("schema", {
+        connectionId: "conn-1",
+        schema: [],
+        error: "Not connected.",
+      }),
+    );
+
+    const notice = await screen.findByText("Schema unavailable");
+    expect(notice.closest("[title]")?.getAttribute("title")).toBe(
+      "Schema autocomplete unavailable: Not connected.",
+    );
+    expect(screen.queryByText("Indexing schema…")).toBeNull();
+
+    const combobox = screen.getByRole("combobox", {
+      name: "Active connection",
+    });
+    await user.selectOptions(combobox, "conn-2");
+    clearPostedMessages();
+    await user.selectOptions(combobox, "conn-1");
+
+    await waitFor(() => {
+      expect(getPostedMessages()).toEqual(
+        expect.arrayContaining([
+          { type: "getSchema", payload: { connectionId: "conn-1" } },
+        ]),
+      );
+    });
+
+    act(() =>
+      dispatchIncomingMessage("schema", {
+        connectionId: "conn-1",
+        schema: [
+          {
+            database: "app_db",
+            schema: "public",
+            object: "users",
+            columns: [],
+          },
+        ],
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("monaco-schema-count").textContent).toBe("1");
+      expect(screen.queryByText("Schema unavailable")).toBeNull();
     });
   });
 

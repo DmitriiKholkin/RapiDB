@@ -1,3 +1,8 @@
+import { getDynamoDbNativeCellValidationError } from "../../../shared/dynamodbCellInput";
+import {
+  hasPostgresArrayBounds,
+  parsePostgresArrayLiteral,
+} from "../../../shared/postgresArrayParser";
 import { redisBinarySnapshotDisplay } from "../../../shared/redisValueSnapshot";
 import type { ColumnTypeMeta as ColumnMeta } from "../../../shared/tableTypes";
 import { formatScalarValueForDisplay } from "../../utils/valueFormatting";
@@ -30,6 +35,7 @@ export interface StructuredCellDialogState {
 function resolveStructuredCellKind(
   column: Pick<ColumnMeta, "category" | "nativeType">,
 ): StructuredCellKind | null {
+  if (column.category === "binary") return null;
   const normalizedNativeType = column.nativeType.trim().toLowerCase();
 
   if (column.category === "array" || normalizedNativeType.endsWith("[]")) {
@@ -238,83 +244,69 @@ function isValidJsonStructure(tokens: string[]): boolean {
   return pos === tokens.length;
 }
 
-function isXmlLikeText(text: string, nativeType: string): boolean {
-  const trimmedNativeType = nativeType.trim().toLowerCase();
-  const trimmed = text.trim();
-
-  if (!trimmed.startsWith("<") || !trimmed.endsWith(">")) {
-    return false;
-  }
-
-  if (trimmedNativeType.includes("xml") || trimmed.startsWith("<?xml")) {
-    return true;
-  }
-
-  return (
-    /^<([A-Za-z_][\w:.-]*)(?:\s[^>]*)?>[\s\S]*<\/\1>$/.test(trimmed) ||
-    /^<([A-Za-z_][\w:.-]*)(?:\s[^>]*)?\/>$/.test(trimmed)
-  );
-}
-
-function shouldIncreaseXmlIndent(token: string): boolean {
-  if (
-    token.startsWith("</") ||
-    token.startsWith("<?") ||
-    token.startsWith("<!") ||
-    token.endsWith("/>") ||
-    token.includes("</")
-  ) {
-    return false;
-  }
-
-  return /^<[^/][^>]*>$/.test(token);
-}
-
-function formatXmlText(text: string): string {
-  const normalized = text.trim().replace(/>\s*</g, ">\n<");
-  const tokens = normalized
-    .split("\n")
-    .map((token) => token.trim())
-    .filter((token) => token.length > 0);
-
-  let indentLevel = 0;
-  const lines: string[] = [];
-
-  for (const token of tokens) {
-    if (token.startsWith("</")) {
-      indentLevel = Math.max(0, indentLevel - 1);
-    }
-
-    lines.push(`${"  ".repeat(indentLevel)}${token}`);
-
-    if (shouldIncreaseXmlIndent(token)) {
-      indentLevel += 1;
-    }
-  }
-
-  return lines.join("\n");
-}
-
 export function serializeStructuredCellDialogDraft(
   draftText: string,
   column: Pick<ColumnMeta, "category" | "nativeType">,
 ): string {
-  const structuredKind = resolveStructuredCellKind(column);
-  const trimmed = draftText.trim();
-
-  if (!structuredKind) {
+  if (!resolveStructuredCellKind(column)) {
     return draftText;
   }
 
-  if (structuredKind === "json" || structuredKind === "array") {
-    return trimmed;
+  return draftText.trim();
+}
+
+export function getStructuredCellDraftValidationError(
+  draftText: string,
+  column: Pick<ColumnMeta, "category" | "nativeType">,
+  isNull = false,
+): string | null {
+  if (isNull) {
+    return null;
   }
 
-  if (!trimmed) {
-    return "";
+  const structuredKind = resolveStructuredCellKind(column);
+  if (structuredKind !== "json" && structuredKind !== "array") {
+    return null;
   }
 
-  return trimmed.replace(/>\s+</g, "><");
+  const normalizedNativeType = column.nativeType.trim().toLowerCase();
+  const requiresObjectRoot = normalizedNativeType === "map";
+  const nativeError = getDynamoDbNativeCellValidationError(
+    draftText,
+    normalizedNativeType,
+  );
+  if (nativeError !== undefined) return nativeError;
+  const supportsPostgresLiteral =
+    structuredKind === "array" && normalizedNativeType.endsWith("[]");
+  const trimmed = draftText.trim();
+  if (
+    supportsPostgresLiteral &&
+    (trimmed.startsWith("{") || hasPostgresArrayBounds(trimmed))
+  ) {
+    try {
+      parsePostgresArrayLiteral(trimmed);
+      return null;
+    } catch {
+      return "Enter a valid PostgreSQL array literal before applying this value.";
+    }
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(draftText) as unknown;
+  } catch {
+    return requiresObjectRoot
+      ? "Enter a valid JSON object before applying this DynamoDB Map value."
+      : "Enter valid JSON before applying this value.";
+  }
+
+  if (
+    requiresObjectRoot &&
+    (parsed === null || Array.isArray(parsed) || typeof parsed !== "object")
+  ) {
+    return "Enter a JSON object before applying this DynamoDB Map value.";
+  }
+
+  return null;
 }
 
 export function getStructuredCellDialogValue(
@@ -392,8 +384,6 @@ export function getStructuredCellDialogValue(
   return {
     kind: "xml",
     language: "xml",
-    formattedText: isXmlLikeText(trimmed, column.nativeType)
-      ? formatXmlText(trimmed)
-      : rawText,
+    formattedText: rawText,
   };
 }

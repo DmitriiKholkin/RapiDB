@@ -1,4 +1,6 @@
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import { normalizeNumericToken } from "../../shared/numericNormalization";
+import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
@@ -79,14 +81,46 @@ const SQLITE_SELECT_STARTERS = new Set([
   "EXPLAIN",
   "VALUES",
 ]);
+const SQLITE_MAX_RETAINED_RESULT_SETS = 100;
+const SQLITE_MAX_RETAINED_RESULT_COLUMNS = 4096;
 const SQLITE_DML_STARTERS = new Set(["INSERT", "UPDATE", "DELETE", "REPLACE"]);
-const SQLITE_TIME_LITERAL_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+const SQLITE_TIME_LITERAL_RE =
+  /^(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:\s*(Z|[+-](\d{2}):(\d{2})))?$/i;
 const SQLITE_DATETIME_LITERAL_RE =
   /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
 const SQLITE_INT64_MIN = -(1n << 63n);
 const SQLITE_INT64_MAX = (1n << 63n) - 1n;
 const SQLITE_JS_SAFE_INTEGER_MIN = BigInt(Number.MIN_SAFE_INTEGER);
 const SQLITE_JS_SAFE_INTEGER_MAX = BigInt(Number.MAX_SAFE_INTEGER);
+
+function exactSqliteIntegerFilterToken(value: string): string {
+  const match = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(value);
+  if (!match || !(match[2] || match[3])) return value;
+  const digits = `${match[2]}${match[3] ?? ""}`.replace(/^0+/, "");
+  if (!digits) return "0";
+  const exponent = Number(match[4] ?? "0");
+  const shift = exponent - (match[3]?.length ?? 0);
+  if (!Number.isSafeInteger(shift)) return value;
+  let integer: string;
+  if (shift >= 0) {
+    if (digits.length + shift > 19) return value;
+    integer = digits + "0".repeat(shift);
+  } else {
+    const cut = digits.length + shift;
+    if (cut <= 0 || /[1-9]/.test(digits.slice(cut))) return value;
+    integer = digits.slice(0, cut);
+    if (integer.length > 19) return value;
+  }
+  const signed = `${match[1] === "-" ? "-" : ""}${integer}`;
+  const number = BigInt(signed);
+  return number >= SQLITE_INT64_MIN && number <= SQLITE_INT64_MAX
+    ? number.toString()
+    : value;
+}
+
+function normalizeSqliteIntegerTrailingDot(value: string): string {
+  return value.replace(/^(\s*[+-]?\d+)\.(?=([eE][+-]?\d+)?\s*$)/, "$1");
+}
 function findClosingSqliteParen(sql: string, openIndex: number): number {
   let depth = 0;
   let quote: "'" | '"' | "`" | "]" | null = null;
@@ -224,14 +258,25 @@ function approximateNumericFilterTolerance(rawValue: string): number {
 function sqliteDeclaredTypeBase(typeName: string): string {
   return typeName.toUpperCase().trim().split("(")[0].trim();
 }
-function classifySql(sql: string): "select" | "dml" {
+function classifySql(sql: string): SqlStatementKind {
   const start = skipSqlTrivia(sql, 0);
   const leadingKeyword = readSqlKeyword(sql, start);
   if (!leadingKeyword) return "dml";
   if (leadingKeyword.keyword === "WITH") {
-    return classifyWithStatement(sql, leadingKeyword.next);
+    const mainKeyword = sqliteWithMainKeyword(sql, leadingKeyword.next);
+    return mainKeyword && SQLITE_SELECT_STARTERS.has(mainKeyword)
+      ? "select"
+      : "dml";
   }
   return SQLITE_SELECT_STARTERS.has(leadingKeyword.keyword) ? "select" : "dml";
+}
+function isSQLiteDmlStatement(sql: string): boolean {
+  const leadingKeyword = readSqlKeyword(sql, 0);
+  const keyword =
+    leadingKeyword?.keyword === "WITH"
+      ? sqliteWithMainKeyword(sql, leadingKeyword.next)
+      : leadingKeyword?.keyword;
+  return keyword !== undefined && SQLITE_DML_STARTERS.has(keyword);
 }
 function splitSQLiteScript(sql: string): string[] {
   const stmts: string[] = [];
@@ -453,11 +498,63 @@ function sqliteColumnDefinitionName(definition: string): string | null {
     }
     return null;
   }
-  const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(trimmed);
+  const match = /^[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/.exec(
+    trimmed,
+  );
   return match?.[0] ?? null;
 }
-function sqliteSplitCreateDefinitions(createSql: string): string[] {
-  const openParenIndex = createSql.indexOf("(");
+function sqliteAsciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
+}
+function stripSqliteComments(sql: string): string {
+  let stripped = "";
+  let index = 0;
+  while (index < sql.length) {
+    const current = sql[index];
+    if (
+      current === '"' ||
+      current === "'" ||
+      current === "`" ||
+      current === "["
+    ) {
+      const end = skipQuotedSql(sql, index);
+      stripped += sql.slice(index, end);
+      index = end;
+      continue;
+    }
+    if (
+      (current === "-" && sql[index + 1] === "-") ||
+      (current === "/" && sql[index + 1] === "*")
+    ) {
+      index = skipSqlTrivia(sql, index);
+      stripped += " ";
+      continue;
+    }
+    stripped += current;
+    index++;
+  }
+  return stripped;
+}
+function sqliteSplitCreateDefinitions(rawCreateSql: string): string[] {
+  const createSql = stripSqliteComments(rawCreateSql);
+  let openParenIndex = -1;
+  for (let index = 0; index < createSql.length; ) {
+    const current = createSql[index];
+    if (
+      current === '"' ||
+      current === "'" ||
+      current === "`" ||
+      current === "["
+    ) {
+      index = skipQuotedSql(createSql, index);
+      continue;
+    }
+    if (current === "(") {
+      openParenIndex = index;
+      break;
+    }
+    index++;
+  }
   if (openParenIndex < 0) {
     return [];
   }
@@ -542,7 +639,7 @@ function parseSqliteGeneratedColumns(
       .slice(openParenIndex + 1, closeParenIndex)
       .trim();
     const suffix = definition.slice(closeParenIndex + 1);
-    details.set(columnName.toLowerCase(), {
+    details.set(sqliteAsciiLower(columnName), {
       expression: expression || undefined,
       generatedKind: /\bSTORED\b/i.test(suffix)
         ? "stored"
@@ -553,7 +650,7 @@ function parseSqliteGeneratedColumns(
   }
   return details;
 }
-function classifyWithStatement(sql: string, start: number): SqlStatementKind {
+function sqliteWithMainKeyword(sql: string, start: number): string | undefined {
   let index = skipSqlTrivia(sql, start);
   const maybeRecursive = readSqlKeyword(sql, index);
   if (maybeRecursive?.keyword === "RECURSIVE") {
@@ -561,14 +658,14 @@ function classifyWithStatement(sql: string, start: number): SqlStatementKind {
   }
   while (index < sql.length) {
     index = skipSqlIdentifier(sql, index);
-    if (index >= sql.length) return "dml";
+    if (index >= sql.length) return undefined;
     index = skipSqlTrivia(sql, index);
     if (sql[index] === "(") {
       index = skipBalancedParens(sql, index);
       index = skipSqlTrivia(sql, index);
     }
     const asKeyword = readSqlKeyword(sql, index);
-    if (asKeyword?.keyword !== "AS") return "dml";
+    if (asKeyword?.keyword !== "AS") return undefined;
     index = skipSqlTrivia(sql, asKeyword.next);
     const materializedKeyword = readSqlKeyword(sql, index);
     if (materializedKeyword?.keyword === "NOT") {
@@ -579,7 +676,7 @@ function classifyWithStatement(sql: string, start: number): SqlStatementKind {
     } else if (materializedKeyword?.keyword === "MATERIALIZED") {
       index = skipSqlTrivia(sql, materializedKeyword.next);
     }
-    if (sql[index] !== "(") return "dml";
+    if (sql[index] !== "(") return undefined;
     index = skipBalancedParens(sql, index);
     index = skipSqlTrivia(sql, index);
     if (sql[index] === ",") {
@@ -588,10 +685,7 @@ function classifyWithStatement(sql: string, start: number): SqlStatementKind {
     }
     break;
   }
-  const mainKeyword = readSqlKeyword(sql, index);
-  if (!mainKeyword) return "dml";
-  if (SQLITE_SELECT_STARTERS.has(mainKeyword.keyword)) return "select";
-  return SQLITE_DML_STARTERS.has(mainKeyword.keyword) ? "dml" : "dml";
+  return readSqlKeyword(sql, index)?.keyword;
 }
 function isUnsafeSQLiteScript(sql: string): boolean {
   let keyword = nextSqlKeyword(sql, 0);
@@ -624,14 +718,23 @@ function canSQLiteStatementReturnRows(sql: string): boolean {
 }
 function normalizeSqliteTimeLiteral(value: string): string | null {
   const trimmed = value.trim();
-  if (!SQLITE_TIME_LITERAL_RE.test(trimmed)) return null;
-  const parts = trimmed.split(":");
-  const hours = Number(parts[0]);
-  const minutes = Number(parts[1]);
-  const secondsPart = parts[2] ?? "00";
-  const seconds = Number(secondsPart.split(".")[0]);
-  if (hours > 23 || minutes > 59 || seconds > 59) return null;
-  return parts.length === 2 ? `${trimmed}:00` : trimmed;
+  const match = SQLITE_TIME_LITERAL_RE.exec(trimmed);
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  const seconds = Number(match[3] ?? "00");
+  if (
+    hours > 24 ||
+    minutes > 59 ||
+    seconds > 59 ||
+    Number(match[5] ?? 0) > 14 ||
+    Number(match[6] ?? 0) > 59
+  )
+    return null;
+  return match[3] ? trimmed : `${trimmed.slice(0, 5)}:00${trimmed.slice(5)}`;
+}
+function sqliteTimeKeyExpression(column: string): string {
+  return `COALESCE(RAPIDB_TIME_KEY(${column}), RAPIDB_TIME_KEY(TIME(${column})))`;
 }
 function normalizeSqliteDatetimeLiteral(value: string): string | null {
   const trimmed = value.trim().replace(/ ([+-]\d{2}:\d{2})$/, "$1");
@@ -670,6 +773,9 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   const offsetMinutes = Number(match[8] ?? "00");
   if (offsetHours > 14 || offsetMinutes > 59) return null;
   return normalized;
+}
+function sqliteDatetimeKeyExpression(column: string): string {
+  return `COALESCE(RAPIDB_DATETIME_KEY(${column}), RAPIDB_DATETIME_KEY(DATETIME(${column})))`;
 }
 function parseSqliteBlobDisplayValue(val: string): Uint8Array | null {
   try {
@@ -763,7 +869,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       {
         filePath: this.config.filePath,
         readOnly: this.config.readOnly,
-        sqliteWalMode: this.config.sqliteWalMode,
       },
       this.runtimeTargets,
     );
@@ -824,13 +929,18 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         sql: string;
       }[];
       createSql = master[0]?.sql ?? "";
-      const re =
-        /[`"[]?(\w+)[`"\]]?\s+INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/gi;
-      let match: RegExpExecArray | null;
-      match = re.exec(createSql);
-      while (match !== null) {
-        autoIncrementColumns.add(match[1].toLowerCase());
-        match = re.exec(createSql);
+      for (const definition of sqliteSplitCreateDefinitions(createSql)) {
+        const columnName = sqliteColumnDefinitionName(definition);
+        if (!columnName) continue;
+        const nameEnd = /^["`[]/.test(definition)
+          ? skipQuotedSql(definition, 0)
+          : columnName.length;
+        if (
+          /^\s*INTEGER\b[^,)]*\bPRIMARY\s+KEY\b[^,)]*\bAUTOINCREMENT\b/i.test(
+            definition.slice(nameEnd),
+          )
+        )
+          autoIncrementColumns.add(sqliteAsciiLower(columnName));
       }
     } catch {}
     const generatedColumns = parseSqliteGeneratedColumns(createSql);
@@ -839,7 +949,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       if (!generatedKind) {
         continue;
       }
-      const key = row.name.toLowerCase();
+      const key = sqliteAsciiLower(row.name);
       const detail = generatedColumns.get(key) ?? {};
       generatedColumns.set(key, {
         ...detail,
@@ -848,7 +958,9 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     }
     return {
       rows,
-      foreignKeyColumns: new Set(fkRows.map((row) => row.from)),
+      foreignKeyColumns: new Set(
+        fkRows.map((row) => sqliteAsciiLower(row.from)),
+      ),
       autoIncrementColumns,
       generatedColumns,
     };
@@ -858,7 +970,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     metadata: SQLiteTableMetadata,
   ): ColumnMeta {
     const generatedDetail = metadata.generatedColumns.get(
-      row.name.toLowerCase(),
+      sqliteAsciiLower(row.name),
     );
     const isComputed = generatedDetail !== undefined;
     const defaultValue = !isComputed
@@ -870,7 +982,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       nullable: row.notnull === 0,
       defaultValue,
       identityGeneration: metadata.autoIncrementColumns.has(
-        row.name.toLowerCase(),
+        sqliteAsciiLower(row.name),
       )
         ? "auto_increment"
         : undefined,
@@ -883,7 +995,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           : generatedDetail.generatedKind === "stored",
       isPrimaryKey: row.pk > 0,
       primaryKeyOrdinal: row.pk > 0 ? row.pk : undefined,
-      isForeignKey: metadata.foreignKeyColumns.has(row.name),
+      isForeignKey: metadata.foreignKeyColumns.has(sqliteAsciiLower(row.name)),
     };
   }
   async disconnect(): Promise<void> {
@@ -912,7 +1024,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     const rows = this.requireDb().all(`SELECT name, type
        FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master
        WHERE type IN ('table','view')
-         AND name NOT LIKE 'sqlite_%'
+         AND name NOT LIKE 'sqlite!_%' ESCAPE '!'
        ORDER BY type DESC, name`) as {
       name: string;
       type: string;
@@ -941,6 +1053,30 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       this.enrichColumn(this.toColumnMeta(row, metadata)),
     );
   }
+  async getTableRowIdentityOrderExpressions(
+    _database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): Promise<string[]> {
+    const master = schema
+      ? `${quoteSqliteIdentifier(schema)}.sqlite_master`
+      : "sqlite_master";
+    const result = await this.query(
+      `SELECT type FROM ${master} WHERE name = ?`,
+      [table],
+    );
+    if (result.rows[0]?.__col_0 !== "table") {
+      return [];
+    }
+    const columnNames = new Set(
+      columns.map((column) => column.name.toLowerCase()),
+    );
+    const alias = ["rowid", "_rowid_", "oid"].find(
+      (candidate) => !columnNames.has(candidate),
+    );
+    return alias ? [alias] : [];
+  }
   async query(
     sql: string,
     params?: unknown[],
@@ -967,8 +1103,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     if (transactional) db.exec("SAVEPOINT rapidb_query_deadline");
     try {
       const result = await this.executeQuery(sql, params, operationContext);
-      checkDeadline();
-      if (transactional) db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
+      if (transactional) {
+        checkDeadline();
+        db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
+      }
       if (db.inTransaction) {
         throw new Error(
           "Unfinished SQLite transaction was rolled back. Execute BEGIN/SAVEPOINT and COMMIT/ROLLBACK/RELEASE in the same script. Earlier commits are not undone.",
@@ -976,8 +1114,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       }
       return result;
     } catch (error) {
-      // The worker session is shared by editors and table mutations. Explicit
-      // transactions (including failed scripts) must not leak to the next call.
       if (db.inTransaction) {
         try {
           if (transactional) {
@@ -1036,12 +1172,15 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     onResultSet?: () => void,
   ): QueryResult {
     const kind = classifySql(sql);
+    const isDml = isSQLiteDmlStatement(sql);
     const db = this.requireDb();
     if (hardCap !== undefined) {
       const result = db.queryBounded(sql, params, hardCap, onResultSet);
+      const changes =
+        result.changes === undefined ? undefined : isDml ? result.changes : 0;
       const affectedRows =
-        result.changes ??
-        (kind === "dml" && canSQLiteStatementReturnRows(sql)
+        changes ??
+        (isDml && canSQLiteStatementReturnRows(sql)
           ? Number(
               (db.get("SELECT changes() AS affected") as { affected: number })
                 .affected,
@@ -1049,10 +1188,11 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           : undefined);
       return {
         columns: result.columns,
+        columnMeta: result.columnMeta,
         rows: result.rows.map((row) =>
           Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
         ),
-        rowCount: result.rowCount,
+        rowCount: changes ?? result.rowCount,
         ...(affectedRows !== undefined ? { affectedRows } : {}),
         truncated: result.truncated,
         executionTimeMs: Date.now() - start,
@@ -1060,12 +1200,13 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     }
     if (kind === "select") {
       try {
-        const { columns, rows: rawRows } = db.allRaw(sql, params);
+        const { columns, columnMeta, rows: rawRows } = db.allRaw(sql, params);
         const rows = rawRows.map((row) =>
           Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
         );
         return {
           columns,
+          columnMeta,
           rows,
           rowCount: rows.length,
           executionTimeMs: Date.now() - start,
@@ -1078,33 +1219,28 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       }
     }
     if (canSQLiteStatementReturnRows(sql)) {
-      const returningRows = db.all(sql, params) as Record<string, unknown>[];
-      if (returningRows.length > 0) {
-        const columns = Object.keys(returningRows[0]);
-        const rows = returningRows.map((row) =>
-          Object.fromEntries(columns.map((col, i) => [`__col_${i}`, row[col]])),
-        );
-        return {
-          columns,
-          rows,
-          rowCount: rows.length,
-          executionTimeMs: Date.now() - start,
-        };
-      }
+      const { columns, columnMeta, rows: rawRows } = db.allRaw(sql, params);
+      const rows = rawRows.map((row) =>
+        Object.fromEntries(
+          row.map((value, index) => [`__col_${index}`, value]),
+        ),
+      );
       return {
-        columns: [],
-        rows: [],
-        rowCount: 0,
+        columns,
+        columnMeta,
+        rows,
+        rowCount: rows.length,
         executionTimeMs: Date.now() - start,
       };
     }
     const info = db.run(sql, params);
+    const changes = isDml ? info.changes : 0;
     return {
       columns: [],
       rows: [],
-      rowCount: info.changes,
+      rowCount: changes,
       executionTimeMs: Date.now() - start,
-      affectedRows: info.changes,
+      affectedRows: changes,
     };
   }
   private _executeScript(
@@ -1112,30 +1248,65 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     start: number,
     hardCap?: number,
   ): QueryResult {
-    let lastResult: QueryResult = {
-      columns: [],
-      rows: [],
-      rowCount: 0,
-      executionTimeMs: 0,
-    };
+    const resultSets: QueryResultSet[] = [];
+    let retainedRows = 0;
+    let retainedColumns = 0;
+    let resultSetsTruncated = false;
     let totalAffected = 0;
     for (const stmt of stmts) {
-      const r = this._executeSingle(stmt, [], start, hardCap, () => {
-        lastResult.rows = [];
-      });
+      const remainingHardCap =
+        hardCap === undefined ? undefined : Math.max(1, hardCap - retainedRows);
+      const r = this._executeSingle(stmt, [], start, remainingHardCap);
       totalAffected += r.affectedRows ?? 0;
-      if (r.columns.length > 0) {
-        lastResult = r;
-      } else if (lastResult.columns.length === 0) {
-        lastResult = r;
+      if (r.columns.length === 0) continue;
+      if (
+        resultSets.length >= SQLITE_MAX_RETAINED_RESULT_SETS ||
+        retainedColumns + r.columns.length > SQLITE_MAX_RETAINED_RESULT_COLUMNS
+      ) {
+        resultSetsTruncated = true;
+        continue;
       }
+
+      const remainingRows =
+        hardCap === undefined
+          ? r.rows.length
+          : Math.max(0, hardCap - retainedRows);
+      const rows = r.rows.slice(0, remainingRows);
+      const truncated = r.truncated === true || rows.length < r.rows.length;
+      resultSets.push({
+        id: `result-${resultSets.length + 1}`,
+        columns: r.columns,
+        columnMeta: r.columnMeta ?? [],
+        rows,
+        rowCount: r.rowCount,
+        truncated,
+      });
+      retainedRows += rows.length;
+      retainedColumns += r.columns.length;
     }
-    lastResult.executionTimeMs = Date.now() - start;
-    if (lastResult.columns.length === 0) {
-      lastResult.rowCount = totalAffected;
-      lastResult.affectedRows = totalAffected;
-    }
-    return lastResult;
+
+    const firstResultSet = resultSets[0];
+    return {
+      columns: firstResultSet?.columns ?? [],
+      columnMeta: firstResultSet?.columnMeta ?? [],
+      rows: firstResultSet?.rows ?? [],
+      rowCount:
+        resultSets.length > 0
+          ? resultSets.reduce(
+              (total, resultSet) => total + resultSet.rowCount,
+              0,
+            )
+          : totalAffected,
+      executionTimeMs: Date.now() - start,
+      ...(resultSets.length > 0 ? { resultSets } : {}),
+      ...(resultSets.some((resultSet) => resultSet.truncated)
+        ? { truncated: true }
+        : {}),
+      ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
+      ...(resultSets.length === 0 && totalAffected > 0
+        ? { affectedRows: totalAffected }
+        : {}),
+    };
   }
   override getCapabilities() {
     return { ...super.getCapabilities(), boundedQueryResults: true };
@@ -1180,21 +1351,39 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     table: string,
   ): Promise<import("./types").ForeignKeyMeta[]> {
     const safeTable = table.replace(/"/g, '""');
+    const db = this.requireDb();
     const sqliteSchema = this.resolveSqliteSchema(database, schema);
-    const rows = this.requireDb().all(
+    const rows = db.all(
       `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.foreign_key_list("${safeTable}")`,
     ) as {
       from: string;
       table: string;
-      to: string;
+      to: string | null;
       id: number;
+      seq: number;
     }[];
+    const primaryKeys = new Map<string, string[]>();
+    const primaryKeyColumns = (referencedTable: string): string[] => {
+      let columns = primaryKeys.get(referencedTable);
+      if (!columns) {
+        columns = (
+          db.all(
+            `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.table_info("${referencedTable.replace(/"/g, '""')}")`,
+          ) as { name: string; pk: number }[]
+        )
+          .filter((column) => column.pk > 0)
+          .sort((left, right) => left.pk - right.pk)
+          .map((column) => column.name);
+        primaryKeys.set(referencedTable, columns);
+      }
+      return columns;
+    };
     return rows.map((r) => ({
-      constraintName: `fk_${table}_${r.from}`,
+      constraintName: `fk_${table}_${r.id}`,
       column: r.from,
-      referencedSchema: "main",
+      referencedSchema: sqliteSchema,
       referencedTable: r.table,
-      referencedColumn: r.to,
+      referencedColumn: r.to ?? primaryKeyColumns(r.table)[r.seq] ?? "",
     }));
   }
   async getConstraints(
@@ -1408,7 +1597,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         } catch (rollbackError) {
           throw new SQLiteRollbackFailure(error, rollbackError);
         }
-        if (error instanceof TransactionVerificationError) throw error;
+        if (error instanceof TransactionVerificationError) {
+          error.rollbackConfirmed = true;
+          throw error;
+        }
         throw new MutationNotExecutedError(
           error instanceof Error ? error.message : String(error),
           error,
@@ -1570,6 +1762,25 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
   ): string | [string, string] | undefined {
     if (
+      column.category === "integer" &&
+      !this.hasBooleanSemantics(column) &&
+      ["eq", "neq", "gt", "gte", "lt", "lte", "between", "in"].includes(
+        operator,
+      )
+    ) {
+      if (Array.isArray(value)) {
+        value = value.map(normalizeSqliteIntegerTrailingDot) as [
+          string,
+          string,
+        ];
+      } else if (typeof value === "string") {
+        value =
+          operator === "in"
+            ? value.split(",").map(normalizeSqliteIntegerTrailingDot).join(",")
+            : normalizeSqliteIntegerTrailingDot(value);
+      }
+    }
+    if (
       this.isNumericCategory(column.category) &&
       column.category !== "decimal" &&
       typeof value === "string" &&
@@ -1590,7 +1801,13 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           if (parts.length === 0) {
             throw error;
           }
-          return parts.join(", ");
+          return parts
+            .map((part) =>
+              this.hasBooleanSemantics(column)
+                ? part
+                : (normalizeNumericToken(part) ?? part),
+            )
+            .join(", ");
         }
         return trimmed;
       }
@@ -1754,6 +1971,32 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         return { sql: `${col} ${op} ?`, params: [boolVal] };
       }
     }
+    if (column.category === "integer" && !this.hasBooleanSemantics(column)) {
+      if (operator === "between" && Array.isArray(val)) {
+        return {
+          sql: `${col} BETWEEN ? AND ?`,
+          params: val.map(exactSqliteIntegerFilterToken),
+        };
+      }
+      if (operator === "in" && typeof val === "string") {
+        const parts = val
+          .split(",")
+          .map((part) => exactSqliteIntegerFilterToken(part.trim()));
+        return {
+          sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
+          params: parts,
+        };
+      }
+      if (
+        typeof val === "string" &&
+        ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
+      ) {
+        return {
+          sql: `${col} ${this.sqlOperator(operator)} ?`,
+          params: [exactSqliteIntegerFilterToken(val)],
+        };
+      }
+    }
     if (
       this.isNumericCategory(column.category) &&
       typeof val === "string" &&
@@ -1836,7 +2079,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           throw invalidSqliteTemporalFilterError(column.name, "time");
         }
         return {
-          sql: `TIME(${col}) BETWEEN TIME(?) AND TIME(?)`,
+          sql: `${sqliteTimeKeyExpression(col)} BETWEEN RAPIDB_TIME_KEY(?) AND RAPIDB_TIME_KEY(?)`,
           params: [startLiteral, endLiteral],
         };
       }
@@ -1844,9 +2087,19 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         const parts = val
           .split(",")
           .map((part) => part.trim())
-          .filter(Boolean);
+          .filter(Boolean)
+          .map((part) => {
+            const literal = normalizeSqliteTimeLiteral(part);
+            if (!literal) {
+              throw invalidSqliteTemporalFilterError(column.name, "time");
+            }
+            return literal;
+          });
+        if (parts.length === 0) {
+          throw invalidSqliteTemporalFilterError(column.name, "time");
+        }
         return {
-          sql: `TIME(${col}) IN (${parts.map(() => "TIME(?)").join(", ")})`,
+          sql: `${sqliteTimeKeyExpression(col)} IN (${parts.map(() => "RAPIDB_TIME_KEY(?)").join(", ")})`,
           params: parts,
         };
       }
@@ -1857,7 +2110,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         const literal = normalizeSqliteTimeLiteral(val);
         if (literal) {
           const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
-          return { sql: `TIME(${col}) ${sqlOp} TIME(?)`, params: [literal] };
+          return {
+            sql: `${sqliteTimeKeyExpression(col)} ${sqlOp} RAPIDB_TIME_KEY(?)`,
+            params: [literal],
+          };
         }
         if (operator === "eq" || operator === "neq") {
           return {
@@ -1876,7 +2132,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           throw invalidSqliteTemporalFilterError(column.name, "datetime");
         }
         return {
-          sql: `DATETIME(${col}) BETWEEN DATETIME(?) AND DATETIME(?)`,
+          sql: `${sqliteDatetimeKeyExpression(col)} BETWEEN RAPIDB_DATETIME_KEY(?) AND RAPIDB_DATETIME_KEY(?)`,
           params: [startLiteral, endLiteral],
         };
       }
@@ -1893,7 +2149,9 @@ export class SQLiteCoreDriver extends BaseDBDriver {
             return literal;
           });
         return {
-          sql: `DATETIME(${col}) IN (${parts.map(() => "DATETIME(?)").join(", ")})`,
+          sql: `${sqliteDatetimeKeyExpression(col)} IN (${parts
+            .map(() => "RAPIDB_DATETIME_KEY(?)")
+            .join(", ")})`,
           params: parts,
         };
       }
@@ -1905,7 +2163,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         if (literal) {
           const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
           return {
-            sql: `DATETIME(${col}) ${sqlOp} DATETIME(?)`,
+            sql: `${sqliteDatetimeKeyExpression(col)} ${sqlOp} RAPIDB_DATETIME_KEY(?)`,
             params: [literal],
           };
         }

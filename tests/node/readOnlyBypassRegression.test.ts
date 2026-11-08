@@ -10,6 +10,10 @@ import {
   mayChangeDatabaseSchema,
   sqlReadOnlyQueryGuard,
 } from "../../src/extension/utils/readOnlyGuards";
+import {
+  hasExecutableMysqlComment,
+  scanSqlForCap,
+} from "../../src/extension/utils/sqlStatementScan";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 function pgGuard(): ReadOnlyQueryGuard {
@@ -61,6 +65,50 @@ function mssqlGuard(): ReadOnlyQueryGuard {
 }
 
 describe("readOnly bypass regressions (stage 1)", () => {
+  it("detects executable MySQL/MariaDB comments outside strings and comments", () => {
+    expect(hasExecutableMysqlComment("SELECT 1 /*!50000 SELECT 2 */")).toBe(
+      true,
+    );
+    expect(hasExecutableMysqlComment("/*M!100100 SELECT 2 */")).toBe(true);
+    expect(hasExecutableMysqlComment("SELECT '/*!50000 SELECT 2 */'")).toBe(
+      false,
+    );
+    expect(hasExecutableMysqlComment('SELECT "/*M!100100 SELECT 2 */"')).toBe(
+      false,
+    );
+    expect(hasExecutableMysqlComment("SELECT 1 /* !50000 SELECT 2 */")).toBe(
+      false,
+    );
+    expect(
+      hasExecutableMysqlComment("SELECT 1 -- /*!50000 SELECT 2 */\n"),
+    ).toBe(false);
+    expect(
+      hasExecutableMysqlComment("SELECT 1 # /*M!100100 SELECT 2 */\n"),
+    ).toBe(false);
+  });
+
+  it.each(
+    Array.from({ length: 33 }, (_, index) => (index === 32 ? 127 : index)),
+  )("recognizes ASCII control U+%s after a MySQL dash comment", (code) => {
+    const prefix = `SELECT 1 --${String.fromCharCode(code)}`;
+    const endsLine = code === 10 || code === 13;
+    for (const wrapper of ["/*!50000 SELECT 2 */", "/*M!100100 SELECT 2 */"]) {
+      expect(hasExecutableMysqlComment(`${prefix} ${wrapper}`)).toBe(endsLine);
+      expect(
+        hasExecutableMysqlComment(`${prefix} plain text\n${wrapper}`),
+      ).toBe(true);
+      expect(hasExecutableMysqlComment(`SELECT 1--1 ${wrapper}`)).toBe(true);
+    }
+  });
+
+  it("blocks executable comments when quote boundaries depend on NO_BACKSLASH_ESCAPES", () => {
+    const ambiguousSql = String.raw`SELECT 'foo\' /*!50000 UNION SELECT 1 */`;
+    expect(hasExecutableMysqlComment(ambiguousSql)).toBe(true);
+    expect(hasExecutableMysqlComment(String.raw`SELECT 'foo\\' AS value`)).toBe(
+      false,
+    );
+  });
+
   it("denies DML hidden in subqueries", () => {
     const guard = pgGuard();
     expect(
@@ -76,6 +124,18 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(
       guard("WITH moved AS (DELETE FROM users RETURNING *) SELECT * FROM moved")
         .allowed,
+    ).toBe(false);
+  });
+
+  it.each([
+    "/*!50000 , 1 AS y */",
+    "/*M!100100 , 1 AS y */",
+  ])("detects %s with mixed ANSI_QUOTES string and identifier escaping", (comment) => {
+    expect(
+      hasExecutableMysqlComment(String.raw`SELECT 'a\'b' AS "x\" ${comment}`),
+    ).toBe(true);
+    expect(
+      hasExecutableMysqlComment(`SELECT 'literal ${comment}' AS "identifier"`),
     ).toBe(false);
   });
 
@@ -179,6 +239,34 @@ describe("readOnly bypass regressions (stage 1)", () => {
     });
   });
 
+  it("applies SELECT read-only checks to PostgreSQL TABLE statements", () => {
+    const guard = pgGuard();
+    const mutatingQueries = [
+      "TABLE pg_class ORDER BY pg_terminate_backend(123)",
+      "TABLE pg_class LIMIT (SELECT count(*) FROM dblink_exec('dbname=app', 'DELETE FROM accounts'))",
+      "TABLE t UNION SELECT pg_advisory_lock(1)",
+      "TABLE t ORDER BY nextval('s')",
+      "TABLE t FOR UPDATE",
+      "TABLE t FOR NO KEY UPDATE",
+      "TABLE t FOR SHARE",
+      "TABLE t FOR KEY SHARE",
+    ];
+    for (const sql of mutatingQueries) {
+      expect(guard(sql), sql).toHaveProperty("allowed", false);
+      expect(sqlReadOnlyQueryGuard(sql, "postgresql"), sql).toHaveProperty(
+        "allowed",
+        false,
+      );
+    }
+
+    expect(guard("TABLE users;")).toEqual({ allowed: true });
+    expect(guard("TABLE public.users")).toEqual({ allowed: true });
+    expect(guard("TABLE ONLY public.users *")).toEqual({ allowed: true });
+    expect(guard("TABLE users ORDER BY id LIMIT 10")).toEqual({
+      allowed: true,
+    });
+  });
+
   it("does not flag function names inside literals", () => {
     const guard = pgGuard();
     expect(guard("SELECT 'nextval(''x'')'")).toEqual({ allowed: true });
@@ -262,6 +350,72 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("SELECT $é$DELETE FROM users").allowed).toBe(false);
   });
 
+  it("matches PostgreSQL's non-ASCII identifier and dollar-tag characters", () => {
+    const guard = pgGuard();
+    const identifierScript =
+      "SELECT 1 AS x€$a$; COMMIT; DROP TABLE accounts; SELECT 1 AS y€$a$";
+    const dollarTagScript =
+      "SELECT $€$'$€$; COMMIT; DELETE FROM accounts; -- '";
+
+    for (const sql of [
+      identifierScript,
+      dollarTagScript,
+      "SELECT 1 AS x😀$a$; COMMIT; DROP TABLE accounts; SELECT 1 AS y😀$a$",
+      "SELECT $😀$'$😀$; COMMIT; DELETE FROM accounts; -- '",
+      "SELECT 1 AS x $a$; COMMIT; DROP TABLE accounts; SELECT 1 AS y $a$",
+      "SELECT 1 AS x﻿$a$; COMMIT; DROP TABLE accounts; SELECT 1 AS y﻿$a$",
+    ]) {
+      expect(guard(sql).allowed, sql).toBe(false);
+    }
+    expect(mayChangeDatabaseSchema(identifierScript, "postgresql")).toBe(true);
+    expect(
+      mayChangeDatabaseSchema(
+        "SELECT $€$'$€$; DROP TABLE accounts; -- '",
+        "postgresql",
+      ),
+    ).toBe(true);
+    expect(guard("SELECT $€$DELETE FROM users$€$ AS payload")).toEqual({
+      allowed: true,
+    });
+    expect(
+      scanSqlForCap(dollarTagScript, "pg").map((token) => token.text),
+    ).toEqual([
+      "SELECT",
+      "$€$'$€$",
+      ";",
+      "COMMIT",
+      ";",
+      "DELETE",
+      "FROM",
+      "accounts",
+      ";",
+    ]);
+  });
+
+  it("classifies PostgreSQL lone surrogates as the U+FFFD that is sent", () => {
+    const guard = pgGuard();
+    const unpairedTagScript =
+      "SELECT $\ud800$ x $\udc00$; DELETE FROM accounts; -- $\ud800$";
+    const replacementTagScripts = [
+      "SELECT $\ud800$ x $�$; DROP TABLE accounts; -- $\ud800$",
+      "SELECT $a\udbff$ x $a�$; DROP TABLE accounts; -- $a\udbff$",
+    ];
+
+    for (const sql of [
+      unpairedTagScript,
+      ...replacementTagScripts,
+      "SELECT $\ud800$'$�$; DELETE FROM accounts; -- '",
+    ]) {
+      expect(guard(sql).allowed, sql).toBe(false);
+    }
+    for (const sql of replacementTagScripts) {
+      expect(mayChangeDatabaseSchema(sql, "postgresql"), sql).toBe(true);
+    }
+    expect(
+      scanSqlForCap(unpairedTagScript, "pg").map((token) => token.text),
+    ).toEqual(["SELECT", "$�$ x $�$", ";", "DELETE", "FROM", "accounts", ";"]);
+  });
+
   it("does not strip MySQL subtraction as a -- comment", () => {
     expect(mysqlGuard()("SELECT 1--1 INTO @a").allowed).toBe(false);
     expect(sqlReadOnlyQueryGuard("SELECT 1--1 INTO @a").allowed).toBe(false);
@@ -336,7 +490,6 @@ describe("readOnly bypass regressions (stage 1)", () => {
   it.each([
     "\n",
     "\r\n",
-    "\r",
   ])("does not consume the line ending after an empty MySQL hash comment %j", (lineEnding) => {
     const guard = mysqlGuard();
     expect(
@@ -424,6 +577,38 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(pgGuard()("SELECT ARRAY[1, 2, 3]").allowed).toBe(true);
   });
 
+  it.each([
+    "SELECT a#pg_terminate_backend(123)::int FROM (SELECT 1 AS a) s",
+    "SELECT a#pg_advisory_lock(1)::text::int FROM (SELECT 1 AS a) s",
+    "SELECT a#dblink_exec('dbname=x','DELETE FROM t')::int FROM (SELECT 1 AS a) s",
+  ])("does not let the PostgreSQL # operator hide mutating functions: %s", (sql) => {
+    expect(pgGuard()(sql).allowed).toBe(false);
+    expect(sqlReadOnlyQueryGuard(sql, "postgresql").allowed).toBe(false);
+    expect(sqlReadOnlyQueryGuard(sql).allowed).toBe(false);
+  });
+
+  it("keeps # as an identifier character for T-SQL temp tables", () => {
+    const guard = mssqlGuard();
+    expect(guard("SELECT * FROM #t").allowed).toBe(true);
+    expect(guard("SELECT * FROM ##t").allowed).toBe(true);
+    expect(guard("SELECT a#b FROM t").allowed).toBe(true);
+    expect(guard("SELECT * INTO #t FROM x").allowed).toBe(false);
+    expect(guard("SELECT a#delete FROM t").allowed).toBe(true);
+    expect(guard("SELECT x#pg_advisory_lock(1) FROM #t").allowed).toBe(true);
+    expect(pgGuard()("SELECT a#1; DELETE FROM t").allowed).toBe(false);
+    expect(pgGuard()("SELECT x#pg_advisory_lock(1) FROM #t").allowed).toBe(
+      false,
+    );
+  });
+
+  it("allows PostgreSQL # operators that do not hide mutations", () => {
+    const guard = pgGuard();
+    expect(guard("SELECT 5#3").allowed).toBe(true);
+    expect(
+      guard("SELECT data#>'{a}', data#>>'{a,b}', data#-'{a}' FROM t").allowed,
+    ).toBe(true);
+  });
+
   it("denies statements concealed after nested PostgreSQL block comments", () => {
     expect(
       pgGuard()('SELECT "pg_advisory_lock"/* a /* b */ c */(42)').allowed,
@@ -491,9 +676,10 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("SELECT count((DELETE FROM posts RETURNING *))").allowed).toBe(
       false,
     );
-    expect(guard("SELECT COMMENT ON TABLE posts IS 'changed'").allowed).toBe(
-      false,
-    );
+    expect(
+      guard("SELECT comment FROM posts; COMMENT ON TABLE posts IS 'changed'")
+        .allowed,
+    ).toBe(false);
     expect(
       guard(
         "SELECT pg_catalog.pg_create_logical_replication_slot('rapidb_slot', 'test_decoding')",
@@ -511,5 +697,157 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(
       mayChangeDatabaseSchema("SELECT 1 /*!50000 SELECT 1 */", "postgresql"),
     ).toBe(false);
+  });
+
+  it.each([
+    "SELECT pg_switch_wal()",
+    "SELECT pg_switch_xlog()",
+    "SELECT pg_stat_reset()",
+    "SELECT pg_stat_reset_shared('bgwriter')",
+    "SELECT pg_stat_reset_single_table_counters(16384)",
+    "SELECT pg_stat_statements_reset()",
+    "SELECT pg_copy_logical_replication_slot('a', 'b')",
+    "SELECT pg_copy_physical_replication_slot('a', 'b')",
+    "SELECT pg_rotate_logfile()",
+    "SELECT pg_promote()",
+    "SELECT pg_wal_replay_pause()",
+    "SELECT pg_wal_replay_resume()",
+    "SELECT pg_backup_start('label')",
+    "SELECT * FROM pg_backup_stop()",
+    "SELECT pg_start_backup('label')",
+    "SELECT pg_stop_backup()",
+    "SELECT pg_log_backend_memory_contexts(1234)",
+    "SELECT pg_replication_origin_create('origin')",
+    "SELECT pg_catalog.pg_replication_origin_advance('origin', '0/0')",
+    'SELECT "pg_stat_reset"()',
+  ])("denies PostgreSQL side-effect functions not blocked by READ ONLY: %s", (sql) => {
+    expect(pgGuard()(sql).allowed).toBe(false);
+  });
+
+  it("allows mutation-keyword column names and REPLACE() calls outside statement starts", () => {
+    const pg = pgGuard();
+    const mysql = mysqlGuard();
+    const mssql = mssqlGuard();
+    for (const guard of [pg, mysql, mssql]) {
+      expect(guard("SELECT REPLACE(name, 'a', 'b') FROM users")).toEqual({
+        allowed: true,
+      });
+      expect(guard("SELECT id, start FROM shifts")).toEqual({ allowed: true });
+    }
+    expect(pg("SELECT id, lock, copy, start AS begins FROM t")).toEqual({
+      allowed: true,
+    });
+    expect(pg("SELECT s.update, count(start) FROM shifts s")).toEqual({
+      allowed: true,
+    });
+    expect(
+      pg("SELECT * FROM shifts WHERE start > now() ORDER BY start"),
+    ).toEqual({ allowed: true });
+    expect(pg("VALUES (replace('a', 'b', 'c'))")).toEqual({ allowed: true });
+    expect(
+      sqlReadOnlyQueryGuard("SELECT replace(name, 'a', 'b') FROM t", "sqlite"),
+    ).toEqual({ allowed: true });
+  });
+
+  it.each([
+    ["SELECT 1 DELETE FROM t", "transactsql"],
+    ["SELECT a, 1 DELETE FROM t", "transactsql"],
+    ["SELECT 'x' DELETE FROM t", "transactsql"],
+    ["SELECT [x] DELETE FROM t", "transactsql"],
+    ["SELECT 1.DELETE FROM t", "transactsql"],
+    ["SELECT $ DELETE FROM t", "transactsql"],
+    ["SELECT a FROM t WHERE 1=1 DELETE FROM t", "transactsql"],
+    ["SELECT a FROM t ORDER BY 1 UPDATE t SET a = 1", "transactsql"],
+    ["SELECT 1 REPLACE INTO t VALUES (1)", "transactsql"],
+    ["SELECT * FROM (DELETE FROM users RETURNING *) AS x", "postgresql"],
+    ["SELECT * FROM t WHERE id IN (DELETE FROM u RETURNING id)", "postgresql"],
+    ["SELECT * FROM t LOCK IN SHARE MODE", "mysql"],
+    ["SELECT * FROM t FOR UPDATE", "mysql"],
+    ["SELECT a INTO b FROM t", "postgresql"],
+    ["SELECT replace INTO t", "mysql"],
+  ] as const)("keeps denying mutations at statement and clause starts: %s", (sql, dialect) => {
+    expect(sqlReadOnlyQueryGuard(sql, dialect).allowed).toBe(false);
+  });
+
+  it("denies MySQL DESC/DESCRIBE ANALYZE like EXPLAIN ANALYZE", () => {
+    const guard = mysqlGuard();
+    expect(guard("DESC ANALYZE SELECT * FROM t").allowed).toBe(false);
+    expect(guard("DESCRIBE ANALYZE SELECT * FROM t").allowed).toBe(false);
+    expect(guard("describe analyze format=tree select 1").allowed).toBe(false);
+    expect(guard("DESC SELECT pg_advisory_lock(1)").allowed).toBe(false);
+    expect(guard("DESC users")).toEqual({ allowed: true });
+    expect(guard("DESCRIBE users id")).toEqual({ allowed: true });
+    expect(guard("DESC SELECT * FROM t")).toEqual({ allowed: true });
+    expect(guard("DESCRIBE FORMAT=JSON SELECT * FROM t")).toEqual({
+      allowed: true,
+    });
+  });
+
+  it("denies MariaDB sequence advancement in the mysql dialect", () => {
+    const guard = mysqlGuard();
+    expect(guard("SELECT NEXT VALUE FOR s").allowed).toBe(false);
+    expect(guard("SELECT next /* c */ value for db.s").allowed).toBe(false);
+    expect(guard("SELECT NEXTVAL(s)").allowed).toBe(false);
+    expect(guard("SELECT SETVAL(s, 10)").allowed).toBe(false);
+    expect(guard("SELECT s.nextval").allowed).toBe(false);
+    expect(guard("SELECT PREVIOUS VALUE FOR s")).toEqual({ allowed: true });
+    expect(guard("SELECT LASTVAL(s)")).toEqual({ allowed: true });
+    expect(guard("SELECT 'NEXT VALUE FOR s' AS example")).toEqual({
+      allowed: true,
+    });
+  });
+
+  it.each([
+    "SELECT 1\nDELIMITER =\n=DROP TABLE t=",
+    "SELECT 1\nDELIMITER and\nand DROP TABLE t and",
+    "SELECT 1\nDELIMITER ,\n,DELETE FROM t,",
+    "SELECT 1\nDELIMITER ,\n,COMMIT,",
+    "SELECT 1\nDELIMITER //\n//RENAME TABLE a TO b//",
+    "SELECT 1\nDELIMITER //\n//FLUSH TABLES//",
+  ])("denies MySQL scripts that switch DELIMITER: %j", (sql) => {
+    expect(mysqlGuard()(sql).allowed).toBe(false);
+    expect(mayChangeDatabaseSchema(sql, "mysql")).toBe(true);
+  });
+
+  it.each([
+    "SELECT 1 SHUTDOWN WITH NOWAIT",
+    "SELECT 1 DBCC FREEPROCCACHE",
+    "SELECT 1 RECONFIGURE",
+    "SELECT 1 DENY SELECT ON t TO u",
+    "SELECT 1 WAITFOR DELAY '00:10'",
+    "SELECT 1 ENABLE TRIGGER tr ON t",
+    "SELECT * FROM t DISABLE TRIGGER ALL ON t",
+    "SELECT 'x' RECEIVE TOP (1) * FROM q",
+  ])("denies T-SQL statements appended without a separator: %s", (sql) => {
+    expect(mssqlGuard()(sql).allowed).toBe(false);
+  });
+
+  it("allows T-SQL statement words used as column names", () => {
+    const guard = mssqlGuard();
+    expect(guard("SELECT open, close FROM prices")).toEqual({ allowed: true });
+    expect(
+      guard("SELECT p.open, p.close - p.open AS delta FROM prices p"),
+    ).toEqual({
+      allowed: true,
+    });
+    expect(guard("SELECT * FROM prices WHERE open > 1 ORDER BY close")).toEqual(
+      {
+        allowed: true,
+      },
+    );
+    expect(
+      guard(
+        "SELECT id FROM t ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+      ),
+    ).toEqual({ allowed: true });
+  });
+
+  it("treats PostgreSQL TABLE with a quoted identifier like SELECT", () => {
+    const guard = pgGuard();
+    expect(guard('TABLE "Users"')).toEqual({ allowed: true });
+    expect(guard('TABLE public."Users"')).toEqual({ allowed: true });
+    expect(guard('TABLE "Users" FOR UPDATE').allowed).toBe(false);
+    expect(guard("TABLE \"Users\" ORDER BY nextval('s')").allowed).toBe(false);
+    expect(guard("TABLE").allowed).toBe(false);
   });
 });

@@ -173,6 +173,22 @@ function request(
   };
 }
 
+function exportedString(row: Record<string, unknown>, name: string): string {
+  const attribute = row[name];
+  expect(attribute).toEqual({ S: expect.any(String) });
+  if (
+    !attribute ||
+    typeof attribute !== "object" ||
+    !("S" in attribute) ||
+    typeof attribute.S !== "string"
+  ) {
+    throw new Error(
+      `Expected native DynamoDB string AttributeValue for ${name}`,
+    );
+  }
+  return attribute.S;
+}
+
 async function exportChunks(
   service: TableReadService,
   req: DriverTablePageRequest,
@@ -197,6 +213,157 @@ async function exportChunks(
 }
 
 describe("B03 DynamoDB logical pages and service export", () => {
+  it("returns no rows for a nonmatching client filter with skipCount", async () => {
+    const item = marshall({
+      tenant_id: "tenant",
+      user_id: "target",
+      email: "person@example.com",
+    });
+    const { driver, service } = createHarness(() => ({ Item: item }));
+    const req: DriverTablePageRequest = {
+      ...request("Query", 1),
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        { column: "user_id", operator: "eq", value: "target" },
+        { column: "email", operator: "ilike", value: "absent" },
+      ],
+    };
+    for (const page of [1, 2]) {
+      const result = await driver.readTablePage({ ...req, page });
+      expect(result.rows).toEqual([]);
+      expect(result.totalCount).toBe(0);
+    }
+    const chunks = await exportChunks(service, req);
+    expect(chunks.flatMap((chunk) => chunk.rows)).toEqual([]);
+  });
+
+  it("terminates a full-key skipCount export after one row", async () => {
+    const item = marshall({ tenant_id: "tenant", user_id: "target" });
+    const { driver, service, send } = createHarness(() => ({ Item: item }));
+    const req: DriverTablePageRequest = {
+      ...request("Query", 1),
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        { column: "user_id", operator: "eq", value: "target" },
+      ],
+    };
+    expect((await driver.readTablePage(req)).rows).toHaveLength(1);
+    const second = await driver.readTablePage({ ...req, page: 2 });
+    expect(second.rows).toEqual([]);
+    expect(second.totalCount).toBe(0);
+    const stream = service.exportAll(
+      "ddb",
+      req.database,
+      req.schema,
+      req.table,
+      1,
+      null,
+      req.filters,
+    );
+    expect((await stream.next()).value?.rows).toHaveLength(1);
+    expect((await stream.next()).done).toBe(true);
+    expect(
+      send.mock.calls.filter(
+        ([command]) => command.constructor.name === "GetItemCommand",
+      ),
+    ).toHaveLength(2);
+  });
+
+  it("propagates cancellation during GetItem and permits retry", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("Cancelled", "AbortError");
+    const item = marshall({ tenant_id: "tenant", user_id: "target" });
+    let cancel = true;
+    const { driver } = createHarness(
+      () => ({ Item: item }),
+      (options) => {
+        if (cancel) {
+          expect(options?.abortSignal).toBe(controller.signal);
+          controller.abort(reason);
+          cancel = false;
+        }
+      },
+    );
+    const req: DriverTablePageRequest = {
+      ...request("Query", 1),
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        { column: "user_id", operator: "eq", value: "target" },
+      ],
+    };
+    await expect(
+      driver.readTablePage({ ...req, signal: controller.signal }),
+    ).rejects.toBe(reason);
+    expect((await driver.readTablePage(req)).rows).toHaveLength(1);
+    expect((await driver.readTablePage({ ...req, page: 2 })).rows).toEqual([]);
+  });
+
+  it.each([
+    { name: "full key", sort: null, extra: [] },
+    {
+      name: "sorted full key",
+      sort: { column: "email", direction: "desc" as const },
+      extra: [],
+    },
+    {
+      name: "client filter",
+      sort: null,
+      extra: [
+        { column: "email", operator: "ilike" as const, value: "EXAMPLE" },
+      ],
+    },
+    {
+      name: "sorted residual filter",
+      sort: { column: "user_id", direction: "asc" as const },
+      extra: [
+        {
+          column: "email",
+          operator: "eq" as const,
+          value: "person@example.com",
+        },
+      ],
+    },
+  ])("paginates and exports a $name result once", async ({ sort, extra }) => {
+    const item = marshall({
+      tenant_id: "tenant",
+      user_id: "target",
+      email: "person@example.com",
+    });
+    const { driver, service } = createHarness(() => ({ Item: item }));
+    const req: DriverTablePageRequest = {
+      ...request("Query", 1),
+      filters: [
+        { column: "tenant_id", operator: "eq", value: "tenant" },
+        { column: "user_id", operator: "eq", value: "target" },
+        ...extra,
+      ],
+      sort,
+      skipCount: false,
+    };
+    const first = await driver.readTablePage(req);
+    const second = await driver.readTablePage({ ...req, page: 2 });
+    expect(first.rows.map((row) => row.user_id)).toEqual(["target"]);
+    expect(second.rows).toEqual([]);
+    expect([first.totalCount, second.totalCount]).toEqual([1, 1]);
+
+    const stream = service.exportAll(
+      "ddb",
+      req.database,
+      req.schema,
+      req.table,
+      1,
+      sort,
+      req.filters,
+    );
+    const chunk = await stream.next();
+    expect(
+      chunk.value?.rows.map((row: Record<string, unknown>) =>
+        exportedString(row, "user_id"),
+      ),
+    ).toEqual(["target"]);
+    expect((await stream.next()).done).toBe(true);
+  });
+
   it.each(directions)("exports after %s browsing", async (direction) => {
     const { driver, service } = createOrderedHarness();
     const req = {
@@ -210,7 +377,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
       sort: { column: "user_id", direction: reverse },
     });
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.user_id)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
     ).toEqual(
       reverse === "asc" ? ["1", "2", "3", "4", "5"] : ["5", "4", "3", "2", "1"],
     );
@@ -268,7 +437,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
     ]);
     const chunks = await exportChunks(service, request(mode));
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.user_id)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
     ).toEqual(["first", "second"]);
     expect(reads()).toHaveLength(2);
     expect(reads().map(([command]) => command.constructor.name)).toEqual([
@@ -321,7 +492,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
 
     const chunks = await exportChunks(service, { ...req, pageSize: 11 });
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.email)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "email")),
+      ),
     ).toEqual(matches ? ["person@example.com"] : []);
 
     expect(
@@ -371,7 +544,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
       7,
     ]);
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.user_id)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
     ).toEqual(ids);
     expect(reads()).toHaveLength(257);
     reads().forEach(([command], index) => {
@@ -398,9 +573,11 @@ describe("B03 DynamoDB logical pages and service export", () => {
     const req = request(mode, 2);
     req.filters.push({ column: "email", operator: "eq", value: "match" });
     const chunks = await exportChunks(service, req);
-    expect(chunks.map((chunk) => chunk.rows.map((row) => row.user_id))).toEqual(
-      [["first", "second"]],
-    );
+    expect(
+      chunks.map((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
+    ).toEqual([["first", "second"]]);
     expect(reads()).toHaveLength(155);
     expect(
       reads().every(
@@ -421,7 +598,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
     req.filters.push({ column: "email", operator: "eq", value: "match" });
     const chunks = await exportChunks(service, req);
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.user_id)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
     ).toEqual(["matched"]);
     expect(calls).toBe(4097);
     expect(memory()).toEqual({ maxRecent: 256, maxSession: 256 });
@@ -543,7 +722,9 @@ describe("B03 DynamoDB logical pages and service export", () => {
     );
     const chunks = await exportChunks(service, request(mode, 1));
     expect(
-      chunks.flatMap((chunk) => chunk.rows.map((row) => row.user_id)),
+      chunks.flatMap((chunk) =>
+        chunk.rows.map((row) => exportedString(row, "user_id")),
+      ),
     ).toEqual(ids);
     expect(reads()).toHaveLength(301);
   });
@@ -844,5 +1025,56 @@ describe("B03 DynamoDB logical pages and service export", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("DynamoDB cursor cache refresh", () => {
+  function createMutableHarness(initialIds: string[]) {
+    let ids = [...initialIds];
+    const harness = createHarness((input) => {
+      if (input.Select === "COUNT") return { Count: ids.length };
+      const cursor = input.ExclusiveStartKey as
+        | Record<string, AttributeValue>
+        | undefined;
+      const index = cursor ? ids.indexOf(cursor.user_id.S ?? "") + 1 : 0;
+      return index < ids.length
+        ? response(ids[index], index < ids.length - 1)
+        : { Items: [] };
+    });
+    return {
+      ...harness,
+      setIds: (next: string[]) => {
+        ids = [...next];
+      },
+    };
+  }
+
+  it("reopens later pages when a re-read page now has a next cursor", async () => {
+    const { driver, setIds } = createMutableHarness(["1"]);
+    const req = request("Scan", 1);
+
+    expect((await driver.readTablePage(req)).rows).toHaveLength(1);
+    expect((await driver.readTablePage({ ...req, page: 2 })).rows).toEqual([]);
+
+    setIds(["1", "2"]);
+    await driver.readTablePage(req);
+    const second = await driver.readTablePage({ ...req, page: 2 });
+    expect(second.rows.map((row) => row.user_id)).toEqual(["2"]);
+  });
+
+  it("forgets later-page cursors and the count when an earlier page changes", async () => {
+    const { driver, setIds } = createMutableHarness(["1", "2", "3", "4", "5"]);
+    const req = { ...request("Scan", 2), skipCount: false };
+
+    expect((await driver.readTablePage(req)).totalCount).toBe(5);
+    const second = await driver.readTablePage({ ...req, page: 2 });
+    expect(second.rows.map((row) => row.user_id)).toEqual(["3", "4"]);
+
+    setIds(["1", "3", "4", "5"]);
+    const first = await driver.readTablePage(req);
+    expect(first.rows.map((row) => row.user_id)).toEqual(["1", "3"]);
+    expect(first.totalCount).toBe(4);
+    const refreshed = await driver.readTablePage({ ...req, page: 2 });
+    expect(refreshed.rows.map((row) => row.user_id)).toEqual(["4", "5"]);
   });
 });

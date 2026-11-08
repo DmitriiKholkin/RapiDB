@@ -889,8 +889,6 @@ async function verifyElasticsearchDriver(
       ],
     });
     assert.equal(update.affectedRows, 1);
-    // UPDATE advances Elasticsearch's sequence number: DELETE needs a fresh
-    // signed identity, just as it does after the viewer refreshes its data.
     const updated = await readInsertedRow();
     assert.equal(
       JSON.parse(String(updated.row._source)).email,

@@ -378,6 +378,29 @@ describe("B08 exact typed client comparisons", () => {
     ).toEqual([...rows].reverse());
   });
 
+  it("orders zone-less datetimes as UTC regardless of host time zone", () => {
+    const previousTimeZone = process.env.TZ;
+    process.env.TZ = "Asia/Tokyo";
+    try {
+      const columns = [{ name: "value", category: "datetime" as const }];
+      const rows = [{ value: "2024-01-05 00:30:00" }, { value: "2024-01-05" }];
+      expect(applySort(rows, request.sort, columns)).toEqual([
+        rows[1],
+        rows[0],
+      ]);
+      expect(
+        applyFilters(
+          rows,
+          [{ column: "value", operator: "gt", value: "2024-01-05" }],
+          columns,
+        ),
+      ).toEqual([rows[0]]);
+    } finally {
+      if (previousTimeZone === undefined) delete process.env.TZ;
+      else process.env.TZ = previousTimeZone;
+    }
+  });
+
   it("does not allocate an exponent-sized decimal expansion", () => {
     const exponent = "9".repeat(5000);
     expect(compareNumericTokens(`1e${exponent}`, `2e${exponent}`)).toBe(-1);
@@ -397,12 +420,16 @@ function redis(valuesByKey: Record<string, string>) {
       .fn()
       .mockResolvedValue({ cursor: "0", keys: Object.keys(valuesByKey) }),
     type: vi.fn().mockResolvedValue("string"),
+    strLen: vi.fn(async (key: string) => valuesByKey[key]?.length ?? 0),
     withTypeMapping: vi.fn(() => ({
       scan: vi.fn().mockResolvedValue({
         cursor: Buffer.from("0"),
         keys: Object.keys(valuesByKey).map((key) => Buffer.from(key)),
       }),
       get: vi.fn(async (key: string) =>
+        valuesByKey[key] === undefined ? null : Buffer.from(valuesByKey[key]),
+      ),
+      getRange: vi.fn(async (key: string) =>
         valuesByKey[key] === undefined ? null : Buffer.from(valuesByKey[key]),
       ),
     })),
@@ -426,9 +453,7 @@ function mongo(documents: Record<string, unknown>[], emptySchema = false) {
   const find = vi.fn(() => {
     const cursor = {
       limit: vi.fn(() => cursor),
-      sort: vi.fn(() => {
-        throw new Error("server BSON coercion unavailable");
-      }),
+      sort: vi.fn(() => cursor),
       toArray: vi.fn(async () =>
         emptySchema && find.mock.calls.length === 1 ? [] : documents,
       ),
@@ -438,6 +463,9 @@ function mongo(documents: Record<string, unknown>[], emptySchema = false) {
   Object.assign(driver, {
     requireDb: () => ({ collection: () => ({ find }) }),
     isView: async () => false,
+    buildMongoFilterCriteria: () => {
+      throw new Error("server BSON coercion unavailable");
+    },
   });
   return { driver, find };
 }
@@ -511,7 +539,7 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
     ).toBe("other");
   });
 
-  it("Mongo server failure falls back to exact BSON Long/Decimal128 sorting and ranges", async () => {
+  it("Mongo filter-translation fallback uses exact BSON Long/Decimal128 sorting and ranges", async () => {
     const documents = values.map((value, i) => ({
       _id: String(i),
       value: i < 4 ? Long.fromString(value) : Decimal128.fromString(value),
@@ -522,7 +550,7 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
         String(row.value).toLowerCase(),
       ),
     ).toEqual(ordered);
-    expect(find.mock.calls.length).toBe(3);
+    expect(find.mock.calls.length).toBe(2);
     const page = await driver.readTablePage({
       ...request,
       filters: [{ column: "value", operator: "gt", value: values[1] }],
@@ -717,10 +745,17 @@ describe("B08 actual driver fallback paths with SDK-boundary fixtures", () => {
     Object.assign(driver, {
       connected: true,
       client: {
+        indices: { getSettings: vi.fn().mockResolvedValue({}) },
+        openPointInTime: vi.fn().mockResolvedValue({ id: "comparison-pit" }),
+        closePointInTime: vi.fn().mockResolvedValue({ succeeded: true }),
         search: vi.fn().mockResolvedValue({
           hits: {
             total: ids.length,
-            hits: ids.map((_id) => ({ _id, _source: {} })),
+            hits: ids.map((_id, cursor) => ({
+              _id,
+              _source: {},
+              sort: [cursor],
+            })),
           },
         }),
       },

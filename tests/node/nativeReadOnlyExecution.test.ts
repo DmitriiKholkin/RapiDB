@@ -90,7 +90,11 @@ describe("database-native read-only query execution", () => {
     expect(query.mock.calls[1]?.[0]).toMatchObject({
       text: "select 1; select 2",
     });
-    expect(query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK");
+    expect(query.mock.calls.slice(2).map(([sql]) => sql)).toEqual([
+      "ROLLBACK",
+      "DISCARD ALL",
+      "SET extra_float_digits = 3",
+    ]);
   });
 
   it("rejects Oracle editor reads before leasing a session instead of relying on rollback", async () => {

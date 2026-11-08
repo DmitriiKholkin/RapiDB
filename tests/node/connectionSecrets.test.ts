@@ -2,16 +2,107 @@ import { describe, expect, it } from "vitest";
 import {
   extractCredentialBearingUriSecret,
   hasConnectionConfigSecrets,
+  resolveStoredCredentialBearingUri,
   sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
   sanitizePersistedConnectionConfig,
   serializeConnectionSecretsForStoredConfig,
+  shouldForceSecretStorage,
+  shouldKeepHandWrittenSecretsInSettings,
   trimOptionalSecretValue,
 } from "../../src/extension/connectionSecrets";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { validateConnectionConfig } from "../../src/shared/connectionValidation";
 
 describe("connection URI secret handling", () => {
+  it("resolves a stored URI secret only for a matching credential-free settings value", () => {
+    const secret = "redis://user:old@cache.local:6379/0";
+    expect(
+      resolveStoredCredentialBearingUri("redis://cache.local:6379/0", secret),
+    ).toBe(secret);
+    for (const value of [
+      "redis://other.local:6379/0",
+      "redis://user:new@cache.local:6379/0",
+      undefined,
+    ]) {
+      expect(resolveStoredCredentialBearingUri(value, secret)).toBe(value);
+    }
+    expect(
+      resolveStoredCredentialBearingUri(
+        "redis://cache.local:6379/0",
+        "redis://user:pa/ss@cache.local:6379/0",
+      ),
+    ).toBe("redis://cache.local:6379/0");
+  });
+
+  it("retains a mismatched URI secret only when migration asks for it", () => {
+    const previous = JSON.stringify({
+      connectionUri: "redis://user:old@old.local:6379/0",
+    });
+    const config: ConnectionConfig = {
+      id: "redis",
+      name: "Redis",
+      type: "redis",
+      connectionUri: "redis://new.local:6379/0",
+      useSecretStorage: true,
+    };
+    expect(
+      serializeConnectionSecretsForStoredConfig(config, previous),
+    ).toBeUndefined();
+    expect(
+      serializeConnectionSecretsForStoredConfig(config, previous, {
+        retainCredentialBearingUris: true,
+      }),
+    ).toBe(previous);
+  });
+
+  it("removes only explicitly cleared key passphrases and accepts replacements", () => {
+    const previous = JSON.stringify({
+      password: "db-secret",
+      sshPrivateKey: "key",
+      sshPassphrase: "old-ssh",
+      tlsKeyPassphrase: "old-tls",
+      futureSecret: "preserved",
+    });
+    const config: ConnectionConfig = {
+      id: "keys",
+      name: "Keys",
+      type: "pg",
+      ssh: { authMethod: "privateKey" },
+      tls: { mode: "mutualTls" },
+    };
+    const unchanged = JSON.parse(
+      serializeConnectionSecretsForStoredConfig(config, previous) ?? "{}",
+    );
+    expect(unchanged.sshPassphrase).toBe("old-ssh");
+    expect(unchanged.tlsKeyPassphrase).toBe("old-tls");
+    const cleared = JSON.parse(
+      serializeConnectionSecretsForStoredConfig(config, previous, {
+        sshPassphrase: true,
+        tlsKeyPassphrase: true,
+      }) ?? "{}",
+    );
+    expect(cleared).toEqual({
+      password: "db-secret",
+      sshPrivateKey: "key",
+      futureSecret: "preserved",
+    });
+    const replacement = JSON.parse(
+      serializeConnectionSecretsForStoredConfig(
+        {
+          ...config,
+          ssh: { ...config.ssh, passphrase: "new-ssh" },
+          tls: { mode: "mutualTls", keyPassphrase: "new-tls" },
+        },
+        previous,
+        { sshPassphrase: true, tlsKeyPassphrase: true },
+      ) ?? "{}",
+    );
+    expect(replacement).toMatchObject({
+      sshPassphrase: "new-ssh",
+      tlsKeyPassphrase: "new-tls",
+    });
+  });
   it.each([
     ["redis://user:p@ss@host:6379/0", "redis://host:6379/0"],
     ["user:uri-secret@host/db", "host/db"],
@@ -38,6 +129,7 @@ describe("connection URI secret handling", () => {
       name: "URI",
       type: uri.startsWith("redis://") ? "redis" : "mongodb",
       connectionUri: uri,
+      useSecretStorage: true,
     };
     const persisted = sanitizePersistedConnectionConfig(config);
     expect(persisted.connectionUri).toBe(redacted);
@@ -136,6 +228,11 @@ describe("connection URI secret handling", () => {
     "mongodb://us/er:password@host/db",
     "mongodb://us?er:password@host/db",
     "mongodb://us#er:password@host/db",
+    "mongodb://admin:pa/ss@db/app",
+    "redis://user:123?ss@host/0",
+    "redis://cache.local:6379/0?client_name=a:x@b",
+    "redis://user:123?s=s@host/0",
+    "mongodb://user:1234/db?x=1@evil.example.com",
   ])("rejects ambiguous URI %s rather than guessing a host or password", (uri) => {
     expect(() => sanitizeCredentialBearingUri(uri)).toThrow(
       "Ambiguous URI credentials",
@@ -151,6 +248,9 @@ describe("connection URI secret handling", () => {
     "redis://host:6379/0",
     "https://host/path%40name?label=user%40example.com",
     "https://host:443/path%40name",
+    "redis://cache.local:6379/0?client_name=a@b",
+    "https://es.example.com:9243/?x=a@b",
+    "mongodb://host1:27017,host2:27017/db?appName=a@b",
   ])("preserves harmless URI %s", (uri) => {
     expect(sanitizeCredentialBearingUri(uri)).toBe(uri);
     expect(extractCredentialBearingUriSecret(uri)).toBeUndefined();
@@ -171,6 +271,7 @@ describe("connection URI secret handling", () => {
         name: "Endpoint",
         type: "elasticsearch",
         endpoint: uri,
+        useSecretStorage: true,
       };
       const persisted = sanitizePersistedConnectionConfig(config);
       expect(persisted.endpoint).toBe("https://host/");
@@ -201,6 +302,7 @@ describe("connection URI secret handling", () => {
       name: "Elastic",
       type: "elasticsearch",
       endpoint: uri,
+      useSecretStorage: true,
     } as ConnectionConfig);
     expect(persisted.endpoint).toBe(
       "https://cluster.example.com/api?region=us-east-1",
@@ -284,7 +386,10 @@ describe("connection URI secret handling", () => {
           redacted,
         );
         expect(sanitizePersistedConnectionConfig(config)[field]).toBe(
-          useSecretStorage === false ? uri : redacted,
+          useSecretStorage === true ? redacted : uri,
+        );
+        expect(sanitizePersistedConnectionConfig(config).useSecretStorage).toBe(
+          useSecretStorage ?? false,
         );
         expect(
           JSON.parse(
@@ -300,6 +405,160 @@ describe("connection URI secret handling", () => {
 });
 
 describe("connection secret persistence", () => {
+  const handWrittenSecretConfigs: ConnectionConfig[] = [
+    {
+      id: "pg",
+      name: "pg",
+      type: "pg",
+      host: "db",
+      password: "hand-password",
+    },
+    {
+      id: "es",
+      name: "es",
+      type: "elasticsearch",
+      endpoint: "https://es",
+      apiKey: "hand-api-key",
+    },
+    {
+      id: "ddb",
+      name: "ddb",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsAccessKeyId: "hand-access",
+      awsSecretAccessKey: "hand-secret",
+      awsSessionToken: "hand-token",
+    },
+    {
+      id: "ssh",
+      name: "ssh",
+      type: "mysql",
+      host: "db",
+      ssh: {
+        host: "bastion",
+        port: 22,
+        username: "tunnel",
+        authMethod: "privateKey",
+        privateKey: "hand-key",
+        passphrase: "hand-passphrase",
+      },
+    },
+    {
+      id: "ssh-password",
+      name: "ssh-password",
+      type: "mssql",
+      host: "db",
+      ssh: {
+        host: "bastion",
+        port: 22,
+        username: "tunnel",
+        authMethod: "password",
+        password: "hand-ssh-password",
+      },
+    },
+    {
+      id: "tls",
+      name: "tls",
+      type: "oracle",
+      host: "db",
+      tls: {
+        mode: "mutualTls",
+        certFilePath: "/cert",
+        keyFilePath: "/key",
+        keyPassphrase: "hand-tls",
+      },
+    },
+    {
+      id: "uri",
+      name: "uri",
+      type: "mongodb",
+      mongoConnectionMode: "uri",
+      connectionUri: "mongodb://user:hand-uri@host/db",
+    },
+    {
+      id: "redis",
+      name: "redis",
+      type: "redis",
+      uri: "redis://user:hand-uri@host/0",
+    },
+    {
+      id: "ddb-endpoint",
+      name: "ddb-endpoint",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsEndpoint: "https://user:hand-uri@host/",
+    },
+  ];
+
+  it.each(
+    handWrittenSecretConfigs,
+  )("keeps hand-written $id secrets in settings without a storage flag", (config) => {
+    expect(shouldKeepHandWrittenSecretsInSettings(config)).toBe(true);
+    expect(shouldForceSecretStorage(config)).toBe(false);
+    expect(sanitizePersistedConnectionConfig(config)).toEqual({
+      ...config,
+      useSecretStorage: false,
+    });
+    for (const useSecretStorage of [false, true]) {
+      expect(
+        shouldKeepHandWrittenSecretsInSettings({ ...config, useSecretStorage }),
+      ).toBe(false);
+    }
+  });
+
+  it("treats ambiguous hand-written URI credentials as plaintext secrets", () => {
+    const config: ConnectionConfig = {
+      id: "ambiguous",
+      name: "ambiguous",
+      type: "mongodb",
+      connectionUri: "mongodb://admin:pa/ss@db/app",
+    };
+    expect(shouldKeepHandWrittenSecretsInSettings(config)).toBe(true);
+  });
+
+  it.each([
+    "pg",
+    "elasticsearch",
+    "dynamodb",
+  ] as const)("does not force Secret Storage for flagless %s connections without secrets", (type) => {
+    const config: ConnectionConfig = {
+      id: type,
+      name: type,
+      type,
+      host: "db",
+      ssh: {
+        host: "bastion",
+        port: 22,
+        username: "tunnel",
+        authMethod: "privateKey",
+      },
+      tls: { mode: "mutualTls", certFilePath: "/cert", keyFilePath: "/key" },
+    };
+    expect(shouldKeepHandWrittenSecretsInSettings(config)).toBe(false);
+    expect(shouldForceSecretStorage(config)).toBe(false);
+    expect(sanitizePersistedConnectionConfig(config)).toEqual(config);
+  });
+
+  it.each(
+    handWrittenSecretConfigs,
+  )("stores every $id secret only by the explicit flag", (config) => {
+    expect(
+      sanitizePersistedConnectionConfig({ ...config, useSecretStorage: false }),
+    ).toEqual({ ...config, useSecretStorage: false });
+    const persisted = sanitizePersistedConnectionConfig({
+      ...config,
+      useSecretStorage: true,
+    });
+    expect(persisted.useSecretStorage).toBe(true);
+    expect(hasConnectionConfigSecrets(persisted)).toBe(false);
+    expect(
+      serializeConnectionSecretsForStoredConfig(
+        { ...config, useSecretStorage: true },
+        undefined,
+      ),
+    ).toBeDefined();
+  });
+
   it.each([
     undefined,
     false,

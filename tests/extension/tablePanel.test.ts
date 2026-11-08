@@ -1,11 +1,15 @@
+import { BSON, BSONRegExp, Long } from "mongodb";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
+import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import type { IDBDriver } from "../../src/extension/dbDrivers/types";
 import { QueryPanelController } from "../../src/extension/panels/queryPanelController";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ChunkedExportData } from "../../src/extension/utils/exportService";
+import { serializeJsonExportRecord } from "../../src/extension/utils/exportValueFormat";
 import type { TableMutationPreviewPayload } from "../../src/shared/webviewContracts";
 import { elasticsearchKeys } from "../support/elasticsearchIdentity";
 import {
@@ -21,6 +25,7 @@ const getColumnsMock = vi.hoisted(() =>
 const getPageMock = vi.hoisted(() =>
   vi.fn(async () => ({ rows: [], totalCount: 0, columns: [] })),
 );
+const getPageChunksCallMock = vi.hoisted(() => vi.fn());
 const clearForConnectionMock = vi.hoisted(() => vi.fn<(id: string) => void>());
 const prepareDeleteRowsPlanMock = vi.hoisted(() =>
   vi.fn<
@@ -189,6 +194,16 @@ vi.mock("../../src/extension/tableDataService", () => ({
   TableDataService: class {
     getColumns = getColumnsMock;
     getPage = getPageMock;
+    async *getPageChunks(...args: unknown[]) {
+      getPageChunksCallMock(...args);
+      const result = await (
+        getPageMock as unknown as (
+          ...pageArgs: unknown[]
+        ) => ReturnType<typeof getPageMock>
+      )(...args.slice(0, 8), true, args[8]);
+      (args[9] as (() => void) | undefined)?.();
+      yield { columns: result.columns, rows: result.rows };
+    }
     exportAll = exportAllMock;
     prepareInsertRow = prepareInsertRowMock;
     prepareDeleteRowsPlan = prepareDeleteRowsPlanMock;
@@ -321,6 +336,9 @@ function deletePreviewPlan(): import("../../src/extension/tableDataService").Pre
 describe("TablePanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vscodeMock.module.window.showWarningMessage
+      .mockReset()
+      .mockResolvedValue("Export Anyway");
     TablePanel.disposeAll();
     vscodeMock.serializers.clear();
     pendingPreviewControllerState.clear();
@@ -479,6 +497,7 @@ describe("TablePanel", () => {
       getConnection: vi.fn(() => ({ name: "Main", type: "pg" })),
       getDefaultPageSize: vi.fn(() => 25),
       isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => ({})),
       onDidRefreshSchemas: (listener: (id?: string) => void) => {
         refreshListeners.add(listener);
         return { dispose: () => refreshListeners.delete(listener) };
@@ -795,6 +814,7 @@ describe("TablePanel", () => {
         primaryKeyColumns: ["id"],
         isView: false,
         connectionReadOnly: true,
+        connectionSessionKey: expect.any(String),
       },
     });
     await connectionManager.connectTo("conn-2", "explicit");
@@ -974,6 +994,7 @@ describe("TablePanel", () => {
     let disconnectDelay: Promise<void> | undefined;
     let connectDelay: Promise<void> | undefined;
     let columns = [{ name: "id", isPrimaryKey: true }];
+    let serverHost = host;
     const driverFactory = vi.fn(() => {
       let connected = false;
       const driverColumns = columns;
@@ -985,7 +1006,7 @@ describe("TablePanel", () => {
         ) => ({ columns: [], rows: [], rowCount: 1 }),
       );
       return {
-        targetHost: manager.getConnection("conn-1")?.host,
+        targetHost: serverHost,
         connect: vi.fn(async () => {
           await connectDelay;
           connected = true;
@@ -1064,6 +1085,9 @@ describe("TablePanel", () => {
       onDispose,
       setNextColumns: (next: MockColumn[]) => {
         columns = next;
+      },
+      setServerHost: (next: string) => {
+        serverHost = next;
       },
       setDisconnectDelay: (delay?: Promise<void>) => {
         disconnectDelay = delay;
@@ -1524,8 +1548,93 @@ describe("TablePanel", () => {
       payload: { operationId: "op-1", previewToken: "preview-token" },
     });
     expect(confirmMutationPreviewMock).toHaveBeenCalledOnce();
-    expect(panel.webview.postMessage).toHaveBeenCalledTimes(4);
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(5);
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(5, {
+      type: "deleteResult",
+      payload: expect.objectContaining({
+        operationId: "op-1",
+        success: false,
+        changesPossible: true,
+        outcomeUnknown: true,
+        error: expect.stringContaining("already confirmed and executed"),
+      }),
+    });
     expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("ignores a repeated confirm while the preview is executing", async () => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users WHERE id=1"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+    const execution = deferred<unknown>();
+    confirmMutationPreviewMock.mockImplementationOnce(() => execution.promise);
+    const confirming = panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    await vi.waitFor(() =>
+      expect(confirmMutationPreviewMock).toHaveBeenCalledOnce(),
+    );
+    const postCount = panel.webview.postMessage.mock.calls.length;
+
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "preview-token" },
+    });
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(postCount);
+
+    const result = {
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: true,
+        affectedRows: 1,
+        rowOutcomes: [],
+        changesPossible: true,
+        outcomeUnknown: false,
+      },
+    };
+    execution.resolve(result);
+    await confirming;
+
+    expect(confirmMutationPreviewMock).toHaveBeenCalledOnce();
+    expect(panel.webview.postMessage).toHaveBeenCalledTimes(postCount + 1);
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith(result);
+  });
+
+  it("rejects an expired preview token as not executed", async () => {
+    const { panel } = await openSchemaRefreshPath();
+    prepareDeleteRowsPlanMock.mockResolvedValue({
+      previewStatements: ["DELETE FROM users WHERE id=1"],
+    });
+    await panel.webview.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "op-1", primaryKeysList: [{ id: 1 }] },
+    });
+
+    await panel.webview.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "op-1", previewToken: "expired-token" },
+    });
+
+    expect(confirmMutationPreviewMock).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "deleteResult",
+      payload: {
+        operationId: "op-1",
+        success: false,
+        error: expect.stringContaining("expired and was not executed"),
+        changesPossible: false,
+        outcomeUnknown: false,
+        affectedRows: 0,
+        rowOutcomes: [],
+      },
+    });
   });
 
   it("preserves apply prevalidation diagnostics on false-to-true delivery without executing writes", async () => {
@@ -1726,7 +1835,10 @@ describe("TablePanel", () => {
             },
           }
         : type === "insertResult"
-          ? { type: "insertRow", payload: { operationId: "op-1", values: {} } }
+          ? {
+              type: "insertRow",
+              payload: { operationId: "op-1", values: {} },
+            }
           : {
               type: "deleteRows",
               payload: {
@@ -1844,7 +1956,19 @@ describe("TablePanel", () => {
       false,
     );
     expect(panel.webview.postMessage).toHaveBeenCalledTimes(
-      postCountBeforeMutation + 2,
+      postCountBeforeMutation + 3,
+    );
+    expect(panel.webview.postMessage).toHaveBeenNthCalledWith(
+      postCountBeforeMutation + 3,
+      {
+        type: "applyResult",
+        payload: expect.objectContaining({
+          operationId: "op-1",
+          success: false,
+          changesPossible: false,
+          outcomeUnknown: false,
+        }),
+      },
     );
   });
 
@@ -1886,6 +2010,173 @@ describe("TablePanel", () => {
     expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
   });
 
+  it("exports a Mongo page when a hidden field contains an ambiguous EJSON key", async () => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    const driver = new MongoDBDriver({ id: "qa", name: "QA", type: "mongodb" });
+    const source = BSON.deserialize(
+      BSON.serialize({
+        _id: "one",
+        payload: { $oid: "507f1f77bcf86cd799439011" },
+      }),
+      { promoteValues: false, bsonRegExp: true },
+    );
+    const row = Reflect.get(driver, "toRow").call(driver, source);
+    connectionManager.getDriver.mockReturnValue(driver as never);
+    getPageMock.mockResolvedValueOnce({
+      columns: [
+        { name: "_id", nativeType: "string", category: "text" },
+        { name: "payload", nativeType: "object", category: "json" },
+      ],
+      rows: [row],
+      totalCount: 1,
+    } as never);
+    const chunks: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const chunk of loadChunks(new AbortController().signal))
+        chunks.push(chunk);
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportJSON",
+      payload: { limitToPage: { page: 1, pageSize: 25 }, columnOrder: ["_id"] },
+    });
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0].rows).toEqual([{ _id: "one" }]);
+    expect(chunks[0].columns.map((column) => column.name)).toEqual(["_id"]);
+  });
+
+  it("forwards Mongo page fields missing from the schema sample and cancels reads on dispose", async () => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: "mongodb",
+    });
+    const late = {
+      name: "late",
+      nativeType: "mixed",
+      category: "other",
+      isReadOnly: true,
+    };
+    getPageMock.mockResolvedValueOnce({
+      columns: [{ name: "id" }, { name: "name" }, late],
+      rows: [{ id: 1, late: "x" }],
+      totalCount: 1,
+    } as never);
+    await panel.webview.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 21, page: 1 },
+    });
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "tableData",
+      payload: expect.objectContaining({ fetchId: 21, extraColumns: [late] }),
+    });
+    const signal = (
+      getPageMock.mock.calls.at(-1) as unknown[]
+    )[9] as AbortSignal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(false);
+    panel.dispose();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it.each(
+    ["exportCSV", "exportJSON"].flatMap((type) =>
+      ["mongodb", "dynamodb"].map((kind) => ({ type, kind })),
+    ),
+  )("formats native $kind page chunks before column reordering for $type", async ({
+    type,
+    kind,
+  }) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    const driver =
+      kind === "mongodb"
+        ? new MongoDBDriver({ id: "qa", name: "QA", type: "mongodb" })
+        : new DynamoDBDriver({ id: "qa", name: "QA", type: "dynamodb" });
+    const source = {
+      _id: "one",
+      payload: {
+        $rapiDB: { type: "ordinary-customer-value" },
+        binary: Buffer.from([1]),
+        exact:
+          kind === "mongodb"
+            ? Long.fromString("9007199254740993")
+            : "9007199254740993",
+        regex: kind === "mongodb" ? new BSONRegExp("a.b", "s") : "text",
+      },
+    };
+    const formatRow = Reflect.get(
+      driver,
+      kind === "mongodb" ? "toRow" : "formatDynamoRowForDisplay",
+    );
+    const nativeSource =
+      kind === "mongodb"
+        ? BSON.deserialize(BSON.serialize(source), {
+            promoteValues: false,
+            bsonRegExp: true,
+          })
+        : source;
+    const row = formatRow.call(driver, nativeSource);
+    const columns = [
+      { name: "_id", nativeType: "string", category: "text" },
+      { name: "payload", nativeType: "object", category: "json" },
+      { name: "sparse", nativeType: "string", category: "text" },
+    ];
+    connectionManager.getDriver.mockReturnValue(driver as never);
+    getPageMock.mockResolvedValueOnce({
+      columns,
+      rows: [row],
+      totalCount: 1,
+    } as never);
+    const chunks: ChunkedExportData[] = [];
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      for await (const chunk of loadChunks(new AbortController().signal))
+        chunks.push(chunk);
+    });
+    await panel.webview.dispatchMessage({
+      type,
+      payload: {
+        limitToPage: { page: 1, pageSize: 25 },
+        columnOrder: ["sparse", "payload", "_id"],
+      },
+    });
+    expect(chunks).toHaveLength(1);
+    const chunk = chunks[0];
+    expect(chunk.columns.map((c) => c.name)).toEqual([
+      "sparse",
+      "payload",
+      "_id",
+    ]);
+    expect(chunk.missingCells).toEqual([{ rowIndex: 0, columnIndex: 0 }]);
+    const serialized = JSON.parse(
+      serializeJsonExportRecord(
+        chunk.columns.map((c) => ({
+          key: c.name,
+          sourceKey: c.name,
+          category: c.exportCategory ?? c.category,
+          nativeType: c.nativeType,
+          value: chunk.rows[0][c.name],
+          omit: !Object.hasOwn(chunk.rows[0], c.name),
+        })),
+      ),
+    );
+    expect(serialized).not.toHaveProperty("sparse");
+    if (kind === "mongodb") {
+      expect(serialized.payload).toEqual({
+        $rapiDB: { type: "ordinary-customer-value" },
+        binary: { $binary: { base64: "AQ==", subType: "00" } },
+        exact: { $numberLong: "9007199254740993" },
+        regex: { $regularExpression: { pattern: "a.b", options: "s" } },
+      });
+      expect(chunk.columns[1].exportCategory).toBe("other");
+      expect(serialized._id).toBe("one");
+    } else {
+      expect(serialized.payload.M.$rapiDB.M.type).toEqual({
+        S: "ordinary-customer-value",
+      });
+      expect(serialized.payload.M.binary).toEqual({ B: "AQ==" });
+      expect(serialized._id).toEqual({ S: "one" });
+    }
+  });
+
   it.each([
     "exportCSV",
     "exportJSON",
@@ -1923,12 +2214,144 @@ describe("TablePanel", () => {
     expect(exportTableDataMock).toHaveBeenCalledTimes(1);
   });
 
+  it.each(
+    [
+      "pg",
+      "mysql",
+      "sqlite",
+      "mssql",
+      "oracle",
+      "mongodb",
+      "redis",
+      "dynamodb",
+    ].flatMap((databaseType) =>
+      ["exportCSV", "exportJSON"].map((type) => ({ databaseType, type })),
+    ),
+  )("requires acknowledgement of non-snapshot full $type for $databaseType", async ({
+    databaseType,
+    type,
+  }) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: databaseType,
+    });
+    const warning = vscodeMock.module.window.showWarningMessage;
+    warning
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce("Export Anyway");
+
+    await panel.webview.dispatchMessage({ type });
+    expect(exportTableDataMock).not.toHaveBeenCalled();
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /does not guarantee a consistent snapshot.*missing, duplicated, or inconsistent rows/i,
+      ),
+      { modal: true },
+      "Export Anyway",
+    );
+
+    await panel.webview.dispatchMessage({ type });
+    expect(exportTableDataMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "mysql",
+    "mssql",
+    "mongodb",
+    "redis",
+    "dynamodb",
+  ])("warns for a single %s page export without guaranteed snapshot", async (databaseType) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: databaseType,
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: { limitToPage: { page: 1, pageSize: 25 } },
+    });
+    expect(vscodeMock.module.window.showWarningMessage).toHaveBeenCalledOnce();
+    expect(exportTableDataMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "pg",
+    "sqlite",
+    "oracle",
+    "elasticsearch",
+  ])("does not add a multi-page warning to a single %s page", async (databaseType) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    if (databaseType === "elasticsearch") {
+      const driver = {
+        ...connectionManager.getDriver(),
+        readTablePage: vi.fn(),
+      };
+      connectionManager.getDriver.mockReturnValue(driver);
+    }
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: databaseType,
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: { limitToPage: { page: 1, pageSize: 25 } },
+    });
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(exportTableDataMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "exportCSV",
+    "exportJSON",
+  ])("does not warn for Elasticsearch PIT native %s export, including filters and sort", async (type) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    const driver = {
+      ...connectionManager.getDriver(),
+      exportTableChunks: vi.fn(),
+    };
+    connectionManager.getDriver.mockReturnValue(driver);
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: "elasticsearch",
+    });
+    await panel.webview.dispatchMessage({
+      type,
+      payload: {
+        filters: [{ column: "id", operator: "eq", value: "1" }],
+        sort: { column: "id", direction: "asc" },
+      },
+    });
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+    expect(exportTableDataMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("warns when Elasticsearch PIT reader is not the selected path (pageOnly=%s)", async (pageOnly) => {
+    const { panel, connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getConnection.mockReturnValue({
+      name: "Main",
+      type: "elasticsearch",
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportJSON",
+      payload: pageOnly ? { limitToPage: { page: 1, pageSize: 25 } } : {},
+    });
+    expect(vscodeMock.module.window.showWarningMessage).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "exportCSV",
     "exportJSON",
   ])("keeps visible-column positions and metadata across sparse chunks for full %s", async (type) => {
     const { panel } = await openSchemaRefreshPath();
-    const id = { name: "id", category: "integer", nativeType: "int" } as const;
+    const id = {
+      name: "id",
+      category: "integer",
+      nativeType: "int",
+    } as const;
     const name = {
       name: "name",
       category: "text",
@@ -1958,7 +2381,11 @@ describe("TablePanel", () => {
     });
     expect(actual).toEqual([
       { columns: [name, id], rows: [{ name: "one", id: 1 }] },
-      { columns: [name, id], rows: [{ name: undefined, id: 2 }] },
+      {
+        columns: [name, id],
+        rows: [{ id: 2 }],
+        missingCells: [{ rowIndex: 0, columnIndex: 0 }],
+      },
       { columns: [name, id], rows: [{ name: "three", id: 3 }] },
     ]);
     expect(exportAllMock).toHaveBeenCalledWith(
@@ -1970,6 +2397,7 @@ describe("TablePanel", () => {
       { column: "id", direction: "asc" },
       [{ column: "id", operator: "gte", value: "1" }],
       expect.any(AbortSignal),
+      ["name", "id"],
     );
   });
 
@@ -2004,8 +2432,9 @@ describe("TablePanel", () => {
     expect(actual[0]?.rows[0]).toEqual(row);
     expect(Object.hasOwn(actual[0].rows[0], "__proto__")).toBe(true);
     expect(Object.getPrototypeOf(actual[0].rows[0])).toBe(Object.prototype);
-    expect(Object.entries(actual[1].rows[0])).toEqual(
-      columns.map((column) => [column.name, undefined]),
+    expect(Object.entries(actual[1].rows[0])).toEqual([]);
+    expect(actual[1].missingCells).toEqual(
+      columns.map((_, columnIndex) => ({ rowIndex: 0, columnIndex })),
     );
   });
 
@@ -2042,7 +2471,8 @@ describe("TablePanel", () => {
       "id",
     ]);
     expect(actual[0]?.columns[0]).toEqual(name);
-    expect(actual[0]?.rows).toEqual([{ name: undefined, id: 1 }]);
+    expect(actual[0]?.rows).toEqual([{ id: 1 }]);
+    expect(actual[0]?.missingCells).toEqual([{ rowIndex: 0, columnIndex: 0 }]);
   });
 
   it.each([
@@ -2102,6 +2532,109 @@ describe("TablePanel", () => {
     expect(actual).toEqual([chunk]);
   });
 
+  it.each([
+    false,
+    true,
+  ])("stops before reading after reconnect during schema refresh (pageOnly=%s)", async (pageOnly) => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const panel = createdPanel();
+    getColumnsMock.mockResolvedValue([{ name: "id", isPrimaryKey: true }]);
+    await panel.webview.dispatchMessage({ type: "ready" });
+    const pending = deferred<MockColumn[]>();
+    getColumnsMock.mockImplementationOnce(() => pending.promise);
+    fixture.refresh();
+    await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(2));
+    getPageMock.mockClear();
+    const readStarted = vi.fn();
+    exportAllMock.mockImplementationOnce(async function* () {
+      readStarted();
+      yield { columns: [], rows: [] };
+    });
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      const next = loadChunks(new AbortController().signal)
+        [Symbol.asyncIterator]()
+        .next();
+      await Promise.resolve();
+      fixture.invalidate();
+      pending.resolve([{ name: "id", isPrimaryKey: true }]);
+      await expect(next).rejects.toThrow(/export connection changed/i);
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: {
+        columnOrder: ["id"],
+        ...(pageOnly ? { limitToPage: { page: 1, pageSize: 25 } } : {}),
+      },
+    });
+    expect(readStarted).not.toHaveBeenCalled();
+    expect(getPageMock).not.toHaveBeenCalled();
+  });
+
+  it("passes a live session guard through the page export service", async () => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const panel = createdPanel();
+    const pending = deferred<{ rows: []; totalCount: number; columns: [] }>();
+    getPageMock.mockImplementationOnce(() => pending.promise);
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      const next = loadChunks(new AbortController().signal)
+        [Symbol.asyncIterator]()
+        .next();
+      await vi.waitFor(() =>
+        expect(getPageChunksCallMock).toHaveBeenCalledOnce(),
+      );
+      const guard = getPageChunksCallMock.mock.calls[0][9] as () => void;
+      expect(guard).toEqual(expect.any(Function));
+      fixture.invalidate();
+      expect(guard).toThrow(/export connection changed/i);
+      pending.resolve({ rows: [], totalCount: 0, columns: [] });
+      await expect(next).rejects.toThrow(/export connection changed/i);
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportCSV",
+      payload: { limitToPage: { page: 1, pageSize: 25 } },
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("stops before reading after cancellation during schema refresh (pageOnly=%s)", async (pageOnly) => {
+    const fixture = lazyRestoreRegistryFixture();
+    fixture.open();
+    const panel = createdPanel();
+    getColumnsMock.mockResolvedValue([{ name: "id", isPrimaryKey: true }]);
+    await panel.webview.dispatchMessage({ type: "ready" });
+    const pending = deferred<MockColumn[]>();
+    getColumnsMock.mockImplementationOnce(() => pending.promise);
+    fixture.refresh();
+    await vi.waitFor(() => expect(getColumnsMock).toHaveBeenCalledTimes(2));
+    const started = vi.fn();
+    exportAllMock.mockImplementationOnce(async function* () {
+      started();
+      yield { columns: [], rows: [] };
+    });
+    getPageMock.mockClear();
+    exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
+      const controller = new AbortController();
+      const next = loadChunks(controller.signal)[Symbol.asyncIterator]().next();
+      await Promise.resolve();
+      controller.abort();
+      pending.resolve([{ name: "id", isPrimaryKey: true }]);
+      await expect(next).rejects.toMatchObject({ name: "AbortError" });
+    });
+    await panel.webview.dispatchMessage({
+      type: "exportJSON",
+      payload: {
+        columnOrder: ["id"],
+        ...(pageOnly ? { limitToPage: { page: 1, pageSize: 25 } } : {}),
+      },
+    });
+    expect(started).not.toHaveBeenCalled();
+    expect(getPageMock).not.toHaveBeenCalled();
+  });
+
   it.each(
     (["exportCSV", "exportJSON"] as const).flatMap((type) =>
       [false, true].flatMap((pageOnly) =>
@@ -2117,7 +2650,7 @@ describe("TablePanel", () => {
     pageOnly,
     stage,
   }) => {
-    const { manager, panel, driver, onDispose } =
+    const { manager, panel, driver, onDispose, setServerHost } =
       await restoreWithRealConnectionManager({
         host: "server-a",
       });
@@ -2149,9 +2682,7 @@ describe("TablePanel", () => {
       });
       const reconnect = async () => {
         await driver.disconnect();
-        const config = manager.getConnection("conn-1");
-        if (!config) throw new Error("Expected connection config");
-        await manager.saveConnection({ ...config, host: "server-b" });
+        setServerHost("server-b");
         await manager.connectTo("conn-1", "explicit");
       };
       exportTableDataMock.mockImplementationOnce(async ({ loadChunks }) => {
@@ -2203,6 +2734,7 @@ describe("TablePanel", () => {
       driverFactory,
       onDispose,
       setConnectDelay,
+      setServerHost,
     } = await restoreWithRealConnectionManager({
       realPreviews: true,
       host: "server-a",
@@ -2220,9 +2752,7 @@ describe("TablePanel", () => {
       expect(driver.targetHost).toBe("server-a");
       expect(driver.query).not.toHaveBeenCalled();
       await driver.disconnect();
-      const config = manager.getConnection("conn-1");
-      if (!config) throw new Error("Expected connection config");
-      await manager.saveConnection({ ...config, host: "server-b" });
+      setServerHost("server-b");
       expect(onDispose).not.toHaveBeenCalled();
       if (pendingInstall) setConnectDelay(connecting.promise);
       reconnect = manager.connectTo("conn-1", "explicit");
@@ -2323,7 +2853,7 @@ describe("TablePanel", () => {
     "plan",
     "metadata",
   ] as const)("rejects a late server-A preview preparation waiting on %s after server B's metadata is installed", async (waitingOn) => {
-    const { manager, panel, driver, driverFactory } =
+    const { manager, panel, driver, driverFactory, setServerHost } =
       await restoreWithRealConnectionManager({
         realPreviews: true,
         host: "server-a",
@@ -2341,16 +2871,17 @@ describe("TablePanel", () => {
         prepareDeleteRowsPlanMock.mockImplementationOnce(() => plan.promise);
       preparing = panel.webview.dispatchMessage({
         type: "deleteRows",
-        payload: { operationId: "late-delete-a", primaryKeysList: [{ id: 1 }] },
+        payload: {
+          operationId: "late-delete-a",
+          primaryKeysList: [{ id: 1 }],
+        },
       });
       if (waitingOn === "plan")
         await vi.waitFor(() =>
           expect(prepareDeleteRowsPlanMock).toHaveBeenCalledOnce(),
         );
       await driver.disconnect();
-      const config = manager.getConnection("conn-1");
-      if (!config) throw new Error("Expected connection config");
-      await manager.saveConnection({ ...config, host: "server-b" });
+      setServerHost("server-b");
       await manager.connectTo("conn-1", "explicit");
       await vi.waitFor(() =>
         expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
@@ -2802,6 +3333,8 @@ describe("TablePanel", () => {
       10000,
       [],
       null,
+      false,
+      expect.any(AbortSignal),
     );
 
     await panel.webview.dispatchMessage({
@@ -2825,6 +3358,8 @@ describe("TablePanel", () => {
       2,
       [],
       null,
+      false,
+      expect.any(AbortSignal),
     );
   });
 
@@ -2892,6 +3427,7 @@ describe("TablePanel", () => {
         primaryKeyColumns: ["id"],
         isView: false,
         connectionReadOnly: true,
+        connectionSessionKey: expect.any(String),
       },
     });
   });
@@ -3352,6 +3888,67 @@ describe("TablePanel", () => {
       type: "tableMutationPreview",
       payload: expect.anything(),
     });
+  });
+
+  it.each([
+    { supportsAtomicUpdateRows: undefined, refused: true },
+    { supportsAtomicUpdateRows: true, refused: false },
+  ])("checks driver-mode multi-row atomicity before previewing (atomic: $supportsAtomicUpdateRows)", async ({
+    supportsAtomicUpdateRows,
+    refused,
+  }) => {
+    const connectionManager = {
+      getConnection: vi.fn(() => ({ name: "Mongo", type: "mongodb" })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      getDefaultPageSize: vi.fn(() => 25),
+      getSkipTableMutationPreview: vi.fn(() => false),
+      getDriver: vi.fn(() => ({ supportsAtomicUpdateRows })),
+    };
+    const updates = [
+      { primaryKeys: { _id: 1 }, changes: { name: "Ada" } },
+      { primaryKeys: { _id: 2 }, changes: { name: "Grace" } },
+    ];
+    prepareApplyChangesPlanMock.mockReturnValueOnce({
+      executable: true,
+      plan: {
+        mode: "driver",
+        operations: [],
+        previewStatements: ["update 1", "update 2"],
+        updates,
+        skippedRows: [],
+      },
+    });
+
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "db1",
+      "",
+      "users",
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected table panel instance");
+
+    await panel.webview.dispatchMessage({
+      type: "applyChanges",
+      payload: { operationId: "op-1", updates },
+    });
+
+    if (refused) {
+      expect(createApplyChangesPreviewMock).not.toHaveBeenCalled();
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "applyResult",
+        payload: {
+          operationId: "op-1",
+          success: false,
+          error:
+            "This backend cannot guarantee an atomic multi-operation apply. Apply one row at a time.",
+        },
+      });
+    } else {
+      expect(createApplyChangesPreviewMock).toHaveBeenCalledOnce();
+    }
   });
 
   it("builds an Elasticsearch update preview with the driver instance", async () => {

@@ -5,6 +5,7 @@ import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
+  ColumnMeta,
   ColumnTypeMeta,
   FilterOperator,
 } from "../../src/extension/dbDrivers/types";
@@ -12,6 +13,7 @@ import {
   filterOperatorsForCategory,
   resolveFilterOperators,
 } from "../../src/extension/dbDrivers/types";
+import { buildWhere } from "../../src/extension/table/filterSql";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { defaultFilterOperator } from "../../src/shared/tableTypes";
 
@@ -67,6 +69,23 @@ const baseConfig = {
 };
 
 describe("temporal filter operator coverage", () => {
+  it("classifies Oracle inconsistent datatypes as a filter error", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+    } as ConnectionConfig);
+    const isTableFilterError = driver.getCapabilities().isTableFilterError;
+
+    expect(
+      isTableFilterError?.(
+        "ORA-00932: inconsistent datatypes: expected CHAR got RAPIDB.OBJECT_TYPE",
+      ),
+    ).toBe(true);
+    expect(
+      isTableFilterError?.("ORA-00942: table or view does not exist"),
+    ).toBe(false);
+  });
+
   it("exposes scalar operators by category and adds null operators only for nullable columns", () => {
     expect(filterOperatorsForCategory("date")).toEqual(scalarTemporalOperators);
     expect(filterOperatorsForCategory("time")).toEqual(scalarTemporalOperators);
@@ -202,7 +221,7 @@ describe("temporal filter operator coverage", () => {
       params: ["12:34:56"],
     });
     expect(inCondition).toEqual({
-      sql: "`event_at` IN (CAST(? AS DATETIME(6)), CAST(? AS DATETIME(6)))",
+      sql: "`event_at` IN (?, ?)",
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
   });
@@ -237,11 +256,11 @@ describe("temporal filter operator coverage", () => {
     );
 
     expect(gtCondition).toEqual({
-      sql: 'TIME("event_time") > TIME(?)',
+      sql: 'COALESCE(RAPIDB_TIME_KEY("event_time"), RAPIDB_TIME_KEY(TIME("event_time"))) > RAPIDB_TIME_KEY(?)',
       params: ["12:34:56"],
     });
     expect(inCondition).toEqual({
-      sql: 'DATETIME("event_at") IN (DATETIME(?), DATETIME(?))',
+      sql: 'COALESCE(RAPIDB_DATETIME_KEY("event_at"), RAPIDB_DATETIME_KEY(DATETIME("event_at"))) IN (RAPIDB_DATETIME_KEY(?), RAPIDB_DATETIME_KEY(?))',
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
   });
@@ -277,17 +296,50 @@ describe("temporal filter operator coverage", () => {
     });
   });
 
+  it("casts SQL Server date filter inputs so invalid values raise filter errors", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const dateColumn = column("event_date", "date", "date");
+    const invalidDate = "not-a-date";
+
+    expect(
+      driver.buildFilterCondition(dateColumn, "eq", invalidDate, 1),
+    ).toEqual({
+      sql: "[event_date] = CAST(? AS date)",
+      params: [invalidDate],
+    });
+    expect(
+      driver.buildFilterCondition(
+        dateColumn,
+        "between",
+        ["2024-02-29", invalidDate],
+        1,
+      ),
+    ).toEqual({
+      sql: "[event_date] BETWEEN CAST(? AS date) AND CAST(? AS date)",
+      params: ["2024-02-29", invalidDate],
+    });
+    expect(
+      driver
+        .getCapabilities()
+        .isTableFilterError?.(
+          "Conversion failed when converting date and/or time from character string.",
+        ),
+    ).toBe(true);
+  });
+
   describe.each([
-    ["TIME", "time", "12", "12:34", "12:34:00", "TIME"],
+    ["TIME", "time", "12", "12:34", "12:34:00"],
     [
       "DATETIME",
       "datetime",
       "2026",
       "2026-10-01T12:34:56",
       "2026-10-01 12:34:56",
-      "DATETIME",
     ],
-  ] as const)("SQLite %s equality", (nativeType, category, raw, valid, normalized, sqlFunction) => {
+  ] as const)("SQLite %s equality", (nativeType, category, raw, valid, normalized) => {
     const driver = new SQLiteDriver({
       ...baseConfig,
       type: "sqlite",
@@ -335,7 +387,10 @@ describe("temporal filter operator coverage", () => {
         expect(
           driver.buildFilterCondition(temporalColumn, operator, valid, 1),
         ).toEqual({
-          sql: `${sqlFunction}("event") ${operator === "eq" ? "=" : "!="} ${sqlFunction}(?)`,
+          sql:
+            category === "datetime"
+              ? `COALESCE(RAPIDB_DATETIME_KEY("event"), RAPIDB_DATETIME_KEY(DATETIME("event"))) ${operator === "eq" ? "=" : "!="} RAPIDB_DATETIME_KEY(?)`
+              : `COALESCE(RAPIDB_TIME_KEY("event"), RAPIDB_TIME_KEY(TIME("event"))) ${operator === "eq" ? "=" : "!="} RAPIDB_TIME_KEY(?)`,
           params: [normalized],
         });
       }
@@ -393,6 +448,45 @@ describe("temporal filter operator coverage", () => {
       filePath: ":memory:",
     } as ConnectionConfig);
     const datetimeColumn = column("event", "DATETIME", "datetime");
+
+    it("uses precision-preserving keys for datetime comparisons", () => {
+      const fractionalThreshold = "2024-02-29 12:34:56.123455";
+      const eventKey =
+        'COALESCE(RAPIDB_DATETIME_KEY("event"), RAPIDB_DATETIME_KEY(DATETIME("event")))';
+      expect(
+        driver.buildFilterCondition(
+          datetimeColumn,
+          "gt",
+          fractionalThreshold,
+          1,
+        ),
+      ).toEqual({
+        sql: `${eventKey} > RAPIDB_DATETIME_KEY(?)`,
+        params: [fractionalThreshold],
+      });
+      expect(
+        driver.buildFilterCondition(
+          datetimeColumn,
+          "between",
+          [fractionalThreshold, "2024-02-29 12:34:56.123457"],
+          1,
+        ),
+      ).toEqual({
+        sql: `${eventKey} BETWEEN RAPIDB_DATETIME_KEY(?) AND RAPIDB_DATETIME_KEY(?)`,
+        params: [fractionalThreshold, "2024-02-29 12:34:56.123457"],
+      });
+      expect(
+        driver.buildFilterCondition(
+          datetimeColumn,
+          "in",
+          "2024-02-29 12:34:56.123455, 2024-02-29 12:34:56.123456",
+          1,
+        ),
+      ).toEqual({
+        sql: `${eventKey} IN (RAPIDB_DATETIME_KEY(?), RAPIDB_DATETIME_KEY(?))`,
+        params: [fractionalThreshold, "2024-02-29 12:34:56.123456"],
+      });
+    });
 
     it.each([
       "2026-00-01 12:34:56",
@@ -466,7 +560,7 @@ describe("temporal filter operator coverage", () => {
         expect(
           driver.buildFilterCondition(datetimeColumn, operator, value, 1),
         ).toEqual({
-          sql: `DATETIME("event") ${operator === "eq" ? "=" : operator === "neq" ? "!=" : ">"} DATETIME(?)`,
+          sql: `COALESCE(RAPIDB_DATETIME_KEY("event"), RAPIDB_DATETIME_KEY(DATETIME("event"))) ${operator === "eq" ? "=" : operator === "neq" ? "!=" : ">"} RAPIDB_DATETIME_KEY(?)`,
           params: [normalized],
         });
       }
@@ -510,13 +604,87 @@ describe("temporal filter operator coverage", () => {
       params: ["14:30:00.123", 0],
     });
     expect(datetime2Condition).toEqual({
-      sql: "DATEDIFF(millisecond, CAST(? AS datetime2(7)), [event_at]) BETWEEN 0 AND ?",
-      params: ["2024-06-15 14:30:00.123", 0],
+      sql: "[event_at] >= CAST(? AS datetime2(7)) AND [event_at] <= DATEADD(nanosecond, ?, CAST(? AS datetime2(7)))",
+      params: ["2024-06-15 14:30:00.123", 999_900, "2024-06-15 14:30:00.123"],
     });
     expect(datetimeOffsetCondition).toEqual({
-      sql: "DATEDIFF(millisecond, CAST(? AS datetimeoffset(7)), [event_offset]) BETWEEN 0 AND ?",
-      params: ["2024-06-15 11:30:00.123+00:00", 0],
+      sql: "[event_offset] >= CAST(? AS datetimeoffset(7)) AND [event_offset] <= DATEADD(nanosecond, ?, CAST(? AS datetimeoffset(7)))",
+      params: [
+        "2024-06-15 11:30:00.123+00:00",
+        999_900,
+        "2024-06-15 11:30:00.123+00:00",
+      ],
     });
+  });
+
+  it("builds MSSQL datetime2 and datetimeoffset equality as a bounded range instead of an overflowing millisecond DATEDIFF", () => {
+    const driver = new MSSQLDriver({
+      ...baseConfig,
+      type: "mssql",
+    } as ConnectionConfig);
+    const datetime2Column = column("created_at", "datetime2(7)", "datetime");
+    const datetimeOffsetColumn = column(
+      "created_offset",
+      "datetimeoffset(7)",
+      "datetime",
+    );
+
+    const conditions = [
+      driver.buildFilterCondition(
+        datetime2Column,
+        "eq",
+        "2024-06-15 14:30:00",
+        1,
+      ),
+      driver.buildFilterCondition(
+        datetime2Column,
+        "neq",
+        "2024-06-15 14:30:00.1",
+        1,
+      ),
+      driver.buildFilterCondition(
+        datetimeOffsetColumn,
+        "eq",
+        "2024-06-15 14:30:00.12 +02:00",
+        1,
+      ),
+      driver.buildFilterCondition(
+        datetimeOffsetColumn,
+        "neq",
+        "2024-06-15 14:30:00 +02:00",
+        1,
+      ),
+    ];
+
+    for (const condition of conditions) {
+      expect(condition?.sql).not.toContain("DATEDIFF");
+    }
+    expect(conditions).toEqual([
+      {
+        sql: "[created_at] >= CAST(? AS datetime2(7)) AND [created_at] <= DATEADD(nanosecond, ?, CAST(? AS datetime2(7)))",
+        params: ["2024-06-15 14:30:00", 999_999_900, "2024-06-15 14:30:00"],
+      },
+      {
+        sql: "NOT ([created_at] >= CAST(? AS datetime2(7)) AND [created_at] <= DATEADD(nanosecond, ?, CAST(? AS datetime2(7))))",
+        params: ["2024-06-15 14:30:00.1", 99_999_900, "2024-06-15 14:30:00.1"],
+      },
+      {
+        sql: "[created_offset] >= CAST(? AS datetimeoffset(7)) AND [created_offset] <= DATEADD(nanosecond, ?, CAST(? AS datetimeoffset(7)))",
+        params: [
+          "2024-06-15 14:30:00.12+02:00",
+          9_999_900,
+          "2024-06-15 14:30:00.12+02:00",
+        ],
+      },
+      {
+        sql: "NOT ([created_offset] >= CAST(? AS datetimeoffset(7)) AND [created_offset] <= DATEADD(nanosecond, ?, CAST(? AS datetimeoffset(7))))",
+        params: [
+          "2024-06-15 14:30:00+02:00",
+          999_999_900,
+          "2024-06-15 14:30:00+02:00",
+        ],
+      },
+    ]);
   });
 
   it("builds Oracle temporal comparison and IN filters", () => {
@@ -552,5 +720,165 @@ describe("temporal filter operator coverage", () => {
       sql: `RTRIM(RTRIM(TO_CHAR(SYS_EXTRACT_UTC(CAST("event_at" AS TIMESTAMP(9) WITH TIME ZONE)), 'YYYY-MM-DD HH24:MI:SS.FF9'), '0'), '.') IN (:1, :2)`,
       params: ["2026-04-23 12:34:56", "2026-04-24 08:00:00"],
     });
+  });
+
+  it("exposes Oracle temporal Contains through discovered metadata and validated table filters", () => {
+    class MetadataOracleDriver extends OracleDriver {
+      enrichForTest(meta: ColumnMeta) {
+        return this.enrichColumn(meta);
+      }
+    }
+    const driver = new MetadataOracleDriver({
+      ...baseConfig,
+      type: "oracle",
+    } as ConnectionConfig);
+    for (const type of [
+      "DATE",
+      "TIMESTAMP(9)",
+      "TIMESTAMP WITH TIME ZONE",
+      "TIMESTAMP WITH LOCAL TIME ZONE",
+    ]) {
+      for (const nullable of [false, true]) {
+        const meta = driver.enrichForTest({
+          name: "event_at",
+          type,
+          nullable,
+          isPrimaryKey: false,
+          isForeignKey: false,
+        });
+        expect(meta.filterable).toBe(true);
+        expect(meta.filterOperators).toEqual([
+          ...scalarTemporalOperators,
+          "like",
+          ...(nullable ? ["is_null", "is_not_null"] : []),
+        ]);
+        expect(
+          buildWhere(
+            driver,
+            [{ column: "event_at", operator: "like", value: "2024-03-10" }],
+            [meta],
+          ),
+        ).toEqual({
+          clause: expect.stringMatching(/^WHERE .* LIKE :1 ESCAPE '!'$/),
+          params: ["%2024-03-10%"],
+        });
+        expect(() =>
+          buildWhere(
+            driver,
+            [{ column: "event_at", operator: "eq", value: "2024" }],
+            [meta],
+          ),
+        ).toThrow("valid Oracle temporal value");
+      }
+    }
+  });
+
+  it("preserves literal Oracle temporal Contains fragments without adding midnight", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    for (const nativeType of [
+      "DATE",
+      "TIMESTAMP(9)",
+      "TIMESTAMP WITH TIME ZONE",
+      "TIMESTAMP WITH LOCAL TIME ZONE",
+    ]) {
+      const temporalColumn = column(
+        "event_at",
+        nativeType,
+        nativeType === "DATE" ? "date" : "datetime",
+      );
+      for (const operator of ["like", "ilike"] as const) {
+        for (const [input, pattern] of [
+          ["2024", "%2024%"],
+          ["2024-03-10", "%2024-03-10%"],
+          ["12:34", "%12:34%"],
+          [".123456789", "%.123456789%"],
+          [" 2024%_! ", "%2024!%!_!!%"],
+        ]) {
+          const normalized = driver.normalizeFilterValue(
+            temporalColumn,
+            operator,
+            input,
+          );
+          expect(normalized).toBe(input.trim());
+          const direct = driver.buildFilterCondition(
+            temporalColumn,
+            operator,
+            input,
+            3,
+          );
+          expect(direct).toEqual({
+            sql: expect.stringMatching(/ LIKE :3 ESCAPE '!'$/),
+            params: [pattern],
+          });
+          expect(
+            driver.buildFilterCondition(
+              temporalColumn,
+              operator,
+              normalized,
+              3,
+            ),
+          ).toEqual(direct);
+          if (nativeType.includes("TIME ZONE"))
+            expect(direct?.sql).toContain("SYS_EXTRACT_UTC");
+        }
+      }
+    }
+  });
+
+  it("rejects invalid Oracle temporal filter inputs before sending a query", () => {
+    const driver = new OracleDriver({
+      ...baseConfig,
+      type: "oracle",
+      serviceName: "FREEPDB1",
+    } as ConnectionConfig);
+    const dateColumn = column("event_date", "DATE", "date");
+    const message =
+      "[RapiDB Filter] Column event_date expects a valid Oracle temporal value.";
+
+    expect(() =>
+      driver.buildFilterCondition(dateColumn, "eq", "not-a-date", 1),
+    ).toThrow(message);
+    expect(() =>
+      driver.buildFilterCondition(
+        dateColumn,
+        "between",
+        ["2024-02-29", "not-a-date"],
+        1,
+      ),
+    ).toThrow(message);
+    expect(() =>
+      driver.buildFilterCondition(dateColumn, "in", "2024-02-29,not-a-date", 1),
+    ).toThrow(message);
+    expect(() =>
+      driver.buildFilterCondition(
+        dateColumn,
+        "in",
+        "2024-02-29 00:00:00 +99:99",
+        1,
+      ),
+    ).toThrow(message);
+    expect(() =>
+      driver.buildFilterCondition(dateColumn, "eq", "2024-02-29", 1),
+    ).not.toThrow();
+    const normalizedDate = driver.normalizeFilterValue(
+      dateColumn,
+      "eq",
+      "2024-02-29",
+    );
+    expect(normalizedDate).toBe("2024-02-29 00:00:00");
+    expect(
+      driver.buildFilterCondition(dateColumn, "eq", normalizedDate, 1),
+    ).toEqual({
+      sql: `TO_CHAR("event_date", 'YYYY-MM-DD HH24:MI:SS') = :1`,
+      params: ["2024-02-29 00:00:00"],
+    });
+    expect(
+      driver.normalizeFilterValue(dateColumn, "eq", "2024-02-29 12:34:56"),
+    ).toBe("2024-02-29 12:34:56");
+    expect(driver.getCapabilities().isTableFilterError?.(message)).toBe(true);
   });
 });

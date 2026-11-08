@@ -104,6 +104,9 @@ describe("view DDL generation", () => {
   it("Oracle asks DBMS_METADATA for VIEW DDL when the object type is a view", async () => {
     const driver = new OracleDriver(oracleConfig as ConnectionConfig);
     const execute = vi.fn(async (sql: string) => {
+      if (sql.includes("FROM all_mviews")) {
+        return { rows: [] };
+      }
       if (sql.includes("all_objects")) {
         return { rows: [{ OBJECT_TYPE: "VIEW" }] };
       }
@@ -138,6 +141,9 @@ describe("view DDL generation", () => {
     ).resolves.toBe(
       'CREATE OR REPLACE VIEW "TEST_SCHEMA"."V_EMPLOYEES" AS SELECT 1',
     );
+    expect(
+      execute.mock.calls.some(([sql]) => sql.includes("FROM all_mviews")),
+    ).toBe(true);
   });
 
   it("SQLite returns the stored view SQL from sqlite_master", async () => {

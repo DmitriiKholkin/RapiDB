@@ -10,14 +10,21 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import { MongoClient } from "mongodb";
 import { describe, expect, it, vi } from "vitest";
-import type { ConnectionManager } from "../../src/extension/connectionManager";
+import type {
+  ConnectionConfig,
+  ConnectionManager,
+} from "../../src/extension/connectionManager";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
-import { SchemaCacheManager } from "../../src/extension/schemaCacheManager";
+import type { IDBDriver } from "../../src/extension/dbDrivers/types";
+import {
+  loadConnectionRootCatalog,
+  loadDatabaseScope,
+} from "../../src/extension/schema/schemaLoaders";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { resolveConnectionSeed } from "../runtime/testRuntimeConfig";
@@ -32,6 +39,22 @@ vi.mock("vscode", () => ({
 
 const suffix = () => randomUUID().replaceAll("-", "");
 
+async function loadSchemaSnapshot(driver: IDBDriver, config: ConnectionConfig) {
+  const root = await loadConnectionRootCatalog(driver, config);
+  const defaultScope = await loadDatabaseScope(
+    driver,
+    root.defaultDatabaseName,
+    "baseline",
+  );
+  return {
+    databases: root.catalogSnapshot.databases.map((database) =>
+      database.name === defaultScope.database.name
+        ? defaultScope.database
+        : database,
+    ),
+  };
+}
+
 describe("release checklist SQLite metadata", () => {
   it("discovers attached databases, indexes and triggers through the worker", async () => {
     const dir = await mkdtemp(join(tmpdir(), "rapidb-release-"));
@@ -42,11 +65,6 @@ describe("release checklist SQLite metadata", () => {
       filePath: join(dir, "main.db"),
     };
     const driver = new SQLiteDriver(config);
-    const cache = new SchemaCacheManager({
-      getConnection: () => config,
-      getDriver: () => driver,
-      isConnected: () => driver.isConnected(),
-    });
     try {
       await driver.connect();
       await driver.query(
@@ -58,7 +76,7 @@ describe("release checklist SQLite metadata", () => {
       );
       await driver.query("ATTACH DATABASE ? AS extra", [join(dir, "extra.db")]);
       await driver.query("CREATE TABLE extra.other (id INTEGER)");
-      const snapshot = await cache.getSchemaSnapshotAsync(config.id);
+      const snapshot = await loadSchemaSnapshot(driver, config);
       expect(snapshot.databases.map((db) => db.name)).toContain("extra");
       expect(await driver.getIndexes("main", "main", "items")).toEqual(
         expect.arrayContaining([
@@ -71,7 +89,6 @@ describe("release checklist SQLite metadata", () => {
         ]),
       );
     } finally {
-      cache.dispose();
       await driver.disconnect();
       await rm(dir, { recursive: true, force: true });
     }
@@ -139,18 +156,9 @@ describe.runIf(process.env.RAPIDB_RELEASE_QA === "1")(
     it("loads the Oracle root catalog and the application's tables", async () => {
       const config = await resolveConnectionSeed("oracle");
       const driver = new OracleDriver(config);
-      const cache = new SchemaCacheManager({
-        getConnection: () => config,
-        getDriver: () => driver,
-        isConnected: () => driver.isConnected(),
-      });
       try {
         await driver.connect();
-        const snapshot = await cache.getSchemaSnapshotAsync(config.id);
-        expect(
-          cache.getSchemaSnapshotState(config.id, { kind: "connectionRoot" })
-            .status,
-        ).toBe("loaded");
+        const snapshot = await loadSchemaSnapshot(driver, config);
         expect(snapshot.databases.length).toBeGreaterThan(0);
         const tables = snapshot.databases.flatMap((db) =>
           db.schemas.flatMap((schema) =>
@@ -159,7 +167,6 @@ describe.runIf(process.env.RAPIDB_RELEASE_QA === "1")(
         );
         expect(tables).toContain("FIXTURE_ROWS");
       } finally {
-        cache.dispose();
         await driver.disconnect();
       }
     });
@@ -173,17 +180,12 @@ describe.runIf(process.env.RAPIDB_RELEASE_QA === "1")(
       };
       const driver = new ElasticsearchDriver(config);
       const index = `release_qa_${suffix()}`;
-      const cache = new SchemaCacheManager({
-        getConnection: () => config,
-        getDriver: () => driver,
-        isConnected: () => driver.isConnected(),
-      });
       try {
         await driver.connect();
         await driver.query(
           `PUT /${index}\n{"settings":{"number_of_replicas":0},"mappings":{"properties":{"amount":{"type":"long"}}}}`,
         );
-        const snapshot = await cache.getSchemaSnapshotAsync(config.id);
+        const snapshot = await loadSchemaSnapshot(driver, config);
         expect(
           snapshot.databases.flatMap((db) =>
             db.schemas.flatMap((schema) =>
@@ -198,7 +200,6 @@ describe.runIf(process.env.RAPIDB_RELEASE_QA === "1")(
           (await driver.query(`GET /${index}/_settings`)).rows.length,
         ).toBe(1);
       } finally {
-        cache.dispose();
         await driver
           .query(`DELETE /${index}?ignore_unavailable=true`)
           .catch(() => undefined);

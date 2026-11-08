@@ -112,7 +112,7 @@ function harness(
       }
       if (sql === "ROLLBACK") {
         await rollback();
-        return {};
+        return engine === "mysql" ? [{ warningStatus: 0 }] : {};
       }
       if (sql === "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE") {
         events.push("SERIALIZABLE");
@@ -664,6 +664,55 @@ describe("INSERT verification contracts (B02)", () => {
     ).rejects.toThrow(/INSERT verification failed/);
     expect(events).toContain("ROLLBACK");
     expect(events).not.toContain("COMMIT");
+  });
+
+  it.each([
+    "mysql",
+    "pg",
+  ] as const)("%s binds offset TIMESTAMP keys through value-aware SQL only where supported", (engine) => {
+    const { driver } = harness(engine);
+    const key: ColumnTypeMeta = {
+      ...columns[0],
+      name: "seen_at",
+      type: "timestamp",
+      nativeType: "timestamp",
+      category: "datetime",
+      identityGeneration: undefined,
+    };
+    const tableColumns = [key, columns[1]];
+    const requested = { seen_at: "2024-06-15T12:30:00+03:00", amount: "1.25" };
+    const operation: TransactionOperation = { sql: "INSERT", params: [] };
+    const verification = prepareInsertVerification(
+      driver,
+      engine,
+      "target",
+      "public",
+      "edits",
+      requested,
+      tableColumns,
+      operation,
+    );
+    if (!verification) throw new Error("Expected INSERT verification");
+    if (engine === "mysql") {
+      const bind =
+        "`seen_at` BETWEEN FROM_UNIXTIME(?) AND FROM_UNIXTIME(?) AND UNIX_TIMESTAMP(`seen_at`) = CAST(? AS DECIMAL(20,6))";
+      const params = [1718443800 - 86400, 1718443800 + 86401, "1718443800"];
+      expect(verification.sql).toContain(bind);
+      expect(verification.sql).not.toContain("CONVERT_TZ");
+      expect(verification.params).toEqual(params);
+      expect(operation.captureIdentity?.mysqlKeyGuard).toEqual({
+        sql: expect.stringContaining(bind),
+        params,
+      });
+      expect(operation.captureIdentity?.mysqlKeyGuard?.sql).not.toContain(
+        "CONVERT_TZ",
+      );
+    } else {
+      expect(verification.sql).toContain(
+        `"seen_at" = ${driver.buildInsertValueExpr(key, 1)}`,
+      );
+      expect(verification.sql).not.toContain("CONVERT_TZ");
+    }
   });
 
   it("MySQL captures all actual composite PK components, including trigger/default-assigned keys", async () => {

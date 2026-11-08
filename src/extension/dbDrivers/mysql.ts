@@ -1,5 +1,6 @@
 import type { Connection as NativeMysqlConnection, Query } from "mysql2";
 import type {
+  ConnectionOptions,
   FieldPacket,
   Pool,
   PoolConnection,
@@ -11,21 +12,26 @@ import type {
 import * as mysql from "mysql2/promise";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import { getSshTcpForwardTransport } from "../driverRuntimeConfig";
 import { resolveConnectionTlsSettings } from "../services/connectionTls";
 import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { buildWhere } from "../table/filterSql";
+import { normalizeUnknownError } from "../utils/errorHandling";
 import { logger } from "../utils/logger";
+import { splitMySQLScript } from "../utils/mysqlScriptSplit";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
-import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { queryCollectionLimit } from "./boundedQueryRows";
 import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
 import { literalContainsPattern } from "./literalContains";
 import {
   getMetadataContext,
+  runWithMetadataCancellation,
   withMetadataResource,
 } from "./metadataCancellation";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   createMysqlStreamingQuery,
   discardMysqlResultHistory,
@@ -42,6 +48,7 @@ import {
 } from "./timeout";
 import {
   TransactionIdentityStore,
+  TransactionVerificationError,
   verifyTransaction,
 } from "./transactionVerification";
 import type {
@@ -55,6 +62,7 @@ import type {
   FilterOperator,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryColumnMeta,
   QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
@@ -86,167 +94,172 @@ const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
+const MYSQL_MAX_RETAINED_RESULT_SETS = 100;
+const MYSQL_MAX_RETAINED_RESULT_COLUMNS = 4096;
+const MYSQL_JSON_FIELD_TYPE = 245;
+
+function mysqlQueryColumnMeta(field: FieldPacket): QueryColumnMeta {
+  const nativeType = field.type ?? field.columnType;
+  const typeName = field.typeName?.trim().toLowerCase();
+  const extendedTypeName = field.extendedTypeName?.trim().toLowerCase();
+  const extendedFormat = field.extendedFormat?.trim().toLowerCase();
+  const numericTypeNames = [typeName, extendedTypeName, extendedFormat];
+
+  if (
+    nativeType === 0 ||
+    nativeType === 246 ||
+    numericTypeNames.some((name) =>
+      name ? ["decimal", "newdecimal", "numeric"].includes(name) : false,
+    )
+  ) {
+    return { category: "decimal" };
+  }
+  if (
+    [1, 2, 3, 8, 9, 13, 16].includes(nativeType ?? -1) ||
+    numericTypeNames.some((name) =>
+      name
+        ? [
+            "tiny",
+            "tinyint",
+            "short",
+            "smallint",
+            "long",
+            "int",
+            "integer",
+            "mediumint",
+            "longlong",
+            "bigint",
+            "int24",
+            "year",
+            "bit",
+          ].includes(name)
+        : false,
+    )
+  ) {
+    return { category: "integer" };
+  }
+  if (
+    [4, 5].includes(nativeType ?? -1) ||
+    numericTypeNames.some((name) =>
+      name ? ["float", "double", "real"].includes(name) : false,
+    )
+  ) {
+    return { category: "float" };
+  }
+  if (
+    [7, 12].includes(nativeType ?? -1) ||
+    numericTypeNames.some((name) =>
+      name ? ["datetime", "timestamp"].includes(name) : false,
+    )
+  ) {
+    return { category: "datetime" };
+  }
+
+  return {
+    category:
+      nativeType === MYSQL_JSON_FIELD_TYPE ||
+      typeName === "json" ||
+      extendedTypeName === "json" ||
+      extendedFormat === "json"
+        ? "json"
+        : null,
+  };
+}
+
+interface MysqlCapturedResultSet {
+  fields: FieldPacket[];
+  rows: unknown[][];
+  rowCount: number;
+  truncated: boolean;
+  protocolResultIndex: number;
+  partial?: boolean;
+  completed: boolean;
+}
+
+function isQueryResult(value: unknown): value is QueryResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<QueryResult>;
+  return (
+    Array.isArray(result.columns) &&
+    Array.isArray(result.rows) &&
+    typeof result.rowCount === "number" &&
+    typeof result.executionTimeMs === "number"
+  );
+}
+
+function isMysqlServerQueryError(error: unknown): error is Error {
+  if (!(error instanceof Error)) return false;
+  const mysqlError = error as Error & {
+    code?: unknown;
+    errno?: unknown;
+    sqlState?: unknown;
+    fatal?: unknown;
+  };
+  return (
+    mysqlError.fatal !== true &&
+    (typeof mysqlError.sqlState === "string" ||
+      (typeof mysqlError.code === "string" &&
+        mysqlError.code.startsWith("ER_") &&
+        typeof mysqlError.errno === "number"))
+  );
+}
+
+function mayMysqlServerHaveRolledBackTransaction(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const native = error as {
+    code?: unknown;
+    errno?: unknown;
+    sqlState?: unknown;
+  };
+  return (
+    native.code === "ER_LOCK_DEADLOCK" ||
+    native.errno === 1213 ||
+    native.code === "ER_LOCK_WAIT_TIMEOUT" ||
+    native.errno === 1205 ||
+    native.sqlState === "40001"
+  );
+}
+
+function hasJsonValidColumnCheck(
+  checkClauses: readonly string[],
+  columnName: string,
+): boolean {
+  const escapeRegex = (value: string) =>
+    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const quotedColumn = `\`${escapeRegex(columnName.replace(/`/g, "``"))}\``;
+  const columnReference = /^[a-z_][a-z\d_$]*$/i.test(columnName)
+    ? `(?:${quotedColumn}|${escapeRegex(columnName)})`
+    : quotedColumn;
+  const canonicalCheck = new RegExp(
+    `^json_valid\\s*\\(\\s*${columnReference}\\s*\\)$`,
+    "i",
+  );
+  return checkClauses.some((clause) => {
+    let expression = clause.trim();
+    while (expression.startsWith("(") && expression.endsWith(")")) {
+      expression = expression.slice(1, -1).trim();
+    }
+    return canonicalCheck.test(expression);
+  });
+}
+
+function isUnavailableCheckMetadataError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const mysqlError = error as Error & { code?: unknown; errno?: unknown };
+  return (
+    mysqlError.code === "ER_UNKNOWN_TABLE" ||
+    mysqlError.code === "ER_NO_SUCH_TABLE" ||
+    mysqlError.code === "ER_BAD_FIELD_ERROR" ||
+    mysqlError.errno === 1054 ||
+    mysqlError.errno === 1109 ||
+    mysqlError.errno === 1146
+  );
+}
+
 type MysqlSslOptions = Exclude<PoolOptions["ssl"], string | undefined>;
 
-export function splitMySQLScript(sql: string): string[] {
-  const stmts: string[] = [];
-  let delim = ";";
-  let i = 0;
-  const n = sql.length;
-  let buf = "";
-  let compoundDepth = 0;
-  function isWordChar(p: number): boolean {
-    if (p < 0 || p >= n) return false;
-    const ch = sql[p];
-    return /[A-Za-z0-9_]/.test(ch);
-  }
-  function consumeKeyword(kw: string): boolean {
-    if (isWordChar(i - 1)) return false;
-    const len = kw.length;
-    if (sql.slice(i, i + len).toUpperCase() !== kw) return false;
-    if (isWordChar(i + len)) return false;
-    buf += sql.slice(i, i + len);
-    i += len;
-    return true;
-  }
-  while (i < n) {
-    const atLineStart = i === 0 || sql[i - 1] === "\n";
-    if (atLineStart && /^DELIMITER\b/i.test(sql.slice(i))) {
-      while (i < n && sql[i] !== " " && sql[i] !== "\t") i++;
-      while (i < n && (sql[i] === " " || sql[i] === "\t")) i++;
-      let nd = "";
-      while (i < n && sql[i] !== "\r" && sql[i] !== "\n") {
-        nd += sql[i++];
-      }
-      if (nd) delim = nd;
-      while (i < n && sql[i] !== "\n") i++;
-      if (i < n) i++;
-      continue;
-    }
-    const isDashComment =
-      sql[i] === "-" &&
-      sql[i + 1] === "-" &&
-      (!sql[i + 2] || /\s/.test(sql[i + 2]));
-    if (isDashComment || sql[i] === "#") {
-      while (i < n && sql[i] !== "\n") i++;
-      buf += " ";
-      continue;
-    }
-    if (sql[i] === "/" && sql[i + 1] === "*") {
-      const start = i;
-      const executable =
-        sql[i + 2] === "!" ||
-        sql[i + 2] === "+" ||
-        (sql[i + 2] === "M" && sql[i + 3] === "!");
-      i += 2;
-      let closed = false;
-      while (i < n) {
-        if (sql[i] === "*" && sql[i + 1] === "/") {
-          i += 2;
-          closed = true;
-          break;
-        }
-        i++;
-      }
-      if (!closed) {
-        throw new Error(
-          "Unterminated MySQL block comment; script was not submitted.",
-        );
-      }
-      buf += executable ? sql.slice(start, i) : " ";
-      continue;
-    }
-    if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
-      const q = sql[i];
-      buf += q;
-      i++;
-      while (i < n) {
-        const c = sql[i];
-        if (c === "\\" && q !== "`") {
-          buf += c + (sql[i + 1] ?? "");
-          i += 2;
-          continue;
-        }
-        if (c === q && sql[i + 1] === q) {
-          buf += c + c;
-          i += 2;
-          continue;
-        }
-        if (c === q) {
-          buf += c;
-          i++;
-          break;
-        }
-        buf += c;
-        i++;
-      }
-      continue;
-    }
-    if (consumeKeyword("BEGIN")) {
-      if (
-        compoundDepth > 0 ||
-        /^\s*CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)\b/i.test(
-          buf,
-        )
-      ) {
-        compoundDepth++;
-      }
-      continue;
-    }
-    if (consumeKeyword("CASE")) {
-      compoundDepth++;
-      continue;
-    }
-    if (consumeKeyword("IF")) {
-      if (compoundDepth > 0) {
-        compoundDepth++;
-      }
-      continue;
-    }
-    if (consumeKeyword("LOOP")) {
-      if (compoundDepth > 0) {
-        compoundDepth++;
-      }
-      continue;
-    }
-    if (consumeKeyword("REPEAT")) {
-      if (compoundDepth > 0) {
-        compoundDepth++;
-      }
-      continue;
-    }
-    if (consumeKeyword("WHILE")) {
-      if (compoundDepth > 0) {
-        compoundDepth++;
-      }
-      continue;
-    }
-    if (consumeKeyword("END")) {
-      if (compoundDepth > 0) compoundDepth--;
-      continue;
-    }
-    if (compoundDepth === 0 && sql.startsWith(delim, i)) {
-      const s = buf.trim();
-      if (s) stmts.push(s);
-      buf = "";
-      i += delim.length;
-      while (
-        i < n &&
-        (sql[i] === " " ||
-          sql[i] === "\t" ||
-          sql[i] === "\r" ||
-          sql[i] === "\n")
-      ) {
-        i++;
-      }
-      continue;
-    }
-    buf += sql[i++];
-  }
-  const s = buf.trim();
-  if (s) stmts.push(s);
-  return stmts;
-}
+export { splitMySQLScript };
+
 const MYSQL_SPATIAL_TYPES = new Set([
   "point",
   "linestring",
@@ -303,7 +316,8 @@ function isValidMysqlDateParts(
   if (month < 1 || month > 12 || day < 1 || day > 31) {
     return false;
   }
-  const parsed = new Date(Date.UTC(year, month - 1, day));
+  const parsed = new Date(0);
+  parsed.setUTCFullYear(year, month - 1, day);
   return (
     parsed.getUTCFullYear() === year &&
     parsed.getUTCMonth() + 1 === month &&
@@ -394,7 +408,7 @@ function formatMysqlDateParts(parts: {
   day: number;
 }): string {
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${parts.year}-${pad(parts.month)}-${pad(parts.day)}`;
+  return `${String(parts.year).padStart(4, "0")}-${pad(parts.month)}-${pad(parts.day)}`;
 }
 function formatMysqlFraction(
   fractionMicros: number,
@@ -423,19 +437,16 @@ function formatMysqlDatetimeUtc(
   if (parts.timezoneOffsetMinutes === null) {
     return formatMysqlDatetimeParts(parts);
   }
+  const local = new Date(0);
+  local.setUTCFullYear(parts.year, parts.month - 1, parts.day);
+  local.setUTCHours(
+    parts.hours,
+    parts.minutes,
+    parts.seconds,
+    Math.floor(parts.fractionMicros / 1000),
+  );
   const totalMicros =
-    BigInt(
-      Date.UTC(
-        parts.year,
-        parts.month - 1,
-        parts.day,
-        parts.hours,
-        parts.minutes,
-        parts.seconds,
-        Math.floor(parts.fractionMicros / 1000),
-      ),
-    ) *
-      1000n +
+    BigInt(local.getTime()) * 1000n +
     BigInt(parts.fractionMicros % 1000) -
     BigInt(parts.timezoneOffsetMinutes) * 60n * 1000000n;
   let epochMillis = totalMicros / 1000n;
@@ -445,14 +456,14 @@ function formatMysqlDatetimeUtc(
     extraMicros += 1000n;
   }
   const value = new Date(Number(epochMillis));
-  if (Number.isNaN(value.getTime())) {
+  if (Number.isNaN(value.getTime()) || value.getUTCFullYear() < 0) {
     return null;
   }
   const utcFractionMicros =
     value.getUTCMilliseconds() * 1000 + Number(extraMicros);
   const pad = (n: number) => String(n).padStart(2, "0");
   return (
-    `${value.getUTCFullYear()}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
+    `${String(value.getUTCFullYear()).padStart(4, "0")}-${pad(value.getUTCMonth() + 1)}-${pad(value.getUTCDate())} ` +
     `${pad(value.getUTCHours())}:${pad(value.getUTCMinutes())}:${pad(value.getUTCSeconds())}` +
     formatMysqlFraction(utcFractionMicros, parts.fractionDigits)
   );
@@ -494,6 +505,37 @@ function normalizeMysqlDatetimeInput(value: string): string | null {
     return formatMysqlDatetimeParts(parsed);
   }
   return formatMysqlDatetimeUtc(parsed);
+}
+function hasMysqlTimezoneOffset(value: string): boolean {
+  return parseMysqlDatetimeParts(value)?.timezoneOffsetMinutes != null;
+}
+function mysqlUtcTimestampValue(value: unknown): string | null {
+  if (typeof value !== "string" || !value.endsWith("+00:00")) return null;
+  return normalizeMysqlDatetimeInput(value);
+}
+function mysqlTimestampEpoch(value: string): string | null {
+  const parts = parseMysqlDatetimeParts(value);
+  if (!parts || parts.timezoneOffsetMinutes === null) return null;
+  const local = new Date(0);
+  local.setUTCFullYear(parts.year, parts.month - 1, parts.day);
+  local.setUTCHours(parts.hours, parts.minutes, parts.seconds, 0);
+  const seconds =
+    BigInt(local.getTime() / 1000) - BigInt(parts.timezoneOffsetMinutes) * 60n;
+  if (seconds < 1n) return null;
+  return `${seconds}${formatMysqlFraction(parts.fractionMicros, parts.fractionDigits)}`;
+}
+function mysqlTimestampEpochParam(
+  prefix: string,
+  columnName: string,
+  value: string,
+): string {
+  const epoch = mysqlTimestampEpoch(value);
+  if (epoch === null) {
+    throw new Error(
+      `${prefix} Column ${columnName} expects a TIMESTAMP value after 1970-01-01 00:00:00 UTC.`,
+    );
+  }
+  return epoch;
 }
 function invalidMysqlTemporalInputError(
   columnName: string,
@@ -1145,21 +1187,135 @@ function canonicalizeMysqlBitPersistedEditValue(
 type MysqlObjectRow = RowDataPacket & Record<string, unknown>;
 type MysqlArrayRow = unknown[];
 type MysqlSelectRows = MysqlArrayRow[];
-type MysqlQueryRows = MysqlSelectRows | ResultSetHeader;
+type MysqlResultPayload = MysqlSelectRows | ResultSetHeader;
+type MysqlQueryRows = MysqlResultPayload | MysqlResultPayload[];
+type MysqlQueryFields =
+  | FieldPacket[]
+  | (FieldPacket[] | undefined)[]
+  | undefined;
 const MYSQL_POOL_CONNECTION_LIMIT = 5;
+const MYSQL_KILL_QUERY_TIMEOUT_MS = 5000;
+const MYSQL_SESSION_PROBE_TIMEOUT_MS = 2000;
+const MYSQL_SESSION_INIT_SQL = "SET SESSION autocommit = 1";
+const MYSQL_UTC_TIMESTAMP_OPERAND =
+  "CONVERT_TZ(?, '+00:00', @@session.time_zone)";
+const MYSQL_TIMESTAMP_EPOCH_OPERAND = "CAST(? AS DECIMAL(20,6))";
+const MYSQL_TIMESTAMP_PREFILTER_SECONDS = 86400n;
+const MYSQL_FROM_UNIXTIME_SAFE_MAX = 2147483647n;
+function mysqlUtcTimestampWriteValues(
+  operation: import("./types").TransactionOperation,
+): string[] {
+  if (!operation.sql.includes(MYSQL_UTC_TIMESTAMP_OPERAND)) return [];
+  const params = operation.params ?? [];
+  const bound = formatMysqlQuery(operation.sql, params);
+  const [before, after] = MYSQL_UTC_TIMESTAMP_OPERAND.split("?");
+  return params.filter(
+    (value): value is string =>
+      typeof value === "string" &&
+      bound.includes(`${before}${formatMysqlStringLiteral(value)}${after}`),
+  );
+}
+interface MysqlKillTarget {
+  threadId: number;
+  identitySql: string;
+  identity: string;
+}
+function mysqlServerIdentitySql(connection: object): string {
+  const handshake = Reflect.get(connection, "_handshakePacket");
+  const version =
+    handshake && typeof handshake === "object"
+      ? Reflect.get(handshake, "serverVersion")
+      : undefined;
+  return typeof version === "string" && !/mariadb/i.test(version)
+    ? "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_uuid, @@hostname, @@port) AS server_identity"
+    : "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_id, @@hostname, @@port) AS server_identity";
+}
+function mysqlHandshakeAutocommit(connection: object): boolean {
+  const handshake = Reflect.get(connection, "_handshakePacket");
+  const statusFlags =
+    handshake && typeof handshake === "object"
+      ? Reflect.get(handshake, "statusFlags")
+      : undefined;
+  return typeof statusFlags === "number" && (statusFlags & 2) !== 0;
+}
+function readMysqlServerIdentity(
+  rows: unknown,
+): { connectionId: number; identity: string } | null {
+  const row = Array.isArray(rows) ? rows[0] : undefined;
+  if (!row || typeof row !== "object") return null;
+  const connectionId = Number(Reflect.get(row, "connection_id"));
+  const identity = Reflect.get(row, "server_identity");
+  return Number.isSafeInteger(connectionId) &&
+    connectionId > 0 &&
+    typeof identity === "string" &&
+    identity !== ""
+    ? { connectionId, identity }
+    : null;
+}
 interface MysqlQueryOperation {
   cancelled: boolean;
   reject?: (error: Error) => void;
   requestToken?: number;
   connection?: PoolConnection;
 }
-function isMysqlSelectRows(
-  rawRows: MysqlQueryRows,
-): rawRows is MysqlSelectRows {
+function isMysqlSelectRows(rawRows: unknown): rawRows is MysqlSelectRows {
   return (
     Array.isArray(rawRows) &&
     (rawRows.length === 0 || Array.isArray(rawRows[0]))
   );
+}
+
+function isMysqlFieldPacket(value: unknown): value is FieldPacket {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    ("name" in value || "columnType" in value)
+  );
+}
+
+function isMysqlResultFieldGroups(
+  fields: MysqlQueryFields,
+): fields is (FieldPacket[] | undefined)[] {
+  return (
+    Array.isArray(fields) &&
+    fields.length > 1 &&
+    fields.every(
+      (fieldGroup) => fieldGroup === undefined || Array.isArray(fieldGroup),
+    )
+  );
+}
+
+function isMysqlResultSetHeader(value: unknown): value is ResultSetHeader {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    "affectedRows" in value
+  );
+}
+
+function splitMysqlQueryResults(
+  rawRows: MysqlQueryRows,
+  fields: MysqlQueryFields,
+): Array<{ rows: MysqlResultPayload; fields?: FieldPacket[] }> {
+  if (isMysqlResultFieldGroups(fields)) {
+    return (Array.isArray(rawRows) ? rawRows : [rawRows]).map(
+      (resultRows, index) => ({
+        rows: resultRows as MysqlResultPayload,
+        ...(Array.isArray(fields[index]) ? { fields: fields[index] } : {}),
+      }),
+    );
+  }
+  return [
+    {
+      rows: rawRows as MysqlResultPayload,
+      ...(Array.isArray(fields) &&
+      (fields.length === 0 || isMysqlFieldPacket(fields[0]))
+        ? { fields }
+        : {}),
+    },
+  ];
 }
 export class MySQLDriver extends BaseDBDriver {
   protected override getQueryEditorSqlDialect() {
@@ -1180,6 +1336,15 @@ export class MySQLDriver extends BaseDBDriver {
   private activeQueryConnectionSlots = 0;
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
+  private killQueryConnectionOptions?: ConnectionOptions;
+  private readonly killTargets = new WeakMap<object, MysqlKillTarget>();
+  private readonly sessionReady = new WeakMap<object, Promise<void>>();
+  private forceSessionAutocommit = false;
+  private readonly tableIndexCache = new Map<
+    string,
+    import("./types").IndexMeta[]
+  >();
+  private statisticsExpressionSupported: boolean | undefined;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
@@ -1235,7 +1400,7 @@ export class MySQLDriver extends BaseDBDriver {
       const endpointPort = forwardedTransport?.localPort ?? this.config.port;
       const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
       this.assertConnectionEpoch(epoch);
-      pool = mysql.createPool({
+      const connectionOptions: ConnectionOptions = {
         host: tlsIdentity ?? endpointHost,
         port: endpointPort,
         stream: tlsIdentity
@@ -1249,10 +1414,7 @@ export class MySQLDriver extends BaseDBDriver {
         database: this.config.database,
         user: this.config.username,
         password: this.config.password,
-        waitForConnections: true,
-        connectionLimit: 5,
         connectTimeout: this.getConnectionTimeoutMs(),
-        idleTimeout: 30000,
         dateStrings: true,
         jsonStrings: true,
         decimalNumbers: false,
@@ -1260,6 +1422,12 @@ export class MySQLDriver extends BaseDBDriver {
         supportBigNumbers: true,
         queryFormat: formatMysqlQuery,
         ssl,
+      };
+      pool = mysql.createPool({
+        ...connectionOptions,
+        waitForConnections: true,
+        connectionLimit: 5,
+        idleTimeout: 30000,
       });
       const connections = new Set<NativeMysqlConnection>();
       this.poolConnections.set(pool, connections);
@@ -1269,11 +1437,79 @@ export class MySQLDriver extends BaseDBDriver {
         const forget = () => connections.delete(native);
         native.once("end", forget);
         native.once("error", forget);
+        const setAutocommit =
+          this.forceSessionAutocommit || !mysqlHandshakeAutocommit(native);
+        if (setAutocommit) {
+          native.query(MYSQL_SESSION_INIT_SQL, (error: Error | null) => {
+            if (error) this.failSessionInitialization(native, error);
+          });
+        }
+        const identitySql = mysqlServerIdentitySql(native);
+        this.sessionReady.set(
+          native,
+          new Promise<void>((resolve) => {
+            native.query(identitySql, (error: Error | null, rows: unknown) => {
+              const row = Array.isArray(rows) ? rows[0] : undefined;
+              if (
+                !error &&
+                !setAutocommit &&
+                row &&
+                typeof row === "object" &&
+                Number(Reflect.get(row, "autocommit")) === 0
+              ) {
+                this.forceSessionAutocommit = true;
+              }
+              const identity = error ? null : readMysqlServerIdentity(rows);
+              if (identity && identity.connectionId === native.threadId) {
+                this.killTargets.set(native, {
+                  threadId: identity.connectionId,
+                  identitySql,
+                  identity: identity.identity,
+                });
+              }
+              resolve();
+            });
+          }),
+        );
       });
+      const forcedBeforeProbe = this.forceSessionAutocommit;
       const conn = await pool.getConnection();
-      conn.release();
+      const probe = Reflect.get(conn, "connection");
+      const ready =
+        probe && typeof probe === "object"
+          ? this.sessionReady.get(probe)
+          : undefined;
+      let probeAnswered = true;
+      if (ready) {
+        const connectionTimeoutMs = this.getConnectionTimeoutMs();
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        probeAnswered = await Promise.race([
+          ready.then(() => true),
+          new Promise<boolean>((resolve) => {
+            timer = setTimeout(
+              () => resolve(false),
+              Math.min(
+                MYSQL_SESSION_PROBE_TIMEOUT_MS,
+                connectionTimeoutMs > 0
+                  ? connectionTimeoutMs
+                  : MYSQL_SESSION_PROBE_TIMEOUT_MS,
+              ),
+            );
+          }),
+        ]);
+        clearTimeout(timer);
+      }
+      if (
+        !probeAnswered ||
+        (this.forceSessionAutocommit && !forcedBeforeProbe)
+      ) {
+        conn.destroy();
+      } else {
+        conn.release();
+      }
       this.assertConnectionEpoch(epoch);
       this.pool = pool;
+      this.killQueryConnectionOptions = connectionOptions;
       pool = undefined;
     } catch (error) {
       if (pool) await this.closePool(pool).catch(() => undefined);
@@ -1297,9 +1533,27 @@ export class MySQLDriver extends BaseDBDriver {
     this.connectionEpoch += 1;
     this.connectionAbortController?.abort();
     this.connectionAbortController = undefined;
+    this.killQueryConnectionOptions = undefined;
+    this.tableIndexCache.clear();
     const pool = this.pool;
     this.pool = null;
     if (pool) await this.closePool(pool);
+  }
+
+  private failSessionInitialization(
+    native: NativeMysqlConnection,
+    error: Error,
+  ): void {
+    const sessionError = new Error(
+      `MySQL session initialization (${MYSQL_SESSION_INIT_SQL}) failed: ${normalizeUnknownError(error, this.config).message}`,
+    );
+    logger.error("MySQL session initialization failed", error);
+    const fail = Reflect.get(native, "_handleFatalError");
+    try {
+      if (typeof fail === "function") fail.call(native, sessionError);
+    } finally {
+      native.destroy();
+    }
   }
 
   private async closePool(pool: Pool): Promise<void> {
@@ -1334,6 +1588,91 @@ export class MySQLDriver extends BaseDBDriver {
     }
   }
 
+  private interruptAndDestroyConnection(connection: PoolConnection): void {
+    const native = Reflect.get(connection, "connection");
+    const target =
+      native && typeof native === "object"
+        ? this.killTargets.get(native)
+        : undefined;
+    const kill =
+      target && target.threadId === connection.threadId
+        ? this.killServerQuery(target)
+        : undefined;
+    if (!kill) {
+      connection.destroy();
+      return;
+    }
+    void kill.finally(() => connection.destroy());
+  }
+
+  private killServerQuery(target: MysqlKillTarget): Promise<void> | undefined {
+    const options = this.killQueryConnectionOptions;
+    const { threadId } = target;
+    if (!options || !Number.isSafeInteger(threadId) || threadId <= 0) {
+      return undefined;
+    }
+    let abandoned = false;
+    let killer: Awaited<ReturnType<typeof mysql.createConnection>> | undefined;
+    const dispose = () => {
+      const connection = killer;
+      killer = undefined;
+      connection?.destroy();
+    };
+    const attempt = (async () => {
+      const connection = await mysql.createConnection({
+        ...options,
+        connectTimeout: MYSQL_KILL_QUERY_TIMEOUT_MS,
+      });
+      killer = connection;
+      if (abandoned) return;
+      const [rows] = await connection.query({
+        sql: target.identitySql,
+        timeout: MYSQL_KILL_QUERY_TIMEOUT_MS,
+      });
+      if (abandoned) return;
+      if (readMysqlServerIdentity(rows)?.identity !== target.identity) {
+        throw new Error(
+          "the cancellation connection reached a different server",
+        );
+      }
+      await connection.query({
+        sql: `KILL QUERY ${threadId}`,
+        timeout: MYSQL_KILL_QUERY_TIMEOUT_MS,
+      });
+    })();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("MySQL KILL QUERY timed out.")),
+        MYSQL_KILL_QUERY_TIMEOUT_MS,
+      );
+    });
+    return Promise.race([attempt, deadline])
+      .catch((error: unknown) => {
+        logger.warn(
+          `MySQL KILL QUERY ${threadId} failed: ${normalizeUnknownError(error, this.config).message}`,
+        );
+      })
+      .finally(() => {
+        abandoned = true;
+        clearTimeout(timer);
+        dispose();
+        void attempt.then(dispose, dispose);
+      });
+  }
+
+  private cancelQueryOperation(operation: MysqlQueryOperation): void {
+    operation.cancelled = true;
+    if (operation.reject) {
+      operation.reject(new Error("SQL query cancelled."));
+    } else if (
+      operation.connection &&
+      this.activeQueryConnections.delete(operation.connection)
+    ) {
+      this.interruptAndDestroyConnection(operation.connection);
+    }
+  }
+
   async cancelCurrentOperation(
     context?: OperationCancellationContext,
   ): Promise<void> {
@@ -1345,15 +1684,7 @@ export class MySQLDriver extends BaseDBDriver {
         if (operation.requestToken !== context.requestToken) {
           continue;
         }
-        operation.cancelled = true;
-        if (operation.reject) {
-          operation.reject(new Error("MySQL query cancelled."));
-        } else if (
-          operation.connection &&
-          this.activeQueryConnections.delete(operation.connection)
-        ) {
-          operation.connection.destroy();
-        }
+        this.cancelQueryOperation(operation);
       }
       return;
     }
@@ -1363,7 +1694,7 @@ export class MySQLDriver extends BaseDBDriver {
         this.activeTransactionConnections.size > 0;
       for (const connection of [...this.activeTransactionConnections]) {
         this.activeTransactionConnections.delete(connection);
-        connection.destroy();
+        this.interruptAndDestroyConnection(connection);
       }
       if (context === undefined && !hadTransactionConnection) {
         await this.recycleConnectionAfterTimeout();
@@ -1560,7 +1891,12 @@ export class MySQLDriver extends BaseDBDriver {
   private async queryArrayRows(
     queryable: Pool | PoolConnection,
     options: QueryOptions,
-  ): Promise<[MysqlQueryRows, FieldPacket[]]> {
+  ): Promise<[MysqlQueryRows, MysqlQueryFields]> {
+    for (const operation of this.activeQueryOperations) {
+      if (operation.connection === queryable && operation.cancelled) {
+        throw new Error("SQL query cancelled.");
+      }
+    }
     const [rows, fields] = await queryable.query({
       ...options,
       timeout: this.getDbOperationTimeoutMs(),
@@ -1568,7 +1904,7 @@ export class MySQLDriver extends BaseDBDriver {
       typeCast: (field, next) =>
         field.type === "GEOMETRY" ? field.buffer() : next(),
     });
-    return [rows as MysqlQueryRows, fields as FieldPacket[]];
+    return [rows as MysqlQueryRows, fields as MysqlQueryFields];
   }
   async listDatabases(): Promise<DatabaseInfo[]> {
     const rows = await this.queryObjectRows<MysqlObjectRow>(
@@ -1687,6 +2023,42 @@ export class MySQLDriver extends BaseDBDriver {
        ORDER BY c.ORDINAL_POSITION`,
       [database, table, database, table, database, table],
     );
+    let checkClauses: string[] = [];
+    if (rows.some((row) => this.mapTypeCategory(row.COLUMN_TYPE) === "text")) {
+      try {
+        const checkRows = await this.queryObjectRows<
+          RowDataPacket & {
+            CHECK_CLAUSE: string | null;
+            ENFORCED?: string | null;
+          }
+        >(
+          `SELECT cc.CHECK_CLAUSE, tc.*
+           FROM information_schema.TABLE_CONSTRAINTS tc
+           JOIN information_schema.CHECK_CONSTRAINTS cc
+             ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+            AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+           WHERE tc.TABLE_SCHEMA = ?
+             AND tc.TABLE_NAME = ?
+             AND tc.CONSTRAINT_TYPE = 'CHECK'
+             AND NOT EXISTS (
+               SELECT 1
+               FROM information_schema.TABLE_CONSTRAINTS tc2
+               WHERE tc2.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
+                 AND tc2.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+                 AND tc2.CONSTRAINT_TYPE = 'CHECK'
+                 AND (tc2.TABLE_SCHEMA <> tc.TABLE_SCHEMA
+                   OR tc2.TABLE_NAME <> tc.TABLE_NAME)
+             )`,
+          [database, table],
+        );
+        checkClauses = checkRows
+          .filter((row) => row.ENFORCED === undefined || row.ENFORCED === "YES")
+          .map((row) => row.CHECK_CLAUSE)
+          .filter((clause): clause is string => typeof clause === "string");
+      } catch (error) {
+        if (!isUnavailableCheckMetadataError(error)) throw error;
+      }
+    }
     return rows.map((r) => {
       const generationExpression =
         typeof r.GENERATION_EXPRESSION === "string" &&
@@ -1703,9 +2075,13 @@ export class MySQLDriver extends BaseDBDriver {
         !isComputed && r.COLUMN_DEFAULT != null
           ? String(r.COLUMN_DEFAULT)
           : undefined;
+      const isJsonAlias =
+        this.mapTypeCategory(r.COLUMN_TYPE) === "text" &&
+        hasJsonValidColumnCheck(checkClauses, r.COLUMN_NAME);
       return {
         name: r.COLUMN_NAME as string,
         type: r.COLUMN_TYPE as string,
+        ...(isJsonAlias ? { exportCategory: "json" as const } : {}),
         characterSet:
           typeof r.CHARACTER_SET_NAME === "string"
             ? r.CHARACTER_SET_NAME
@@ -1755,14 +2131,23 @@ export class MySQLDriver extends BaseDBDriver {
           connection.connection as unknown as NativeMysqlConnection,
           { sql: "", rowsAsArray: true },
         );
-        return this.withReadOnlyTransaction(connection, operationContext, () =>
-          this.executeBoundedScript(
-            connection,
-            statements,
-            params,
-            hardCap,
-            start,
-          ),
+        return this.withReadOnlyTransaction(
+          connection,
+          operationContext,
+          async () => {
+            await this.assertUnambiguousQueryTimestampWrites(
+              connection,
+              statements,
+              params,
+            );
+            return this.executeBoundedScript(
+              connection,
+              statements,
+              params,
+              hardCap,
+              start,
+            );
+          },
         );
       }, operationContext);
     }
@@ -1773,11 +2158,16 @@ export class MySQLDriver extends BaseDBDriver {
             connection,
             operationContext,
             async () => {
+              await this.assertUnambiguousQueryTimestampWrites(
+                connection,
+                [sql],
+                params,
+              );
               const [rawRows, fields] = await this.queryArrayRows(connection, {
                 sql,
                 values: params as QueryOptions["values"],
               });
-              return this._parseQueryResult(
+              return this._parseQueryResponse(
                 rawRows,
                 fields,
                 Date.now() - start,
@@ -1801,7 +2191,7 @@ export class MySQLDriver extends BaseDBDriver {
               const [rawRows, fields] = await this.queryArrayRows(connection, {
                 sql: stmts[0],
               });
-              return this._parseQueryResult(
+              return this._parseQueryResponse(
                 rawRows,
                 fields,
                 Date.now() - start,
@@ -1831,85 +2221,187 @@ export class MySQLDriver extends BaseDBDriver {
     limit: number,
     start: number,
   ): Promise<QueryResult> {
-    const retained = new BoundedQueryRows<unknown[]>(limit);
-    let fields: FieldPacket[] = [];
+    const capturedResultSets: MysqlCapturedResultSet[] = [];
+    let retainedRowCount = 0;
+    let retainedColumnCount = 0;
+    let seenResultSetCount = 0;
+    let resultSetsTruncated = false;
     let affectedRows = 0;
     const operation = [...this.activeQueryOperations].find(
       (entry) => entry.connection === connection,
     );
+
+    const createResult = (error?: unknown): QueryResult => {
+      const resultSets: QueryResultSet[] = capturedResultSets.map(
+        (captured, index) => {
+          const parsed = this._parseQueryResult(
+            captured.rows,
+            captured.fields,
+            0,
+          );
+          return {
+            id: `result-${index + 1}`,
+            columns: parsed.columns,
+            columnMeta: parsed.columnMeta,
+            rows: parsed.rows,
+            rowCount: captured.rowCount,
+            truncated: captured.truncated,
+            ...(captured.partial ? { partial: true } : {}),
+          };
+        },
+      );
+      const firstResultSet = resultSets[0];
+      return {
+        columns: firstResultSet?.columns ?? [],
+        columnMeta: firstResultSet?.columnMeta ?? [],
+        rows: firstResultSet?.rows ?? [],
+        rowCount:
+          resultSets.length > 0
+            ? resultSets.reduce(
+                (total, resultSet) => total + resultSet.rowCount,
+                0,
+              )
+            : affectedRows,
+        executionTimeMs: Date.now() - start,
+        ...(resultSets.length > 0 ? { resultSets } : {}),
+        ...(resultSets.some((resultSet) => resultSet.truncated)
+          ? { truncated: true }
+          : { truncated: false }),
+        ...(resultSets.length === 0 && affectedRows > 0
+          ? { affectedRows }
+          : {}),
+        ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
+        ...(error !== undefined
+          ? { error: normalizeUnknownError(error, this.config).message }
+          : {}),
+      };
+    };
+
     for (const sql of statements) {
-      if (operation?.cancelled) throw new Error("MySQL query cancelled.");
-      await new Promise<void>((resolve, reject) => {
-        const native =
-          connection.connection as unknown as NativeMysqlConnection;
-        const command = createMysqlStreamingQuery(native, {
-          sql,
-          values: params as QueryOptions["values"],
-          rowsAsArray: true,
+      if (operation?.cancelled) throw new Error("SQL query cancelled.");
+      let activeResultSet: MysqlCapturedResultSet | undefined;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const native =
+            connection.connection as unknown as NativeMysqlConnection;
+          const command = createMysqlStreamingQuery(native, {
+            sql,
+            values: params as QueryOptions["values"],
+            rowsAsArray: true,
+          });
+          let settled = false;
+          const timeoutMs = this.getDbOperationTimeoutMs();
+          const timer = setTimeout(
+            () =>
+              fail(new DriverTimeoutError("dbOperation", "query", timeoutMs)),
+            timeoutMs,
+          );
+          const cleanup = () => {
+            clearTimeout(timer);
+            command.off("fields", onFields);
+            command.off("result", onResult);
+            command.off("end", onEnd);
+            command.off("error", fail);
+            command.on("error", () => undefined);
+            if (operation) operation.reject = undefined;
+          };
+          const fail = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (isMysqlServerQueryError(error)) {
+              if (activeResultSet && !activeResultSet.completed) {
+                const resultIndex = Reflect.get(command, "_resultIndex");
+                if (
+                  typeof resultIndex === "number" &&
+                  resultIndex > activeResultSet.protocolResultIndex
+                ) {
+                  activeResultSet.completed = true;
+                } else {
+                  activeResultSet.partial = true;
+                }
+              }
+            } else {
+              this.activeQueryConnections.delete(connection);
+              if (Reflect.get(error, "fatal") === true) connection.destroy();
+              else this.interruptAndDestroyConnection(connection);
+            }
+            reject(error);
+          };
+          if (operation) operation.reject = fail;
+          const onFields = (nextFields: FieldPacket[] | undefined) => {
+            if (settled) return;
+            if (activeResultSet) activeResultSet.completed = true;
+            activeResultSet = undefined;
+            discardMysqlResultHistory(command, nextFields);
+            if (!nextFields?.length) return;
+            seenResultSetCount++;
+            if (
+              seenResultSetCount > MYSQL_MAX_RETAINED_RESULT_SETS ||
+              retainedColumnCount + nextFields.length >
+                MYSQL_MAX_RETAINED_RESULT_COLUMNS
+            ) {
+              resultSetsTruncated = true;
+              return;
+            }
+            activeResultSet = {
+              fields: nextFields,
+              rows: [],
+              rowCount: 0,
+              truncated: false,
+              protocolResultIndex:
+                typeof Reflect.get(command, "_resultIndex") === "number"
+                  ? Reflect.get(command, "_resultIndex")
+                  : 0,
+              completed: false,
+            };
+            capturedResultSets.push(activeResultSet);
+            retainedColumnCount += nextFields.length;
+          };
+          const onResult = (row: unknown[] | ResultSetHeader) => {
+            if (settled) return;
+            if (Array.isArray(row)) {
+              if (!activeResultSet) return;
+              activeResultSet.rowCount++;
+              if (retainedRowCount < limit) {
+                activeResultSet.rows.push(row);
+                retainedRowCount++;
+              } else {
+                activeResultSet.truncated = true;
+              }
+            } else {
+              affectedRows += row.affectedRows ?? 0;
+            }
+          };
+          const onEnd = () => {
+            if (settled) return;
+            settled = true;
+            if (activeResultSet) activeResultSet.completed = true;
+            cleanup();
+            resolve();
+          };
+          command.on("fields", onFields);
+          command.on("result", onResult);
+          command.on("error", fail);
+          command.on("end", onEnd);
+          try {
+            const submit = native.query as unknown as (command: Query) => Query;
+            submit.call(native, command);
+          } catch (error) {
+            fail(error instanceof Error ? error : new Error(String(error)));
+          }
         });
-        let settled = false;
-        const timeoutMs = this.getDbOperationTimeoutMs();
-        const timer = setTimeout(
-          () => fail(new DriverTimeoutError("dbOperation", "query", timeoutMs)),
-          timeoutMs,
-        );
-        const cleanup = () => {
-          clearTimeout(timer);
-          command.off("fields", onFields);
-          command.off("result", onResult);
-          command.off("end", onEnd);
-          command.off("error", fail);
-          command.on("error", () => undefined);
-          if (operation) operation.reject = undefined;
-        };
-        const fail = (error: Error) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          this.activeQueryConnections.delete(connection);
-          connection.destroy();
-          reject(error);
-        };
-        if (operation) operation.reject = fail;
-        const onFields = (nextFields: FieldPacket[] | undefined) => {
-          if (settled) return;
-          discardMysqlResultHistory(command, nextFields);
-          if (!nextFields) return;
-          fields = nextFields;
-          retained.reset();
-        };
-        const onResult = (row: unknown[] | ResultSetHeader) => {
-          if (settled) return;
-          if (Array.isArray(row)) retained.add(row);
-          else affectedRows += row.affectedRows ?? 0;
-        };
-        const onEnd = () => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve();
-        };
-        command.on("fields", onFields);
-        command.on("result", onResult);
-        command.on("error", fail);
-        command.on("end", onEnd);
-        try {
-          const submit = native.query as unknown as (command: Query) => Query;
-          submit.call(native, command);
-        } catch (error) {
-          fail(error instanceof Error ? error : new Error(String(error)));
+      } catch (error) {
+        if (
+          isMysqlServerQueryError(error) &&
+          (capturedResultSets.length > 0 || resultSetsTruncated)
+        ) {
+          return createResult(error);
         }
-      });
+        throw error;
+      }
     }
-    const result = this._parseQueryResult(
-      retained.rows,
-      fields,
-      Date.now() - start,
-    );
-    result.rowCount = fields.length ? retained.rowCount : affectedRows;
-    result.truncated = retained.truncated;
-    if (!fields.length) result.affectedRows = affectedRows;
-    return result;
+    return createResult();
   }
 
   private async withReadOnlyTransaction<T>(
@@ -1935,10 +2427,30 @@ export class MySQLDriver extends BaseDBDriver {
     } catch (rollbackError) {
       this.activeQueryConnections.delete(connection);
       connection.destroy();
-      throw new AggregateError(
-        operationFailed ? [operationError, rollbackError] : [rollbackError],
-        "MySQL read-only query rollback failed; the connection was discarded.",
-      );
+      const rollbackMessage = normalizeUnknownError(
+        rollbackError,
+        this.config,
+      ).message;
+      const cleanupDiagnostic = `Read-only transaction rollback failed: ${rollbackMessage}; the connection was discarded.`;
+      if (operationFailed) {
+        const operationMessage = normalizeUnknownError(
+          operationError,
+          this.config,
+        ).message;
+        throw new AggregateError(
+          [operationError, rollbackError],
+          `${operationMessage}; ${cleanupDiagnostic}`,
+        );
+      }
+      if (isQueryResult(result)) {
+        return {
+          ...result,
+          error: result.error
+            ? `${result.error}; ${cleanupDiagnostic}`
+            : `Query returned results, but ${cleanupDiagnostic}`,
+        } as T;
+      }
+      throw new AggregateError([rollbackError], cleanupDiagnostic);
     }
     if (operationFailed) throw operationError;
     return result as T;
@@ -1946,7 +2458,11 @@ export class MySQLDriver extends BaseDBDriver {
 
   private async withTrackedQueryConnection<T>(
     operation: (connection: PoolConnection) => Promise<T>,
-    operationContext?: { requestToken?: number; readOnly?: boolean },
+    operationContext?: {
+      requestToken?: number;
+      readOnly?: boolean;
+      signal?: AbortSignal;
+    },
   ): Promise<T> {
     const queryOperation: MysqlQueryOperation = {
       cancelled: false,
@@ -1955,7 +2471,12 @@ export class MySQLDriver extends BaseDBDriver {
     this.activeQueryOperations.add(queryOperation);
     let connection: PoolConnection | undefined;
     let slotAcquired = false;
+    let interrupted = false;
+    const signal = operationContext?.signal;
+    const onAbort = () => this.cancelQueryOperation(queryOperation);
+    signal?.addEventListener("abort", onAbort, { once: true });
     try {
+      if (signal?.aborted) onAbort();
       await this.waitForQueryConnectionSlot(queryOperation);
       this.activeQueryConnectionSlots += 1;
       slotAcquired = true;
@@ -1963,11 +2484,13 @@ export class MySQLDriver extends BaseDBDriver {
       queryOperation.connection = connection;
       if (queryOperation.cancelled) {
         connection.destroy();
-        throw new Error("MySQL query cancelled before execution.");
+        throw new Error("SQL query cancelled before execution.");
       }
       this.activeQueryConnections.add(connection);
       const result = await operation(connection);
-      if (queryOperation.cancelled) throw new Error("MySQL query cancelled.");
+      if (queryOperation.cancelled) throw new Error("SQL query cancelled.");
+      if (!this.activeQueryConnections.has(connection)) return result;
+      const activeConnection = connection;
       const cleanupQuery = (sql: string): Promise<ResultSetHeader> => {
         let timer: ReturnType<typeof setTimeout>;
         return new Promise<ResultSetHeader>((resolve, reject) => {
@@ -1978,7 +2501,7 @@ export class MySQLDriver extends BaseDBDriver {
             timeoutMs,
           );
           queryOperation.reject = reject;
-          connection!
+          activeConnection
             .query<ResultSetHeader>(this.createQueryOptions(sql))
             .then(([header]) => resolve(header), reject);
         }).finally(() => {
@@ -1986,30 +2509,54 @@ export class MySQLDriver extends BaseDBDriver {
           queryOperation.reject = undefined;
         });
       };
-      const status = await cleanupQuery("DO 0");
-      if (
-        !status ||
-        Array.isArray(status) ||
-        !Number.isInteger(status.serverStatus) ||
-        status.serverStatus < 0 ||
-        status.serverStatus > 0xffff
-      ) {
-        throw new Error(
-          "Cannot verify MySQL transaction state; connection was discarded.",
-        );
+      try {
+        const status = await cleanupQuery("DO 0");
+        if (
+          !status ||
+          Array.isArray(status) ||
+          !Number.isInteger(status.serverStatus) ||
+          status.serverStatus < 0 ||
+          status.serverStatus > 0xffff
+        ) {
+          throw new Error(
+            "Cannot verify MySQL transaction state; connection was discarded.",
+          );
+        }
+        if ((status.serverStatus & 1) !== 0) {
+          await cleanupQuery("ROLLBACK");
+          throw new Error(
+            "Unfinished MySQL transaction was rolled back. Execute BEGIN and COMMIT/ROLLBACK in the same script. Earlier commits and nontransactional changes are not undone.",
+          );
+        }
+      } catch (cleanupError) {
+        if (
+          queryOperation.cancelled ||
+          !isQueryResult(result) ||
+          !result.error
+        ) {
+          throw cleanupError;
+        }
+        return {
+          ...result,
+          error: `${result.error}; Query cleanup: ${
+            normalizeUnknownError(cleanupError, this.config).message
+          }`,
+        } as T;
       }
-      if ((status.serverStatus & 1) !== 0) {
-        await cleanupQuery("ROLLBACK");
-        throw new Error(
-          "Unfinished MySQL transaction was rolled back. Execute BEGIN and COMMIT/ROLLBACK in the same script. Earlier commits and nontransactional changes are not undone.",
-        );
-      }
-      if (queryOperation.cancelled) throw new Error("MySQL query cancelled.");
+      if (queryOperation.cancelled) throw new Error("SQL query cancelled.");
       return result;
+    } catch (error) {
+      interrupted =
+        queryOperation.cancelled ||
+        error instanceof DriverTimeoutError ||
+        Reflect.get(Object(error), "code") === "PROTOCOL_SEQUENCE_TIMEOUT";
+      throw error;
     } finally {
+      signal?.removeEventListener("abort", onAbort);
       this.activeQueryOperations.delete(queryOperation);
       if (connection && this.activeQueryConnections.delete(connection)) {
-        connection.destroy();
+        if (interrupted) this.interruptAndDestroyConnection(connection);
+        else connection.destroy();
       }
       if (slotAcquired) {
         this.activeQueryConnectionSlots -= 1;
@@ -2025,22 +2572,88 @@ export class MySQLDriver extends BaseDBDriver {
       this.activeTransactionConnections.size >= MYSQL_POOL_CONNECTION_LIMIT
     ) {
       if (operation.cancelled) {
-        throw new Error("MySQL query cancelled before execution.");
+        throw new Error("SQL query cancelled before execution.");
       }
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
     }
     if (operation.cancelled) {
-      throw new Error("MySQL query cancelled before execution.");
+      throw new Error("SQL query cancelled before execution.");
     }
   }
+  clearTableReadCache(): void {
+    this.tableIndexCache.clear();
+  }
+
+  private async getCachedTableIndexes(
+    request: DriverTablePageRequest,
+    signal: AbortSignal,
+  ): Promise<import("./types").IndexMeta[]> {
+    const key = JSON.stringify([request.database, request.table]);
+    const cached = this.tableIndexCache.get(key);
+    if (cached) return cached;
+    try {
+      const indexes = await runWithMetadataCancellation(
+        signal,
+        request.deadline ?? Number.POSITIVE_INFINITY,
+        () => this.getIndexes(request.database, request.schema, request.table),
+      );
+      this.tableIndexCache.set(key, indexes);
+      return indexes;
+    } catch (error) {
+      signal.throwIfAborted();
+      logger.warn(
+        `MySQL index lookup for table ordering failed: ${normalizeUnknownError(error, this.config).message}`,
+      );
+      return [];
+    }
+  }
+
   async readTablePage(
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(request.signal?.reason);
+    request.signal?.addEventListener("abort", onAbort, { once: true });
+    if (request.signal?.aborted) onAbort();
+    const remainingMs =
+      request.deadline === undefined
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, request.deadline - Date.now());
+    const timer = Number.isFinite(remainingMs)
+      ? setTimeout(
+          () =>
+            controller.abort(
+              new DriverTimeoutError(
+                "dbOperation",
+                "readTablePage",
+                remainingMs,
+              ),
+            ),
+          remainingMs,
+        )
+      : undefined;
+    try {
+      return await this.readTablePageWithSignal(request, controller.signal);
+    } catch (error) {
+      if (controller.signal.aborted) throw controller.signal.reason;
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private async readTablePageWithSignal(
+    request: DriverTablePageRequest,
+    signal: AbortSignal,
+  ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
-    const columns = await this.describeColumns(
-      request.database,
-      request.schema,
-      request.table,
+    signal.throwIfAborted();
+    const columns = await runWithMetadataCancellation(
+      signal,
+      request.deadline ?? Number.POSITIVE_INFINITY,
+      () =>
+        this.describeColumns(request.database, request.schema, request.table),
     );
     if (columns.length === 0) {
       const tableName = this.qualifiedTableName(
@@ -2082,6 +2695,40 @@ export class MySQLDriver extends BaseDBDriver {
     )
       ? `ST_AsText(${sortExpression})`
       : sortExpression;
+    let rowTieBreakers: string[] = [];
+    if (!columns.some((column) => column.isPrimaryKey)) {
+      const columnsByName = new Map(
+        columns.map((column) => [column.name, column]),
+      );
+      const uniqueKey = (
+        await this.getCachedTableIndexes(request, signal)
+      ).find(
+        (index) =>
+          index.unique &&
+          index.columns.length > 0 &&
+          index.columns.every(
+            (name) => columnsByName.get(name)?.nullable === false,
+          ),
+      );
+      rowTieBreakers = (
+        uniqueKey
+          ? uniqueKey.columns
+          : columns
+              .filter(
+                (column) =>
+                  column.category !== "spatial" &&
+                  column.category !== "json" &&
+                  !/^(?:tiny|medium|long)?(?:text|blob)\b/i.test(
+                    column.nativeType.trim(),
+                  ),
+              )
+              .map((column) => column.name)
+      )
+        .filter((name) => name !== request.sort?.column)
+        .map(
+          (name) => `${qualifiedTableName}.${this.quoteIdentifier(name)} ASC`,
+        );
+    }
     const orderByClause = request.sort
       ? `ORDER BY ${[
           `${sortValue} ${request.sort.direction === "desc" ? "DESC" : "ASC"}`,
@@ -2099,8 +2746,12 @@ export class MySQLDriver extends BaseDBDriver {
               (column) =>
                 `${qualifiedTableName}.${this.quoteIdentifier(column.name)} ASC`,
             ),
+          ...rowTieBreakers,
         ].join(", ")}`
-      : this.buildOrderByDefault(columns, qualifiedTableName);
+      : this.buildOrderByDefault(columns, qualifiedTableName) ||
+        (rowTieBreakers.length > 0
+          ? `ORDER BY ${rowTieBreakers.join(", ")}`
+          : "");
 
     let totalCount = 0;
     let countFailed = false;
@@ -2109,6 +2760,7 @@ export class MySQLDriver extends BaseDBDriver {
         const countResult = await this.query(
           `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`,
           whereParams,
+          { signal },
         );
         const countRow = countResult.rows[0] as
           | Record<string, unknown>
@@ -2125,6 +2777,7 @@ export class MySQLDriver extends BaseDBDriver {
       }
     }
 
+    signal.throwIfAborted();
     const fetchPageSize = countFailed ? request.pageSize + 1 : request.pageSize;
     const pagination = this.buildPagination(
       offset,
@@ -2134,6 +2787,7 @@ export class MySQLDriver extends BaseDBDriver {
     const dataResult = await this.query(
       `SELECT ${selectList} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`,
       [...whereParams, ...pagination.params],
+      { signal },
     );
 
     const fetchedRows = dataResult.rows.map((row) =>
@@ -2161,12 +2815,13 @@ export class MySQLDriver extends BaseDBDriver {
     };
   }
   private _parseQueryResult(
-    rawRows: MysqlQueryRows,
+    rawRows: MysqlResultPayload,
     fields: FieldPacket[],
     executionTimeMs: number,
   ): QueryResult {
     if (isMysqlSelectRows(rawRows)) {
       const columns = fields.map((field) => field.name);
+      const columnMeta = fields.map(mysqlQueryColumnMeta);
       const boolCols = new Set<number>();
       const floatCols = new Set<number>();
       const geometryCols = new Set<number>();
@@ -2189,9 +2844,6 @@ export class MySQLDriver extends BaseDBDriver {
         Object.fromEntries(
           row.map((val, i) => {
             let v = val;
-            // TINYINT(1) is only a display-width convention: MySQL still
-            // stores its full integer range. Never collapse a stored key to
-            // 0/1; the table viewer uses these values for UPDATE and DELETE.
             if (boolCols.has(i) && typeof v === "boolean") {
               v = v ? 1 : 0;
             }
@@ -2219,7 +2871,13 @@ export class MySQLDriver extends BaseDBDriver {
           }),
         ),
       );
-      return { columns, rows, rowCount: rows.length, executionTimeMs };
+      return {
+        columns,
+        columnMeta,
+        rows,
+        rowCount: rows.length,
+        executionTimeMs,
+      };
     }
     const affectedRows = rawRows.affectedRows;
     return {
@@ -2230,55 +2888,217 @@ export class MySQLDriver extends BaseDBDriver {
       affectedRows,
     };
   }
+
+  private _parseQueryResponse(
+    rawRows: MysqlQueryRows,
+    fields: MysqlQueryFields,
+    executionTimeMs: number,
+  ): QueryResult {
+    const resultGroups = splitMysqlQueryResults(rawRows, fields);
+    if (
+      resultGroups.length === 1 &&
+      (resultGroups[0].fields?.length ?? 0) <= MYSQL_MAX_RETAINED_RESULT_COLUMNS
+    ) {
+      const result = resultGroups[0];
+      return this._parseQueryResult(
+        result.rows,
+        result.fields ?? [],
+        executionTimeMs,
+      );
+    }
+
+    const resultSets: QueryResultSet[] = [];
+    let retainedColumnCount = 0;
+    let totalAffected = 0;
+    let resultSetsTruncated = false;
+    for (const group of resultGroups) {
+      if (isMysqlResultSetHeader(group.rows)) {
+        totalAffected += group.rows.affectedRows ?? 0;
+        continue;
+      }
+      if (
+        resultSets.length >= MYSQL_MAX_RETAINED_RESULT_SETS ||
+        retainedColumnCount + (group.fields?.length ?? 0) >
+          MYSQL_MAX_RETAINED_RESULT_COLUMNS
+      ) {
+        resultSetsTruncated = true;
+        continue;
+      }
+      const parsed = this._parseQueryResult(group.rows, group.fields ?? [], 0);
+      if (parsed.columns.length === 0) {
+        totalAffected += parsed.affectedRows ?? parsed.rowCount ?? 0;
+      } else {
+        resultSets.push({
+          id: `result-${resultSets.length + 1}`,
+          columns: parsed.columns,
+          columnMeta: parsed.columnMeta,
+          rows: parsed.rows,
+          rowCount: parsed.rowCount,
+          truncated: false,
+        });
+        retainedColumnCount += parsed.columns.length;
+      }
+    }
+
+    const firstResultSet = resultSets[0];
+    return {
+      columns: firstResultSet?.columns ?? [],
+      columnMeta: firstResultSet?.columnMeta ?? [],
+      rows: firstResultSet?.rows ?? [],
+      rowCount:
+        resultSets.length > 0
+          ? resultSets.reduce(
+              (total, resultSet) => total + resultSet.rowCount,
+              0,
+            )
+          : totalAffected,
+      executionTimeMs,
+      ...(resultSets.length > 0 ? { resultSets } : {}),
+      ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
+      ...(resultSets.length === 0 && totalAffected > 0
+        ? { affectedRows: totalAffected }
+        : {}),
+    };
+  }
   private async _executeScript(
     conn: PoolConnection,
     stmts: string[],
     start: number,
   ): Promise<QueryResult> {
-    let lastResult: QueryResult = {
-      columns: [],
-      rows: [],
-      rowCount: 0,
-      executionTimeMs: 0,
-    };
+    const resultSets: QueryResultSet[] = [];
+    let retainedColumnCount = 0;
+    let resultSetsTruncated = false;
     let totalAffected = 0;
+    const createResult = (error?: unknown): QueryResult => {
+      const firstResultSet = resultSets[0];
+      return {
+        columns: firstResultSet?.columns ?? [],
+        columnMeta: firstResultSet?.columnMeta ?? [],
+        rows: firstResultSet?.rows ?? [],
+        rowCount:
+          resultSets.length > 0
+            ? resultSets.reduce(
+                (total, resultSet) => total + resultSet.rowCount,
+                0,
+              )
+            : totalAffected,
+        executionTimeMs: Date.now() - start,
+        ...(resultSets.length > 0 ? { resultSets } : {}),
+        ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
+        ...(resultSets.length === 0 && totalAffected > 0
+          ? { affectedRows: totalAffected }
+          : {}),
+        ...(error !== undefined
+          ? { error: normalizeUnknownError(error, this.config).message }
+          : {}),
+      };
+    };
+
+    const operation = [...this.activeQueryOperations].find(
+      (entry) => entry.connection === conn,
+    );
     for (const stmt of stmts) {
-      const [rawRows, fields] = await this.queryArrayRows(conn, {
-        sql: stmt,
-      });
-      const r = this._parseQueryResult(rawRows, fields, 0);
-      totalAffected += r.affectedRows ?? r.rowCount ?? 0;
-      if (r.columns.length > 0) {
-        lastResult = r;
-      } else if (lastResult.columns.length === 0) {
-        lastResult = r;
+      if (operation?.cancelled) throw new Error("SQL query cancelled.");
+      try {
+        const [rawRows, fields] = await this.queryArrayRows(conn, {
+          sql: stmt,
+        });
+        for (const group of splitMysqlQueryResults(rawRows, fields)) {
+          if (isMysqlResultSetHeader(group.rows)) {
+            totalAffected += group.rows.affectedRows ?? 0;
+            continue;
+          }
+          if (
+            resultSets.length >= MYSQL_MAX_RETAINED_RESULT_SETS ||
+            retainedColumnCount + (group.fields?.length ?? 0) >
+              MYSQL_MAX_RETAINED_RESULT_COLUMNS
+          ) {
+            resultSetsTruncated = true;
+            continue;
+          }
+          const result = this._parseQueryResult(
+            group.rows,
+            group.fields ?? [],
+            0,
+          );
+          if (result.columns.length > 0) {
+            resultSets.push({
+              id: `result-${resultSets.length + 1}`,
+              columns: result.columns,
+              columnMeta: result.columnMeta,
+              rows: result.rows,
+              rowCount: result.rowCount,
+              truncated: false,
+            });
+            retainedColumnCount += result.columns.length;
+          } else {
+            totalAffected += result.affectedRows ?? result.rowCount ?? 0;
+          }
+        }
+      } catch (error) {
+        if (
+          isMysqlServerQueryError(error) &&
+          (resultSets.length > 0 || resultSetsTruncated)
+        ) {
+          return createResult(error);
+        }
+        throw error;
       }
     }
-    lastResult.executionTimeMs = Date.now() - start;
-    if (lastResult.columns.length === 0) {
-      lastResult.rowCount = totalAffected;
-      lastResult.affectedRows = totalAffected;
+    return createResult();
+  }
+  private async queryIndexStatistics(
+    database: string,
+    table: string,
+  ): Promise<
+    (RowDataPacket & {
+      INDEX_NAME: string;
+      COLUMN_NAME: string | null;
+      NON_UNIQUE: number | string;
+      SUB_PART?: number | string | null;
+      INDEX_TYPE?: string | null;
+      COLLATION?: string | null;
+      EXPRESSION?: string | null;
+    })[]
+  > {
+    const select = (withExpression: boolean) =>
+      this.queryObjectRows<
+        RowDataPacket & {
+          INDEX_NAME: string;
+          COLUMN_NAME: string | null;
+          NON_UNIQUE: number | string;
+        }
+      >(
+        `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SUB_PART, INDEX_TYPE, COLLATION${withExpression ? ", EXPRESSION" : ""}
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
+        [database, table],
+      );
+    if (this.statisticsExpressionSupported === false) return select(false);
+    try {
+      const rows = await select(true);
+      this.statisticsExpressionSupported = true;
+      return rows;
+    } catch (error) {
+      const mysqlError = error as { code?: unknown; errno?: unknown };
+      if (
+        this.statisticsExpressionSupported ||
+        (mysqlError?.code !== "ER_BAD_FIELD_ERROR" &&
+          mysqlError?.errno !== 1054)
+      ) {
+        throw error;
+      }
+      this.statisticsExpressionSupported = false;
+      return select(false);
     }
-    return lastResult;
   }
   async getIndexes(
     database: string,
     _schema: string,
     table: string,
   ): Promise<import("./types").IndexMeta[]> {
-    const rows = await this.queryObjectRows<
-      RowDataPacket & {
-        INDEX_NAME: string;
-        COLUMN_NAME: string;
-        NON_UNIQUE: number;
-      }
-    >(
-      `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE
-       FROM information_schema.STATISTICS
-       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-       ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
-      [database, table],
-    );
+    const rows = await this.queryIndexStatistics(database, table);
     const map = new Map<string, import("./types").IndexMeta>();
     for (const r of rows) {
       const name = r.INDEX_NAME as string;
@@ -2286,16 +3106,84 @@ export class MySQLDriver extends BaseDBDriver {
         map.set(name, {
           name,
           columns: [],
-          unique: r.NON_UNIQUE === 0,
+          unique: Number(r.NON_UNIQUE) === 0,
           primary: name === "PRIMARY",
         });
       }
+      const column = r.COLUMN_NAME ?? r.EXPRESSION?.trim();
       const index = map.get(name);
-      if (index) {
-        index.columns.push(r.COLUMN_NAME);
+      if (index && column) {
+        index.columns.push(column);
       }
     }
     return [...map.values()];
+  }
+  override async getIndexDDL(
+    database: string,
+    schema: string,
+    table: string,
+    indexName: string,
+  ): Promise<string> {
+    const rows = (await this.queryIndexStatistics(database, table)).filter(
+      (row) => row.INDEX_NAME === indexName,
+    );
+    const [first] = rows;
+    if (!first) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+    const indexType = String(first.INDEX_TYPE ?? "").toUpperCase();
+    const fullTextOrSpatial =
+      indexType === "FULLTEXT" || indexType === "SPATIAL";
+    const keyParts = rows.map((row) => {
+      const expression = row.EXPRESSION?.trim();
+      const subPart =
+        row.SUB_PART == null || fullTextOrSpatial ? 0 : Number(row.SUB_PART);
+      const keyPart = row.COLUMN_NAME
+        ? `${this.quoteIdentifier(row.COLUMN_NAME)}${subPart > 0 ? `(${subPart})` : ""}`
+        : expression
+          ? `(${expression})`
+          : undefined;
+      if (!keyPart) {
+        throw new Error(`Index "${indexName}" has an unsupported key part`);
+      }
+      return row.COLLATION === "D" ? `${keyPart} DESC` : keyPart;
+    });
+    const qualifiedTableName = this.qualifiedTableName(database, schema, table);
+    if (indexName === "PRIMARY") {
+      return `ALTER TABLE ${qualifiedTableName} ADD PRIMARY KEY (${keyParts.join(", ")});`;
+    }
+    const kind = fullTextOrSpatial
+      ? `${indexType} `
+      : Number(first.NON_UNIQUE) === 0
+        ? "UNIQUE "
+        : "";
+    const using = indexType === "HASH" ? " USING HASH" : "";
+    return `CREATE ${kind}INDEX ${this.quoteIdentifier(indexName)}${using} ON ${qualifiedTableName} (${keyParts.join(", ")});`;
+  }
+  override async getConstraintDDL(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+    constraintKind?: import("./types").TableConstraintMeta["kind"],
+  ): Promise<string> {
+    const constraint = (
+      await this.getConstraints(database, schema, table)
+    ).find(
+      (entry) =>
+        entry.name === constraintName &&
+        (!constraintKind || entry.kind === constraintKind),
+    );
+    if (constraint?.kind === "primary_key" || constraint?.kind === "unique") {
+      return this.getIndexDDL(database, schema, table, constraint.name);
+    }
+    return super.getConstraintDDL(
+      database,
+      schema,
+      table,
+      constraintName,
+      constraintKind,
+    );
   }
   async getForeignKeys(
     database: string,
@@ -2343,7 +3231,6 @@ export class MySQLDriver extends BaseDBDriver {
         REFERENCED_TABLE_SCHEMA: string | null;
         REFERENCED_TABLE_NAME: string | null;
         REFERENCED_COLUMN_NAME: string | null;
-        CHECK_CLAUSE: string | null;
       }
     >(
       `SELECT tc.CONSTRAINT_NAME,
@@ -2351,23 +3238,57 @@ export class MySQLDriver extends BaseDBDriver {
               kcu.COLUMN_NAME,
               kcu.REFERENCED_TABLE_SCHEMA,
               kcu.REFERENCED_TABLE_NAME,
-              kcu.REFERENCED_COLUMN_NAME,
-              cc.CHECK_CLAUSE
+              kcu.REFERENCED_COLUMN_NAME
        FROM information_schema.TABLE_CONSTRAINTS tc
        LEFT JOIN information_schema.KEY_COLUMN_USAGE kcu
          ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
         AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
         AND kcu.TABLE_NAME = tc.TABLE_NAME
         AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-       LEFT JOIN information_schema.CHECK_CONSTRAINTS cc
-         ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-        AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
        WHERE tc.TABLE_SCHEMA = ?
          AND tc.TABLE_NAME = ?
          AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')
        ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`,
       [database, table],
     );
+    const checkClauses = new Map<string, string>();
+    if (rows.some((row) => row.CONSTRAINT_TYPE === "CHECK")) {
+      try {
+        const checkRows = (
+          await this.queryObjectRows<
+            RowDataPacket & {
+              CONSTRAINT_NAME: string;
+              CHECK_CLAUSE: string | null;
+              TABLE_NAME?: string | null;
+            }
+          >(
+            `SELECT cc.*
+             FROM information_schema.CHECK_CONSTRAINTS cc
+             WHERE cc.CONSTRAINT_SCHEMA = ?
+               AND cc.CONSTRAINT_NAME IN (
+                 SELECT tc.CONSTRAINT_NAME
+                 FROM information_schema.TABLE_CONSTRAINTS tc
+                 WHERE tc.TABLE_SCHEMA = ?
+                   AND tc.TABLE_NAME = ?
+                   AND tc.CONSTRAINT_TYPE = 'CHECK'
+               )`,
+            [database, database, table],
+          )
+        ).filter((row) => row.TABLE_NAME == null || row.TABLE_NAME === table);
+        for (const row of checkRows) {
+          if (
+            typeof row.CHECK_CLAUSE === "string" &&
+            checkRows.filter(
+              (other) => other.CONSTRAINT_NAME === row.CONSTRAINT_NAME,
+            ).length === 1
+          ) {
+            checkClauses.set(row.CONSTRAINT_NAME, row.CHECK_CLAUSE);
+          }
+        }
+      } catch (error) {
+        if (!isUnavailableCheckMetadataError(error)) throw error;
+      }
+    }
     const map = new Map<string, import("./types").TableConstraintMeta>();
     for (const row of rows) {
       const name = row.CONSTRAINT_NAME;
@@ -2401,7 +3322,8 @@ export class MySQLDriver extends BaseDBDriver {
         referencedColumns: row.REFERENCED_COLUMN_NAME
           ? [row.REFERENCED_COLUMN_NAME]
           : undefined,
-        checkExpression: row.CHECK_CLAUSE ?? undefined,
+        checkExpression:
+          row.CONSTRAINT_TYPE === "CHECK" ? checkClauses.get(name) : undefined,
         source: "catalog",
       });
     }
@@ -2547,8 +3469,11 @@ export class MySQLDriver extends BaseDBDriver {
     const conn = await this.requirePool().getConnection();
     this.activeTransactionConnections.add(conn);
     let discardTransactionConnection = false;
+    let commitAttempted = false;
     const cancel = () => {
-      if (this.activeTransactionConnections.delete(conn)) conn.destroy();
+      if (this.activeTransactionConnections.delete(conn)) {
+        this.interruptAndDestroyConnection(conn);
+      }
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
@@ -2564,6 +3489,7 @@ export class MySQLDriver extends BaseDBDriver {
         throwIfTransactionCancelled(context);
       }
       await conn.beginTransaction();
+      await this.assertUnambiguousTimestampWrites(conn, operations, context);
       const identities = new TransactionIdentityStore();
       const generatedZeros = new Set<number>();
       for (const [index, op] of operations.entries()) {
@@ -2678,16 +3604,43 @@ export class MySQLDriver extends BaseDBDriver {
         context,
       );
       throwIfTransactionCancelled(context);
+      commitAttempted = true;
       await conn.commit();
     } catch (error) {
+      let rollbackResult: ResultSetHeader;
       try {
-        await conn.rollback();
+        [rollbackResult] = await conn.query<ResultSetHeader>(
+          this.createQueryOptions("ROLLBACK"),
+        );
       } catch (rollbackError) {
         discardTransactionConnection = true;
         throw new AggregateError(
           [error, rollbackError],
           "MySQL transaction and rollback failed; the connection was discarded.",
         );
+      }
+      if (rollbackResult?.warningStatus !== 0) {
+        discardTransactionConnection = true;
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new AggregateError(
+          [error],
+          `MySQL transaction failed; a complete rollback could not be confirmed${
+            typeof rollbackResult?.warningStatus === "number"
+              ? ` (ROLLBACK reported ${rollbackResult.warningStatus} warning(s))`
+              : " (ROLLBACK warning metadata was unavailable)"
+          }. Some changes may persist; the connection was discarded. ${detail}`,
+        );
+      }
+      if (!commitAttempted && error instanceof TransactionVerificationError) {
+        error.rollbackConfirmed = true;
+      }
+      if (
+        !commitAttempted &&
+        !mayMysqlServerHaveRolledBackTransaction(error) &&
+        !(error instanceof TransactionVerificationError)
+      ) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new MutationNotExecutedError(message, error);
       }
       throw error;
     } finally {
@@ -2696,6 +3649,63 @@ export class MySQLDriver extends BaseDBDriver {
         if (discardTransactionConnection) conn.destroy();
         else conn.release();
       }
+    }
+  }
+  private async assertUnambiguousTimestampWrites(
+    conn: PoolConnection,
+    operations: import("./types").TransactionOperation[],
+    context?: import("./types").TransactionContext,
+  ): Promise<void> {
+    const values = [
+      ...new Set(operations.flatMap(mysqlUtcTimestampWriteValues)),
+    ];
+    if (values.length === 0) return;
+    const [rows] = await conn.query<RowDataPacket[]>(
+      this.createQueryOptions(
+        `SELECT @@session.time_zone AS __rapidb_time_zone, ${values
+          .map(
+            (_, index) =>
+              `UNIX_TIMESTAMP(${MYSQL_UTC_TIMESTAMP_OPERAND}) AS __rapidb_epoch_${index}`,
+          )
+          .join(", ")}`,
+        values,
+      ),
+    );
+    throwIfTransactionCancelled(context);
+    const row = rows[0];
+    const timeZone = String(row?.__rapidb_time_zone ?? "unknown");
+    for (const [index, value] of values.entries()) {
+      const expected = mysqlTimestampEpoch(`${value}+00:00`);
+      const actual = canonicalizeExactNumeric(
+        row?.[`__rapidb_epoch_${index}`],
+        null,
+      )?.canonical;
+      if (expected !== null && actual === expected) continue;
+      throw new Error(
+        expected !== null &&
+          actual !== undefined &&
+          actual !== "0" &&
+          !actual.startsWith("-")
+          ? `[RapiDB] TIMESTAMP value ${value} UTC falls into a repeated local hour of the session time zone ${timeZone} (for example when daylight saving time ends), so MySQL cannot store that exact instant. Nothing was written.`
+          : `[RapiDB] TIMESTAMP value ${value} UTC is outside the range MySQL can store in the session time zone ${timeZone}. Nothing was written.`,
+      );
+    }
+  }
+  private async assertUnambiguousQueryTimestampWrites(
+    conn: PoolConnection,
+    statements: string[],
+    params: unknown[] | undefined,
+  ): Promise<void> {
+    try {
+      await this.assertUnambiguousTimestampWrites(
+        conn,
+        statements.map((sql) => ({ sql, params })),
+      );
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
     }
   }
   override async getMutationAtomicityRisk(
@@ -2736,8 +3746,6 @@ export class MySQLDriver extends BaseDBDriver {
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();
     const base = mysqlTypeName(nativeType);
-    // Display width does not restrict TINYINT to 0/1 (including BOOL aliases
-    // reported by MySQL as tinyint(1)). Preserve its integer storage domain.
     if (base === "bool" || base === "boolean") return "boolean";
     if (
       ["tinyint", "smallint", "mediumint", "int", "integer", "bigint"].includes(
@@ -2843,9 +3851,22 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "spatial") {
       return "ST_GeomFromText(?)";
     }
+    if (column.category === "decimal") {
+      const { precision, scale } = this.parseExactNumericConstraint(
+        column.nativeType,
+      );
+      const p = precision ?? 10;
+      const s = scale ?? 0;
+      if (p >= 1 && p <= 65 && s >= 0 && s <= 38 && s <= p) {
+        return `CAST(? AS DECIMAL(${p},${s}))`;
+      }
+    }
     return "?";
   }
   override buildSetExpr(column: ColumnTypeMeta, _paramIndex: number): string {
+    if (column.category === "decimal") {
+      return `${this.quoteIdentifier(column.name)} = ?`;
+    }
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, _paramIndex)}`;
   }
   buildMutationValueExpr(
@@ -2853,6 +3874,13 @@ export class MySQLDriver extends BaseDBDriver {
     value: unknown,
     operation: "insert" | "update",
   ): { sql: string; params: unknown[] } | null {
+    if (column.category === "decimal") return { sql: "?", params: [value] };
+    if (mysqlTypeName(column.nativeType) === "timestamp") {
+      const utcValue = mysqlUtcTimestampValue(value);
+      return utcValue === null
+        ? null
+        : { sql: MYSQL_UTC_TIMESTAMP_OPERAND, params: [utcValue] };
+    }
     if (column.category !== "spatial") return null;
     if (value === null) return { sql: "NULL", params: [] };
     if (typeof value !== "string") {
@@ -2862,8 +3890,6 @@ export class MySQLDriver extends BaseDBDriver {
     if (srid !== null) {
       return { sql: "ST_GeomFromText(?, ?)", params: [wkt, srid] };
     }
-    // Plain WKT edits change coordinates, not their reference system. A new
-    // value (INSERT or a NULL cell) retains the existing SRID-zero default.
     return {
       sql:
         operation === "update"
@@ -2876,6 +3902,32 @@ export class MySQLDriver extends BaseDBDriver {
     column: ColumnTypeMeta,
     value: unknown,
   ): { sql: string; params: unknown[] } | null {
+    if (
+      mysqlTypeName(column.nativeType) === "timestamp" &&
+      typeof value === "string" &&
+      hasMysqlTimezoneOffset(value) &&
+      normalizeMysqlDatetimeInput(value) !== null
+    ) {
+      const name = this.quoteIdentifier(column.name);
+      const epoch = mysqlTimestampEpochParam("[RapiDB]", column.name, value);
+      const exact = `UNIX_TIMESTAMP(${name}) = ${MYSQL_TIMESTAMP_EPOCH_OPERAND}`;
+      const seconds = BigInt(epoch.split(".")[0]);
+      if (
+        seconds <= MYSQL_TIMESTAMP_PREFILTER_SECONDS ||
+        seconds + MYSQL_TIMESTAMP_PREFILTER_SECONDS >=
+          MYSQL_FROM_UNIXTIME_SAFE_MAX
+      ) {
+        return { sql: exact, params: [epoch] };
+      }
+      return {
+        sql: `${name} BETWEEN FROM_UNIXTIME(?) AND FROM_UNIXTIME(?) AND ${exact}`,
+        params: [
+          Number(seconds - MYSQL_TIMESTAMP_PREFILTER_SECONDS),
+          Number(seconds + MYSQL_TIMESTAMP_PREFILTER_SECONDS + 1n),
+          epoch,
+        ],
+      };
+    }
     if (column.category !== "spatial") return null;
     if (typeof value !== "string") {
       throw new TypeError(
@@ -2897,8 +3949,12 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "json") return `${name} = CAST(? AS JSON)`;
     if (column.category === "spatial")
       return `ST_AsBinary(${name}) = ST_AsBinary(ST_GeomFromText(?))`;
-    if (column.category === "text")
-      return `CAST(${name} AS BINARY) = CAST(? AS BINARY)`;
+    if (column.category === "text") {
+      const characterSet = column.characterSet?.trim();
+      return characterSet && /^[a-z0-9_]+$/i.test(characterSet)
+        ? `CAST(${name} AS BINARY) = CAST(CONVERT(? USING ${characterSet}) AS BINARY)`
+        : `CAST(${name} AS BINARY) = CAST(? AS BINARY)`;
+    }
     if (
       column.category === "float" &&
       mysqlTypeName(column.nativeType) === "float"
@@ -2906,6 +3962,18 @@ export class MySQLDriver extends BaseDBDriver {
       return `${name} = CAST(? AS FLOAT)`;
     }
     return super.buildOriginalValueComparison(column, paramIndex);
+  }
+  coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (
+      typeof value === "string" &&
+      value !== NULL_SENTINEL &&
+      ["date", "datetime", "timestamp"].includes(
+        mysqlTypeName(column.nativeType),
+      )
+    ) {
+      return value;
+    }
+    return this.coerceInputValue(value, column);
   }
   protected override coerceBooleanTrue(): unknown {
     return 1;
@@ -2958,7 +4026,9 @@ export class MySQLDriver extends BaseDBDriver {
     if (typeName === "datetime" || typeName === "timestamp") {
       const normalized = normalizeMysqlDatetimeInput(value);
       if (normalized !== null) {
-        return normalized;
+        return typeName === "timestamp" && hasMysqlTimezoneOffset(value)
+          ? `${normalized}+00:00`
+          : normalized;
       }
       if (looksLikeMysqlDatetimeInput(value)) {
         throw invalidMysqlTemporalInputError(column.name, typeName);
@@ -3067,7 +4137,7 @@ export class MySQLDriver extends BaseDBDriver {
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
     if (column.category === "json") {
-      return this.checkJsonPersistedEdit(column, expectedValue, options);
+      return this.checkJsonPersistedEdit(column, expectedValue, options, true);
     }
     if (
       column.category === "date" ||
@@ -3272,7 +4342,7 @@ export class MySQLDriver extends BaseDBDriver {
     if (column.category === "date") {
       if (operator === "between" && Array.isArray(val)) {
         return {
-          sql: `${col} BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)`,
+          sql: `${col} BETWEEN ? AND ?`,
           params: [
             normalizeMysqlDateInput(val[0]) ?? val[0],
             normalizeMysqlDateInput(val[1]) ?? val[1],
@@ -3286,7 +4356,7 @@ export class MySQLDriver extends BaseDBDriver {
           .filter(Boolean)
           .map((part) => normalizeMysqlDateInput(part) ?? part);
         return {
-          sql: `${col} IN (${parts.map(() => "CAST(? AS DATE)").join(", ")})`,
+          sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
           params: parts,
         };
       }
@@ -3296,7 +4366,7 @@ export class MySQLDriver extends BaseDBDriver {
       ) {
         const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
         return {
-          sql: `${col} ${sqlOp} CAST(? AS DATE)`,
+          sql: `${col} ${sqlOp} ?`,
           params: [normalizeMysqlDateInput(val) ?? val],
         };
       }
@@ -3330,24 +4400,81 @@ export class MySQLDriver extends BaseDBDriver {
       }
     }
     if (column.category === "datetime") {
-      if (operator === "between" && Array.isArray(val)) {
+      const epochCol = `UNIX_TIMESTAMP(${col})`;
+      const operand = (raw: string) => {
+        const normalized = normalizeMysqlDatetimeInput(raw);
+        if (
+          normalized === null ||
+          mysqlTypeName(column.nativeType) !== "timestamp" ||
+          !hasMysqlTimezoneOffset(raw)
+        ) {
+          return { target: col, sql: "?", value: normalized ?? raw };
+        }
+        const epoch = mysqlTimestampEpoch(raw);
         return {
-          sql: `${col} BETWEEN CAST(? AS DATETIME(6)) AND CAST(? AS DATETIME(6))`,
-          params: [
-            normalizeMysqlDatetimeInput(val[0]) ?? val[0],
-            normalizeMysqlDatetimeInput(val[1]) ?? val[1],
-          ],
+          target: epochCol,
+          sql: MYSQL_TIMESTAMP_EPOCH_OPERAND,
+          value: epoch ?? "1",
+          beforeFirstTimestamp: epoch === null,
+        };
+      };
+      const compare = (
+        part: ReturnType<typeof operand>,
+        sqlOp: string,
+      ): { sql: string; params: unknown[] } => {
+        if (!part.beforeFirstTimestamp) {
+          return {
+            sql: `${part.target} ${sqlOp} ${part.sql}`,
+            params: [part.value],
+          };
+        }
+        if (sqlOp === ">" || sqlOp === ">=") {
+          return { sql: `${part.target} >= ${part.sql}`, params: ["1"] };
+        }
+        if (sqlOp === "!=") return { sql: `${col} IS NOT NULL`, params: [] };
+        return { sql: "1 = 0", params: [] };
+      };
+      if (operator === "between" && Array.isArray(val)) {
+        const [low, high] = val.map(operand);
+        if (low.beforeFirstTimestamp || high.beforeFirstTimestamp) {
+          const bounds = [compare(low, ">="), compare(high, "<=")];
+          return {
+            sql: `(${bounds.map((bound) => bound.sql).join(" AND ")})`,
+            params: bounds.flatMap((bound) => bound.params),
+          };
+        }
+        return {
+          sql:
+            low.target === high.target
+              ? `${low.target} BETWEEN ${low.sql} AND ${high.sql}`
+              : `(${low.target} >= ${low.sql} AND ${high.target} <= ${high.sql})`,
+          params: [low.value, high.value],
         };
       }
       if (typeof val === "string" && operator === "in") {
-        const parts = val
+        const allOperands = val
           .split(",")
           .map((part) => part.trim())
           .filter(Boolean)
-          .map((part) => normalizeMysqlDatetimeInput(part) ?? part);
+          .map(operand);
+        const operands = allOperands.filter(
+          (part) => !part.beforeFirstTimestamp,
+        );
+        if (operands.length === 0 && allOperands.length > 0) {
+          return { sql: "1 = 0", params: [] };
+        }
+        const groups = [col, epochCol]
+          .map((target) => operands.filter((part) => part.target === target))
+          .filter((group) => group.length > 0);
+        if (groups.length < 2) {
+          return {
+            sql: `${groups[0]?.[0]?.target ?? col} IN (${operands.map((part) => part.sql).join(", ")})`,
+            params: operands.map((part) => part.value),
+          };
+        }
         return {
-          sql: `${col} IN (${parts.map(() => "CAST(? AS DATETIME(6))").join(", ")})`,
-          params: parts,
+          sql: `(${groups.map((group) => `${group[0].target} IN (${group.map((part) => part.sql).join(", ")})`).join(" OR ")})`,
+          params: groups.flat().map((part) => part.value),
         };
       }
       if (
@@ -3355,10 +4482,7 @@ export class MySQLDriver extends BaseDBDriver {
         ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
       ) {
         const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
-        return {
-          sql: `${col} ${sqlOp} CAST(? AS DATETIME(6))`,
-          params: [normalizeMysqlDatetimeInput(val) ?? val],
-        };
+        return compare(operand(val), sqlOp);
       }
     }
     if (
@@ -3390,8 +4514,11 @@ export class MySQLDriver extends BaseDBDriver {
       val !== ""
     ) {
       const sqlOp = this.sqlOperator(operator);
-      if (column.category === "integer" && !/^[+-]?\d+$/.test(val)) {
-        const operand = this.integerFilterOperand(column, val);
+      if (
+        column.category === "decimal" ||
+        (column.category === "integer" && !/^[+-]?\d+$/.test(val))
+      ) {
+        const operand = this.exactNumericFilterOperand(column, val);
         return {
           sql: `${col} ${sqlOp} ${operand.sql}`,
           params: [operand.value],
@@ -3400,15 +4527,13 @@ export class MySQLDriver extends BaseDBDriver {
       const param =
         column.category === "integer"
           ? toMysqlIntegerFilterParam(val)
-          : column.category === "decimal"
-            ? val
-            : Number(val);
+          : Number(val);
       return { sql: `${col} ${sqlOp} ?`, params: [param] };
     }
     if (operator === "between" && Array.isArray(val)) {
-      if (column.category === "integer") {
+      if (column.category === "integer" || column.category === "decimal") {
         const operands = val.map((part) =>
-          this.integerFilterOperand(column, part),
+          this.exactNumericFilterOperand(column, part),
         );
         return {
           sql: `${col} BETWEEN ${operands[0].sql} AND ${operands[1].sql}`,
@@ -3419,9 +4544,9 @@ export class MySQLDriver extends BaseDBDriver {
     }
     if (operator === "in" && typeof val === "string") {
       const parts = val.split(",").map((s) => s.trim());
-      if (column.category === "integer") {
+      if (column.category === "integer" || column.category === "decimal") {
         const operands = parts.map((part) =>
-          this.integerFilterOperand(column, part),
+          this.exactNumericFilterOperand(column, part),
         );
         return {
           sql: `${col} IN (${operands.map((part) => part.sql).join(", ")})`,
@@ -3463,12 +4588,23 @@ export class MySQLDriver extends BaseDBDriver {
         : literalContainsPattern(finalVal);
     return this.buildContainsFilter(col, mysqlVal);
   }
-  private integerFilterOperand(
+  private exactNumericFilterOperand(
     column: ColumnTypeMeta,
     value: string,
   ): { sql: string; value: string } {
-    if (/^[+-]?\d+$/.test(value)) return { sql: "?", value };
-    const literal = exactNumericFilterLiteral(value, column.name, 65, 30);
+    if (column.category === "integer" && /^[+-]?\d+$/.test(value)) {
+      return { sql: "?", value };
+    }
+    const columnScale =
+      column.category === "decimal"
+        ? (this.parseExactNumericConstraint(column.nativeType).scale ?? 0)
+        : 0;
+    const literal = exactNumericFilterLiteral(
+      value,
+      column.name,
+      65,
+      Math.min(38, Math.max(30, columnScale)),
+    );
     return {
       sql: `CAST(? AS DECIMAL(65,${literal.scale}))`,
       value: literal.value,

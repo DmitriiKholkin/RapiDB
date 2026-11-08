@@ -200,6 +200,11 @@ export function registerLiveDriverConformanceTests(
         expect(result).toMatchObject({
           columns: ["same", "same"],
           rowCount: 4,
+        });
+        expect(
+          engineId === "sqlite" ? result : result.resultSets?.[0],
+        ).toMatchObject({
+          rowCount: 4,
           truncated: true,
         });
         expect(
@@ -217,6 +222,11 @@ export function registerLiveDriverConformanceTests(
           columns: ["empty_result"],
           rows: [],
           rowCount: 0,
+        });
+        expect(
+          engineId === "sqlite" ? empty : empty.resultSets?.[0],
+        ).toMatchObject({
+          rowCount: 0,
           truncated: false,
         });
         const parameterized = await harness.driver.query(
@@ -228,6 +238,11 @@ export function registerLiveDriverConformanceTests(
         );
         expect(parameterized).toMatchObject({
           columns: ["bound_value"],
+          rowCount: 1,
+        });
+        expect(
+          engineId === "sqlite" ? parameterized : parameterized.resultSets?.[0],
+        ).toMatchObject({
           rowCount: 1,
           truncated: false,
         });
@@ -264,6 +279,11 @@ export function registerLiveDriverConformanceTests(
             expect(result).toMatchObject({
               rowCount: 5,
               affectedRows: 5,
+            });
+            expect(
+              engineId === "sqlite" ? result : result.resultSets?.[0],
+            ).toMatchObject({
+              rowCount: 5,
               truncated: true,
             });
             const state = await harness.driver.query(
@@ -279,7 +299,7 @@ export function registerLiveDriverConformanceTests(
     }
 
     if (engineId === "postgres") {
-      it("drains many native PostgreSQL result sets and returns only the bounded last command", async () => {
+      it("drains every PostgreSQL result set with a shared row budget and the first set primary", async () => {
         const source = Array.from(
           { length: 25 },
           (_, i) => `SELECT ${i} AS batch_number, generate_series(1, 500) AS n`,
@@ -287,12 +307,21 @@ export function registerLiveDriverConformanceTests(
         const result = await harness.driver.query(source, undefined, {
           hardCap: 3,
         });
-        expect(result).toMatchObject({ rowCount: 500, truncated: true });
+        expect(result).toMatchObject({ rowCount: 12500, truncated: true });
         expect(result.rows).toEqual([
-          { __col_0: 24, __col_1: 1 },
-          { __col_0: 24, __col_1: 2 },
-          { __col_0: 24, __col_1: 3 },
+          { __col_0: 0, __col_1: 1 },
+          { __col_0: 0, __col_1: 2 },
+          { __col_0: 0, __col_1: 3 },
         ]);
+        expect(result.resultSets).toHaveLength(25);
+        expect(result.resultSets?.[24]).toMatchObject({
+          rows: [],
+          rowCount: 500,
+          truncated: true,
+        });
+        expect(
+          result.resultSets?.reduce((count, set) => count + set.rows.length, 0),
+        ).toBe(3);
         for (const sql of [
           "SHOW ALL",
           "EXPLAIN SELECT * FROM generate_series(1, 20) AS n WHERE n > 0 ORDER BY n",
@@ -312,21 +341,27 @@ export function registerLiveDriverConformanceTests(
     }
 
     if (engineId === "postgres" || engineId === "mssql") {
-      it("propagates late native errors after a full budget and recovers the pool", async () => {
+      it("retains rowsets and reports late native errors after a full budget, then recovers the pool", async () => {
         const source =
           engineId === "postgres"
             ? "SELECT generate_series(1, 20); DO $$ BEGIN RAISE EXCEPTION 'budget late failure'; END $$;"
             : "WITH c(n) AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4) SELECT n FROM c; THROW 50000, 'budget late failure', 1;";
-        await expect(
-          harness.driver.query(source, undefined, { hardCap: 2 }),
-        ).rejects.toThrow("budget late failure");
+        const result = await harness.driver.query(source, undefined, {
+          hardCap: 2,
+        });
+        expect(result.error).toContain("budget late failure");
+        expect(result.rows).toHaveLength(2);
+        expect(result.resultSets?.[0]).toMatchObject({
+          rowCount: engineId === "postgres" ? 20 : 4,
+          truncated: true,
+        });
         const next = await harness.driver.query(
           "SELECT 7 AS recovered",
           undefined,
           { hardCap: 2 },
         );
         expect(Number(next.rows[0].__col_0)).toBe(7);
-        expect(next.truncated).toBe(false);
+        expect(next.resultSets?.[0].truncated).toBe(false);
       });
 
       if (transport === "direct") {
@@ -385,7 +420,11 @@ export function registerLiveDriverConformanceTests(
             undefined,
             { hardCap: 2 },
           );
-          expect(result).toMatchObject({ rowCount: 20, truncated: true });
+          expect(result).toMatchObject({ rowCount: 20 });
+          expect(result.resultSets?.[0]).toMatchObject({
+            rowCount: 20,
+            truncated: true,
+          });
           expect(result.rows).toHaveLength(2);
           expect(
             Number(
@@ -400,23 +439,42 @@ export function registerLiveDriverConformanceTests(
           );
           expect(profile).toMatchObject({
             columns: ["id"],
+          });
+          expect(profile.resultSets).toHaveLength(2);
+          expect(profile.resultSets?.[0]).toMatchObject({
             rowCount: 5,
             truncated: true,
           });
+          expect(profile.resultSets?.[1].rowCount).toBeGreaterThan(0);
+          expect(profile.resultSets?.[1]).toMatchObject({
+            rows: [],
+            truncated: true,
+          });
+          expect(profile.rowCount).toBe(
+            profile.resultSets?.reduce((count, set) => count + set.rowCount, 0),
+          );
           expect(profile.rows).toHaveLength(2);
           const json = await harness.driver.query(
             `SELECT id FROM ${table} ORDER BY id FOR JSON PATH`,
             undefined,
             { hardCap: 1 },
           );
-          expect(json).toMatchObject({ rowCount: 1, truncated: false });
+          expect(json).toMatchObject({ rowCount: 1 });
+          expect(json.resultSets?.[0]).toMatchObject({
+            rowCount: 1,
+            truncated: false,
+          });
           expect(JSON.parse(String(json.rows[0].__col_0))).toHaveLength(5);
           const xml = await harness.driver.query(
             `SELECT id AS [@id] FROM ${table} ORDER BY id FOR XML PATH('item')`,
             undefined,
             { hardCap: 1 },
           );
-          expect(xml).toMatchObject({ rowCount: 1, truncated: false });
+          expect(xml).toMatchObject({ rowCount: 1 });
+          expect(xml.resultSets?.[0]).toMatchObject({
+            rowCount: 1,
+            truncated: false,
+          });
           expect(String(xml.rows[0].__col_0).match(/<item /g)).toHaveLength(5);
         } finally {
           await harness.driver.query(`DROP TABLE ${table}`);
@@ -471,7 +529,11 @@ export function registerLiveDriverConformanceTests(
         );
         expect(rewrite.error).toBeUndefined();
         const result = await harness.driver.query(rewrite.queryText);
-        expect(result.rows.map((row) => Number(row.__col_0))).toEqual([1, 2]);
+        expect(result.rows).toEqual([{ __col_0: "first; result" }]);
+        expect(result.resultSets).toHaveLength(2);
+        expect(
+          result.resultSets?.[1].rows.map((row) => Number(row.__col_0)),
+        ).toEqual([1, 2]);
       });
     }
 
@@ -556,7 +618,18 @@ export function registerLiveDriverConformanceTests(
           const rewrite = applyHardCapToSqlQuery(source, "sqlite", 2);
           expect(rewrite.error).toBeUndefined();
           const result = await harness.driver.query(rewrite.queryText);
-          expect(result.rows.map((row) => Number(row.__col_0))).toEqual([1, 2]);
+          const sets = result.resultSets;
+          if (source.startsWith("SELECT 99")) {
+            expect(result.rows).toEqual([{ __col_0: 99 }]);
+            expect(sets).toHaveLength(2);
+            expect(sets?.[1].rows.map((row) => Number(row.__col_0))).toEqual([
+              1, 2,
+            ]);
+          } else {
+            expect(result.rows.map((row) => Number(row.__col_0))).toEqual([
+              1, 2,
+            ]);
+          }
         }
       });
     }

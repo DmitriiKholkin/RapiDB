@@ -1,5 +1,4 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import type { QueryColumnMeta } from "../../shared/tableTypes";
 import {
   ensureSQLiteRuntimeInstalled,
   probeInstalledBetterSqlite3Runtime,
@@ -30,6 +29,11 @@ interface BetterSqlite3Database {
   readonly inTransaction: boolean;
   close(): void;
   exec(sql: string): void;
+  function(
+    name: string,
+    options: { deterministic?: boolean },
+    fn: (value: unknown) => unknown,
+  ): void;
   pragma(source: string, options?: { simple?: boolean }): unknown;
   prepare(sql: string): BetterSqlite3Statement;
 }
@@ -54,7 +58,11 @@ export interface SQLiteDatabase {
   allRaw(
     sql: string,
     params?: readonly unknown[],
-  ): { columns: string[]; rows: unknown[][] };
+  ): {
+    columns: string[];
+    columnMeta: QueryColumnMeta[];
+    rows: unknown[][];
+  };
   queryBounded(
     sql: string,
     params: readonly unknown[],
@@ -62,6 +70,7 @@ export interface SQLiteDatabase {
     onResultSet?: () => void,
   ): {
     columns: string[];
+    columnMeta: QueryColumnMeta[];
     rows: unknown[][];
     rowCount: number;
     changes?: number;
@@ -79,7 +88,6 @@ export interface SQLiteDatabase {
 export interface SQLiteRuntimeOpenConfig {
   filePath: string;
   readOnly?: boolean;
-  sqliteWalMode?: "auto" | "off";
 }
 
 export type SQLiteRuntimeTargetId =
@@ -116,6 +124,113 @@ export function resolveSQLiteRuntimeTarget(
 
 function sqliteRuntimeTarget(): string {
   return resolveSQLiteRuntimeTarget() ?? `${process.platform}-${process.arch}`;
+}
+
+function sqliteDateTimeKeyFromSeconds(
+  seconds: number,
+  fraction: string,
+): string | null {
+  if (
+    !Number.isSafeInteger(seconds) ||
+    seconds < -210_866_760_000 ||
+    seconds > 253_402_300_799
+  ) {
+    return null;
+  }
+  const sortableSeconds = seconds + 1_000_000_000_000;
+  if (sortableSeconds < 0 || sortableSeconds >= 10_000_000_000_000) {
+    return null;
+  }
+  return `${String(sortableSeconds).padStart(13, "0")}.${fraction.replace(/0+$/, "")}`;
+}
+
+function sqliteTimeSortKey(value: unknown): string | null {
+  const key = sqliteDateTimeSortKey(value);
+  if (key === null) return null;
+  const [whole, fraction] = key.split(".");
+  const seconds = Number(whole) - 1_000_000_000_000;
+  const timeOfDay = ((seconds % 86_400) + 86_400) % 86_400;
+  return `${String(timeOfDay).padStart(5, "0")}.${fraction}`;
+}
+
+function sqliteDateTimeSortKey(value: unknown): string | null {
+  if (typeof value === "number" || typeof value === "bigint") {
+    const julianDay = Number(value);
+    if (
+      !Number.isFinite(julianDay) ||
+      julianDay < 0 ||
+      julianDay >= 5_373_484.5
+    )
+      return null;
+    const unixMilliseconds =
+      Math.round(julianDay * 86_400_000) - 2_440_587.5 * 86_400_000;
+    if (!Number.isSafeInteger(unixMilliseconds)) return null;
+    const seconds = Math.floor(unixMilliseconds / 1000);
+    const milliseconds = unixMilliseconds - seconds * 1000;
+    const fraction =
+      milliseconds === 0 ? "" : String(milliseconds).padStart(3, "0");
+    return sqliteDateTimeKeyFromSeconds(seconds, fraction);
+  }
+  if (typeof value !== "string") return null;
+
+  const text = value.trim();
+  const normalized = /^\d{2}:\d{2}/.test(text) ? `2000-01-01 ${text}` : text;
+  const match =
+    /^(-?\d{4})-(\d{2})-(\d{2})(?:[\t-\r T]+(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d+))?)?(?:[\t-\r ]*(Z|[+-]\d{2}:\d{2}))?)?$/i.exec(
+      normalized,
+    );
+  if (!match) return null;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hours = Number(match[4] ?? "00");
+  const minutes = Number(match[5] ?? "00");
+  const secondsPart = Number(match[6] ?? "00");
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hours > 24 ||
+    minutes > 59 ||
+    secondsPart > 59
+  ) {
+    return null;
+  }
+
+  let offsetSeconds = 0;
+  const timezone = match[8];
+  if (timezone && timezone.toUpperCase() !== "Z") {
+    const sign = timezone[0] === "+" ? 1 : -1;
+    const offsetDigits = timezone.slice(1).replace(":", "");
+    const offsetHours = Number(offsetDigits.slice(0, 2));
+    const offsetMinutes = Number(offsetDigits.slice(2));
+    if (offsetHours > 14 || offsetMinutes > 59) {
+      return null;
+    }
+    offsetSeconds = sign * (offsetHours * 60 + offsetMinutes) * 60;
+  }
+
+  let adjustedYear = year;
+  adjustedYear -= month <= 2 ? 1 : 0;
+  const era = Math.floor(adjustedYear / 400);
+  const yearOfEra = adjustedYear - era * 400;
+  const adjustedMonth = month + (month > 2 ? -3 : 9);
+  const dayOfYear = Math.floor((153 * adjustedMonth + 2) / 5) + day - 1;
+  const dayOfEra =
+    yearOfEra * 365 +
+    Math.floor(yearOfEra / 4) -
+    Math.floor(yearOfEra / 100) +
+    dayOfYear;
+  const daysSinceUnixEpoch = era * 146_097 + dayOfEra - 719_468;
+  const utcSeconds =
+    daysSinceUnixEpoch * 86_400 +
+    hours * 3_600 +
+    minutes * 60 +
+    secondsPart -
+    offsetSeconds;
+  return sqliteDateTimeKeyFromSeconds(utcSeconds, match[7] ?? "");
 }
 
 export function resolveBetterSqlite3LoadTargets(
@@ -179,8 +294,8 @@ export function formatSQLiteRuntimeLoadErrorMessage(
 
   const versionHint = isModuleVersionError
     ? " The SQLite binary was compiled for a different Node.js version. " +
-      "RapiDB will fetch a host-compatible binary automatically, but the cached copy is stale or incompatible. " +
-      "Reload VS Code and retry the SQLite connection to force a fresh download."
+      "RapiDB re-downloads a host-compatible binary automatically when the cached runtime metadata does not match this host, but the cached copy still failed to load. " +
+      "Delete the cached SQLite runtime directory (installedPackage below) and retry the SQLite connection to force a fresh download."
     : "";
 
   const managedHint =
@@ -312,6 +427,38 @@ function normalizeSqliteIntegers(value: unknown): unknown {
   return value;
 }
 
+function inferSqliteQueryColumnMeta(
+  rows: readonly unknown[][],
+  columnCount: number,
+): QueryColumnMeta[] {
+  return Array.from({ length: columnCount }, (_, columnIndex) => {
+    let sawInteger = false;
+    let sawFloat = false;
+    let sawOtherValue = false;
+    for (const row of rows) {
+      const value = row[columnIndex];
+      if (value === null || value === undefined) continue;
+      if (typeof value === "bigint") {
+        sawInteger = true;
+      } else if (typeof value === "number") {
+        sawFloat = true;
+      } else {
+        sawOtherValue = true;
+      }
+    }
+    return {
+      category:
+        !sawOtherValue && (sawInteger || sawFloat)
+          ? sawInteger && sawFloat
+            ? "decimal"
+            : sawInteger
+              ? "integer"
+              : "float"
+          : null,
+    };
+  });
+}
+
 class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
   constructor(private readonly database: BetterSqlite3Database) {}
 
@@ -344,15 +491,26 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
   allRaw(
     sql: string,
     params: readonly unknown[] = [],
-  ): { columns: string[]; rows: unknown[][] } {
+  ): {
+    columns: string[];
+    columnMeta: QueryColumnMeta[];
+    rows: unknown[][];
+  } {
     const statement = this.database.prepare(sql);
     if (!statement.reader)
       throw new TypeError(
         "This statement does not return data. Use run() instead.",
       );
-    const rows = executeStatement<unknown[][]>(statement.raw(), "all", params);
     const columns = statement.columns().map((column) => column.name);
-    return { columns, rows };
+    const exactStatement = statement.raw().safeIntegers(true);
+    const rawRows = params.length
+      ? (exactStatement.all(params) as unknown[][])
+      : (exactStatement.all() as unknown[][]);
+    return {
+      columns,
+      columnMeta: inferSqliteQueryColumnMeta(rawRows, columns.length),
+      rows: normalizeSqliteIntegers(rawRows) as unknown[][],
+    };
   }
 
   queryBounded(
@@ -370,6 +528,7 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
       );
       return {
         columns: [],
+        columnMeta: [],
         rows: [],
         rowCount: info.changes,
         changes: info.changes,
@@ -380,14 +539,19 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     const exact = statement.raw().safeIntegers(true);
     const iterator = params.length ? exact.iterate(params) : exact.iterate();
     const rows: unknown[][] = [];
+    const rawRows: unknown[][] = [];
     let rowCount = 0;
     for (const row of iterator) {
       rowCount++;
-      if (rows.length < limit)
+      if (rows.length < limit) {
+        rawRows.push(row);
         rows.push(normalizeSqliteIntegers(row) as unknown[]);
+      }
     }
+    const columns = statement.columns().map((column) => column.name);
     return {
-      columns: statement.columns().map((column) => column.name),
+      columns,
+      columnMeta: inferSqliteQueryColumnMeta(rawRows, columns.length),
       rows,
       rowCount,
       truncated: rowCount > rows.length,
@@ -429,17 +593,18 @@ export async function openSQLiteDatabase(
   }
 
   try {
+    database.pragma("schema_version", { simple: true });
     database.pragma("foreign_keys = ON");
-
-    if (!readOnly) {
-      if (config.sqliteWalMode === "off") {
-        database.pragma("journal_mode = DELETE");
-      } else {
-        try {
-          database.pragma("journal_mode = WAL", { simple: true });
-        } catch {}
-      }
-    }
+    database.function(
+      "RAPIDB_DATETIME_KEY",
+      { deterministic: true },
+      sqliteDateTimeSortKey,
+    );
+    database.function(
+      "RAPIDB_TIME_KEY",
+      { deterministic: true },
+      sqliteTimeSortKey,
+    );
 
     return new BetterSqlite3DatabaseAdapter(database);
   } catch (error) {

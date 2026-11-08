@@ -1,5 +1,5 @@
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
@@ -34,6 +34,7 @@ import type {
   TableDetailSectionKind,
   TableDetailState,
 } from "../connectionManagerModels";
+import { sanitizeCredentialBearingUri } from "../connectionSecrets";
 import { redisKeyspaceDisplayName } from "../dbDrivers/redisKeyspace";
 import type {
   ColumnTypeMeta,
@@ -46,7 +47,6 @@ import {
   DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST,
   resolveDriverTableSectionAvailability,
 } from "../dbDrivers/types";
-import { getExplorerSchemaScopeKey } from "../schemaCacheUtils";
 import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
@@ -99,13 +99,63 @@ type CategoryKind =
 
 const _coloredIconCache = new Map<string, vscode.Uri>();
 
+function readRegularFile(filePath: string): string | undefined {
+  try {
+    if (!fs.lstatSync(filePath).isFile()) return undefined;
+    const fd = fs.openSync(
+      filePath,
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    try {
+      return fs.readFileSync(fd, "utf8");
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function writePrivateIconFile(
+  dir: string,
+  fileName: string,
+  contents: string,
+): string {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory()) {
+    throw new Error(`Icon directory is not a directory: ${dir}`);
+  }
+  const filePath = path.join(dir, fileName);
+  if (readRegularFile(filePath) === contents) {
+    return filePath;
+  }
+  const tempPath = path.join(dir, `.${fileName}.${randomUUID()}.tmp`);
+  fs.writeFileSync(tempPath, contents, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
+  try {
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    fs.rmSync(tempPath, { force: true });
+    throw error;
+  }
+  return filePath;
+}
+
 function getColoredServerIconUri(
+  storageDir: string | undefined,
   hexColor: string,
   isConnected: boolean,
-): vscode.Uri {
+): vscode.Uri | undefined {
+  if (!storageDir) {
+    return undefined;
+  }
   const safeHex = /^#[0-9a-fA-F]{3,8}$/.test(hexColor) ? hexColor : "#888888";
   const stateKey = isConnected ? "connected" : "disconnected";
-  const cacheKey = `${safeHex}:${stateKey}`;
+  const cacheKey = `${storageDir}:${safeHex}:${stateKey}`;
   const cached = _coloredIconCache.get(cacheKey);
   if (cached) {
     return cached;
@@ -129,24 +179,18 @@ function getColoredServerIconUri(
     </defs>
     <path transform="translate(0,0.5)" mask="url(#mask)" fill="${safeHex}" d="M3.5 1h9A1.5 1.5 0 0 1 14 2.5v2c-.25.273-.389.63-.39 1c.001.37.14.727.39 1v2c-.25.273-.389.63-.39 1c.001.37.14.727.39 1v2a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 2 12.5v-2c.25-.273.389-.63.39-1c-.001-.37-.14-.727-.39-1v-2c.25-.273.389-.63.39-1c-.001-.37-.14-.727-.39-1v-2A1.5 1.5 0 0 1 3.5 1z"/>
   </svg>`;
-  const dir = path.join(os.tmpdir(), "rapidb-icons");
   try {
-    fs.mkdirSync(dir, { recursive: true });
-    const filePath = path.join(dir, `conn-${safeKey}-${stateKey}.svg`);
-    fs.writeFileSync(
-      filePath,
-      isConnected ? svgIconConnected : svgIconDisconnected,
-      "utf8",
+    const uri = vscode.Uri.file(
+      writePrivateIconFile(
+        path.join(storageDir, "icons"),
+        `conn-${safeKey}-${stateKey}.svg`,
+        isConnected ? svgIconConnected : svgIconDisconnected,
+      ),
     );
-    const uri = vscode.Uri.file(filePath);
     _coloredIconCache.set(cacheKey, uri);
     return uri;
   } catch {
-    const fallback = vscode.Uri.file(
-      path.join(dir, `conn-${safeKey}-${stateKey}.svg`),
-    );
-    _coloredIconCache.set(cacheKey, fallback);
-    return fallback;
+    return undefined;
   }
 }
 
@@ -254,6 +298,7 @@ export class RapiDBNode extends vscode.TreeItem {
     public readonly detailKey?: string,
     public readonly ddlSupport?: IndexDdlSupport,
     public readonly dataObjectKind?: DataDbObjectKind,
+    public readonly constraintKind?: TableConstraintMeta["kind"],
   ) {
     super(label, collapsibleState);
 
@@ -267,6 +312,7 @@ export class RapiDBNode extends vscode.TreeItem {
       section,
       detailKey,
       parentTable || section ? dataObjectKind : undefined,
+      ...(constraintKind ? [constraintKind] : []),
     ]);
 
     this.contextValue = kind;
@@ -375,7 +421,10 @@ export class ConnectionProvider
   private _dragActive = false;
   private _connectedOnlyMode = false;
 
-  constructor(private readonly connectionManager: ConnectionProviderManager) {
+  constructor(
+    private readonly connectionManager: ConnectionProviderManager,
+    private readonly iconStorageDir?: string,
+  ) {
     const scheduleRefresh = (connectionId?: string) => {
       if (connectionId) {
         this._pendingConnectionRefreshIds.add(connectionId);
@@ -458,12 +507,12 @@ export class ConnectionProvider
 
   refreshConnectionTree(connectionId?: string): void {
     if (!connectionId) {
+      this.refresh();
       const connectionIds = new Set([
         ...this._connectionNodes.keys(),
         ...this._expandedDescendantNodes.keys(),
       ]);
       if (connectionIds.size === 0) {
-        this.refresh();
         return;
       }
       for (const expandedConnectionId of connectionIds) {
@@ -1267,6 +1316,10 @@ export class ConnectionProvider
     manifest: DriverEntityManifest,
   ): RapiDBNode {
     const displayName = this.getObjectDisplayName(connectionId, objectName);
+    const connectionType = this.getConnectionType(connectionId);
+    const isOraclePackage =
+      connectionType === "oracle" &&
+      this.isOraclePackageRoutine({ routineIdentity: detailKey });
     const dataObjectKind = isDataDbObjectKind(kind) ? kind : undefined;
     const collapsibleState =
       dataObjectKind &&
@@ -1289,14 +1342,20 @@ export class ConnectionProvider
     );
     const includeSchema = this.hasSchemaConcept(connectionId);
     const kindLabel = formatTooltipObjectKindLabel(
-      getDbObjectKindDisplayLabel(this.getConnectionType(connectionId), kind),
+      isOraclePackage
+        ? "package"
+        : getDbObjectKindDisplayLabel(connectionType, kind),
     );
     node.tooltip =
-      this.getConnectionType(connectionId) === "elasticsearch"
+      connectionType === "elasticsearch"
         ? `${kindLabel}: ${displayName}`
         : includeSchema
           ? `${kindLabel}: ${displayName}\nSchema: ${schemaName}\nDatabase: ${databaseName}`
           : `${kindLabel}: ${displayName}\nDatabase: ${databaseName}`;
+    if (isOraclePackage) {
+      node.iconPath = new vscode.ThemeIcon(ICON_MAP.category_packages);
+      node.accessibilityInformation = { label: node.tooltip };
+    }
     node.contextValue = this.composeContextValue(kind, connectionId);
 
     if (isDataDbObjectKind(kind)) {
@@ -1467,6 +1526,7 @@ export class ConnectionProvider
       constraint.name,
       undefined,
       request.objectKind,
+      constraint.kind,
     );
     node.contextValue = this.composeContextValue(
       "table_detail_constraint",
@@ -1484,6 +1544,7 @@ export class ConnectionProvider
     const flags = [
       index.primary ? "primary" : undefined,
       index.unique ? "unique" : undefined,
+      index.partial ? "partial" : undefined,
     ].filter((value): value is string => Boolean(value));
     const descriptionParts = [
       flags.length > 0 ? flags.join(", ") : undefined,
@@ -1654,8 +1715,14 @@ export class ConnectionProvider
     node.description = config.type;
 
     if (config.color && kind !== "connectionNode_connecting") {
-      const iconUri = getColoredServerIconUri(config.color, connected);
-      node.iconPath = { light: iconUri, dark: iconUri };
+      const iconUri = getColoredServerIconUri(
+        this.iconStorageDir,
+        config.color,
+        connected,
+      );
+      if (iconUri) {
+        node.iconPath = { light: iconUri, dark: iconUri };
+      }
     }
     node.tooltip = this.buildConnectionTooltip(config);
 
@@ -1680,20 +1747,22 @@ export class ConnectionProvider
     );
   }
 
+  private tooltipSafeUri(value: string | undefined): string | undefined {
+    if (value === undefined) return undefined;
+    try {
+      return sanitizeCredentialBearingUri(value) ?? value;
+    } catch {
+      return "—";
+    }
+  }
+
   private connectionTooltipDetails(config: ConnectionConfig): string[] {
     if (config.type === "sqlite") {
       const sqliteAccess = config.readOnly ? "read-only" : "read-write";
-      const sqliteWalStatus =
-        config.sqliteWalMode === "off"
-          ? "disabled"
-          : config.readOnly
-            ? "automatic when writable"
-            : "automatic";
       return [
         "Type: `sqlite`",
         `File: \`${config.filePath ?? "—"}\``,
         `Access: \`${sqliteAccess}\``,
-        `WAL: \`${sqliteWalStatus}\``,
       ];
     }
 
@@ -1704,8 +1773,7 @@ export class ConnectionProvider
           ? "api key"
           : "none";
       const endpoint =
-        config.connectionUri ??
-        config.endpoint ??
+        this.tooltipSafeUri(config.connectionUri ?? config.endpoint) ??
         (config.host
           ? `${isConnectionTlsEnabled(resolveConnectionTlsMode(config)) ? "https" : "http"}://${config.host}${config.port ? `:${config.port}` : ""}`
           : "—");

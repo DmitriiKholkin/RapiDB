@@ -125,8 +125,6 @@ describe("MySQL TINYINT(1) is an integer storage type, not a boolean constraint"
         );
         expect(result.success).toBe(true);
       }
-      // CAST prevents the driver's TINYINT display heuristic from hiding the
-      // actual persisted identities in this independent verification query.
       const actual = await driver.query(
         `SELECT CAST(id AS SIGNED), payload FROM ${table} ORDER BY id`,
       );

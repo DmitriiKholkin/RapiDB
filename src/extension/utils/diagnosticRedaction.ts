@@ -1,6 +1,6 @@
 const REDACTED = "[REDACTED]";
 const SECRET_KEY =
-  /^(?:password|passwd|pwd|passphrase|tlsCertificateKeyFilePassword|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|api[_-]?key|access[_-]?token|auth[_-]?token|authorization|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
+  /^(?:password|passwd|pwd|passphrase|tlsCertificateKeyFilePassword|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|ssl[_-]?key|ssl[_-]?password|(?:x[_-]?)?api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|authorization|cookie|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
 const URI_SECRET_KEY =
   /^(?:auth|key|sig|proxyUsername|username|user|authMechanismProperties|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
 const URI_KEY = /^(?:connectionUri|uri|endpoint|awsEndpoint)$/i;
@@ -40,10 +40,11 @@ function collectSecrets(
     } else if (URI_KEY.test(key) && typeof item === "string") {
       const safe = redactUri(item);
       if (safe !== item) secrets.uris.set(item, safe);
-      const authority = /^[a-z][a-z\d+.-]*:\/\/([^/?#]*)/i.exec(item)?.[1];
-      if (authority !== undefined) {
-        const at = authority.lastIndexOf("@");
-        const userinfo = authority.slice(0, at);
+      const scheme = /^[a-z][a-z\d+.-]*:\/\//i.exec(item);
+      if (scheme) {
+        const rest = item.slice(scheme[0].length);
+        const at = uriUserinfoEnd(rest);
+        const userinfo = rest.slice(0, at);
         const colon = userinfo.indexOf(":");
         if (at >= 0 && colon >= 0) {
           const password = userinfo.slice(colon + 1);
@@ -90,21 +91,35 @@ function collectSecrets(
   } catch {}
 }
 
+function uriUserinfoEnd(rest: string): number {
+  const boundary = rest.search(/[/?#\s"'<>`]/);
+  const authorityEnd = boundary < 0 ? rest.length : boundary;
+  const at = rest.lastIndexOf("@", authorityEnd);
+  const colon = rest.indexOf(":");
+  if (at >= 0 || colon < 0 || colon >= authorityEnd || rest.startsWith("[")) {
+    return at;
+  }
+  const passwordPrefix = rest.slice(colon + 1, authorityEnd);
+  const quotedUserinfo = /^["'][^\s/?#<>`]*@/.test(rest.slice(authorityEnd));
+  if (!/^\d+$/.test(passwordPrefix) || quotedUserinfo) {
+    return rest.indexOf("@");
+  }
+  const tokenBoundary = rest.search(/[\s"'<>`]/);
+  const userinfoEnd = rest.lastIndexOf(
+    "@",
+    tokenBoundary < 0 ? rest.length : tokenBoundary,
+  );
+  return userinfoEnd >= 0 &&
+    !rest.slice(authorityEnd, userinfoEnd).includes("=")
+    ? userinfoEnd
+    : -1;
+}
+
 function redactUri(uri: string): string {
   const scheme = /^[a-z][a-z\d+.-]*:\/\//i.exec(uri);
   if (!scheme) return uri;
   const rest = uri.slice(scheme[0].length);
-  const boundary = rest.search(/[/?#\s"'<>`]/);
-  const authorityEnd = boundary < 0 ? rest.length : boundary;
-  let at = rest.lastIndexOf("@", authorityEnd);
-  const colon = rest.indexOf(":");
-  if (at < 0 && colon >= 0 && colon < authorityEnd && !rest.startsWith("[")) {
-    const passwordPrefix = rest.slice(colon + 1, authorityEnd);
-    const quotedUserinfo = /^["'][^\s/?#<>`]*@/.test(rest.slice(authorityEnd));
-    if (!/^\d+$/.test(passwordPrefix) || quotedUserinfo) {
-      at = rest.indexOf("@");
-    }
-  }
+  const at = uriUserinfoEnd(rest);
   if (at >= 0) uri = `${scheme[0]}${REDACTED}@${rest.slice(at + 1)}`;
   return uri.replace(
     /([?&#;])([^=&#;\s]+)=([^&#;]*)/g,
@@ -221,9 +236,10 @@ export function redactDiagnosticValue(
       return UNINSPECTABLE;
     }
     try {
+      // Redacted errors keep the prototype but not internal slots, symbol or #private state: never call prototype methods that rely on them.
       const copy =
         item instanceof Error
-          ? new Error()
+          ? (Object.create(Object.getPrototypeOf(item)) as Error)
           : item instanceof Map
             ? new Map()
             : item instanceof Set
@@ -260,11 +276,32 @@ export function redactDiagnosticValue(
           copy.add(visit(value, depth + 1));
         }
       } else if (copy instanceof Error) {
+        const defineErrorField = (key: string, value: string) =>
+          Object.defineProperty(copy, key, {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+          });
         try {
-          copy.name = String(visit((item as Error).name, depth + 1));
-          copy.message = String(visit((item as Error).message, depth + 1));
+          defineErrorField(
+            "name",
+            String(visit((item as Error).name, depth + 1)),
+          );
+          defineErrorField(
+            "message",
+            String(visit((item as Error).message, depth + 1)),
+          );
         } catch {
-          copy.name = "Error";
+          defineErrorField("name", "Error");
+          changed = true;
+        }
+        try {
+          const stack = (item as Error).stack;
+          if (typeof stack === "string") {
+            defineErrorField("stack", String(visit(stack, depth + 1)));
+          }
+        } catch {
           changed = true;
         }
       }

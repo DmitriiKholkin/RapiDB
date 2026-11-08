@@ -30,7 +30,6 @@
   "overrides": [
     {
       "includes": [
-        "src/webview/components/connectionForm/useConnectionFormState.ts",
         "src/webview/components/table/useCellSelection.ts",
         "src/webview/components/table/useTableDataController.ts"
       ],

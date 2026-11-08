@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ConnectionDriverFactory } from "../../src/extension/connectionDriverFactory";
+import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import {
   createDriverTimeoutSettingsSnapshot,
   createTimeoutAwareDriver,
@@ -88,8 +88,8 @@ describe("B11 logical and SDK deadlines", () => {
     });
     await vi.advanceTimersByTimeAsync(0);
     expect(client.search).toHaveBeenCalledTimes(1);
-    expect(client.openPointInTime).not.toHaveBeenCalled();
-    expect(client.closePointInTime).not.toHaveBeenCalled();
+    expect(client.openPointInTime).toHaveBeenCalledOnce();
+    expect(client.closePointInTime).toHaveBeenCalledOnce();
   });
 
   it.each([
@@ -141,16 +141,18 @@ describe("B11 logical and SDK deadlines", () => {
     expect(options?.signal?.aborted).toBe(true);
   });
 
-  it("passes the live timeout provider through the production driver factory", async () => {
+  it("passes the live timeout provider through the timeout-aware Elasticsearch driver", async () => {
     const { client } = createElasticsearchPitMock(3);
     client.indices.getSettings.mockImplementationOnce(
       () => new Promise(() => undefined),
     );
-    const driver = new ConnectionDriverFactory(timeoutSettings).createDriver({
-      id: "es",
-      name: "ES",
-      type: "elasticsearch",
-    });
+    const driver = createTimeoutAwareDriver(
+      new ElasticsearchDriver(
+        { id: "es", name: "ES", type: "elasticsearch" },
+        timeoutSettings,
+      ),
+      timeoutSettings,
+    );
     Object.assign(driver, { client, connected: true });
     const result = required(driver.exportTableChunks)(request);
     const rejected = expect(collect(result)).rejects.toMatchObject({

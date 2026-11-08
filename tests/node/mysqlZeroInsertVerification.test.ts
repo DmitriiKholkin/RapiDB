@@ -3,6 +3,7 @@ import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import {
   executeAtomicSqlApplyPlan,
+  executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
@@ -43,9 +44,13 @@ function harness(
     triggerId?: number;
     mismatch?: boolean;
     rollbackFailure?: Error;
+    rollbackPacket?: unknown;
+    nonTransactionalSideEffect?: boolean;
     metadata?: ColumnTypeMeta[];
     packet?: unknown;
     modeResult?: unknown;
+    updateFailure?: Error;
+    commitFailure?: Error;
     onStage?: (stage: Stage) => void;
   } = {},
 ) {
@@ -53,6 +58,7 @@ function harness(
   const driver = new MySQLDriver(config);
   const metadata = options.metadata ?? columns;
   const stored = new Map<number, unknown>();
+  const auditWrites: number[] = [];
   let snapshot = new Map(stored);
   let nextId = 100;
   let sessionMode = mode;
@@ -69,6 +75,14 @@ function harness(
       async (input: string | { sql: string; values?: unknown[] }) => {
         const sql = typeof input === "string" ? input : input.sql;
         const params = typeof input === "string" ? [] : (input.values ?? []);
+        if (sql === "ROLLBACK") {
+          await conn.rollback();
+          return [
+            "rollbackPacket" in options
+              ? options.rollbackPacket
+              : { warningStatus: 0 },
+          ];
+        }
         if (sql === "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE") {
           events.push("SERIALIZABLE");
           return [[]];
@@ -122,6 +136,8 @@ function harness(
         }
         if (sql.startsWith("UPDATE")) {
           events.push("UPDATE");
+          if (options.nonTransactionalSideEffect) auditWrites.push(1);
+          if (options.updateFailure) throw options.updateFailure;
           stored.set(Number(params.at(-1)), params[0]);
           return [{ affectedRows: 1 }];
         }
@@ -161,6 +177,7 @@ function harness(
     }),
     commit: vi.fn(async () => {
       events.push("COMMIT");
+      if (options.commitFailure) throw options.commitFailure;
     }),
     rollback: vi.fn(async () => {
       events.push("ROLLBACK");
@@ -213,6 +230,7 @@ function harness(
     prepare,
     apply,
     stored,
+    auditWrites,
     events,
     packets,
     identityReads,
@@ -227,6 +245,141 @@ function harness(
 afterEach(() => vi.restoreAllMocks());
 
 describe("F02: MySQL AUTO_INCREMENT zero verification", () => {
+  it("reports a statement rejection as not executed after a successful rollback", async () => {
+    const updateFailure = new Error(
+      "Incorrect integer value: 'not-a-number' for column 'amount' at row 1",
+    );
+    const h = harness("", { updateFailure });
+
+    const result = await executePreparedApplyPlan(h.manager, h.apply());
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining(updateFailure.message),
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
+    expect(h.events).toEqual(["BEGIN", "UPDATE", "ROLLBACK"]);
+    expect(h.stored.get(50)).toBe(5);
+    expect(h.conn.release).toHaveBeenCalledOnce();
+    expect(h.conn.destroy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { code: "ER_LOCK_DEADLOCK", errno: 1213, sqlState: "40001" },
+    { errno: 1213 },
+    { code: "ER_LOCK_WAIT_TIMEOUT", errno: 1205, sqlState: "HY000" },
+    { errno: 1205 },
+    { sqlState: "40001" },
+  ])("keeps server rollback outcome unknown despite a clean later ROLLBACK: %j", async (native) => {
+    const updateFailure = Object.assign(
+      new Error("server aborted transaction"),
+      native,
+    );
+    const h = harness("", {
+      updateFailure,
+      nonTransactionalSideEffect: true,
+      rollbackPacket: { warningStatus: 0 },
+    });
+    const result = await executePreparedApplyPlan(h.manager, h.apply());
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+    expect(result.error).toContain("outcome may be unknown");
+    expect(result.error).not.toContain("no changes were made");
+    expect(h.auditWrites).toEqual([1]);
+    expect(h.events).toEqual(["BEGIN", "UPDATE", "ROLLBACK"]);
+  });
+
+  it("keeps a commit error outcome unknown even when rollback succeeds", async () => {
+    const commitFailure = new Error("commit acknowledgement was lost");
+    const h = harness("", { commitFailure });
+
+    const result = await executePreparedApplyPlan(h.manager, h.apply());
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining("outcome may be unknown"),
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+    expect(h.events).toEqual([
+      "BEGIN",
+      "UPDATE",
+      "VERIFY",
+      "COMMIT",
+      "ROLLBACK",
+    ]);
+    expect(h.stored.get(50)).toBe(5);
+  });
+
+  it("keeps an incomplete rollback outcome unknown when a trigger left durable side effects", async () => {
+    const updateFailure = new Error("trigger rejected after audit write");
+    const h = harness("", {
+      updateFailure,
+      nonTransactionalSideEffect: true,
+      rollbackPacket: { warningStatus: 1 },
+    });
+
+    const result = await executePreparedApplyPlan(h.manager, h.apply());
+
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+      error: expect.stringContaining(
+        "complete rollback could not be confirmed",
+      ),
+    });
+    expect(result.error).toContain(updateFailure.message);
+    expect(result.error).toContain("Some changes may persist");
+    expect(result.error).not.toContain("no changes were made");
+    expect(h.auditWrites).toEqual([1]);
+    expect(h.stored.get(50)).toBe(5);
+    expect(h.events).toEqual(["BEGIN", "UPDATE", "ROLLBACK"]);
+    expect(h.conn.destroy).toHaveBeenCalledOnce();
+    expect(h.conn.release).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    null,
+    {},
+    { warningStatus: "0" },
+    { warningStatus: -1 },
+  ])("does not infer a complete rollback from invalid OK metadata %j", async (rollbackPacket) => {
+    const h = harness("", {
+      updateFailure: new Error("statement rejected"),
+      rollbackPacket,
+    });
+    const result = await executePreparedApplyPlan(h.manager, h.apply());
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+    expect(h.conn.destroy).toHaveBeenCalledOnce();
+    expect(h.conn.release).not.toHaveBeenCalled();
+  });
+
+  it("does not expose a verification error as a safe rejection when rollback has warnings", async () => {
+    const h = harness("", {
+      mismatch: true,
+      rollbackPacket: { warningStatus: 1 },
+    });
+    const plan = await h.prepare({ id: 0, amount: 7 });
+    const result = await executeAtomicSqlApplyPlan(h.manager, null, [plan]);
+    expect(result).toMatchObject({
+      success: false,
+      changesPossible: true,
+      outcomeUnknown: true,
+      error: expect.stringContaining("verification failed"),
+    });
+    expect(h.conn.destroy).toHaveBeenCalledOnce();
+  });
+
   it.each([
     "",
     noAuto,

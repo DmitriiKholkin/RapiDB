@@ -1,9 +1,9 @@
+import type { EventEmitter } from "node:events";
 import type * as mssql from "mssql";
+import { logger } from "../utils/logger";
 import { throwIfQueryCancelled } from "./timeout";
 import type { QueryExecutionOptions } from "./types";
 
-// node-mssql 12 / tedious 19 expose these at runtime, but not in @types/mssql. Keep the
-// tedious/pool private protocol here, rather than patching shared pool methods.
 interface SessionConnection {
   inTransaction: boolean;
   closed: boolean;
@@ -49,7 +49,6 @@ export class MssqlQuerySession {
     this.cancellation = new Promise<never>((_, reject) => {
       this.rejectStopped = reject;
     });
-    // Cancellation can happen before acquire/body has installed its race.
     void this.cancellation.catch(() => {});
     context?.signal?.addEventListener("abort", this.onAbort, { once: true });
     if (context?.signal?.aborted) this.onAbort();
@@ -73,6 +72,16 @@ export class MssqlQuerySession {
     } catch {}
   }
 
+  hasStopped(): boolean {
+    return this.stopped;
+  }
+
+  private disarm(): void {
+    this.completed = true;
+    this.context?.signal?.removeEventListener("abort", this.onAbort);
+    if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
+  }
+
   private assertActive(): void {
     if (this.stopped) throw this.stopReason;
     this.assertCurrent();
@@ -80,7 +89,6 @@ export class MssqlQuerySession {
   }
 
   private discard(connection: SessionConnection): void {
-    // Flag BEFORE close/release: even if close throws, tarn must never lend it.
     connection.hasError = true;
     connection.close();
   }
@@ -91,8 +99,6 @@ export class MssqlQuerySession {
       this.pool.acquire(this, (error, connection) => {
         if (error) return reject(error);
         try {
-          // acquire cannot be aborted through node-mssql's public API. A late
-          // arrival still belongs to us and must be returned exactly once.
           if (this.finished)
             throw new DOMException("MSSQL query ended", "AbortError");
           this.assertActive();
@@ -155,7 +161,6 @@ export class MssqlQuerySession {
           callback(null, this.connection, this.pool.config);
         });
       },
-      // Request completion is NOT the end of a script/session lease.
       release: () => {},
     };
     const remaining =
@@ -171,8 +176,6 @@ export class MssqlQuerySession {
           ? Math.min(configured, remaining)
           : remaining;
     const request = this.pool.request();
-    // Supported by node-mssql 12; missing from @types/mssql. Reparent BEFORE
-    // execution, so the library's automatic release is confined to this lease.
     const protocol = request as unknown as {
       parent: typeof parent;
       overrides: { requestTimeout?: number };
@@ -182,14 +185,68 @@ export class MssqlQuerySession {
     return request;
   }
 
+  trackStatementCompletions(
+    request: mssql.Request,
+    onComplete: () => void,
+  ): () => void {
+    type NativeRequest = Pick<EventEmitter, "emit">;
+    type RequestProtocol = {
+      _setCurrentRequest?: (nativeRequest: NativeRequest) => unknown;
+    };
+    const protocol = request as unknown as RequestProtocol;
+    const originalSet = protocol._setCurrentRequest;
+    if (typeof originalSet !== "function") return () => {};
+    const hadOwnSet = Object.hasOwn(protocol, "_setCurrentRequest");
+    const restorers: Array<() => void> = [];
+    const seen = new WeakSet<object>();
+    const wrappedSet = function (
+      this: RequestProtocol,
+      nativeRequest: NativeRequest,
+    ): unknown {
+      const result = originalSet.call(this, nativeRequest);
+      if (
+        !nativeRequest ||
+        typeof nativeRequest.emit !== "function" ||
+        seen.has(nativeRequest)
+      )
+        return result;
+      seen.add(nativeRequest);
+      const originalEmit = nativeRequest.emit;
+      const hadOwnEmit = Object.hasOwn(nativeRequest, "emit");
+      const wrappedEmit = function (
+        this: NativeRequest,
+        event: string | symbol,
+        ...args: unknown[]
+      ): boolean {
+        const emitted = originalEmit.call(this, event, ...args);
+        if (event === "done" || event === "doneInProc" || event === "doneProc")
+          onComplete();
+        return emitted;
+      };
+      nativeRequest.emit = wrappedEmit;
+      restorers.push(() => {
+        if (nativeRequest.emit !== wrappedEmit) return;
+        if (hadOwnEmit) nativeRequest.emit = originalEmit;
+        else Reflect.deleteProperty(nativeRequest, "emit");
+      });
+      return result;
+    };
+    protocol._setCurrentRequest = wrappedSet;
+    return () => {
+      if (protocol._setCurrentRequest === wrappedSet) {
+        if (hadOwnSet) protocol._setCurrentRequest = originalSet;
+        else Reflect.deleteProperty(protocol, "_setCurrentRequest");
+      }
+      for (const restore of restorers) restore();
+    };
+  }
+
   async execute<T>(
     request: mssql.Request,
     operation: (request: mssql.Request) => Promise<T>,
   ): Promise<T> {
     this.assertActive();
     this.activeRequest = request;
-    // On abort we may stop waiting before tedious settles. Keep an error sink
-    // until native completion so a late streaming error cannot become unhandled.
     const onError = () => {};
     request.on("error", onError);
     const pending = Promise.resolve().then(() => {
@@ -268,6 +325,7 @@ export class MssqlQuerySession {
           "MSSQL script ended with an open transaction; it cannot be reported as successful.",
         );
       }
+      this.disarm();
     } catch (error) {
       failed = true;
       failure = error;
@@ -278,28 +336,34 @@ export class MssqlQuerySession {
     try {
       if (connection) await this.cleanup(connection);
     } catch (cleanupError) {
-      failure = failed
-        ? new AggregateError(
-            [failure, cleanupError],
-            "MSSQL query and session cleanup failed.",
-          )
-        : cleanupError;
-      failed = true;
+      if (failed) {
+        failure = new AggregateError(
+          [failure, cleanupError],
+          "MSSQL query and session cleanup failed.",
+        );
+      } else {
+        logger.error(
+          "MSSQL session cleanup failed after a successful query",
+          cleanupError,
+        );
+      }
     } finally {
       try {
         if (connection) this.pool.release(connection);
       } catch (releaseError) {
-        failure = failed
-          ? new AggregateError(
-              [failure, releaseError],
-              "MSSQL query session release failed.",
-            )
-          : releaseError;
-        failed = true;
+        if (failed) {
+          failure = new AggregateError(
+            [failure, releaseError],
+            "MSSQL query session release failed.",
+          );
+        } else {
+          logger.error(
+            "MSSQL session release failed after a successful query",
+            releaseError,
+          );
+        }
       }
-      this.completed = true;
-      this.context?.signal?.removeEventListener("abort", this.onAbort);
-      if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
+      this.disarm();
     }
     if (this.stopped && !failed) throw this.stopReason;
     if (failed) throw failure;

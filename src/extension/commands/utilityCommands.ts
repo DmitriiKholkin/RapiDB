@@ -1,4 +1,4 @@
-import * as vscode from "vscode";
+import type * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
 import type { ConnectionManager } from "../connectionManager";
 import type {

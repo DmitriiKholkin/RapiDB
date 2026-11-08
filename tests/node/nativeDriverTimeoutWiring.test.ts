@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Query as PgQuery } from "pg";
+import { Client as PgClient, Query as PgQuery } from "pg";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
@@ -14,6 +14,7 @@ const timeoutSettingsProvider = () => ({
 
 afterEach(() => {
   vi.resetModules();
+  vi.unstubAllEnvs();
 });
 
 describe("native driver timeout wiring", () => {
@@ -189,7 +190,11 @@ describe("native driver timeout wiring", () => {
     }
   });
 
-  it("passes configured timeouts into the PostgreSQL pool", async () => {
+  it.each([
+    undefined,
+    "disabled",
+  ] as const)("passes PostgreSQL timeouts and preserves the distinction between legacy TLS and %s", async (tlsMode) => {
+    vi.stubEnv("PGSSLMODE", "no-verify");
     const poolConfigs: unknown[] = [];
     class MockPool {
       readonly connect = vi.fn(async () => ({
@@ -230,6 +235,7 @@ describe("native driver timeout wiring", () => {
         database: "app_db",
         username: "user",
         password: "secret",
+        tls: tlsMode ? { mode: tlsMode } : undefined,
       },
       timeoutSettingsProvider,
     );
@@ -241,6 +247,13 @@ describe("native driver timeout wiring", () => {
       query_timeout: 42000,
       statement_timeout: 42000,
     });
+    const nativeClient = new PgClient(
+      poolConfigs[0] as ConstructorParameters<typeof PgClient>[0],
+    );
+    expect(Reflect.get(nativeClient, "ssl")).toEqual(
+      tlsMode ? false : { rejectUnauthorized: false },
+    );
+    await driver.disconnect();
   });
 
   it("routes PostgreSQL SSH connections through the forwarded socket and preserves TLS servername", async () => {

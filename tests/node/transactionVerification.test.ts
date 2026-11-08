@@ -2,11 +2,16 @@ import mssql from "mssql";
 import oracledb from "oracledb";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import {
+  isMutationNotExecutedError,
+  MutationNotExecutedError,
+} from "../../src/extension/dbDrivers/mutationExecutionState";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteCoreDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
+import { TransactionVerificationError } from "../../src/extension/dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
   TransactionOptions,
@@ -89,7 +94,7 @@ function harness(
       }
       if (sql === "ROLLBACK") {
         await rollback();
-        return {};
+        return engine === "mysql" ? [{ warningStatus: 0 }] : {};
       }
       if (!sql.startsWith("SELECT")) {
         events.push("DML");
@@ -189,7 +194,17 @@ function harness(
   const outsideQuery = vi
     .spyOn(driver, "query")
     .mockRejectedValue(new Error("Outside transaction read forbidden"));
-  return { driver, events, lease, execute, outsideQuery, cancel, release };
+  return {
+    driver,
+    events,
+    lease,
+    execute,
+    outsideQuery,
+    cancel,
+    release,
+    commit,
+    rollback,
+  };
 }
 
 afterEach(() => {
@@ -271,6 +286,303 @@ describe("transaction-scoped UPDATE verification", () => {
     expect(events.includes("READ")).toBe(failure !== "affected zero");
     expect(outsideQuery).not.toHaveBeenCalled();
     if (engine === "pg") expect(release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("confirms an MSSQL verification failure only after rollback succeeds", async () => {
+    const { driver, events } = harness("mssql", async () => [[10]]);
+    let transactionError: unknown;
+
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toBeInstanceOf(TransactionVerificationError);
+    expect(transactionError).toMatchObject({ rollbackConfirmed: true });
+    expect(events).toContain("ROLLBACK");
+    expect(events).not.toContain("COMMIT");
+  });
+
+  it.each([
+    "pg",
+    "mysql",
+    "oracle",
+    "sqlite",
+  ] as const)("confirms %s verification rollback", async (engine) => {
+    const { driver } = harness(engine, async () => [[10]]);
+    if (engine === "sqlite") {
+      (driver as unknown as { db: { queryBounded: unknown } }).db.queryBounded =
+        () => ({ columns: ["__col_0"], rows: [[10]], rowCount: 1 });
+    }
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9" }],
+        undefined,
+        options,
+      ),
+    ).rejects.toMatchObject({ rollbackConfirmed: true });
+  });
+
+  it("preserves Oracle verification evidence when close fails after rollback", async () => {
+    const { driver, rollback, release, events } = harness(
+      "oracle",
+      async () => {
+        throw new Error("network read failed");
+      },
+    );
+    release.mockImplementation(() => {
+      events.push("CLOSE");
+      throw new Error("close failed");
+    });
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9" }],
+        undefined,
+        options,
+      ),
+    ).rejects.toMatchObject({
+      rollbackConfirmed: true,
+      message: expect.stringContaining("network read failed"),
+    });
+    expect(rollback).toHaveBeenCalledOnce();
+    expect(events.indexOf("ROLLBACK")).toBeLessThan(events.indexOf("CLOSE"));
+  });
+
+  it("preserves an acknowledged Oracle commit when close fails", async () => {
+    const { driver, commit, release, events } = harness("oracle", async () => [
+      [9],
+    ]);
+    release.mockImplementation(() => {
+      events.push("CLOSE");
+      throw new Error("close failed");
+    });
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9" }],
+        undefined,
+        options,
+      ),
+    ).resolves.toBeUndefined();
+    expect(commit).toHaveBeenCalledOnce();
+    expect(events.indexOf("COMMIT")).toBeLessThan(events.indexOf("CLOSE"));
+  });
+
+  it("does not confirm Oracle rollback when rollback and close fail", async () => {
+    const { driver, rollback, release } = harness("oracle", async () => {
+      throw new Error("network read failed");
+    });
+    rollback.mockRejectedValue(new Error("rollback failed"));
+    release.mockImplementation(() => {
+      throw new Error("close failed");
+    });
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9" }],
+        undefined,
+        options,
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("rollback failed"),
+      errors: [
+        expect.objectContaining({ rollbackConfirmed: false }),
+        expect.any(Error),
+      ],
+    });
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("does not confirm an MSSQL verification failure when rollback fails", async () => {
+    const { driver, events } = harness("mssql", async () => [[10]]);
+    vi.spyOn(mssql.Transaction.prototype, "rollback").mockRejectedValue(
+      new Error("rollback failed"),
+    );
+
+    let transactionError: unknown;
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toBeInstanceOf(AggregateError);
+    expect(transactionError).toMatchObject({
+      message: expect.stringContaining("transaction and rollback failed"),
+    });
+    expect(events).not.toContain("COMMIT");
+  });
+
+  it("marks an MSSQL pre-commit statement error not executed after rollback", async () => {
+    const { driver, events, execute } = harness("mssql", async () => [[9]]);
+    execute.mockRejectedValueOnce(new Error("CLR is disabled"));
+
+    await expect(
+      driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      ),
+    ).rejects.toMatchObject({
+      name: "MutationNotExecutedError",
+      executionState: "not-executed",
+      message: "CLR is disabled",
+    });
+    expect(events).toContain("ROLLBACK");
+    expect(events).not.toContain("COMMIT");
+  });
+
+  it.each([
+    "statement",
+    "verification",
+  ] as const)("keeps an MSSQL server-aborted %s failure outcome unknown", async (failure) => {
+    const { driver, execute, rollback, commit } = harness("mssql", async () => [
+      [10],
+    ]);
+    const statementError = new Error("The transaction ended in the trigger.");
+    if (failure === "statement") execute.mockRejectedValueOnce(statementError);
+    const abortedError = Object.assign(
+      new Error("Transaction has been aborted."),
+      { code: "EABORT" },
+    );
+    rollback.mockRejectedValueOnce(abortedError);
+
+    let transactionError: unknown;
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toBeInstanceOf(AggregateError);
+    expect(isMutationNotExecutedError(transactionError)).toBe(false);
+    expect(transactionError).not.toBeInstanceOf(TransactionVerificationError);
+    const errors = (transactionError as AggregateError).errors;
+    expect(errors[1]).toBe(abortedError);
+    if (failure === "statement") {
+      expect(errors[0]).toBe(statementError);
+    } else {
+      expect(errors[0]).toBeInstanceOf(TransactionVerificationError);
+      expect(errors[0]).toMatchObject({ rollbackConfirmed: false });
+    }
+    expect(rollback).toHaveBeenCalledExactlyOnceWith();
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it("keeps an MSSQL XACT_ABORT outcome unknown when session close fails", async () => {
+    const { driver, execute, commit } = harness("mssql", async () => [[9]]);
+    execute.mockRejectedValueOnce(new Error("CLR is disabled"));
+    const closeError = new Error("session close failed");
+    const abortedError = Object.assign(
+      new Error("Transaction has been aborted."),
+      { code: "EABORT" },
+    );
+    const connection = {
+      rollbackTransaction: vi.fn((callback: (error?: unknown) => void) => {
+        callback(abortedError);
+      }),
+      close: vi.fn(() => {
+        throw closeError;
+      }),
+      removeListener: vi.fn(),
+    };
+
+    vi.spyOn(mssql.Transaction.prototype, "begin").mockImplementation(
+      async function (this: mssql.Transaction) {
+        (
+          this as unknown as { _acquiredConnection: typeof connection }
+        )._acquiredConnection = connection;
+      } as never,
+    );
+    vi.spyOn(mssql.Transaction.prototype, "rollback").mockImplementation(
+      async function (this: mssql.Transaction) {
+        const acquired = (
+          this as unknown as { _acquiredConnection: typeof connection }
+        )._acquiredConnection;
+        await new Promise<void>((resolve, reject) => {
+          acquired.rollbackTransaction((error) =>
+            error ? reject(error) : resolve(),
+          );
+        });
+      } as never,
+    );
+
+    let transactionError: unknown;
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toBeInstanceOf(AggregateError);
+    expect(transactionError).toMatchObject({
+      message: expect.stringContaining(
+        "session close error: session close failed",
+      ),
+    });
+    expect(isMutationNotExecutedError(transactionError)).toBe(false);
+    expect(connection.rollbackTransaction).toHaveBeenCalledOnce();
+    expect(connection.close).toHaveBeenCalledOnce();
+    expect(commit).not.toHaveBeenCalled();
+  });
+
+  it("keeps MSSQL commit failures outcome-unknown after a later rollback", async () => {
+    const { driver, events, commit } = harness("mssql", async () => [[9]]);
+    commit.mockRejectedValueOnce(new Error("connection lost during commit"));
+
+    let transactionError: unknown;
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toMatchObject({
+      message: expect.stringContaining("connection lost during commit"),
+    });
+    expect(isMutationNotExecutedError(transactionError)).toBe(false);
+    expect(transactionError).not.toBeInstanceOf(MutationNotExecutedError);
+    expect(events).toContain("ROLLBACK");
+    expect(commit).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("labels an Oracle verification failure as rolled back only after rollback succeeds", async () => {
+    const { driver, events } = harness("oracle", async () => [[10]]);
+
+    let transactionError: unknown;
+    try {
+      await driver.runTransaction(
+        [{ sql: "UPDATE edits SET amount = 9", expectedAffectedRows: 1 }],
+        undefined,
+        options,
+      );
+    } catch (error) {
+      transactionError = error;
+    }
+
+    expect(transactionError).toBeInstanceOf(TransactionVerificationError);
+    expect(transactionError).toMatchObject({ rollbackConfirmed: true });
+    expect(events).toContain("ROLLBACK");
+    expect(events).not.toContain("COMMIT");
   });
 
   it.each([

@@ -80,8 +80,6 @@ describe("MongoDB query truncation through controller and file export", () => {
   });
 
   async function createHarness(documents: MongoDocument[]) {
-    // Only MongoDB's SDK boundary and VS Code's dialogs are mocked. The driver,
-    // formatter, controller, serializers, and atomic file writes are real.
     const { MongoDBDriver } = await import(
       "../../src/extension/dbDrivers/mongodb"
     );
@@ -118,7 +116,6 @@ describe("MongoDB query truncation through controller and file export", () => {
         },
         async toArray() {
           if (closed) throw new Error("Cursor is closed");
-          // MongoDB find().limit(0) is unlimited, not an empty result.
           return documents.slice(
             offset,
             limit === 0 ? undefined : offset + Math.abs(limit),
@@ -260,6 +257,135 @@ describe("MongoDB query truncation through controller and file export", () => {
     return content;
   }
 
+  it.each([
+    "find",
+    "aggregate",
+    "multi",
+  ] as const)("preserves missing versus null through %s query, reordering, sorting and CSV/JSON export", async (method) => {
+    const harness = await createHarness([
+      { _id: "b", value: null },
+      { _id: "a" },
+      { _id: "c", value: "" },
+    ]);
+    const queryText =
+      method === "multi"
+        ? "db.c.find({});db.c.aggregate([])"
+        : readQuery(method);
+    const { raw, formatted } = await harness.execute(queryText);
+    const valueIndex = raw.columns.indexOf("value");
+    const idIndex = raw.columns.indexOf("_id");
+    expect(raw.missingCells).toEqual(
+      method === "multi"
+        ? [
+            { rowIndex: 1, columnIndex: valueIndex },
+            { rowIndex: 4, columnIndex: valueIndex },
+          ]
+        : [{ rowIndex: 1, columnIndex: valueIndex }],
+    );
+    expect(formatted.missingCells).toEqual(raw.missingCells);
+    const payload = {
+      columnOrder: [`__col_${valueIndex}`, `__col_${idIndex}`],
+      sort: [{ id: `__col_${idIndex}`, desc: false }],
+    };
+    const csvPath = join(tempDir, "missing.csv");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: csvPath });
+    await harness.controller.handleMessage({
+      type: "exportResultsCSV",
+      payload,
+    });
+    const repeat = method === "multi" ? 2 : 1;
+    expect(await readFile(csvPath, "utf8")).toBe(
+      "value,_id\n" +
+        "MISSING,a\n".repeat(repeat) +
+        "(NULL),b\n".repeat(repeat) +
+        ",c\n".repeat(repeat),
+    );
+    const jsonPath = join(tempDir, "missing.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: jsonPath });
+    await harness.controller.handleMessage({
+      type: "exportResultsJSON",
+      payload,
+    });
+    expect(JSON.parse(await readFile(jsonPath, "utf8"))).toEqual([
+      ...Array.from({ length: repeat }, () => ({ _id: "a" })),
+      ...Array.from({ length: repeat }, () => ({ value: null, _id: "b" })),
+      ...Array.from({ length: repeat }, () => ({ value: "", _id: "c" })),
+    ]);
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { docs: [{ _id: "a" }, { _id: "b", value: "MISSING" }], marker: "MISSING" },
+    {
+      docs: [
+        { _id: "a", value: null },
+        { _id: "b", value: "(NULL)" },
+      ],
+      marker: "(NULL)",
+    },
+  ])("rejects MongoDB CSV marker collision $marker but preserves it in JSON", async ({
+    docs,
+  }) => {
+    const harness = await createHarness(docs);
+    await harness.execute(readQuery("find"));
+    const csvPath = join(tempDir, "collision.csv");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: csvPath });
+    await harness.controller.handleMessage({ type: "exportResultsCSV" });
+    expect(ui.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("cannot distinguish"),
+    );
+    expect(await readdir(tempDir)).not.toContain("collision.csv");
+    ui.showErrorMessage.mockClear();
+    const jsonPath = join(tempDir, "collision.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: jsonPath });
+    await harness.controller.handleMessage({ type: "exportResultsJSON" });
+    expect(JSON.parse(await readFile(jsonPath, "utf8"))).toEqual(docs);
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps BSON numeric metadata and JSON serialization consistent in multi-command results", async () => {
+    const { Long, Decimal128 } = await import("mongodb");
+    const documents = [
+      {
+        _id: "a",
+        long: Long.fromString("9223372036854775807"),
+        decimal: Decimal128.fromString("1.25"),
+        precise: Decimal128.fromString("123456789.987654321"),
+        text: "123",
+      },
+      { _id: "b", long: null, decimal: null, precise: null, text: null },
+      { _id: "c" },
+    ];
+    const single = await createHarness(documents);
+    const { raw: singleRaw } = await single.execute(readQuery("find"));
+    const multi = await createHarness(documents);
+    const { raw: multiRaw } = await multi.execute(
+      "db.c.find({});db.c.aggregate([])",
+    );
+    expect(multiRaw.columnMeta).toEqual(singleRaw.columnMeta);
+    for (const [harness, name] of [
+      [single, "single"],
+      [multi, "multi"],
+    ] as const) {
+      ui.showSaveDialog.mockResolvedValue({
+        fsPath: join(tempDir, `${name}.json`),
+      });
+      await harness.controller.handleMessage({ type: "exportResultsJSON" });
+    }
+    const one = await readFile(join(tempDir, "single.json"), "utf8");
+    const combined = await readFile(join(tempDir, "multi.json"), "utf8");
+    expect(one).toContain('"long":9223372036854775807');
+    expect(one).toContain('"decimal":1.25');
+    expect(one).toContain('"precise":"123456789.987654321"');
+    expect(one).toContain('"text":"123"');
+    expect(JSON.parse(combined)).toEqual([
+      ...JSON.parse(one),
+      ...JSON.parse(one),
+    ]);
+    expect(combined.match(/"long":9223372036854775807/g)).toHaveLength(2);
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+  });
+
   const truncatedCases = READ_METHODS.flatMap((method) =>
     EXPORT_FORMATS.flatMap((format) =>
       (["confirm", "decline"] as const).flatMap((decision) =>
@@ -287,7 +413,11 @@ describe("MongoDB query truncation through controller and file export", () => {
     expectReadLimit(harness, method, retained + 1);
     expect(raw.rows).toHaveLength(retained);
     expect(raw.truncated).toBe(true);
-    expect(formatted).toMatchObject({ truncated: true, truncatedAt: retained });
+    expect(formatted).toMatchObject({
+      truncated: true,
+      truncatedAt: retained,
+    });
+
     expect(formatted.columns).toEqual(["_id", "value"]);
     ui.showWarningMessage.mockResolvedValue(
       decision === "confirm" ? EXPORT_CONFIRMATION : undefined,

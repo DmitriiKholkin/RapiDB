@@ -47,6 +47,11 @@ export async function startSqlTlsFixture(
       authentications += 1;
       if (engine === "mysql") {
         secure.write(mysqlPacket(Buffer.from([0, 0, 0, 2, 0, 0, 0]), 3));
+        secure.on("data", (packet: Buffer) => {
+          if (packet[4] === 0x03) {
+            secure.write(mysqlPacket(Buffer.from([0, 0, 0, 2, 0, 0, 0]), 1));
+          }
+        });
       } else {
         secure.write(Buffer.from("5200000008000000005a0000000549", "hex"));
         secure.on("data", (query: Buffer) => {

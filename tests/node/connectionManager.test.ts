@@ -1,5 +1,8 @@
+import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
+import * as os from "node:os";
+import * as path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
 import type { ConnectionStoreMutation } from "../../src/extension/connectionManagerStore";
@@ -498,6 +501,239 @@ class NotifyingConnectionManagerStore extends FakeConnectionManagerStore {
 }
 
 describe("ConnectionManager", () => {
+  it.each([
+    { type: "pg", host: "db", database: "postgres", user: "legacy-user" },
+    { type: "mysql", host: "db", username: "qa" },
+    { type: "mssql", host: "db", username: "qa" },
+    { type: "oracle", host: "db", database: "FREEPDB1", username: "qa" },
+    { type: "sqlite", filePath: "/tmp/existing.sqlite" },
+    { type: "mongodb", connectionUri: "mongodb://db/app" },
+    { type: "redis", connectionUri: "redis://db/0" },
+    { type: "elasticsearch", connectionUri: "https://db:9200" },
+    { type: "dynamodb", awsRegion: "eu-west-1", awsEndpoint: "http://db:8000" },
+  ] as const)("preserves a $type session when saving legacy JSON presentation settings", async (legacy) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config = { id: "legacy-metadata", name: "Legacy", ...legacy };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    try {
+      await manager.connectTo(config.id);
+      const driver = manager.getDriver(config.id);
+      const current = manager.getConnection(config.id) as ConnectionConfig;
+      const { user: _legacyUser, ...edited } = current as ConnectionConfig & {
+        user?: string;
+      };
+      await manager.saveConnection({
+        ...edited,
+        name: "Renamed",
+        folder: "QA",
+        color: "red",
+        readOnly: false,
+      });
+      expect(manager.getDriver(config.id)).toBe(driver);
+      expect(manager.isConnected(config.id)).toBe(true);
+    } finally {
+      await manager.dispose();
+    }
+  });
+  it("keeps the live session for metadata saves but disconnects for a changed stored password", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "save-metadata",
+      name: "Primary",
+      type: "pg",
+      host: "db.internal",
+      database: "app",
+      username: "admin",
+      useSecretStorage: true,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    await store.storeSecret(config.id, JSON.stringify({ password: "old" }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    try {
+      await manager.connectTo(config.id);
+      const driver = manager.getDriver(config.id);
+      await manager.saveConnection({
+        ...config,
+        name: "Renamed",
+        color: "red",
+        folder: "Prod",
+      });
+      expect(manager.getDriver(config.id)).toBe(driver);
+      expect(manager.isConnected(config.id)).toBe(true);
+      await manager.saveConnection({ ...config, password: "new" });
+      expect(manager.getDriver(config.id)).toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("disconnects MongoDB when explicit TLS changes URI inheritance", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "mongo-tls-mode",
+      name: "Mongo",
+      type: "mongodb",
+      connectionUri: "mongodb+srv://mongo.example.com/db",
+      mongoConnectionMode: "uri",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    try {
+      await manager.connectTo(config.id);
+      expect(manager.isConnected(config.id)).toBe(true);
+      await manager.saveConnection({ ...config, tls: { mode: "disabled" } });
+      expect(manager.getDriver(config.id)).toBeUndefined();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("tests a SQLite file through a read-only driver without changing the saved profile", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rapidb-sqlite-test-"));
+    const sqliteFile = path.join(dir, "existing.sqlite");
+    fs.writeFileSync(sqliteFile, "fixture");
+    const config: ConnectionConfig = {
+      id: "sqlite-test",
+      name: "SQLite",
+      type: "sqlite",
+      filePath: sqliteFile,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([config]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    try {
+      expect(await manager.testConnection(config)).toMatchObject({
+        success: true,
+        message: expect.stringMatching(/write permissions/),
+      });
+      expect(driverInstances.at(-1)?.config).toMatchObject({
+        readOnly: true,
+      });
+      expect(manager.getConnection(config.id)?.readOnly).toBeUndefined();
+      expect(fs.readFileSync(sqliteFile, "utf8")).toBe("fixture");
+      expect(fs.readdirSync(dir)).toEqual(["existing.sqlite"]);
+    } finally {
+      await manager.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("tests creation without creating the requested SQLite file", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rapidb-sqlite-test-"));
+    const target = path.join(dir, "new.sqlite");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    try {
+      const config = {
+        name: "SQLite",
+        type: "sqlite" as const,
+        filePath: target,
+      };
+      expect(await manager.testConnection(config)).toMatchObject({
+        success: true,
+        message: expect.stringMatching(/created when connecting/),
+      });
+      expect(driverInstances.at(-1)?.config).toMatchObject({
+        filePath: ":memory:",
+        readOnly: false,
+      });
+      expect(fs.existsSync(target)).toBe(false);
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally {
+      await manager.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+    "rejects a writable SQLite profile when the file cannot be opened for writing",
+    async () => {
+      const { ConnectionManager } = await import(
+        "../../src/extension/connectionManager"
+      );
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rapidb-sqlite-test-"));
+      const target = path.join(dir, "readonly.sqlite");
+      fs.writeFileSync(target, "fixture", { mode: 0o444 });
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        new FakeConnectionManagerStore(),
+      );
+      try {
+        expect(
+          await manager.testConnection({
+            name: "SQLite",
+            type: "sqlite",
+            filePath: target,
+          }),
+        ).toMatchObject({ success: false });
+        expect(fs.readFileSync(target, "utf8")).toBe("fixture");
+        expect(fs.readdirSync(dir)).toEqual(["readonly.sqlite"]);
+      } finally {
+        await manager.dispose();
+        fs.chmodSync(target, 0o600);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not treat a dangling SQLite symlink as a creatable missing database", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rapidb-sqlite-test-"));
+    const target = path.join(dir, "link.sqlite");
+    fs.symlinkSync("missing.sqlite", target);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+    );
+    try {
+      expect(
+        await manager.testConnection({
+          name: "SQLite",
+          type: "sqlite",
+          filePath: target,
+        }),
+      ).toMatchObject({
+        success: false,
+        error: expect.stringMatching(/dangling symbolic link/),
+      });
+      expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    } finally {
+      await manager.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does not disconnect for presentation-only, reordered or unrelated settings changes", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -518,7 +754,6 @@ describe("ConnectionManager", () => {
     );
     await manager.connectTo(config.id);
     const driver = manager.getDriver(config.id);
-    // An unrelated event used to discard the only cached settings snapshot.
     store.fireConfigurationChange("rapidb.queryRowLimit");
     store.setConnections([
       {
@@ -589,6 +824,7 @@ describe("ConnectionManager", () => {
     );
     const config = createSshPgConfig("notifying-migration");
     config.password = "db-password";
+    config.useSecretStorage = true;
     config.ssh = {
       ...config.ssh,
       hostVerificationMode: "trustOnFirstUse",
@@ -634,7 +870,6 @@ describe("ConnectionManager", () => {
     expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
       fingerprint,
     );
-    // A subsequent unowned pin edit must still invalidate the established session.
     store.setConnections([
       {
         ...store.getConnections()[0],
@@ -686,7 +921,6 @@ describe("ConnectionManager", () => {
     if (field === "readOnly") next.readOnly = true;
     store.setConnections(field === "removed" ? [] : [next]);
     store.fireConfigurationChange("rapidb.connections");
-    // A slow disconnect must not leave the old target available to new work.
     expect(manager.getDriver(config.id)).toBeUndefined();
     expect(manager.isConnected(config.id)).toBe(false);
     expect(invalidated).toHaveBeenCalledWith(config.id);
@@ -2174,6 +2408,7 @@ describe("ConnectionManager", () => {
       database: "app",
       username: "postgres",
       password: "new",
+      useSecretStorage: true,
     }));
     store.setConnections(connections);
     const previous = '{ "password": "old" }';
@@ -2210,6 +2445,191 @@ describe("ConnectionManager", () => {
     await expect(store.getSecret("a")).resolves.toBe(previous);
     await expect(store.getSecret("b")).resolves.toBeUndefined();
     expect(store.getConnections()).toEqual(connections);
+  });
+
+  it("migrates other connections when one stored URI has ambiguous credentials", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const ambiguous: ConnectionConfig = {
+      id: "ambiguous",
+      name: "Ambiguous",
+      type: "mongodb",
+      mongoConnectionMode: "uri",
+      connectionUri: "mongodb://admin:pa/ss@db/app",
+      useSecretStorage: true,
+    };
+    store.setConnections([
+      ambiguous,
+      {
+        id: "good",
+        name: "Good",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "pg-secret",
+        useSecretStorage: true,
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await (
+      manager as unknown as {
+        _migrateAllStoredConnectionSecrets(): Promise<void>;
+      }
+    )._migrateAllStoredConnectionSecrets();
+
+    const [storedAmbiguous, storedGood] = store.getConnections();
+    expect(storedAmbiguous).toEqual(ambiguous);
+    expect(storedGood).toMatchObject({ id: "good", useSecretStorage: true });
+    expect(storedGood.password).toBeUndefined();
+    await expect(store.getSecret("good")).resolves.toBe(
+      JSON.stringify({ password: "pg-secret" }),
+    );
+    await expect(store.getSecret("ambiguous")).resolves.toBeUndefined();
+  });
+
+  it("lets an editor replace a stored URI with ambiguous credentials", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const { connectionEditState } = await import(
+      "../../src/extension/connectionEditState"
+    );
+    const store = new FakeConnectionManagerStore();
+    const ambiguous: ConnectionConfig = {
+      id: "ambiguous",
+      name: "Ambiguous",
+      type: "mongodb",
+      mongoConnectionMode: "uri",
+      connectionUri: "mongodb://admin:pa/ss@db/app",
+    };
+    store.setConnections([ambiguous]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const state = connectionEditState(ambiguous, {});
+    expect(JSON.stringify(state)).not.toContain("pa/ss");
+
+    const saved = await manager.saveConnection(
+      {
+        ...ambiguous,
+        connectionUri: "mongodb://admin:pa%2Fss@db/app",
+        useSecretStorage: true,
+      },
+      {},
+      { kind: "edit", id: "ambiguous", state },
+    );
+
+    expect(saved.connectionUri).toBe("mongodb://db/app");
+    expect(store.getConnections()[0]?.connectionUri).toBe("mongodb://db/app");
+    await expect(store.getSecret("ambiguous")).resolves.toContain(
+      "mongodb://admin:pa%2Fss@db/app",
+    );
+  });
+
+  it("hydrates a stored credential-bearing URI only while it matches the settings target", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const secretUri = "redis://user:old-secret@old.example.com:6379/0";
+    store.setSecret("redis-uri", JSON.stringify({ connectionUri: secretUri }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const config: ConnectionConfig = {
+      id: "redis-uri",
+      name: "Redis",
+      type: "redis",
+      useSecretStorage: true,
+      connectionUri: "redis://old.example.com:6379/0",
+    };
+
+    await expect(manager._hydratePassword(config)).resolves.toMatchObject({
+      connectionUri: secretUri,
+    });
+    await expect(
+      manager._hydratePassword({
+        ...config,
+        connectionUri: "redis://new.example.com:6379/0",
+      }),
+    ).resolves.toMatchObject({
+      connectionUri: "redis://new.example.com:6379/0",
+    });
+  });
+
+  it("keeps a credentialed URI secret when background migration sees a hand-edited target", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const secret = JSON.stringify({
+      connectionUri: "redis://user:old-secret@old.example.com:6379/0",
+    });
+    store.setConnections([
+      {
+        id: "redis-edited",
+        name: "Redis",
+        type: "redis",
+        useSecretStorage: true,
+        connectionUri: "redis://new.example.com:6379/0",
+      },
+    ]);
+    store.setSecret("redis-edited", secret);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await (
+      manager as unknown as {
+        _migrateAllStoredConnectionSecrets(): Promise<void>;
+      }
+    )._migrateAllStoredConnectionSecrets();
+
+    await expect(store.getSecret("redis-edited")).resolves.toBe(secret);
+    const config = manager.getConnection("redis-edited");
+    if (!config) throw new Error("Expected connection config");
+    await expect(manager._hydratePassword(config)).resolves.toMatchObject({
+      connectionUri: "redis://new.example.com:6379/0",
+    });
+  });
+
+  it("disconnects a reconnecting driver after a credential-only edit", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const config: ConnectionConfig = {
+      id: "redis-reconnecting",
+      name: "Redis",
+      type: "redis",
+      host: "cache.local",
+      port: 6379,
+      useSecretStorage: true,
+    };
+    store.setConnections([config]);
+    store.setSecret(config.id, JSON.stringify({ password: "old-secret" }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo(config.id);
+    const driver = driverInstances[0];
+    vi.spyOn(driver, "isConnected").mockReturnValue(false);
+
+    await manager.saveConnection({ ...config, password: "new-secret" });
+
+    expect(driver.disconnectCalls).toBe(1);
+    expect(manager.getDriver(config.id)).toBeUndefined();
   });
 
   it("retains secret-only migration rollback for a store conflict", async () => {
@@ -2298,10 +2718,12 @@ describe("ConnectionManager", () => {
     );
     const store = new FakeConnectionManagerStore();
     const config: ConnectionConfig = {
-      id: "sqlite-existing",
-      name: "SQLite",
-      type: "sqlite",
-      filePath: "/tmp/app.db",
+      id: "pg-existing",
+      name: "Postgres",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
       useSecretStorage: true,
     };
     store.setConnections([config]);
@@ -2348,6 +2770,7 @@ describe("ConnectionManager", () => {
       database: "app",
       username: "postgres",
       password: "secret",
+      useSecretStorage: true,
     });
 
     expect(saved.id).not.toBe("");
@@ -2588,13 +3011,17 @@ describe("ConnectionManager", () => {
       },
     },
   ])("aborts final hydration after successful migration and retries with unchanged $name", async ({
-    config,
+    config: legacyConfig,
     secrets,
     hydrated,
   }) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
+    const config: ConnectionConfig = {
+      ...legacyConfig,
+      useSecretStorage: true,
+    };
     const store = new FakeConnectionManagerStore();
     const originalConfig = structuredClone(config);
     const rawSecret = JSON.stringify(secrets);
@@ -2699,7 +3126,10 @@ describe("ConnectionManager", () => {
       "../../src/extension/connectionManager"
     );
     const store = new FakeConnectionManagerStore();
-    const config = createSshPgConfig("permanent-storage-failure");
+    const config = {
+      ...createSshPgConfig("permanent-storage-failure"),
+      useSecretStorage: true,
+    };
     store.setConnections([config]);
     const storageError = new Error("Keychain permanently unavailable");
     vi.spyOn(store, "getSecret").mockRejectedValue(storageError);
@@ -2751,8 +3181,8 @@ describe("ConnectionManager", () => {
     expect((driverInstances[0]?.config as ConnectionConfig).password).toBe(
       useSecretStorage ? "" : undefined,
     );
-    if (useSecretStorage) expect(reads).toHaveBeenCalledWith(config.id);
-    else expect(reads).not.toHaveBeenCalled();
+    if (useSecretStorage === false) expect(reads).not.toHaveBeenCalled();
+    else expect(reads).toHaveBeenCalledWith(config.id);
     expect(config.password).toBeUndefined();
     await manager.dispose();
   });
@@ -2798,7 +3228,7 @@ describe("ConnectionManager", () => {
     });
   });
 
-  it("migrates persisted plaintext password to Secret Storage on connect", async () => {
+  it("migrates legacy plaintext password alongside useSecretStorage true to Secret Storage on connect", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -2813,6 +3243,7 @@ describe("ConnectionManager", () => {
         database: "app",
         username: "postgres",
         password: "legacy-password",
+        useSecretStorage: true,
       },
     ]);
 
@@ -2835,6 +3266,706 @@ describe("ConnectionManager", () => {
     await expect(store.getSecret("conn-legacy")).resolves.toContain(
       "legacy-password",
     );
+  });
+
+  it.each([
+    {
+      name: "password",
+      config: {
+        id: "hand-pg",
+        name: "Hand pg",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        password: "hand-password",
+      } as ConnectionConfig,
+      expected: { password: "hand-password" },
+    },
+    {
+      name: "API key",
+      config: {
+        id: "hand-es",
+        name: "Hand es",
+        type: "elasticsearch",
+        endpoint: "https://cluster.example.com",
+        apiKey: "hand-api-key",
+      } as ConnectionConfig,
+      expected: { apiKey: "hand-api-key" },
+    },
+    {
+      name: "AWS credentials",
+      config: {
+        id: "hand-ddb",
+        name: "Hand ddb",
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "hand-access",
+        awsSecretAccessKey: "hand-secret",
+        awsSessionToken: "hand-session",
+      } as ConnectionConfig,
+      expected: {
+        awsAccessKeyId: "hand-access",
+        awsSecretAccessKey: "hand-secret",
+        awsSessionToken: "hand-session",
+      },
+    },
+    {
+      name: "credential URI",
+      config: {
+        id: "hand-redis",
+        name: "Hand redis",
+        type: "redis",
+        connectionUri: "redis://user:hand-pass@localhost:6379",
+      } as ConnectionConfig,
+      expected: { connectionUri: "redis://user:hand-pass@localhost:6379" },
+    },
+    {
+      name: "SSH password",
+      config: {
+        ...createSshPgConfig("hand-ssh"),
+        password: "hand-password",
+      } as ConnectionConfig,
+      expected: {
+        password: "hand-password",
+        ssh: { password: "ssh-secret" },
+      },
+    },
+  ])("connects with hand-written plaintext $name without moving it to Secret Storage", async ({
+    config,
+    expected,
+  }) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    for (const useSecretStorage of [undefined, false]) {
+      driverInstances.length = 0;
+      const store = new FakeConnectionManagerStore();
+      const stored: ConnectionConfig = { ...config, useSecretStorage };
+      store.setConnections([structuredClone(stored)]);
+      const writes = vi.spyOn(store, "storeSecret");
+      const deletes = vi.spyOn(store, "deleteSecret");
+      const createSshRuntime = vi.fn(async () => ({
+        transport: {
+          kind: "tcpForward" as const,
+          localHost: "127.0.0.1" as const,
+          localPort: 15432,
+          remoteHost: "db.internal",
+          remotePort: 5432,
+        },
+        verifiedFingerprintSha256:
+          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        dispose: vi.fn(async () => undefined),
+      }));
+      const manager = new ConnectionManager(
+        createExtensionContextStub() as never,
+        store,
+        { createSshRuntime },
+      );
+
+      manager.getConnections();
+      await (
+        manager as unknown as {
+          _migrateAllStoredConnectionSecrets(): Promise<void>;
+        }
+      )._migrateAllStoredConnectionSecrets();
+      await manager.connectTo(config.id);
+
+      expect(manager.isConnected(config.id)).toBe(true);
+      expect(driverInstances[0]?.config).toMatchObject(expected);
+      if (config.ssh) {
+        expect(createSshRuntime).toHaveBeenCalledWith(
+          expect.objectContaining({
+            auth: { kind: "password", password: "ssh-secret" },
+          }),
+          expect.any(Object),
+          { signal: expect.any(AbortSignal) },
+        );
+      }
+      expect(store.getConnections()).toEqual([stored]);
+      expect(writes).not.toHaveBeenCalled();
+      expect(deletes).not.toHaveBeenCalled();
+      await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    {
+      name: "pg password",
+      config: {
+        type: "pg",
+        host: "db",
+        database: "app",
+        username: "u",
+        password: "pg-secret",
+      },
+      expected: { password: "pg-secret" },
+    },
+    {
+      name: "mysql password",
+      config: {
+        type: "mysql",
+        host: "db",
+        username: "u",
+        password: "my-secret",
+      },
+      expected: { password: "my-secret" },
+    },
+    {
+      name: "mssql password",
+      config: {
+        type: "mssql",
+        host: "db",
+        username: "u",
+        password: "ms-secret",
+      },
+      expected: { password: "ms-secret" },
+    },
+    {
+      name: "oracle password",
+      config: {
+        type: "oracle",
+        host: "db",
+        serviceName: "XEPDB1",
+        username: "u",
+        password: "ora-secret",
+      },
+      expected: { password: "ora-secret" },
+    },
+    {
+      name: "mongodb URI",
+      config: {
+        type: "mongodb",
+        mongoConnectionMode: "uri",
+        connectionUri: "mongodb://u:mongo-secret@db:27017/app",
+      },
+      expected: { connectionUri: "mongodb://u:mongo-secret@db:27017/app" },
+    },
+    {
+      name: "redis URI",
+      config: {
+        type: "redis",
+        connectionUri: "redis://u:redis-secret@db:6379/0",
+      },
+      expected: { connectionUri: "redis://u:redis-secret@db:6379/0" },
+    },
+    {
+      name: "elasticsearch API key",
+      config: {
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        apiKey: "es-secret",
+      },
+      expected: { apiKey: "es-secret" },
+    },
+    {
+      name: "dynamodb keys",
+      config: {
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "ddb-access",
+        awsSecretAccessKey: "ddb-secret",
+        awsSessionToken: "ddb-token",
+      },
+      expected: {
+        awsAccessKeyId: "ddb-access",
+        awsSecretAccessKey: "ddb-secret",
+        awsSessionToken: "ddb-token",
+      },
+    },
+    {
+      name: "TLS key passphrase",
+      config: {
+        type: "pg",
+        host: "db",
+        database: "app",
+        username: "u",
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "tls-secret",
+        },
+      },
+      expected: { tls: { keyPassphrase: "tls-secret" } },
+    },
+    {
+      name: "SSH password",
+      config: {
+        ...createSshPgConfig("toggle"),
+        password: "db-secret",
+      },
+      expected: { password: "db-secret" },
+    },
+  ] as Array<{
+    name: string;
+    config: Partial<ConnectionConfig>;
+    expected: Partial<ConnectionConfig>;
+  }>)("moves $name between settings and Secret Storage when the storage flag is toggled", async ({
+    config: partial,
+    expected,
+  }) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const { hasConnectionConfigSecrets } = await import(
+      "../../src/extension/connectionSecrets"
+    );
+    const config = {
+      ...partial,
+      id: "toggle",
+      name: "Toggle",
+      useSecretStorage: false,
+    } as ConnectionConfig;
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "db.internal",
+        remotePort: 5432,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose: vi.fn(async () => undefined),
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    const connectAndExpectSecrets = async () => {
+      await manager.connectTo(config.id);
+      expect(driverInstances.at(-1)?.config).toMatchObject(expected);
+      if (config.ssh) {
+        expect(createSshRuntime).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            auth: { kind: "password", password: "ssh-secret" },
+          }),
+          expect.any(Object),
+          { signal: expect.any(AbortSignal) },
+        );
+      }
+      await manager.disconnectFrom(config.id);
+    };
+
+    await connectAndExpectSecrets();
+    await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+
+    await manager.saveConnection({ ...config, useSecretStorage: true });
+    expect(store.getConnections()[0].useSecretStorage).toBe(true);
+    expect(hasConnectionConfigSecrets(store.getConnections()[0])).toBe(false);
+    expect(await store.getSecret(config.id)).toBeDefined();
+    await connectAndExpectSecrets();
+
+    await manager.saveConnection(config);
+    expect(store.getConnections()).toEqual([config]);
+    await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+    await connectAndExpectSecrets();
+    await manager.dispose();
+  });
+
+  it("marks a flagless profile with secrets already in Secret Storage and hydrates it", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "old-es",
+      name: "Old ES",
+      type: "elasticsearch",
+      endpoint: "https://es.example.com",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    store.setSecret(config.id, JSON.stringify({ apiKey: "stored-key" }));
+    const writes = vi.spyOn(store, "storeSecret");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await (
+      manager as unknown as {
+        _migrateAllStoredConnectionSecrets(): Promise<void>;
+      }
+    )._migrateAllStoredConnectionSecrets();
+    expect(store.getConnections()).toEqual([
+      { ...config, useSecretStorage: true },
+    ]);
+    expect(writes).not.toHaveBeenCalled();
+    await manager.connectTo(config.id);
+    expect(driverInstances.at(-1)?.config).toMatchObject({
+      apiKey: "stored-key",
+    });
+    await manager.dispose();
+  });
+
+  it("hydrates a flagless profile from Secret Storage before background migration runs", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "flagless-doc",
+      name: "Flagless",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    store.setSecret(config.id, JSON.stringify({ password: "stored-secret" }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    vi.spyOn(
+      manager as unknown as {
+        _migrateAllStoredConnectionSecrets(): Promise<void>;
+      },
+      "_migrateAllStoredConnectionSecrets",
+    ).mockResolvedValue(undefined);
+
+    await manager.connectTo(config.id);
+
+    expect(driverInstances.at(-1)?.config).toMatchObject({
+      password: "stored-secret",
+    });
+    expect(store.getConnections()).toEqual([config]);
+    await manager.dispose();
+  });
+
+  it("connects a flagless profile without secrets when Secret Storage is unavailable", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "flagless-locked",
+      name: "Flagless",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    vi.spyOn(store, "getSecret").mockRejectedValue(new Error("locked"));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo(config.id);
+
+    expect(manager.isConnected(config.id)).toBe(true);
+    expect(
+      (driverInstances.at(-1)?.config as ConnectionConfig).password,
+    ).toBeUndefined();
+    await manager.dispose();
+  });
+
+  it("adds a keychain hint when a flagless connect fails after Secret Storage could not be read", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "flagless-hint",
+      name: "Flagless",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    const reads = vi
+      .spyOn(store, "getSecret")
+      .mockRejectedValue(new Error("locked"));
+    const authError = Object.assign(
+      new Error("password authentication failed"),
+      {
+        code: "28P01",
+      },
+    );
+    driverBehaviors.set(config.id, { connectError: authError });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    const failure = await manager.connectTo(config.id).catch((error) => error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure.message).toBe(
+      "password authentication failed Secret Storage could not be read; saved credentials were not used. Unlock your keychain and retry.",
+    );
+    expect(failure.code).toBe("28P01");
+    expect(failure.cause).toBe(authError);
+
+    reads.mockResolvedValue(undefined);
+    await expect(manager.connectTo(config.id)).rejects.toBe(authError);
+    await manager.dispose();
+  });
+
+  it("does not read Secret Storage for a flagless SQLite connection", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "sqlite-flagless",
+      name: "SQLite",
+      type: "sqlite",
+      filePath: "/tmp/app.db",
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    const reads = vi.spyOn(store, "getSecret");
+
+    await expect(manager._hydratePassword(config)).resolves.toBe(config);
+    expect(reads).not.toHaveBeenCalled();
+    await manager.dispose();
+  });
+
+  it("ignores a stale Secret Storage entry of a plaintext profile", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "stale-doc",
+      name: "Stale",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "current-password",
+      useSecretStorage: false,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    store.setSecret(
+      config.id,
+      JSON.stringify({ password: "stale-password", sshPassword: "stale-ssh" }),
+    );
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await manager.connectTo(config.id);
+    expect(driverInstances.at(-1)?.config).toMatchObject({
+      password: "current-password",
+    });
+    await manager.disconnectFrom(config.id);
+
+    await manager.saveConnection({ ...config, useSecretStorage: true });
+    expect(JSON.parse((await store.getSecret(config.id)) ?? "{}")).toEqual({
+      password: "current-password",
+    });
+    await manager.dispose();
+  });
+
+  it.each([
+    undefined,
+    true,
+  ])("removes the Secret Storage entry only after settings switch to plaintext (previous flag %s)", async (previousFlag) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const previous: ConnectionConfig = {
+      id: "turn-off",
+      name: "Turn off",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage: previousFlag,
+    };
+    const next: ConnectionConfig = {
+      ...previous,
+      password: "moved-password",
+      useSecretStorage: false,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(previous)]);
+    const raw = JSON.stringify({ password: "moved-password" });
+    store.setSecret(previous.id, raw);
+    const deleteSecret = store.deleteSecret.bind(store);
+    const deletes = vi
+      .spyOn(store, "deleteSecret")
+      .mockImplementation(async (id) => {
+        expect(store.getConnections()).toEqual([next]);
+        await deleteSecret(id);
+      });
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    store.failNextConnectionWrite(new Error("settings write failed"));
+    await expect(manager.saveConnection(next)).rejects.toThrow(
+      "settings write failed",
+    );
+    expect(store.getConnections()).toEqual([previous]);
+    await expect(store.getSecret(previous.id)).resolves.toBe(raw);
+    expect(deletes).not.toHaveBeenCalled();
+
+    await manager.saveConnection(next);
+    expect(store.getConnections()).toEqual([next]);
+    expect(deletes).toHaveBeenCalledOnce();
+    await expect(store.getSecret(previous.id)).resolves.toBeUndefined();
+    await manager.dispose();
+  });
+
+  it("keeps plaintext settings when removing the old Secret Storage entry fails", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const previous: ConnectionConfig = {
+      id: "cleanup-fails",
+      name: "Cleanup",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage: true,
+    };
+    const next: ConnectionConfig = {
+      ...previous,
+      password: "moved-password",
+      useSecretStorage: false,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(previous)]);
+    store.setSecret(
+      previous.id,
+      JSON.stringify({ password: "moved-password" }),
+    );
+    vi.spyOn(store, "deleteSecret").mockRejectedValue(new Error("locked"));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(manager.saveConnection(next)).resolves.toMatchObject({
+      useSecretStorage: false,
+    });
+    expect(store.getConnections()).toEqual([next]);
+    await manager.connectTo(next.id);
+    expect(driverInstances.at(-1)?.config).toMatchObject({
+      password: "moved-password",
+    });
+    await manager.dispose();
+  });
+
+  it("reports unavailable Secret Storage when the editor could not read it", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const config: ConnectionConfig = {
+      id: "no-state",
+      name: "No state",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage: true,
+    };
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([structuredClone(config)]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    await expect(
+      manager.saveConnection(
+        config,
+        {},
+        {
+          kind: "edit",
+          id: config.id,
+          state: undefined,
+        },
+      ),
+    ).rejects.toThrow("Secret Storage was unavailable");
+    await manager.dispose();
+  });
+
+  it("keeps hand-written plaintext secrets when another connection is saved", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const handWritten: ConnectionConfig[] = [
+      {
+        id: "hand-tls",
+        name: "Hand TLS",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "hand-tls-passphrase",
+        },
+        useSecretStorage: false,
+      } as ConnectionConfig,
+      {
+        ...createSshPgConfig("hand-ssh-key"),
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "privateKey",
+          hostVerificationMode: "manual",
+          privateKey: "hand-private-key",
+          passphrase: "hand-passphrase",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
+      },
+    ];
+    const store = new FakeConnectionManagerStore();
+    store.setConnections(structuredClone(handWritten));
+    const writes = vi.spyOn(store, "storeSecret");
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+
+    manager.getConnections();
+    await (
+      manager as unknown as {
+        _migrateAllStoredConnectionSecrets(): Promise<void>;
+      }
+    )._migrateAllStoredConnectionSecrets();
+    await manager.saveConnection({
+      id: "other",
+      name: "Other",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "other-password",
+      useSecretStorage: true,
+    });
+
+    expect(store.getConnections().slice(0, 2)).toEqual(handWritten);
+    expect(writes).toHaveBeenCalledOnce();
+    expect(writes).toHaveBeenCalledWith(
+      "other",
+      JSON.stringify({ password: "other-password" }),
+    );
+    await expect(store.getSecret("hand-tls")).resolves.toBeUndefined();
+    await expect(store.getSecret("hand-ssh-key")).resolves.toBeUndefined();
+    await manager.dispose();
   });
 
   it.each([
@@ -2891,6 +4022,7 @@ describe("ConnectionManager", () => {
       name: "Redis",
       type: "redis",
       connectionUri,
+      useSecretStorage: true,
     });
     const persisted = store.getConnections()[0];
     expect(persisted.connectionUri).toBe("redis://host:6379/0");
@@ -2921,6 +4053,7 @@ describe("ConnectionManager", () => {
       type: "elasticsearch",
       endpoint: "https://cluster.example.com",
       apiKey: "plaintext-key",
+      useSecretStorage: true,
     });
 
     const persisted = store
@@ -2953,6 +4086,7 @@ describe("ConnectionManager", () => {
       name: "Elastic With Endpoint Secret",
       type: "elasticsearch",
       endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
+      useSecretStorage: true,
     });
 
     const persisted = store
@@ -2992,6 +4126,7 @@ describe("ConnectionManager", () => {
       name: "Mongo With URI Secret",
       type: "mongodb",
       uri: "mongodb://db-user:db-pass@localhost:27017/app",
+      useSecretStorage: true,
     });
 
     const persisted = store
@@ -3055,6 +4190,7 @@ describe("ConnectionManager", () => {
         passphrase: "key-passphrase",
         hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
       },
+      useSecretStorage: true,
     });
 
     const persisted = store
@@ -3178,6 +4314,12 @@ describe("ConnectionManager", () => {
           ["https://db.internal", 443],
           ["https://db.internal:443", 443],
           ["https://db.internal:8443", 8443],
+          ["http://[2001:db8::12]", 80],
+          ["http://[2001:db8::12]:80", 80],
+          ["http://[2001:db8::12]:8080", 8080],
+          ["https://[2001:db8::12]", 443],
+          ["https://[2001:db8::12]:443", 443],
+          ["https://[2001:db8::12]:8443", 8443],
         ] as const
       ).map(([endpoint, remotePort]) => ({ type, endpoint, remotePort })),
     ),
@@ -3186,6 +4328,7 @@ describe("ConnectionManager", () => {
     endpoint,
     remotePort,
   }) => {
+    const remoteHost = endpoint.includes("[") ? "2001:db8::12" : "db.internal";
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -3195,7 +4338,7 @@ describe("ConnectionManager", () => {
         kind: "tcpForward" as const,
         localHost: "127.0.0.1" as const,
         localPort: 15432,
-        remoteHost: "db.internal",
+        remoteHost,
         remotePort: Number(remotePort),
       },
       verifiedFingerprintSha256:
@@ -3225,15 +4368,142 @@ describe("ConnectionManager", () => {
         expect.anything(),
         {
           kind: "tcpForward",
-          remoteHost: "db.internal",
+          remoteHost,
           remotePort,
         },
         { signal: expect.any(AbortSignal) },
       );
       expect(driverInstances[0]?.config).toMatchObject({
         endpoint: `${endpoint.startsWith("https:") ? "https" : "http"}://127.0.0.1:15432/`,
+        runtimeOverrides: { tlsServername: remoteHost },
       });
       expect(dispose).toHaveBeenCalledOnce();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it.each([
+    ["elasticsearch", "connectionUri"],
+    ["elasticsearch", "endpoint"],
+    ["dynamodb", "endpoint"],
+    ["dynamodb", "awsEndpoint"],
+  ] as const)("keeps IPv6 URL and TLS identity transient during connectTo: %s %s", async (type, source) => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const endpoint = "https://[2001:db8::12]:8443/service?keep=true";
+    const config: ConnectionConfig = {
+      ...createSshPgConfig("http-ipv6-identity"),
+      type,
+      [source]: endpoint,
+      awsRegion: "us-east-1",
+      tls: {
+        mode: type === "elasticsearch" ? "requireVerifyFull" : "disabled",
+      },
+    };
+    const dispose = vi.fn(async () => undefined);
+    const createSshRuntime = vi.fn(async () => ({
+      transport: {
+        kind: "tcpForward" as const,
+        localHost: "127.0.0.1" as const,
+        localPort: 15432,
+        remoteHost: "2001:db8::12",
+        remotePort: 8443,
+      },
+      verifiedFingerprintSha256:
+        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      dispose,
+    }));
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+      { createSshRuntime },
+    );
+    try {
+      await manager.saveConnection(config);
+      const persisted = store.getConnections();
+      await manager.connectTo(config.id);
+      expect(createSshRuntime).toHaveBeenCalledWith(
+        expect.anything(),
+        { kind: "tcpForward", remoteHost: "2001:db8::12", remotePort: 8443 },
+        { signal: expect.any(AbortSignal) },
+      );
+      expect(driverInstances[0]?.config).toMatchObject({
+        [source]: "https://127.0.0.1:15432/service?keep=true",
+        tls: config.tls,
+        runtimeOverrides: { tlsServername: "2001:db8::12" },
+      });
+      expect(config[source]).toBe(endpoint);
+      expect(store.getConnections()).toEqual(persisted);
+    } finally {
+      await manager.dispose();
+      expect(dispose).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("resolves IPv6 URL authorities to bare TCP targets for SSH forwarding", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      new FakeConnectionManagerStore(),
+      { createSshRuntime: vi.fn() },
+    );
+    const resolver = manager as unknown as {
+      resolveSshRuntimeRequest(config: ConnectionConfig): unknown;
+      resolveUrlRemoteTarget(
+        value: string | undefined,
+        defaultPort: number,
+      ): unknown;
+      resolveDynamoRemoteTarget(config: ConnectionConfig): unknown;
+      resolveElasticsearchRemoteTarget(config: ConnectionConfig): unknown;
+    };
+    try {
+      for (const type of ["elasticsearch", "dynamodb"] as const) {
+        const config: ConnectionConfig = {
+          id: "facade-ipv6",
+          name: "IPv6",
+          type,
+          endpoint: "https://[2001:db8::12]/service?keep=true",
+        };
+        expect(resolver.resolveSshRuntimeRequest(config)).toEqual({
+          kind: "tcpForward",
+          remoteHost: "2001:db8::12",
+          remotePort: 443,
+        });
+        expect(config.endpoint).toBe(
+          "https://[2001:db8::12]/service?keep=true",
+        );
+      }
+      expect(resolver.resolveUrlRemoteTarget(undefined, 9200)).toBeUndefined();
+      expect(resolver.resolveUrlRemoteTarget("tcp://[::1]", 9200)).toEqual({
+        host: "::1",
+        port: 9200,
+      });
+      expect(
+        resolver.resolveDynamoRemoteTarget({
+          id: "d",
+          name: "D",
+          type: "dynamodb",
+        }),
+      ).toEqual({
+        host: "dynamodb.us-east-1.amazonaws.com",
+        port: 443,
+      });
+      expect(
+        resolver.resolveElasticsearchRemoteTarget({
+          id: "e",
+          name: "E",
+          type: "elasticsearch",
+          host: "db.internal",
+        }),
+      ).toEqual({
+        host: "db.internal",
+        port: 9200,
+      });
     } finally {
       await manager.dispose();
     }
@@ -3354,7 +4624,10 @@ describe("ConnectionManager", () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
-    const config = createSshPgConfig("ssh-persist-failure");
+    const config = {
+      ...createSshPgConfig("ssh-persist-failure"),
+      useSecretStorage: true,
+    };
     config.ssh = {
       ...config.ssh,
       hostVerificationMode: "trustOnFirstUse",
@@ -3387,9 +4660,7 @@ describe("ConnectionManager", () => {
       await expect(manager.connectTo(config.id)).rejects.toBe(failure);
       expect(createSshRuntime).toHaveBeenCalledOnce();
       expect(dispose).toHaveBeenCalledOnce();
-      expect(driverInstances).toHaveLength(1);
-      expect(driverInstances[0]?.connectCalls).toBe(1);
-      expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+      expect(driverInstances).toHaveLength(0);
       expect(manager.isConnected(config.id)).toBe(false);
       expect(manager.isConnecting(config.id)).toBe(false);
       expect(
@@ -3506,6 +4777,7 @@ describe("ConnectionManager", () => {
         username: "tunnel",
         hostVerificationMode: "manual",
         fingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        readyTimeoutMs: 15_000,
         auth: {
           kind: "password",
           password: "ssh-secret",
@@ -3580,6 +4852,7 @@ describe("ConnectionManager", () => {
         username: "tunnel",
         hostVerificationMode: "trustOnFirstUse",
         fingerprintSha256: undefined,
+        readyTimeoutMs: 15_000,
         auth: {
           kind: "password",
           password: "ssh-secret",
@@ -3614,7 +4887,7 @@ describe("ConnectionManager", () => {
       const fingerprint =
         "SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=";
       const dispose = vi.fn(async () => undefined);
-      const createSshRuntime = vi.fn(async () => ({
+      const runtime = () => ({
         transport: {
           kind: "tcpForward" as const,
           localHost: "127.0.0.1" as const,
@@ -3624,8 +4897,9 @@ describe("ConnectionManager", () => {
         },
         verifiedFingerprintSha256: fingerprint,
         dispose,
-      }));
-      return { config, store, fingerprint, dispose, createSshRuntime };
+      });
+      const createSshRuntime = vi.fn(async () => runtime());
+      return { config, store, fingerprint, dispose, runtime, createSshRuntime };
     }
 
     it.each([
@@ -3638,33 +4912,33 @@ describe("ConnectionManager", () => {
       const { config, store, fingerprint, dispose, createSshRuntime } = setup();
       config.ssh = { ...config.ssh, hostFingerprintSha256: fingerprint };
       store.setConnections([config]);
-      createSshRuntime.mockImplementation(async () => ({
-        transport: {
-          kind: "tcpForward" as const,
-          localHost: "127.0.0.1" as const,
-          localPort: 15436,
-          remoteHost: "db.internal",
-          remotePort: 5432,
-        },
-        verifiedFingerprintSha256: fingerprint.replace(/=+$/, ""),
-        dispose,
-      }));
-      if (changedKey) {
-        driverBehaviors.set(config.id, {
-          connectImpl: async () => {
-            const current = store.getConnections()[0];
-            store.setConnections([
-              {
-                ...current,
-                ssh: {
-                  ...current.ssh,
-                  hostFingerprintSha256: "SHA256:DifferentHostKey=",
-                },
+      let changeDuringSetup = changedKey;
+      createSshRuntime.mockImplementation(async () => {
+        if (changeDuringSetup) {
+          changeDuringSetup = false;
+          const current = store.getConnections()[0];
+          store.setConnections([
+            {
+              ...current,
+              ssh: {
+                ...current.ssh,
+                hostFingerprintSha256: "SHA256:DifferentHostKey=",
               },
-            ]);
+            },
+          ]);
+        }
+        return {
+          transport: {
+            kind: "tcpForward" as const,
+            localHost: "127.0.0.1" as const,
+            localPort: 15436,
+            remoteHost: "db.internal",
+            remotePort: 5432,
           },
-        });
-      }
+          verifiedFingerprintSha256: fingerprint.replace(/=+$/, ""),
+          dispose,
+        };
+      });
       const manager = new ConnectionManager(
         createExtensionContextStub() as never,
         store,
@@ -3695,11 +4969,11 @@ describe("ConnectionManager", () => {
     it.each([
       "constructor",
       "connect",
-    ] as const)("does not pin when the database %s fails", async (stage) => {
+    ] as const)("keeps the pin learned by the SSH handshake when the database %s fails", async (stage) => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, dispose, createSshRuntime } = setup();
+      const { config, store, fingerprint, dispose, createSshRuntime } = setup();
       const failure = new Error("database connection failed");
       driverBehaviors.set(
         config.id,
@@ -3714,11 +4988,17 @@ describe("ConnectionManager", () => {
       );
       try {
         await expect(manager.connectTo(config.id)).rejects.toBe(failure);
-        expect(
-          store.getConnections()[0].ssh?.hostFingerprintSha256,
-        ).toBeUndefined();
+        expect(store.getConnections()[0].ssh?.hostFingerprintSha256).toBe(
+          fingerprint,
+        );
         expect(dispose).toHaveBeenCalledOnce();
         expect(manager.isConnected(config.id)).toBe(false);
+        await expect(manager.connectTo(config.id)).rejects.toBe(failure);
+        expect(createSshRuntime).toHaveBeenLastCalledWith(
+          expect.objectContaining({ fingerprintSha256: fingerprint }),
+          expect.anything(),
+          { signal: expect.any(AbortSignal) },
+        );
       } finally {
         await manager.dispose();
       }
@@ -3750,18 +5030,17 @@ describe("ConnectionManager", () => {
       }
     });
 
-    it("does not pin a canceled database connection, including late success", async () => {
+    it("does not pin a connection canceled during SSH setup, including late success", async () => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, createSshRuntime } = setup();
+      const { config, store, runtime, createSshRuntime } = setup();
       const started = createDeferred<void>();
       const finish = createDeferred<void>();
-      driverBehaviors.set(config.id, {
-        connectImpl: async () => {
-          started.resolve();
-          await finish.promise;
-        },
+      createSshRuntime.mockImplementation(async () => {
+        started.resolve();
+        await finish.promise;
+        return runtime();
       });
       const manager = new ConnectionManager(
         createExtensionContextStub() as never,
@@ -3798,14 +5077,13 @@ describe("ConnectionManager", () => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, dispose, createSshRuntime } = setup();
+      const { config, store, dispose, runtime, createSshRuntime } = setup();
       const started = createDeferred<void>();
       const finish = createDeferred<void>();
-      driverBehaviors.set(config.id, {
-        connectImpl: async () => {
-          started.resolve();
-          await finish.promise;
-        },
+      createSshRuntime.mockImplementation(async () => {
+        started.resolve();
+        await finish.promise;
+        return runtime();
       });
       const manager = new ConnectionManager(
         createExtensionContextStub() as never,
@@ -3830,7 +5108,7 @@ describe("ConnectionManager", () => {
         await expect(attempt.promise).rejects.toThrow(/SSH.*changed/);
         expect(store.getConnections()).toEqual(expected);
         expect(dispose).toHaveBeenCalledOnce();
-        expect(driverInstances[0]?.disconnectCalls).toBeGreaterThanOrEqual(1);
+        expect(driverInstances).toHaveLength(0);
         expect(manager.isConnected(config.id)).toBe(false);
       } finally {
         finish.resolve();
@@ -3842,14 +5120,13 @@ describe("ConnectionManager", () => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, createSshRuntime } = setup();
+      const { config, store, runtime, createSshRuntime } = setup();
       const started = createDeferred<void>();
       const finish = createDeferred<void>();
-      driverBehaviors.set(config.id, {
-        connectImpl: async () => {
-          started.resolve();
-          await finish.promise;
-        },
+      createSshRuntime.mockImplementation(async () => {
+        started.resolve();
+        await finish.promise;
+        return runtime();
       });
       const manager = new ConnectionManager(
         createExtensionContextStub() as never,
@@ -3889,7 +5166,7 @@ describe("ConnectionManager", () => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, fingerprint, createSshRuntime } = setup();
+      const { config, store, fingerprint, runtime, createSshRuntime } = setup();
       const first = new ConnectionManager(
         createExtensionContextStub() as never,
         store,
@@ -3912,12 +5189,11 @@ describe("ConnectionManager", () => {
       const releaseFirst = createDeferred<void>();
       const releaseSecond = createDeferred<void>();
       let calls = 0;
-      driverBehaviors.set(config.id, {
-        connectImpl: async () => {
-          const ordinal = ++calls;
-          if (calls === 2) bothStarted.resolve();
-          await (ordinal === 1 ? releaseFirst.promise : releaseSecond.promise);
-        },
+      createSshRuntime.mockImplementation(async () => {
+        const ordinal = ++calls;
+        if (calls === 2) bothStarted.resolve();
+        await (ordinal === 1 ? releaseFirst.promise : releaseSecond.promise);
+        return runtime();
       });
       try {
         const firstAttempt = first.beginConnect(config.id);
@@ -3959,19 +5235,18 @@ describe("ConnectionManager", () => {
       const { ConnectionManager } = await import(
         "../../src/extension/connectionManager"
       );
-      const { config, store, fingerprint, createSshRuntime } = setup();
+      const { config, store, fingerprint, runtime, createSshRuntime } = setup();
       config.ssh = { ...config.ssh, hostFingerprintSha256: fingerprint };
       store.setConnections([config]);
-      driverBehaviors.set(config.id, {
-        connectImpl: async () => {
-          const current = store.getConnections()[0];
-          store.setConnections([
-            {
-              ...current,
-              ssh: { ...current.ssh, hostFingerprintSha256: undefined },
-            },
-          ]);
-        },
+      createSshRuntime.mockImplementation(async () => {
+        const current = store.getConnections()[0];
+        store.setConnections([
+          {
+            ...current,
+            ssh: { ...current.ssh, hostFingerprintSha256: undefined },
+          },
+        ]);
+        return runtime();
       });
       const manager = new ConnectionManager(
         createExtensionContextStub() as never,
@@ -4170,7 +5445,7 @@ describe("ConnectionManager", () => {
       uri: "mongodb://host/app?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3ASESSION_SECRET",
       safe: "mongodb://host/app?authMechanism=MONGODB-AWS",
     },
-  ])("migrates plaintext credential-bearing $type URI to Secret Storage on connect", async ({
+  ])("migrates legacy plaintext credential-bearing $type URI alongside useSecretStorage true on connect", async ({
     type,
     uri,
     safe,
@@ -4186,6 +5461,7 @@ describe("ConnectionManager", () => {
         name: "Legacy URI",
         type,
         connectionUri: uri,
+        useSecretStorage: true,
       },
     ]);
 
@@ -4967,7 +6243,7 @@ describe("ConnectionManager", () => {
       await manager.dispose();
     });
 
-    it("treats a genuinely empty database catalog as loaded without discovery retries", async () => {
+    it("loads Redis db0 without discovery retries when the keyspace catalog is empty", async () => {
       const behavior: DriverBehavior = {
         listDatabasesImpl: vi.fn(() => []),
         listSchemasImpl: vi.fn(() => []),
@@ -4981,11 +6257,11 @@ describe("ConnectionManager", () => {
       expect(manager.getSchemaSnapshotState("discovery")).toEqual({
         status: "loaded",
         isPartial: false,
-        snapshot: { databases: [] },
+        snapshot: { databases: [{ name: "db0", schemas: [] }] },
       });
       manager.ensureSchemaSnapshotLoading("discovery");
       expect(behavior.listDatabasesImpl).toHaveBeenCalledTimes(1);
-      expect(behavior.listSchemasImpl).not.toHaveBeenCalled();
+      expect(behavior.listSchemasImpl).toHaveBeenCalledExactlyOnceWith("db0");
       await manager.dispose();
     });
   });
@@ -5443,6 +6719,50 @@ describe("ConnectionManager", () => {
       "conn-1",
       () => manager.getSchemaSnapshotState("conn-1").status === "loaded",
     );
+  });
+
+  it("warms schema scopes without marking them expanded", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    driverBehaviors.set("conn-1", {
+      listDatabases: [
+        { name: "app_db", schemas: [] },
+        { name: "archive_db", schemas: [] },
+      ],
+      listSchemasByDatabase: {
+        app_db: [{ name: "public" }],
+        archive_db: [{ name: "audit" }],
+      },
+    });
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([
+      {
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+        database: "app_db",
+        host: "localhost",
+        username: "postgres",
+      },
+    ]);
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.connectTo("conn-1");
+    const scope = { kind: "database", database: "archive_db" } as const;
+
+    manager.warmSchemaScope("conn-1", scope);
+    await waitForSchemaCondition(
+      manager,
+      "conn-1",
+      () => manager.getSchemaSnapshotState("conn-1", scope).status === "loaded",
+    );
+
+    expect(manager.isSchemaScopeExpanded("conn-1", scope)).toBe(false);
+    manager.ensureSchemaScopeLoading("conn-1", scope);
+    expect(manager.isSchemaScopeExpanded("conn-1", scope)).toBe(true);
   });
 
   it("deduplicates expanded database and schema scope loads", async () => {
@@ -6103,6 +7423,37 @@ describe("ConnectionManager", () => {
       "select 3",
       "select 2",
     ]);
+  });
+
+  it("disables new history at limit zero without silently clearing entries or disabling bookmarks", async () => {
+    const { ConnectionManager } = await import(
+      "../../src/extension/connectionManager"
+    );
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(
+      createExtensionContextStub() as never,
+      store,
+    );
+    await manager.addToHistory("conn-1", "select 'existing'");
+    const existingHistory = store.readHistory();
+    store.setHistoryLimit(0);
+    const writeHistory = vi.spyOn(store, "writeHistory");
+
+    await manager.addToHistory("conn-1", "select 'not recorded'");
+
+    expect(writeHistory).not.toHaveBeenCalled();
+    expect(manager.getHistory()).toEqual(existingHistory);
+
+    const queryText = "  -- sensitive comment\nselect 'sensitive literal'  ";
+    const bookmark = await manager.addBookmark("conn-1", queryText);
+    expect(bookmark.sql).toBe(queryText.trim());
+    expect(manager.getBookmarks()).toEqual([bookmark]);
+
+    await manager.clearHistory();
+    expect(manager.getHistory()).toEqual([]);
+    expect(manager.getBookmarks()).toEqual([bookmark]);
+    await manager.clearBookmarks();
+    expect(manager.getBookmarks()).toEqual([]);
   });
 
   it("serializes concurrent history additions without losing entries", async () => {

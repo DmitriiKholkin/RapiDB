@@ -453,6 +453,7 @@ describe("QueryPanel", () => {
           columns: [],
         },
       ]),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "Primary", type: "pg" },
       ]),
@@ -516,7 +517,7 @@ describe("QueryPanel", () => {
 
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "schema",
-      payload: { connectionId: "conn-1", schema: [] },
+      payload: { connectionId: "conn-1", schema: [], error: "Not connected." },
     });
     connectionManager.getConnection.mockReturnValue(undefined as never);
     connectionManager.getConnections.mockReturnValue([]);
@@ -565,6 +566,7 @@ describe("QueryPanel", () => {
       isConnected: vi.fn((id: string) => id === "conn-1"),
       getSchema: vi.fn(() => mergedSchema),
       getSchemaAsync: vi.fn(async () => refreshedSchema),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
       getConnections: vi.fn(() => [
         { id: "conn-1", name: "Primary", type: "pg" },
       ]),

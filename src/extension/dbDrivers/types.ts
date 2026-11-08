@@ -19,7 +19,10 @@ import type {
   TriggerMeta,
   TypeCategory,
 } from "../../shared/tableTypes";
-import type { QueryEditorPresentation } from "../../shared/webviewContracts";
+import type {
+  QueryEditorPresentation,
+  QueryResultSet,
+} from "../../shared/webviewContracts";
 
 export {
   type ColumnMeta,
@@ -28,13 +31,10 @@ export {
   type FilterOperator,
   type ForeignKeyMeta,
   type GeneratedKind,
-  type IdentityGenerationKind,
   type IndexMeta,
   type MongoValueTypeHint,
   NULL_SENTINEL,
   type QueryColumnMeta,
-  type QueryMissingCell,
-  type ScalarFilterOperator,
   type TableConstraintMeta,
   type TriggerMeta,
   type TypeCategory,
@@ -55,12 +55,16 @@ export interface QueryResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  exportRows?: Record<string, unknown>[];
   responseMetadata?: Record<string, unknown>[];
   missingCells?: QueryMissingCell[];
   rowCount: number;
   executionTimeMs: number;
   affectedRows?: number;
   truncated?: boolean;
+  resultSets?: QueryResultSet[];
+  resultSetsTruncated?: boolean;
+  error?: string;
 }
 export interface DatabaseExecutionScope {
   database?: string;
@@ -100,6 +104,8 @@ export type ReadOnlyQueryGuard = (queryText: string) => ReadOnlyQueryDecision;
 
 export interface DriverCapabilities {
   tabularRead: "sql" | "nosql";
+  rejectsUnknownMutationColumn?: (columnName: string) => boolean;
+  unsupportedMutationColumnMessage?: (columnName: string) => string | undefined;
   schemaNamespaces?: "none";
   queryMode?: "sql" | "text";
   supportsMutations?: boolean;
@@ -185,6 +191,7 @@ export interface DriverTablePageResult {
   rows: Record<string, unknown>[];
   mongoIdTypes?: Array<"objectId" | "string" | null>;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
+  rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -194,12 +201,16 @@ export interface DriverTableExportRequest {
   schema: string;
   table: string;
   chunkSize: number;
+  filters?: FilterExpression[];
+  sort?: DriverSortConfig | null;
 }
 
 export type DriverTableExportChunk = Pick<
   DriverTablePageResult,
   "columns" | "rows"
->;
+> & {
+  missingCells?: QueryMissingCell[];
+};
 
 export interface DriverUpdateRowsRequest {
   database: string;
@@ -306,6 +317,7 @@ export interface IDBDriver {
     schema: string,
     table: string,
     constraintName: string,
+    constraintKind?: TableConstraintMeta["kind"],
   ): Promise<string>;
   getIndexDDL(
     database: string,
@@ -346,10 +358,17 @@ export interface IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult>;
   clearTableReadCache?(): void;
+  readTablePageChunks?(
+    request: DriverTablePageRequest,
+  ): AsyncIterable<DriverTableExportChunk>;
   exportTableChunks?(
     request: DriverTableExportRequest,
     signal?: AbortSignal,
   ): AsyncIterable<DriverTableExportChunk>;
+  formatTableExportChunk?(
+    chunk: DriverTableExportChunk,
+    selectedColumns?: readonly string[],
+  ): DriverTableExportChunk;
   validateTableUpdates?(
     updates: readonly Pick<
       DriverUpdateRowsRequest["updates"][number],
@@ -428,6 +447,12 @@ export interface IDBDriver {
     columnName: string,
     tableReference: string,
   ): string;
+  getTableRowIdentityOrderExpressions?(
+    database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): Promise<string[]>;
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown;
   coerceTableEditValue?(
     value: unknown,

@@ -7,6 +7,7 @@ import type {
 } from "../../shared/webviewContracts";
 import { isoToLocalDateStr as isoToSharedLocalDateStr } from "../utils/dateUtils";
 import {
+  canonicalizeJsonNumericValues,
   canonicalizeJsonPreservingRawNumbers,
   parseJsonPreservingRawNumbers,
   serializeCanonicalJson,
@@ -64,7 +65,7 @@ import {
 
 const pad2 = (n: number) => String(n).padStart(2, "0");
 const SQL_FILTER_ERROR_RE =
-  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
+  /^\[RapiDB Filter\]|invalid input syntax|invalid cidr|malformed array|not a valid (binary|hex|uuid)|syntax error in input|invalid value for type|invalid number|operator does not exist|conversion failed|arithmetic overflow|ORA-00932|ORA-0(1841|1843|1858|1861|6502)|ORA-01722|incorrect (date|datetime|time)|Incorrect integer value|Truncated incorrect|data truncat/i;
 export function formatDatetimeForDisplay(val: unknown): string | null {
   if (val instanceof Date) {
     if (Number.isNaN(val.getTime())) return null;
@@ -301,22 +302,10 @@ function normalizeNumericFilterToken(rawValue: string): string | null {
 function splitNumericFilterInList(rawValue: string): string[] {
   const input = rawValue.trim();
   if (input === "") return [];
-  const parts: string[] = [];
-  let start = 0;
-  for (let i = 0; i < input.length; i += 1) {
-    if (input[i] !== ",") continue;
-    const prevChar = i > 0 ? input[i - 1] : "";
-    const nextSlice = input.slice(i + 1);
-    const isThousandsSeparator =
-      /\d/.test(prevChar) && /^\d{3}(?=[^\d]|$)/.test(nextSlice);
-    if (isThousandsSeparator) {
-      continue;
-    }
-    parts.push(input.slice(start, i).trim());
-    start = i + 1;
-  }
-  parts.push(input.slice(start).trim());
-  return parts.filter(Boolean);
+  return input
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
 }
 const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 const UUID_RE =
@@ -348,6 +337,7 @@ function parseTypePrecisionScale(nativeType: string): ExactNumericConstraint {
     scale: match[2] === undefined ? null : Number.parseInt(match[2], 10),
   };
 }
+const MAX_EXACT_NUMERIC_EXPONENT = 16383;
 function numberToDecimalString(value: number): string {
   const raw = value.toString();
   if (!/[eE]/.test(raw)) {
@@ -358,6 +348,30 @@ function numberToDecimalString(value: number): string {
   const sign = mantissa.startsWith("-") ? "-" : "";
   const unsignedMantissa = mantissa.replace(/^[+-]/, "");
   const [integerPart, fractionPart = ""] = unsignedMantissa.split(".");
+  return shiftDecimalPoint(sign, integerPart, fractionPart, exponent);
+}
+function expandDecimalExponent(raw: string): string | null {
+  const match = /^([+-])?(\d*)(?:\.(\d*))?[eE]([+-]?\d+)$/.exec(raw);
+  if (!match || `${match[2]}${match[3] ?? ""}` === "") {
+    return null;
+  }
+  const exponent = Number.parseInt(match[4], 10);
+  if (Math.abs(exponent) > MAX_EXACT_NUMERIC_EXPONENT) {
+    return null;
+  }
+  return shiftDecimalPoint(
+    match[1] === "-" ? "-" : "",
+    match[2],
+    match[3] ?? "",
+    exponent,
+  );
+}
+function shiftDecimalPoint(
+  sign: string,
+  integerPart: string,
+  fractionPart: string,
+  exponent: number,
+): string {
   const digits = `${integerPart}${fractionPart}`;
   const decimalIndex = integerPart.length + exponent;
   if (decimalIndex <= 0) {
@@ -388,7 +402,11 @@ function canonicalizeExactNumeric(
   value: unknown,
   scale: number | null,
 ): CanonicalExactNumericValue | null {
-  const raw = parseDecimalString(value);
+  const parsed = parseDecimalString(value);
+  if (parsed === null) {
+    return null;
+  }
+  const raw = /[eE]/.test(parsed) ? expandDecimalExponent(parsed) : parsed;
   if (raw === null) {
     return null;
   }
@@ -577,6 +595,17 @@ function stableJsonValue(value: unknown): unknown {
 }
 function canonicalizeJsonPersistedEditValue(
   value: unknown,
+  normalizeNumbers = false,
+): CanonicalPersistedEditValue | null {
+  const canonical = canonicalizeJsonPersistedEditText(value);
+  if (!canonical || !normalizeNumbers) {
+    return canonical;
+  }
+  const normalized = canonicalizeJsonNumericValues(canonical.canonical);
+  return normalized === null ? canonical : { canonical: normalized };
+}
+function canonicalizeJsonPersistedEditText(
+  value: unknown,
 ): CanonicalPersistedEditValue | null {
   const nullish = canonicalizeNullishPersistedEditValue(value);
   if (nullish) {
@@ -666,7 +695,7 @@ function canonicalizeBinaryPersistedEditValue(
     return null;
   }
   if (value === "") {
-    return { canonical: "" };
+    return { canonical: "0x" };
   }
   if (!isHexLike(value)) {
     return null;
@@ -674,6 +703,17 @@ function canonicalizeBinaryPersistedEditValue(
   return {
     canonical: hexFromBuffer(parseHexToBuffer(value)).toLowerCase(),
   };
+}
+const SINGLE_PRECISION_SIGNIFICANT_DIGITS = 7;
+function roundToShortestSinglePrecision(value: number): number {
+  const single = Math.fround(value);
+  for (let digits = 1; digits < 9; digits++) {
+    const candidate = Number.parseFloat(single.toPrecision(digits));
+    if (Math.fround(candidate) === single) {
+      return candidate;
+    }
+  }
+  return Number.parseFloat(single.toPrecision(9));
 }
 function canonicalizeApproximateNumericPersistedEditValue(
   value: unknown,
@@ -692,8 +732,9 @@ function canonicalizeApproximateNumericPersistedEditValue(
     return null;
   }
   return {
-    canonical: Number.parseFloat(
-      parsed.toPrecision(significantDigits),
+    canonical: (significantDigits <= SINGLE_PRECISION_SIGNIFICANT_DIGITS
+      ? roundToShortestSinglePrecision(parsed)
+      : Number.parseFloat(parsed.toPrecision(significantDigits))
     ).toString(),
   };
 }
@@ -718,9 +759,10 @@ function findApproximateNumericPrecisionLoss(
   if (!Number.isFinite(parsed)) {
     return null;
   }
-  const roundedNumber = Number.parseFloat(
-    parsed.toPrecision(significantDigits),
-  );
+  const roundedNumber =
+    significantDigits <= SINGLE_PRECISION_SIGNIFICANT_DIGITS
+      ? roundToShortestSinglePrecision(parsed)
+      : Number.parseFloat(parsed.toPrecision(significantDigits));
   const rounded = canonicalizeExactNumeric(
     numberToDecimalString(roundedNumber),
     null,
@@ -891,7 +933,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     }
 
     for (const index of indexes) {
-      if (index.primary || !index.unique) {
+      if (index.primary || !index.unique || index.partial) {
         continue;
       }
 
@@ -945,10 +987,15 @@ export abstract class BaseDBDriver implements IDBDriver {
     schema: string,
     table: string,
     constraintName: string,
+    constraintKind?: TableConstraintMeta["kind"],
   ): Promise<string> {
     const constraint = (
       await this.getConstraints(database, schema, table)
-    ).find((entry) => entry.name === constraintName);
+    ).find(
+      (entry) =>
+        entry.name === constraintName &&
+        (!constraintKind || entry.kind === constraintKind),
+    );
     if (!constraint) {
       throw new Error(`Constraint "${constraintName}" not found`);
     }
@@ -1408,14 +1455,14 @@ export abstract class BaseDBDriver implements IDBDriver {
           return nullish;
         }
         if (typeof value === "string") {
-          return { canonical: value.trimEnd() };
+          return { canonical: value.replace(/ +$/, "") };
         }
         if (
           typeof value === "number" ||
           typeof value === "boolean" ||
           typeof value === "bigint"
         ) {
-          return { canonical: String(value).trimEnd() };
+          return { canonical: String(value).replace(/ +$/, "") };
         }
         return null;
       },
@@ -1452,12 +1499,13 @@ export abstract class BaseDBDriver implements IDBDriver {
     column: ColumnTypeMeta,
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
+    normalizeNumbers = false,
   ): PersistedEditCheckResult | null {
     return this.checkNormalizedPersistedEdit(
       column,
       expectedValue,
       options,
-      canonicalizeJsonPersistedEditValue,
+      (value) => canonicalizeJsonPersistedEditValue(value, normalizeNumbers),
       `Column "${column.name}" expects valid JSON.`,
     );
   }

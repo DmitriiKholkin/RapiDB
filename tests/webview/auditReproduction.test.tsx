@@ -29,7 +29,7 @@ it("B05: sends a DEFAULT-only draft as an empty insert and retains it on failure
       preserveScrollPositionRef: { current: () => {} },
       rowsRef: { current: [] },
       mongoIdTypesRef: { current: [] },
-      mongoValueTypesRef: { current: [] },
+      rowValueTypesRef: { current: [] },
       selected: new Set(),
     }),
   );
@@ -103,7 +103,7 @@ it("M16 clears apply-busy state while retaining drafts for a correlated backend-
       preserveScrollPositionRef: { current: () => {} },
       rowsRef: { current: [] },
       mongoIdTypesRef: { current: [] },
-      mongoValueTypesRef: { current: [] },
+      rowValueTypesRef: { current: [] },
       selected: new Set(),
     }),
   );
@@ -171,7 +171,7 @@ it("M16 accepts a resent known backend result without unknown-write recovery", (
       preserveScrollPositionRef: { current: () => {} },
       rowsRef: { current: [] },
       mongoIdTypesRef: { current: [] },
-      mongoValueTypesRef: { current: [] },
+      rowValueTypesRef: { current: [] },
       selected: new Set(),
     }),
   );
@@ -231,7 +231,7 @@ it("M16 ignores a delayed mutation reply from an earlier controller epoch", () =
     preserveScrollPositionRef: { current: () => {} },
     rowsRef: { current: [] },
     mongoIdTypesRef: { current: [] },
-    mongoValueTypesRef: { current: [] },
+    rowValueTypesRef: { current: [] },
     selected: new Set<number>(),
   };
   const previous = renderHook(() => useTableMutationController(params));

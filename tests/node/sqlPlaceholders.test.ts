@@ -1,16 +1,23 @@
 import { describe, expect, it } from "vitest";
+import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import {
   indexedPlaceholderOffsets,
   questionMarkPlaceholderOffsets,
 } from "../../src/extension/dbDrivers/sqlPlaceholders";
-import { SqlPreviewMaterializer } from "../../src/extension/dbDrivers/sqlPreviewMaterializer";
+
+const previewDriver = new SQLiteDriver({
+  id: "sql-placeholders-preview",
+  name: "SQL Placeholders Preview",
+  type: "sqlite",
+  filePath: ":memory:",
+});
 
 describe("default placeholder scanner compatibility", () => {
   it("retains MySQL-style backslash escapes in generic scanners and previews", () => {
     const literal = "'it\\'s ? $1 :1'";
     const sql = `SELECT ${literal}, ?`;
     expect(questionMarkPlaceholderOffsets(sql)).toEqual([sql.lastIndexOf("?")]);
-    expect(new SqlPreviewMaterializer().materializePreviewSql(sql, [7])).toBe(
+    expect(previewDriver.materializePreviewSql(sql, [7])).toBe(
       `SELECT ${literal}, 7`,
     );
     for (const marker of ["$", ":"] as const) {
@@ -18,15 +25,15 @@ describe("default placeholder scanner compatibility", () => {
       expect(
         indexedPlaceholderOffsets(indexedSql, marker).map(({ start }) => start),
       ).toEqual([indexedSql.lastIndexOf(marker)]);
-      expect(
-        new SqlPreviewMaterializer().materializePreviewSql(indexedSql, [7]),
-      ).toBe(`SELECT ${literal}, 7`);
+      expect(previewDriver.materializePreviewSql(indexedSql, [7])).toBe(
+        `SELECT ${literal}, 7`,
+      );
     }
   });
 
   it("retains PostgreSQL dollar-quote protection in generic indexed previews", () => {
     const sql = "SELECT $body$ ' ? $1 :1 $body$, $1";
-    expect(new SqlPreviewMaterializer().materializePreviewSql(sql, [7])).toBe(
+    expect(previewDriver.materializePreviewSql(sql, [7])).toBe(
       "SELECT $body$ ' ? $1 :1 $body$, 7",
     );
   });
@@ -53,7 +60,7 @@ describe("default placeholder scanner compatibility", () => {
         text: `${marker}1`,
       },
     ]);
-    expect(new SqlPreviewMaterializer().materializePreviewSql(sql, [7])).toBe(
+    expect(previewDriver.materializePreviewSql(sql, [7])).toBe(
       `SELECT [x]]${marker}1], 7`,
     );
   });
@@ -61,7 +68,7 @@ describe("default placeholder scanner compatibility", () => {
   it("keeps the question-mark scanner's bracket escaping contract", () => {
     const sql = "SELECT [x]]?], ?";
     expect(questionMarkPlaceholderOffsets(sql)).toEqual([sql.lastIndexOf("?")]);
-    expect(new SqlPreviewMaterializer().materializePreviewSql(sql, [7])).toBe(
+    expect(previewDriver.materializePreviewSql(sql, [7])).toBe(
       "SELECT [x]]?], 7",
     );
   });

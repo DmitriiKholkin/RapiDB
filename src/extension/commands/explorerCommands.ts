@@ -55,7 +55,7 @@ async function ensureConnectionReady(
   }
 
   try {
-    await connectWithProgress(
+    const connected = await connectWithProgress(
       connectionManager,
       connectionId,
       "RapiDB: Connecting…",
@@ -64,7 +64,7 @@ async function ensureConnectionReady(
       "automatic",
     );
     refresh();
-    return true;
+    return connected;
   } catch (err: unknown) {
     const error = logErrorWithContext(failureContext, err);
     vscode.window.showErrorMessage(`[RapiDB] Cannot connect: ${error.message}`);
@@ -250,6 +250,7 @@ export function registerExplorerCommands(
           location.schema,
           node.parentTable,
           node.objectName,
+          ...(node.constraintKind ? ([node.constraintKind] as const) : []),
         );
       } else if (
         node.kind === "table_detail_index" &&

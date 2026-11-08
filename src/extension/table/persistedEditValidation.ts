@@ -1,6 +1,7 @@
 import {
   isColumnReadOnly,
   isServerGeneratedColumn,
+  type MongoValueTypeHint,
 } from "../../shared/tableTypes";
 import type {
   ApplyResultPayload,
@@ -12,6 +13,36 @@ import { unknownSqlMutationColumns, writableEntries } from "./updateSql";
 export interface PersistedEditFailure {
   columns: string[];
   message: string;
+}
+
+export function applyRowTypeHints(
+  driver: IDBDriver,
+  columnMap: Map<string, ColumnTypeMeta>,
+  originalTypes: Record<string, MongoValueTypeHint> | undefined,
+): Map<string, ColumnTypeMeta> {
+  const rowColumnMap = new Map(columnMap);
+  if (driver.getCapabilities?.().tabularRead !== "nosql") return rowColumnMap;
+  for (const [name, hint] of Object.entries(originalTypes ?? {})) {
+    if (
+      hint.nativeType === "null" ||
+      hint.nativeType === "undefined" ||
+      hint.nativeType === "missing"
+    ) {
+      continue;
+    }
+    const column = rowColumnMap.get(name);
+    if (column) {
+      rowColumnMap.set(name, {
+        ...column,
+        category: hint.category,
+        nativeType: hint.nativeType,
+        ...(hint.bsonSubtype !== undefined
+          ? { bsonSubtype: hint.bsonSubtype }
+          : {}),
+      });
+    }
+  }
+  return rowColumnMap;
 }
 
 export function validatePersistedEditRecord(
@@ -75,6 +106,21 @@ export function validateInsertColumnNames(
   values: Record<string, unknown>,
   columnMap: Map<string, ColumnTypeMeta>,
 ): PersistedEditFailure | null {
+  const unsupportedMessage =
+    driver.getCapabilities?.().unsupportedMutationColumnMessage;
+  const unsupported = Object.entries(values).flatMap(([name, value]) => {
+    const message =
+      value !== undefined && !columnMap.has(name)
+        ? unsupportedMessage?.(name)
+        : undefined;
+    return message ? [{ name, message }] : [];
+  });
+  if (unsupported.length > 0) {
+    return {
+      columns: unsupported.map(({ name }) => name),
+      message: unsupported.map(({ message }) => message).join(" "),
+    };
+  }
   const unknownColumns = unknownSqlMutationColumns(driver, values, columnMap);
   if (unknownColumns.length === 0) return null;
   return {

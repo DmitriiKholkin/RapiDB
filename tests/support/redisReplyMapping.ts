@@ -9,6 +9,10 @@ export function withRedisReplyMapping<T extends object>(client: T) {
     get?: (key: string) => Promise<unknown>;
     zRangeWithScores?: (...args: unknown[]) => Promise<unknown>;
   };
+  for (const command of ["strLen", "hLen", "lLen", "sCard", "zCard", "xLen"]) {
+    if (!(command in client))
+      Object.assign(client, { [command]: vi.fn(async () => 0) });
+  }
   return Object.assign(client, {
     withTypeMapping: vi.fn(() => ({
       scan: async (...args: unknown[]) => {
@@ -28,8 +32,28 @@ export function withRedisReplyMapping<T extends object>(client: T) {
             ? value
             : Buffer.from(String(value));
       },
+      getRange: async (key: string, start: number, end: number) => {
+        const value = await commands.get?.(key);
+        return value == null
+          ? null
+          : (Buffer.isBuffer(value)
+              ? value
+              : Buffer.from(String(value))
+            ).subarray(start, end + 1);
+      },
       zRangeWithScores: (...args: unknown[]) =>
         commands.zRangeWithScores?.(...args),
+      ...Object.fromEntries(
+        ["hGetAll", "lRange", "sMembers", "xRange", "sendCommand"]
+          .filter((command) => command in client)
+          .map((command) => [
+            command,
+            (...args: unknown[]) =>
+              (client as Record<string, (...args: unknown[]) => unknown>)[
+                command
+              ](...args),
+          ]),
+      ),
     })),
   });
 }

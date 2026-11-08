@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { QueryPanelCachedResult } from "../../src/extension/panels/queryPanelController";
 import { createSqlReadOnlyQueryGuard } from "../../src/extension/utils/readOnlyGuards";
 import {
   MONGO_ERROR_URI,
@@ -162,6 +163,7 @@ describe("QueryPanelController", () => {
       ),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync,
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
       getQueryEditorPresentation: vi.fn(() => undefined),
       getDriverEntityManifest: vi.fn(() => undefined),
       getDriverCapabilities: vi.fn(() => undefined),
@@ -216,7 +218,7 @@ describe("QueryPanelController", () => {
     expect(getSchemaAsync).not.toHaveBeenCalled();
     expect(view.postMessage).toHaveBeenCalledWith({
       type: "schema",
-      payload: { connectionId: "initial", schema: [] },
+      payload: { connectionId: "initial", schema: [], error: "Not connected." },
     });
   });
 
@@ -280,6 +282,136 @@ describe("QueryPanelController", () => {
   });
 
   it.each([
+    { failure: "Storage unavailable", message: "Storage unavailable" },
+    { failure: { cause: new Error("Disk full") }, message: "Disk full" },
+    { failure: null, message: "Unknown error" },
+  ])("reports bookmark storage failures without changing SQL results and permits retry: $message", async ({
+    failure,
+    message,
+  }) => {
+    const addBookmark = vi
+      .fn(async () => undefined)
+      .mockRejectedValueOnce(failure);
+    const cachedResult = {
+      columns: ["id"],
+      columnMeta: [],
+      rows: [{ id: 1 }],
+      rowCount: 1,
+      executionTimeMs: 5,
+    };
+    const view = {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "initial",
+      getLastQueryResult: () => cachedResult,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({ addBookmark } as never, view);
+    await controller.handleMessage({
+      type: "addBookmark",
+      payload: {
+        connectionId: "explicit",
+        queryText: "select 1",
+        requestId: "save:1",
+      },
+    });
+    expect(view.postMessage.mock.calls).toEqual([
+      [
+        {
+          type: "bookmarkSaved",
+          payload: { ok: false, error: message, requestId: "save:1" },
+        },
+      ],
+    ]);
+    expect(view.setLastQueryResult).not.toHaveBeenCalled();
+    expect(view.setActiveConnectionId).not.toHaveBeenCalled();
+
+    await controller.handleMessage({
+      type: "addBookmark",
+      payload: {
+        connectionId: "explicit",
+        queryText: "select 1",
+        requestId: "save:2",
+      },
+    });
+    expect(addBookmark).toHaveBeenNthCalledWith(1, "explicit", "select 1");
+    expect(addBookmark).toHaveBeenNthCalledWith(2, "explicit", "select 1");
+    expect(view.postMessage).toHaveBeenCalledTimes(2);
+    expect(view.postMessage).toHaveBeenLastCalledWith({
+      type: "bookmarkSaved",
+      payload: { ok: true, requestId: "save:2" },
+    });
+    expect(view.setLastQueryResult).not.toHaveBeenCalled();
+    expect(view.getLastQueryResult()).toBe(cachedResult);
+  });
+
+  it.each([
+    "exportResultsCSV",
+    "exportResultsJSON",
+  ])("%s follows grid text sorting and preserves native row alignment", async (type) => {
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const values = [
+      "item10",
+      "item2",
+      "A",
+      "a",
+      "z",
+      "z",
+      "z",
+      "z",
+      "z",
+      "z",
+      "z",
+      "item3",
+    ];
+    const cached = {
+      columns: ["value"],
+      columnMeta: [{ category: "text" as const }],
+      rows: values.map((value) => ({ __col_0: value })),
+      exportRows: values.map((_, index) => ({ __col_0: { source: index } })),
+      missingCells: [{ rowIndex: 11, columnIndex: 0 }],
+    };
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "initial",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+    const exporter =
+      type === "exportResultsCSV"
+        ? exportQueryResultsAsCsv
+        : exportQueryResultsAsJson;
+    for (const [desc, indices] of [
+      [false, [2, 3, 1, 11, 0, 4, 5, 6, 7, 8, 9, 10]],
+      [true, [4, 5, 6, 7, 8, 9, 10, 0, 11, 1, 2, 3]],
+    ] as const) {
+      await controller.handleMessage({
+        type,
+        payload: { sort: [{ id: "__col_0", desc }] },
+      });
+      expect(exporter).toHaveBeenLastCalledWith(
+        {
+          ...cached,
+          rows: indices.map((i) => cached.rows[i]),
+          exportRows: indices.map((i) => cached.exportRows[i]),
+          missingCells: [{ rowIndex: indices.indexOf(11), columnIndex: 0 }],
+        },
+        { context: undefined },
+      );
+    }
+  });
+
+  it.each([
     "exportResultsCSV",
     "exportResultsJSON",
   ])("%s preserves duplicate columns through default export, reorder, and sort", async (type) => {
@@ -293,6 +425,11 @@ describe("QueryPanelController", () => {
         { __col_0: 2, __col_1: "a" },
         { __col_0: 1, __col_1: "c" },
         { __col_0: 1, __col_1: "b" },
+      ],
+      exportRows: [
+        { __col_0: { N: "2" }, __col_1: { S: "a" } },
+        { __col_0: { N: "1" }, __col_1: { S: "c" } },
+        { __col_0: { N: "1" }, __col_1: { S: "b" } },
       ],
     };
     const snapshot = structuredClone(cached);
@@ -334,6 +471,11 @@ describe("QueryPanelController", () => {
           { __col_0: "c", __col_1: 1 },
           { __col_0: "b", __col_1: 1 },
         ],
+        exportRows: [
+          { __col_0: { S: "a" }, __col_1: { N: "2" } },
+          { __col_0: { S: "c" }, __col_1: { N: "1" } },
+          { __col_0: { S: "b" }, __col_1: { N: "1" } },
+        ],
       },
       { context: undefined },
     );
@@ -350,6 +492,7 @@ describe("QueryPanelController", () => {
         {
           ...cached,
           rows: indices.map((i) => cached.rows[i]),
+          exportRows: indices.map((i) => cached.exportRows[i]),
         },
         { context: undefined },
       );
@@ -373,6 +516,11 @@ describe("QueryPanelController", () => {
           { __col_0: "c", __col_1: 1 },
           { __col_0: "a", __col_1: 2 },
         ],
+        exportRows: [
+          { __col_0: { S: "b" }, __col_1: { N: "1" } },
+          { __col_0: { S: "c" }, __col_1: { N: "1" } },
+          { __col_0: { S: "a" }, __col_1: { N: "2" } },
+        ],
       },
       { context: undefined },
     );
@@ -388,6 +536,11 @@ describe("QueryPanelController", () => {
         columns: ["value"],
         columnMeta: [cached.columnMeta[1]],
         rows: [{ __col_0: "c" }, { __col_0: "b" }, { __col_0: "a" }],
+        exportRows: [
+          { __col_0: { S: "c" } },
+          { __col_0: { S: "b" } },
+          { __col_0: { S: "a" } },
+        ],
       },
       { context: undefined },
     );
@@ -404,6 +557,157 @@ describe("QueryPanelController", () => {
     expect(showWarningMessage).toHaveBeenCalledTimes(2);
   });
 
+  it.each([
+    "exportResultsCSV",
+    "exportResultsJSON",
+  ])("%s matches exact numeric grid order while aligning native rows and missing cells", async (type) => {
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const values = [
+      "10",
+      "2",
+      "9007199254740993",
+      "9007199254740992",
+      "-0.00000000000000000002",
+      "-0.00000000000000000001",
+      "2.0",
+      null,
+      undefined,
+    ];
+    const exporter =
+      type === "exportResultsCSV"
+        ? exportQueryResultsAsCsv
+        : exportQueryResultsAsJson;
+    for (const category of ["integer", "decimal", "float"] as const) {
+      const cached = {
+        columns: ["value", "value"],
+        columnMeta: [{ category }, { category: "text" as const }],
+        rows: values.map((value, index) => ({
+          __col_0: value,
+          __col_1: `row-${index}`,
+        })),
+        exportRows: values.map((_value, index) => ({
+          __col_0: { source: index },
+          __col_1: { source: `row-${index}` },
+        })),
+        missingCells: [{ rowIndex: 8, columnIndex: 0 }],
+      };
+      const snapshot = structuredClone(cached);
+      const controller = new QueryPanelController({} as never, {
+        getActiveConnectionId: () => "active",
+        getInitialConnectionId: () => "initial",
+        getLastQueryResult: () => cached,
+        postMessage: vi.fn(),
+        setActiveConnectionId: vi.fn(),
+        setLastQueryResult: vi.fn(),
+        syncTitle: vi.fn(),
+      });
+      for (const [desc, indices] of [
+        [false, [7, 8, 4, 5, 1, 6, 0, 3, 2]],
+        [true, [2, 3, 0, 1, 6, 5, 4, 7, 8]],
+      ] as const) {
+        await controller.handleMessage({
+          type,
+          payload: {
+            sort: [{ id: "__col_0", desc }],
+            columnOrder: ["__col_1", "__col_0"],
+          },
+        });
+        expect(exporter).toHaveBeenLastCalledWith(
+          {
+            ...cached,
+            columnMeta: [cached.columnMeta[1], cached.columnMeta[0]],
+            rows: indices.map((i) => ({
+              __col_0: cached.rows[i].__col_1,
+              __col_1: cached.rows[i].__col_0,
+            })),
+            exportRows: indices.map((i) => ({
+              __col_0: cached.exportRows[i].__col_1,
+              __col_1: cached.exportRows[i].__col_0,
+            })),
+            missingCells: [{ rowIndex: indices.indexOf(8), columnIndex: 1 }],
+          },
+          { context: undefined },
+        );
+      }
+      expect(cached).toEqual(snapshot);
+    }
+  });
+
+  it("exports only aggregate-capped rows from the same formatted result posted to the grid", async () => {
+    const actual = await vi.importActual<
+      typeof import("../../src/extension/utils/queryResultFormatting")
+    >("../../src/extension/utils/queryResultFormatting");
+    formatQueryResult.mockImplementation(actual.formatQueryResult);
+    const first = Array.from({ length: 6000 }, (_, i) => ({ __col_0: i }));
+    const second = Array.from({ length: 4001 }, (_, i) => ({ __col_0: i }));
+    const raw = {
+      columns: ["first"],
+      rows: first,
+      rowCount: 10001,
+      executionTimeMs: 1,
+      resultSets: [
+        { id: "one", columns: ["first"], rows: first, rowCount: 6000 },
+        { id: "two", columns: ["second"], rows: second, rowCount: 4001 },
+      ],
+    };
+    const query = vi.fn(async () => raw);
+    const manager = {
+      getConnection: () => ({ id: "qa", type: "pg" }),
+      getDriver: () => ({ query }),
+      getDriverCapabilities: () => ({ boundedQueryResults: true }),
+      isConnected: () => true,
+      getQueryRowLimit: () => 10000,
+      addToHistory: vi.fn(async () => undefined),
+    };
+    let cached: ReturnType<typeof actual.formatQueryResult> | null = null;
+    const view = {
+      getActiveConnectionId: () => "qa",
+      getInitialConnectionId: () => "qa",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn((value) => {
+        cached = value;
+      }),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(manager as never, view);
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "SELECT first; SELECT second" },
+    });
+    const posted = view.postMessage.mock.calls.find(
+      ([message]) => message.type === "queryResult",
+    )?.[0].payload;
+    expect(posted.resultSets[1]).toMatchObject({
+      truncated: true,
+      truncatedAt: 4000,
+      rowCount: 4001,
+    });
+    expect(posted.resultSets[1].rows).toHaveLength(4000);
+    for (const type of ["exportResultsJSON", "exportResultsCSV"]) {
+      showWarningMessage.mockResolvedValueOnce("Export displayed rows");
+      await controller.handleMessage({ type, payload: { resultSetIndex: 1 } });
+      const exporter =
+        type === "exportResultsJSON"
+          ? exportQueryResultsAsJson
+          : exportQueryResultsAsCsv;
+      expect(exporter).toHaveBeenLastCalledWith(posted.resultSets[1], {
+        context: undefined,
+      });
+      expect(showWarningMessage).toHaveBeenLastCalledWith(
+        expect.stringContaining("first 4,000 displayed rows"),
+        { modal: true },
+        "Export displayed rows",
+      );
+    }
+  });
+
   it("warns and skips both exports when cached results are empty", async () => {
     const connectionManager = {
       isConnected: vi.fn(() => true),
@@ -413,6 +717,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -708,6 +1013,72 @@ describe("QueryPanelController", () => {
     }
   });
 
+  it("explains the Redis query-client disconnect after a cancellation request", async () => {
+    let rejectQuery!: (error: Error) => void;
+    const pendingQuery = new Promise<never>((_resolve, reject) => {
+      rejectQuery = reject;
+    });
+    const driver = {
+      query: vi.fn(() => pendingQuery),
+      cancelCurrentOperation: vi.fn(() => {
+        rejectQuery(new Error("Disconnects client"));
+      }),
+    };
+    const connectionManager = {
+      getConnection: () => ({
+        id: "redis",
+        name: "Redis QA",
+        type: "redis",
+        readOnly: false,
+      }),
+      getDriverCapabilities: () => ({ boundedQueryResults: true }),
+      isConnected: () => true,
+      addToHistory: vi.fn(async () => undefined),
+      getDriver: () => driver,
+      getQueryRowLimit: () => 100,
+    };
+    const view = {
+      getActiveConnectionId: () => "redis",
+      getInitialConnectionId: () => "redis",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "BLPOP manual_cancel_probe 15",
+        operationId: "redis:cancel",
+      },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+    await controller.handleMessage({
+      type: "cancelQuery",
+      payload: { operationId: "redis:cancel" },
+    });
+    await running;
+
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        connectionId: "redis",
+        operationId: "redis:cancel",
+        error:
+          "[RapiDB] Query cancellation was requested. The Redis query client was disconnected to stop the active request. The operation outcome may be unknown; cancellation does not confirm rollback.",
+      }),
+    });
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
   it.each([
     "during cancellation",
     "after acknowledgement",
@@ -987,6 +1358,215 @@ describe("QueryPanelController", () => {
     expect(exportQueryResultsAsCsv).toHaveBeenCalledOnce();
   });
 
+  it("requires explicit confirmation before exporting a partial result set", async () => {
+    showWarningMessage.mockResolvedValue("Export partial result");
+    const partial = {
+      id: "result-2",
+      columns: ["id"],
+      columnMeta: [],
+      rows: [{ __col_0: 1 }],
+      rowCount: 2,
+      partial: true,
+      truncated: false,
+      truncatedAt: 1,
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => ({
+        columns: ["id"],
+        rows: [{ __col_0: 1 }],
+        resultSets: [partial],
+      }),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+
+    await controller.handleMessage({ type: "exportResultsCSV" });
+
+    expect(showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("only rows received before the error"),
+      { modal: true },
+      "Export partial result",
+    );
+    expect(exportQueryResultsAsCsv).toHaveBeenCalledWith(partial, {
+      context: undefined,
+    });
+  });
+
+  it.each(
+    (["csv", "json"] as const).flatMap((format) =>
+      [false, true].map((withResultSets) => ({ format, withResultSets })),
+    ),
+  )("confirms exporting $format after a batch error (result sets: $withResultSets)", async ({
+    format,
+    withResultSets,
+  }) => {
+    const realFormatting = await vi.importActual<
+      typeof import("../../src/extension/utils/queryResultFormatting")
+    >("../../src/extension/utils/queryResultFormatting");
+    formatQueryResult.mockImplementation(realFormatting.formatQueryResult);
+    const completed = {
+      id: "result-1",
+      columns: ["value"],
+      columnMeta: [{ category: "number" as const }],
+      rows: [{ __col_0: 1 }],
+      rowCount: 1,
+    };
+    const query = vi.fn(async () => ({
+      ...completed,
+      executionTimeMs: 1,
+      error: "syntax error near FROM",
+      ...(withResultSets ? { resultSets: [completed] } : {}),
+    }));
+    let cached: QueryPanelCachedResult | null = null;
+    const view = {
+      getActiveConnectionId: () => "mysql",
+      getInitialConnectionId: () => "mysql",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: (result: QueryPanelCachedResult | null) => {
+        cached = result;
+      },
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      {
+        getConnection: () => ({ id: "mysql", type: "mysql" }),
+        isConnected: () => true,
+        getQueryRowLimit: () => 100,
+        getDriver: () => ({ query }),
+        addToHistory: vi.fn(async () => undefined),
+        refreshSchemaCache: vi.fn(),
+      } as never,
+      view,
+    );
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "SELECT 1; SELECT FROM;" },
+    });
+    expect(query).toHaveBeenCalledOnce();
+    expect(view.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "queryResult",
+        payload: expect.objectContaining({ error: "syntax error near FROM" }),
+      }),
+    );
+    const request = {
+      type: format === "csv" ? "exportResultsCSV" : "exportResultsJSON",
+    } as const;
+    await controller.handleMessage(request);
+    expect(showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("only rows received before the error"),
+      { modal: true },
+      "Export partial result",
+    );
+    expect(exportQueryResultsAsCsv).not.toHaveBeenCalled();
+    expect(exportQueryResultsAsJson).not.toHaveBeenCalled();
+
+    showWarningMessage.mockResolvedValue("Export partial result");
+    await controller.handleMessage(request);
+    const exporter =
+      format === "csv" ? exportQueryResultsAsCsv : exportQueryResultsAsJson;
+    expect(exporter).toHaveBeenCalledOnce();
+    expect(exporter).toHaveBeenCalledWith(
+      expect.objectContaining({ rows: [{ __col_0: 1 }], partial: true }),
+      { context: undefined },
+    );
+  });
+
+  it("exports the requested SQL Server result set", async () => {
+    const selectedSet = {
+      id: "result-2",
+      columns: ["second_value"],
+      columnMeta: [{ category: null }],
+      rows: [{ __col_0: 2 }],
+      rowCount: 1,
+      truncated: false,
+      truncatedAt: 1,
+    };
+    const cached = {
+      columns: ["first_value"],
+      columnMeta: [{ category: null }],
+      rows: [{ __col_0: 1 }],
+      resultSets: [
+        {
+          id: "result-1",
+          columns: ["first_value"],
+          columnMeta: [{ category: null }],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          truncated: false,
+          truncatedAt: 1,
+        },
+        selectedSet,
+      ],
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+
+    await controller.handleMessage({
+      type: "exportResultsCSV",
+      payload: { resultSetIndex: 1 },
+    });
+
+    expect(exportQueryResultsAsCsv).toHaveBeenCalledWith(selectedSet, {
+      context: undefined,
+    });
+  });
+
+  it.each([
+    "exportResultsCSV",
+    "exportResultsJSON",
+  ] as const)("refuses %s when every result column is collapsed", async (type) => {
+    const cached = {
+      columns: ["id", "name"],
+      columnMeta: [{ category: null }, { category: null }],
+      rows: [{ __col_0: 1, __col_1: "Ada" }],
+      truncated: true,
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController({} as never, {
+      getActiveConnectionId: () => "active",
+      getInitialConnectionId: () => "active",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    });
+
+    await controller.handleMessage({ type, payload: { columnOrder: [] } });
+
+    expect(showWarningMessage).toHaveBeenCalledOnce();
+    expect(showWarningMessage).toHaveBeenCalledWith(
+      "[RapiDB] All result columns are collapsed. Expand at least one column to export.",
+    );
+    expect(exportQueryResultsAsCsv).not.toHaveBeenCalled();
+    expect(exportQueryResultsAsJson).not.toHaveBeenCalled();
+  });
+
   it("applies SQL hard cap before driver.query when configured row limit exceeds safety policy", async () => {
     const query = vi.fn(async () => ({
       columns: ["id"],
@@ -1008,6 +1588,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 50_000),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1065,6 +1646,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 50_000),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1378,6 +1960,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 50_000),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1437,6 +2020,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 50_000),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1496,6 +2080,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 50_000),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1602,8 +2187,8 @@ describe("QueryPanelController", () => {
     );
   });
 
-  it("treats MySQL executable comments as schema-changing only for MySQL", async () => {
-    async function runWithConnectionType(type: string) {
+  it("blocks MySQL/MariaDB executable comments before query dispatch", async () => {
+    async function runWithConnectionType(type: string, queryText: string) {
       const query = vi.fn(async () => ({
         columns: ["id"],
         rows: [{ id: 1 }],
@@ -1611,6 +2196,7 @@ describe("QueryPanelController", () => {
         rowCount: 1,
         executionTimeMs: 2,
       }));
+      const addToHistory = vi.fn(async () => undefined);
       const connectionManager = {
         getConnection: vi.fn(() => ({
           id: "active",
@@ -1619,12 +2205,13 @@ describe("QueryPanelController", () => {
         })),
         isConnected: vi.fn(() => true),
         connectTo: vi.fn(async () => undefined),
-        addToHistory: vi.fn(async () => undefined),
+        addToHistory,
         addBookmark: vi.fn(async () => undefined),
         getDriver: vi.fn(() => ({ query })),
         getDriverCapabilities: vi.fn(() => ({ boundedQueryResults: true })),
         getQueryRowLimit: vi.fn(() => 50_000),
         getSchemaAsync: vi.fn(async () => []),
+        getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
         refreshSchemaCache: vi.fn(),
       };
       const view = {
@@ -1644,13 +2231,79 @@ describe("QueryPanelController", () => {
         view,
       ).handleMessage({
         type: "executeQuery",
-        payload: { queryText: "SELECT 1 /*!50000 SELECT 1 */" },
+        payload: { queryText },
       });
-      return connectionManager.refreshSchemaCache;
+      return { query, addToHistory, view };
     }
 
-    expect(await runWithConnectionType("mysql")).toHaveBeenCalledTimes(1);
-    expect(await runWithConnectionType("pg")).not.toHaveBeenCalled();
+    const mysqlExecutable = await runWithConnectionType(
+      "mysql",
+      "SELECT 1 /*!50000 SELECT 1 */",
+    );
+    const mariaDbExecutable = await runWithConnectionType(
+      "mysql",
+      "/*M!100100 SELECT 1 */",
+    );
+    const mixedMysql = await runWithConnectionType(
+      "mysql",
+      String.raw`SELECT 'a\'b' AS "x\" /*!50000 , 1 AS y */`,
+    );
+    const mixedMariaDb = await runWithConnectionType(
+      "mysql",
+      String.raw`SELECT 'a\'b' AS "x\" /*M!100100 , 1 AS y */`,
+    );
+    for (const result of [
+      mysqlExecutable,
+      mariaDbExecutable,
+      mixedMysql,
+      mixedMariaDb,
+    ]) {
+      expect(result.query).not.toHaveBeenCalled();
+      expect(result.addToHistory).not.toHaveBeenCalled();
+      expect(result.view.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "queryResult",
+          payload: expect.objectContaining({
+            error: expect.stringContaining("server executes their contents"),
+          }),
+        }),
+      );
+    }
+
+    const quotedText = await runWithConnectionType(
+      "mysql",
+      "SELECT '/*!50000 SELECT 1 */' AS comment_text",
+    );
+    expect(quotedText.query).toHaveBeenCalledOnce();
+
+    for (const code of [0, 1, 8, 14, 31, 127]) {
+      for (const wrapper of [
+        "/*!50000 ordinary text */",
+        "/*M!100100 ordinary text */",
+      ]) {
+        const queryText = `SELECT 1 --${String.fromCharCode(code)} ${wrapper}`;
+        const result = await runWithConnectionType("mysql", queryText);
+        expect(result.query).toHaveBeenCalledOnce();
+        expect(result.query).toHaveBeenCalledWith(
+          queryText,
+          undefined,
+          expect.any(Object),
+        );
+        expect(result.addToHistory).toHaveBeenCalledOnce();
+        expect(result.view.postMessage).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: "queryResult",
+            payload: expect.objectContaining({ rows: [{ id: 1 }] }),
+          }),
+        );
+      }
+    }
+
+    const postgres = await runWithConnectionType(
+      "pg",
+      "SELECT 1 /*!50000 SELECT 1 */",
+    );
+    expect(postgres.query).toHaveBeenCalledOnce();
   });
 
   it("pushes merged cached schema only for the active or initial connection when schema loads", async () => {
@@ -1664,6 +2317,7 @@ describe("QueryPanelController", () => {
     ]);
     const connectionManager = {
       getSchema,
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -1708,6 +2362,49 @@ describe("QueryPanelController", () => {
 
     expect(getSchema).toHaveBeenCalledTimes(1);
     expect(view.postMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps shared schema cache errors when pushing loaded schema updates", async () => {
+    const partialSchema = [
+      { database: "app_db", schema: "public", object: "users", columns: [] },
+    ];
+    const connectionManager = {
+      getSchema: vi.fn(() => partialSchema),
+      getSchemaSnapshotState: vi.fn(() => ({
+        status: "error",
+        error: "audit: permission denied for schema audit",
+      })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "conn-1"),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleSchemaLoaded("conn-1");
+
+    expect(connectionManager.getSchemaSnapshotState).toHaveBeenCalledWith(
+      "conn-1",
+    );
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "schema",
+      payload: {
+        connectionId: "conn-1",
+        schema: partialSchema,
+        error: "audit: permission denied for schema audit",
+      },
+    });
   });
 
   it("includes driver-owned editor presentation in pushed connection metadata", async () => {
@@ -1892,6 +2589,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2188,6 +2886,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => undefined),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2246,6 +2945,7 @@ describe("QueryPanelController", () => {
     const connectionManager = {
       isConnected: vi.fn(() => true),
       getSchemaAsync,
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2330,6 +3030,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2417,6 +3118,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => driver),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2506,6 +3208,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2603,6 +3306,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2698,6 +3402,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query, cancelCurrentOperation })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2757,6 +3462,51 @@ describe("QueryPanelController", () => {
     errorSpy.mockRestore();
   });
 
+  it("flags schema load failures recorded by the shared schema cache", async () => {
+    const partialSchema = [{ object: "users" }];
+    const connectionManager = {
+      isConnected: vi.fn(() => true),
+      getSchemaAsync: vi.fn(async () => partialSchema),
+      getSchemaSnapshotState: vi.fn(() => ({
+        status: "error",
+        error: "permission denied for schema audit",
+      })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => "conn-1"),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    await controller.handleMessage({
+      type: "getSchema",
+      payload: { connectionId: "conn-1" },
+    });
+
+    expect(connectionManager.getSchemaSnapshotState).toHaveBeenCalledWith(
+      "conn-1",
+    );
+    expect(view.postMessage).toHaveBeenCalledWith({
+      type: "schema",
+      payload: {
+        connectionId: "conn-1",
+        schema: partialSchema,
+        error: "permission denied for schema audit",
+      },
+    });
+  });
+
   it("handles schema load rejection and posts safe empty schema", async () => {
     const schemaError = new Error("schema failed");
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -2794,7 +3544,7 @@ describe("QueryPanelController", () => {
 
     expect(view.postMessage).toHaveBeenCalledWith({
       type: "schema",
-      payload: { connectionId: "conn-1", schema: [] },
+      payload: { connectionId: "conn-1", schema: [], error: "schema failed" },
     });
 
     errorSpy.mockRestore();
@@ -2824,6 +3574,7 @@ describe("QueryPanelController", () => {
       getDriver: vi.fn(() => ({ query })),
       getQueryRowLimit: vi.fn(() => 100),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
 
     const view = {
@@ -2900,6 +3651,7 @@ describe("QueryPanelController", () => {
       getQueryRowLimit: () => 100,
       addToHistory: vi.fn(async () => undefined),
       getSchemaAsync: async () => [],
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
     const view = {
       getActiveConnectionId: () => activeConnectionId,
@@ -3038,6 +3790,7 @@ describe("QueryPanelController", () => {
       getQueryRowLimit: vi.fn(() => 100),
       addToHistory: vi.fn(async () => undefined),
       getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
     };
     const view = {
       getActiveConnectionId: vi.fn(() => activeConnectionId),
@@ -3106,5 +3859,251 @@ describe("QueryPanelController", () => {
     ]);
     resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
     await second;
+  });
+
+  it.each([
+    "in order",
+    "in reverse order",
+  ])("applies only the latest connection switch when superseded cancellations settle %s", async (settleOrder) => {
+    let activeConnectionId = "conn-1";
+    let resolveQuery: ((value: unknown) => void) | undefined;
+    const cancellations: Array<() => void> = [];
+    const driver = {
+      query: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveQuery = resolve;
+          }),
+      ),
+      cancelCurrentOperation: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            cancellations.push(resolve);
+          }),
+      ),
+    };
+    const connectionManager = {
+      getConnection: vi.fn((id: string) => ({ id, name: id, type: "pg" })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => driver),
+      getQueryRowLimit: vi.fn(() => 100),
+      addToHistory: vi.fn(async () => undefined),
+      getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => activeConnectionId),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn((id: string) => {
+        activeConnectionId = id;
+      }),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select slow", connectionId: "conn-1" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+
+    const switchToSecond = controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-2" },
+    });
+    const switchBack = controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-1" },
+    });
+    await vi.waitFor(() => expect(cancellations).toHaveLength(2));
+
+    if (settleOrder === "in order") {
+      cancellations[0]();
+      await switchToSecond;
+      cancellations[1]();
+      await switchBack;
+    } else {
+      cancellations[1]();
+      await switchBack;
+      cancellations[0]();
+      await switchToSecond;
+    }
+
+    expect(view.setActiveConnectionId).not.toHaveBeenCalledWith("conn-2");
+    expect(activeConnectionId).toBe("conn-1");
+
+    resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
+    await running;
+
+    view.setActiveConnectionId.mockClear();
+    await controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-2" },
+    });
+    expect(view.setActiveConnectionId).toHaveBeenCalledWith("conn-2");
+    expect(activeConnectionId).toBe("conn-2");
+  });
+
+  it("does not apply a pending connection switch after disposal", async () => {
+    let activeConnectionId = "conn-1";
+    let resolveQuery: ((value: unknown) => void) | undefined;
+    const cancellations: Array<() => void> = [];
+    const driver = {
+      query: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveQuery = resolve;
+          }),
+      ),
+      cancelCurrentOperation: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            cancellations.push(resolve);
+          }),
+      ),
+    };
+    const connectionManager = {
+      getConnection: vi.fn((id: string) => ({ id, name: id, type: "pg" })),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => driver),
+      getQueryRowLimit: vi.fn(() => 100),
+      addToHistory: vi.fn(async () => undefined),
+      getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => activeConnectionId),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn((id: string) => {
+        activeConnectionId = id;
+      }),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select slow", connectionId: "conn-1" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+
+    const pendingSwitch = controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-2" },
+    });
+    await vi.waitFor(() => expect(cancellations).toHaveLength(1));
+
+    const disposing = controller.dispose();
+    await vi.waitFor(() => expect(cancellations).toHaveLength(2));
+    view.postMessage.mockClear();
+    for (const settle of cancellations) settle();
+    await pendingSwitch;
+    await disposing;
+
+    expect(view.setActiveConnectionId).not.toHaveBeenCalled();
+    expect(view.syncTitle).not.toHaveBeenCalled();
+    expect(connectionManager.getSchemaAsync).not.toHaveBeenCalled();
+    expect(view.postMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "schema" }),
+    );
+    expect(activeConnectionId).toBe("conn-1");
+
+    resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
+    await running;
+  });
+
+  it("resolves schema pushes to the pending connection while a switch is in flight", async () => {
+    let activeConnectionId = "conn-1";
+    let resolveQuery: ((value: unknown) => void) | undefined;
+    const cancellations: Array<() => void> = [];
+    const driver = {
+      query: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            resolveQuery = resolve;
+          }),
+      ),
+      cancelCurrentOperation: vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            cancellations.push(resolve);
+          }),
+      ),
+    };
+    const connectionManager = {
+      getConnection: vi.fn((id: string) => ({ id, name: id, type: "pg" })),
+      getConnections: vi.fn(() => []),
+      getQueryEditorPresentation: vi.fn(() => undefined),
+      getDriverCapabilities: vi.fn(() => ({})),
+      isConnected: vi.fn(() => true),
+      getDriver: vi.fn(() => driver),
+      getQueryRowLimit: vi.fn(() => 100),
+      addToHistory: vi.fn(async () => undefined),
+      getSchemaAsync: vi.fn(async () => []),
+      getSchemaSnapshotState: vi.fn(() => ({ status: "loaded" })),
+    };
+    const view = {
+      getActiveConnectionId: vi.fn(() => activeConnectionId),
+      getInitialConnectionId: vi.fn(() => "conn-1"),
+      getLastQueryResult: vi.fn(() => null),
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn((id: string) => {
+        activeConnectionId = id;
+      }),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(
+      connectionManager as never,
+      view,
+    );
+
+    const running = controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select slow", connectionId: "conn-1" },
+    });
+    await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+
+    const pendingSwitch = controller.handleMessage({
+      type: "activeConnectionChanged",
+      payload: { connectionId: "conn-2" },
+    });
+    await vi.waitFor(() => expect(cancellations).toHaveLength(1));
+
+    controller.handleConnectionsChanged();
+    await vi.waitFor(() =>
+      expect(connectionManager.getSchemaAsync).toHaveBeenCalledWith("conn-2"),
+    );
+    expect(connectionManager.getSchemaAsync).not.toHaveBeenCalledWith("conn-1");
+
+    cancellations[0]();
+    await pendingSwitch;
+    expect(activeConnectionId).toBe("conn-2");
+
+    resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
+    await running;
   });
 });

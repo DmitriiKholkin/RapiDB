@@ -1,9 +1,14 @@
 import { EventEmitter } from "node:events";
 import * as mssql from "mssql";
+import { Client } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
-import type { BoundedPostgresQuery } from "../../src/extension/dbDrivers/postgresBoundedQuery";
+import {
+  type BoundedPostgresQuery,
+  POSTGRES_MAX_RETAINED_RESULT_COLUMNS,
+  POSTGRES_MAX_RETAINED_RESULT_SETS,
+} from "../../src/extension/dbDrivers/postgresBoundedQuery";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 import { mockMssqlSessionPool } from "../helpers/mssqlQuerySessionHarness";
 
@@ -55,7 +60,69 @@ function postgresHarness(run: (query: WireQuery) => void) {
 }
 
 describe("driver-owned result budgets", () => {
-  it("PG drains many real Query protocol results without pg buffering rows or accumulating result builders", async () => {
+  it("PG waits for rollback after ErrorResponse before releasing a previously idle client", async () => {
+    const client = new Client();
+    Reflect.set(client, "readyForQuery", true);
+    Reflect.set(client, "_txStatus", "I");
+    const getTransactionStatus = () =>
+      Reflect.get(client, "getTransactionStatus").call(client);
+    const release = vi.fn();
+    Reflect.set(client, "release", release);
+    const deliver = (method: string, message: unknown) =>
+      Reflect.get(client, method).call(client, message);
+    let errorDelivered!: () => void;
+    const failed = new Promise<void>((resolve) => {
+      errorDelivered = resolve;
+    });
+    const sent: string[] = [];
+    Reflect.get(client, "connection").query = (sql: string) => {
+      sent.push(sql);
+      if (sql === "ROLLBACK") return;
+      queueMicrotask(() => {
+        deliver("_handleCommandComplete", { text: "BEGIN" });
+        deliver("_handleRowDescription", { fields: [field()] });
+        deliver("_handleDataRow", { fields: ["1"] });
+        deliver("_handleCommandComplete", { text: "SELECT 1" });
+        deliver(
+          "_handleErrorMessage",
+          Object.assign(new Error("division by zero"), { code: "22012" }),
+        );
+        errorDelivered();
+      });
+    };
+    const query = vi.spyOn(client, "query");
+    const driver = new PostgresDriver({
+      id: "ready-race",
+      name: "PG",
+      type: "pg",
+    });
+    Reflect.set(driver, "pool", {
+      connect: async () => client,
+      totalCount: 0,
+      idleCount: 1,
+      waitingCount: 0,
+    });
+    const sql = "BEGIN; SELECT 1; SELECT 1/0";
+    const pending = driver.query(sql, undefined, { hardCap: 2 });
+    await failed;
+    await vi.waitFor(() => expect(query).toHaveBeenCalledWith("ROLLBACK"));
+    expect(getTransactionStatus()).toBe("I");
+    expect(release).not.toHaveBeenCalled();
+    expect(sent).toEqual([sql]);
+    deliver("_handleReadyForQuery", { status: "E" });
+    expect(sent).toEqual([sql, "ROLLBACK"]);
+    expect(release).not.toHaveBeenCalled();
+    deliver("_handleCommandComplete", { text: "ROLLBACK" });
+    deliver("_handleReadyForQuery", { status: "I" });
+    expect(await pending).toMatchObject({
+      rows: [{ __col_0: 1 }],
+      error: "division by zero",
+    });
+    expect(getTransactionStatus()).toBe("I");
+    expect(release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("PG exposes every Query protocol result without pg buffering rows or accumulating result builders", async () => {
     let peakRetained = 0;
     let peakInternal = 0;
     let peakBuilders = 0;
@@ -94,27 +161,88 @@ describe("driver-owned result budgets", () => {
     expect(peakBuilders).toBe(1);
     expect(result).toMatchObject({
       columns: ["same", "same"],
-      rowCount: 120,
+      rowCount: 9600,
       affectedRows: 120,
       truncated: true,
     });
     expect(result.rows).toEqual([
-      { __col_0: 79000, __col_1: 1 },
-      { __col_0: 79001, __col_1: 2 },
-      { __col_0: 79002, __col_1: 3 },
+      { __col_0: 0, __col_1: 1 },
+      { __col_0: 1, __col_1: 2 },
+      { __col_0: 2, __col_1: 3 },
     ]);
+    expect(result.resultSets).toHaveLength(80);
+    expect(result.resultSets?.[0]).toMatchObject({
+      id: "result-1",
+      rowCount: 120,
+      truncated: true,
+      rows: [
+        { __col_0: 0, __col_1: 1 },
+        { __col_0: 1, __col_1: 2 },
+        { __col_0: 2, __col_1: 3 },
+      ],
+    });
+    expect(result.resultSets?.[79]).toMatchObject({
+      id: "result-80",
+      rowCount: 120,
+      truncated: true,
+      rows: [],
+    });
+    expect(
+      result.resultSets?.reduce(
+        (total, resultSet) => total + resultSet.rows.length,
+        0,
+      ),
+    ).toBeLessThanOrEqual(3);
     expect(client.release).toHaveBeenCalledExactlyOnceWith();
     expect(formatQueryResult(result, 10)).toMatchObject({
       truncated: true,
-      rowCount: 120,
+      rowCount: 9600,
       affectedRows: 120,
     });
+  });
+
+  it("PG bounds retained result-set metadata by count and total column count", async () => {
+    const { driver } = postgresHarness((query) => {
+      for (let set = 0; set < POSTGRES_MAX_RETAINED_RESULT_SETS + 1; set++) {
+        query.handleRowDescription({ fields: [field(`set_${set}`)] });
+        query.handleCommandComplete({ text: "SELECT 0" }, {});
+      }
+      query.handleReadyForQuery({});
+    });
+
+    const manySets = await driver.query("many result sets", undefined, {
+      hardCap: 10,
+    });
+    expect(manySets.resultSets).toHaveLength(POSTGRES_MAX_RETAINED_RESULT_SETS);
+    expect(manySets.resultSetsTruncated).toBe(true);
+
+    const wideDriverHarness = postgresHarness((query) => {
+      query.handleRowDescription({
+        fields: Array.from(
+          { length: POSTGRES_MAX_RETAINED_RESULT_COLUMNS + 1 },
+          (_, index) => field(`column_${index}`),
+        ),
+      });
+      query.handleCommandComplete({ text: "SELECT 0" }, {});
+      query.handleReadyForQuery({});
+    });
+    const wideSet = await wideDriverHarness.driver.query(
+      "one very wide result set",
+      undefined,
+      { hardCap: 10 },
+    );
+    expect(wideSet).toMatchObject({
+      columns: [],
+      rows: [],
+      resultSetsTruncated: true,
+    });
+    expect(wideSet.columnMeta).toBeUndefined();
   });
 
   it.each([
     "empty SELECT",
     "final DML",
-  ])("PG keeps last-command semantics for %s after a large earlier result", async (last) => {
+  ])("PG keeps earlier rowsets available after a %s", async (last) => {
     const { driver } = postgresHarness((query) => {
       query.handleRowDescription({ fields: [field()] });
       for (let row = 0; row < 20; row++)
@@ -129,10 +257,163 @@ describe("driver-owned result budgets", () => {
       query.handleReadyForQuery({});
     });
     const result = await driver.query("script", undefined, { hardCap: 2 });
-    expect(result.rows).toEqual([]);
-    expect(result.truncated).toBe(false);
-    expect(result.columns).toEqual(last === "empty SELECT" ? ["empty"] : []);
-    expect(result.rowCount).toBe(last === "empty SELECT" ? 0 : 42);
+    expect(result.rows).toEqual([{ __col_0: 0 }, { __col_0: 1 }]);
+    expect(result.truncated).toBe(true);
+    expect(result.columns).toEqual(["id"]);
+    expect(result.rowCount).toBe(20);
+    expect(result.resultSets).toHaveLength(last === "empty SELECT" ? 2 : 1);
+    expect(result.resultSets?.[0]).toMatchObject({
+      columns: ["id"],
+      rowCount: 20,
+      truncated: true,
+    });
+    if (last === "empty SELECT") {
+      expect(result.resultSets?.[1]).toMatchObject({
+        columns: ["empty"],
+        rowCount: 0,
+      });
+    } else {
+      expect(result.affectedRows).toBe(42);
+    }
+  });
+
+  it("PG maps every rowset returned by the unbounded pg client path", async () => {
+    const driver = new PostgresDriver({
+      id: "pg-unbounded",
+      name: "PG",
+      type: "pg",
+      host: "localhost",
+    });
+    const client = {
+      query: vi.fn(async () => [
+        {
+          command: "SELECT",
+          fields: [field("first_result")],
+          rows: [[1]],
+          rowCount: 1,
+        },
+        {
+          command: "SELECT",
+          fields: [field("second_result")],
+          rows: [[2]],
+          rowCount: 1,
+        },
+      ]),
+      release: vi.fn(),
+    };
+    (driver as unknown as { pool: unknown }).pool = {
+      connect: vi.fn(async () => client),
+      totalCount: 0,
+      idleCount: 1,
+      waitingCount: 0,
+    };
+
+    const result = await driver.query(
+      "SELECT 1 AS first_result; SELECT 2 AS second_result",
+    );
+
+    expect(result).toMatchObject({
+      columns: ["first_result"],
+      rows: [{ __col_0: 1 }],
+      rowCount: 2,
+      resultSets: [
+        {
+          id: "result-1",
+          columns: ["first_result"],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+          truncated: false,
+        },
+        {
+          id: "result-2",
+          columns: ["second_result"],
+          rows: [{ __col_0: 2 }],
+          rowCount: 1,
+          truncated: false,
+        },
+      ],
+    });
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("PG marks timestamp results temporal and leaves text untyped", async () => {
+    const driver = new PostgresDriver({
+      id: "pg-temporal-meta",
+      name: "PG",
+      type: "pg",
+      host: "localhost",
+    });
+    const client = {
+      query: vi.fn(async () => ({
+        command: "SELECT",
+        fields: [
+          { ...field("ts"), dataTypeID: 1114 },
+          { ...field("tstz"), dataTypeID: 1184 },
+          { ...field("label"), dataTypeID: 25 },
+        ],
+        rows: [
+          [
+            "2024-01-01 10:00:00",
+            "2024-01-01 10:00:00+00",
+            "2024-01-01T10:00:00.000Z",
+          ],
+        ],
+        rowCount: 1,
+      })),
+      release: vi.fn(),
+    };
+    (driver as unknown as { pool: unknown }).pool = {
+      connect: vi.fn(async () => client),
+      totalCount: 0,
+      idleCount: 1,
+      waitingCount: 0,
+    };
+
+    const result = await driver.query("SELECT ts, tstz, label FROM t");
+
+    expect(result.columnMeta).toEqual([
+      { category: "datetime" },
+      { category: "datetime" },
+      { category: null },
+    ]);
+  });
+
+  it("PG preserves completed rowsets and reports a later statement error", async () => {
+    const { driver } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field("first_result")] });
+      query.handleDataRow({ fields: ["1"] });
+      query.handleCommandComplete({ text: "SELECT 1" }, {});
+      query.handleRowDescription({ fields: [field("second_result")] });
+      query.handleError(new Error("division by zero"), {});
+    });
+
+    const result = await driver.query(
+      "SELECT 1 AS first_result; SELECT 1/0 AS second_result",
+      undefined,
+      { hardCap: 10 },
+    );
+
+    expect(result).toMatchObject({
+      columns: ["first_result"],
+      rows: [{ __col_0: 1 }],
+      rowCount: 1,
+      error: "division by zero",
+      resultSets: [
+        {
+          id: "result-1",
+          columns: ["first_result"],
+          rows: [{ __col_0: 1 }],
+          rowCount: 1,
+        },
+        {
+          id: "result-2",
+          columns: ["second_result"],
+          rows: [],
+          rowCount: 0,
+          partial: true,
+        },
+      ],
+    });
   });
 
   it.each([
@@ -154,7 +435,7 @@ describe("driver-owned result budgets", () => {
 
   it.each([
     1, 3, 4,
-  ])("PG reports truncation only for the final %i-row result, not discarded earlier sets", async (finalCount) => {
+  ])("PG enforces a shared retained-row budget across result sets with a %i-row final set", async (finalCount) => {
     const { driver } = postgresHarness((query) => {
       for (const [name, count] of [
         ["earlier", 20],
@@ -179,15 +460,28 @@ describe("driver-owned result budgets", () => {
       },
     );
     expect(result).toMatchObject({
-      columns: ["final"],
-      rowCount: finalCount,
-      truncated: finalCount > 3,
+      columns: ["earlier"],
+      rowCount: 20 + finalCount,
+      truncated: true,
     });
     expect(result.rows).toEqual(
-      Array.from({ length: Math.min(finalCount, 3) }, (_, index) => ({
+      Array.from({ length: 3 }, (_, index) => ({
         __col_0: index,
       })),
     );
+    expect(result.resultSets).toHaveLength(2);
+    expect(result.resultSets?.[1]).toMatchObject({
+      columns: ["final"],
+      rowCount: finalCount,
+      rows: [],
+      truncated: true,
+    });
+    expect(
+      result.resultSets?.reduce(
+        (total, resultSet) => total + resultSet.rows.length,
+        0,
+      ),
+    ).toBe(3);
   });
 
   it("PG keeps draining a bounded writable query until real pg ReadyForQuery completion", async () => {
@@ -225,18 +519,153 @@ describe("driver-owned result budgets", () => {
     expect(client.release).toHaveBeenCalledExactlyOnceWith();
   });
 
-  it("PG propagates a late server error and destroys the incomplete connection exactly once", async () => {
+  it("PG preserves partial rows from a single SELECT before a late server error", async () => {
     const { driver, client } = postgresHarness((query) => {
       query.handleRowDescription({ fields: [field()] });
       for (let row = 0; row < 20; row++)
         query.handleDataRow({ fields: [String(row)] });
       query.handleError(new Error("late failure"), {});
     });
+    const result = await driver.query(
+      "SELECT id FROM rows_that_fail_late",
+      undefined,
+      { hardCap: 2, readOnly: true },
+    );
+    expect(result).toMatchObject({
+      columns: ["id"],
+      rows: [{ __col_0: 0 }, { __col_0: 1 }],
+      rowCount: 20,
+      truncated: true,
+      error: "late failure",
+      resultSets: [
+        {
+          id: "result-1",
+          columns: ["id"],
+          rowCount: 20,
+          truncated: true,
+          partial: true,
+        },
+      ],
+    });
+    expect(client.query).toHaveBeenCalledWith("ROLLBACK");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("PG marks streamed rows partial when a row parser fails before ReadyForQuery", async () => {
+    const { driver } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field()] });
+      query.handleDataRow({ fields: ["17"] });
+      const resultBuilder = Reflect.get(query, "_result") as unknown as {
+        _parsers: Array<(value: unknown) => unknown>;
+      };
+      resultBuilder._parsers[0] = () => {
+        throw new Error("row parser failed");
+      };
+      query.handleDataRow({ fields: ["malformed"] });
+      query.handleCommandComplete({ text: "SELECT 2" }, {});
+      query.handleReadyForQuery({});
+    });
+
+    const result = await driver.query(
+      "SELECT value FROM malformed_rows",
+      undefined,
+      { hardCap: 10 },
+    );
+
+    expect(result).toMatchObject({
+      columns: ["id"],
+      rows: [{ __col_0: 17 }],
+      rowCount: 1,
+      error: "row parser failed",
+      resultSets: [
+        {
+          partial: true,
+          rowCount: 1,
+        },
+      ],
+    });
+  });
+
+  it("PG keeps earlier complete sets and marks sets skipped after parser failure partial", async () => {
+    const { driver } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field("before")] });
+      query.handleDataRow({ fields: ["1"] });
+      query.handleCommandComplete({ text: "SELECT 1" }, {});
+      query.handleRowDescription({ fields: [field("failing")] });
+      query.handleDataRow({ fields: ["10"] });
+      const builder = Reflect.get(query, "_result") as unknown as {
+        _parsers: Array<(value: unknown) => unknown>;
+      };
+      builder._parsers[0] = () => {
+        throw new Error("parser failed");
+      };
+      query.handleDataRow({ fields: ["bad"] });
+      query.handleCommandComplete({ text: "SELECT 2" }, {});
+      query.handleRowDescription({ fields: [field("after")] });
+      query.handleDataRow({ fields: ["100"] });
+      query.handleCommandComplete({ text: "SELECT 1" }, {});
+      query.handleReadyForQuery({});
+    });
+    const result = await driver.query(
+      "SELECT before; SELECT failing; SELECT after",
+      undefined,
+      { hardCap: 10 },
+    );
+    expect(result.error).toBe("parser failed");
+    expect(result.resultSets).toMatchObject([
+      { rows: [{ __col_0: 1 }], rowCount: 1 },
+      { rows: [{ __col_0: 10 }], rowCount: 1, partial: true },
+      { rows: [], rowCount: 0, partial: true },
+    ]);
+    expect(result.resultSets?.[0]).not.toHaveProperty("partial", true);
+    const formatted = formatQueryResult(result, 10);
+    expect(formatted.resultSets?.[1].partial).toBe(true);
+    expect(formatted.resultSets?.[2].partial).toBe(true);
+  });
+
+  it("PG retains a partial set after a later command without RowDescription", async () => {
+    const { driver } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field()] });
+      query.handleDataRow({ fields: ["17"] });
+      const builder = Reflect.get(query, "_result") as unknown as {
+        _parsers: Array<(value: unknown) => unknown>;
+      };
+      builder._parsers[0] = () => {
+        throw new Error("parser failed");
+      };
+      query.handleDataRow({ fields: ["bad"] });
+      query.handleCommandComplete({ text: "SELECT 2" }, {});
+      query.handleCommandComplete({ text: "UPDATE 1" }, {});
+      query.handleReadyForQuery({});
+    });
+    const result = await driver.query(
+      "SELECT failing; UPDATE mock",
+      undefined,
+      { hardCap: 10 },
+    );
+    expect(result.resultSets).toMatchObject([
+      { rows: [{ __col_0: 17 }], rowCount: 1, partial: true },
+    ]);
+    expect(result.error).toBe("parser failed");
+  });
+
+  it("PG does not label a parser failure before any decoded row as a completed result", async () => {
+    const { driver, client } = postgresHarness((query) => {
+      query.handleRowDescription({ fields: [field()] });
+      const builder = Reflect.get(query, "_result") as unknown as {
+        _parsers: Array<(value: unknown) => unknown>;
+      };
+      builder._parsers[0] = () => {
+        throw new Error("first row parser failed");
+      };
+      query.handleDataRow({ fields: ["bad"] });
+      query.handleCommandComplete({ text: "SELECT 1" }, {});
+      query.handleReadyForQuery({});
+    });
     await expect(
-      driver.query("script", undefined, { hardCap: 2, readOnly: true }),
-    ).rejects.toThrow("late failure");
-    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
-    expect(client.query).not.toHaveBeenCalledWith("ROLLBACK");
+      driver.query("SELECT failing", undefined, { hardCap: 10 }),
+    ).rejects.toThrow("first row parser failed");
+    expect(client.release).toHaveBeenCalledOnce();
   });
 
   it("PG still supports targeted cancellation of a draining bounded query", async () => {
@@ -336,10 +765,18 @@ describe("driver-owned result budgets", () => {
     const result = await pending;
     expect(result).toMatchObject({
       columns: ["same", "same"],
-      rowCount: 1000,
+      rowCount: 60000,
       affectedRows: 60000,
-      truncated: true,
     });
+    expect(result.resultSets).toHaveLength(60);
+    expect(
+      result.resultSets?.every(
+        (set) => set.rowCount === 1000 && set.truncated === true,
+      ),
+    ).toBe(true);
+    expect(
+      result.resultSets?.reduce((total, set) => total + set.rows.length, 0),
+    ).toBe(3);
     expect(result.rows).toEqual([
       { __col_0: 0, __col_1: -0 },
       { __col_0: 1, __col_1: -1 },
@@ -349,7 +786,7 @@ describe("driver-owned result budgets", () => {
     expect(request.query).toHaveBeenCalledWith("UPDATE items SET x = 1");
   });
 
-  it("MSSQL preserves last-GO-batch selection and empty final result metadata", async () => {
+  it("MSSQL preserves first-GO selection and every later empty result set", async () => {
     const requests = [new Request(), new Request()];
     requests[0].query.mockImplementation(async () => {
       requests[0].emit("recordset", [column("before")]);
@@ -360,18 +797,32 @@ describe("driver-owned result budgets", () => {
       requests[1].emit("recordset", [column("empty")]);
       return { rowsAffected: [0], recordsets: [] };
     });
-    expect(
-      await mssqlHarness(requests).query(
-        "SELECT 1\nGO\nSELECT 2 WHERE 0=1",
-        undefined,
-        { hardCap: 2 },
-      ),
-    ).toMatchObject({
-      columns: ["empty"],
-      rows: [],
-      rowCount: 0,
-      truncated: false,
+    const result = await mssqlHarness(requests).query(
+      "SELECT 1\nGO\nSELECT 2 WHERE 0=1",
+      undefined,
+      { hardCap: 2 },
+    );
+    expect(result).toMatchObject({
+      columns: ["before"],
+      rows: [{ __col_0: 0 }, { __col_0: 1 }],
+      rowCount: 100,
     });
+    expect(result.resultSets).toMatchObject([
+      {
+        id: "result-1",
+        columns: ["before"],
+        rows: [{ __col_0: 0 }, { __col_0: 1 }],
+        rowCount: 100,
+        truncated: true,
+      },
+      {
+        id: "result-2",
+        columns: ["empty"],
+        rows: [],
+        rowCount: 0,
+        truncated: false,
+      },
+    ]);
     expect(
       requests.every(
         (request) => request.stream && request.eventNames().length === 0,
@@ -395,7 +846,10 @@ describe("driver-owned result budgets", () => {
       columns: ["JSON_result"],
       rows: [{ __col_0: '[{"id":1},{"id":2}]' }],
       rowCount: 1,
+    });
+    expect(result.resultSets?.[0]).toMatchObject({
       truncated: false,
+      rowCount: 1,
     });
   });
 
@@ -410,11 +864,20 @@ describe("driver-owned result budgets", () => {
       drained = true;
       return { rowsAffected: [100], recordsets: [] };
     });
-    await expect(
-      mssqlHarness([request]).query("UPDATE items SET x=1", undefined, {
+    const result = await mssqlHarness([request]).query(
+      "UPDATE items SET x=1",
+      undefined,
+      {
         hardCap: 2,
-      }),
-    ).rejects.toThrow("late SQL failure");
+      },
+    );
+    expect(result.error).toBe("late SQL failure");
+    expect(result.rows).toEqual([{ __col_0: 0 }, { __col_0: 1 }]);
+    expect(result.resultSets?.[0]).toMatchObject({
+      partial: true,
+      truncated: true,
+      rowCount: 100,
+    });
     expect(drained).toBe(true);
     expect(request.cancel).not.toHaveBeenCalled();
     expect(request.eventNames()).toEqual([]);

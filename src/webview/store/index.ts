@@ -5,7 +5,10 @@ import type {
   QueryColumnMeta,
   QueryMissingCell,
 } from "../../shared/tableTypes";
-import type { QueryEditorPresentation } from "../../shared/webviewContracts";
+import type {
+  QueryEditorPresentation,
+  QueryResultSet,
+} from "../../shared/webviewContracts";
 
 export interface QueryResult {
   operationId?: string;
@@ -14,6 +17,8 @@ export interface QueryResult {
   columns: string[];
   columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  resultSets?: QueryResultSet[];
+  resultSetsTruncated?: boolean;
   responseMetadata?: Record<string, unknown>[];
   missingCells?: QueryMissingCell[];
   rowCount: number;
@@ -27,10 +32,18 @@ export interface QueryResult {
 
 export type QueryStatus = "idle" | "running" | "success" | "error";
 
+export interface QueryOperation {
+  operationId: string;
+  connectionId: string;
+}
+
 export interface QueryState {
   status: QueryStatus;
   result: QueryResult | null;
-  setRunning: () => void;
+  activeOperation: QueryOperation | null;
+  operationSequence: number;
+  nextOperationId: (panelId: string) => string;
+  setRunning: (operation: QueryOperation) => void;
   setResult: (result: QueryResult) => void;
   setError: (error: string) => void;
   reset: () => void;
@@ -41,13 +54,38 @@ const WEBVIEW_QUERY_RESULT_HARD_CAP = QUERY_LIMIT_POLICY.hardCap;
 function normalizeQueryResult(result: QueryResult): QueryResult {
   const columnMeta = Array.isArray(result.columnMeta) ? result.columnMeta : [];
   const rows = Array.isArray(result.rows) ? result.rows : [];
+  let remainingRows = WEBVIEW_QUERY_RESULT_HARD_CAP;
+  const resultSets = result.resultSets?.map((resultSet) => {
+    const setRows = Array.isArray(resultSet.rows) ? resultSet.rows : [];
+    const cappedRows = setRows.slice(0, remainingRows);
+    remainingRows = Math.max(0, remainingRows - cappedRows.length);
+    const setTruncated =
+      resultSet.truncated === true || cappedRows.length < setRows.length;
+    return {
+      ...resultSet,
+      rows: cappedRows,
+      rowCount:
+        cappedRows.length < setRows.length
+          ? Math.max(resultSet.rowCount, setRows.length)
+          : resultSet.rowCount,
+      truncated: setTruncated,
+      ...(setTruncated ? { truncatedAt: cappedRows.length } : {}),
+    };
+  });
   const rowCount =
     Number.isFinite(result.rowCount) && result.rowCount >= 0
       ? result.rowCount
       : rows.length;
   const rowsExceedHardCap = rows.length > WEBVIEW_QUERY_RESULT_HARD_CAP;
 
-  if (!rowsExceedHardCap && columnMeta === result.columnMeta) {
+  const resultSetsChanged = resultSets?.some(
+    (resultSet, index) => resultSet !== result.resultSets?.[index],
+  );
+  if (
+    !rowsExceedHardCap &&
+    !resultSetsChanged &&
+    columnMeta === result.columnMeta
+  ) {
     return result;
   }
 
@@ -58,12 +96,13 @@ function normalizeQueryResult(result: QueryResult): QueryResult {
   const normalized: QueryResult = {
     ...result,
     columnMeta,
+    ...(resultSets ? { resultSets } : {}),
     rows: cappedRows,
     rowCount: rowsExceedHardCap ? Math.max(rowCount, rows.length) : rowCount,
     truncated: normalizedTruncated,
   };
 
-  if (normalizedTruncated && normalized.truncatedAt === undefined) {
+  if (normalizedTruncated) {
     normalized.truncatedAt = cappedRows.length;
   }
 
@@ -103,10 +142,18 @@ export interface SchemaState {
   getSchema: (connectionId: string) => SchemaObject[];
 }
 
-export const useQueryStore = create<QueryState>((set) => ({
+export const useQueryStore = create<QueryState>((set, get) => ({
   status: "idle",
   result: null,
-  setRunning: () => set({ status: "running", result: null }),
+  activeOperation: null,
+  operationSequence: 0,
+  nextOperationId: (panelId) => {
+    const operationSequence = get().operationSequence + 1;
+    set({ operationSequence });
+    return `${panelId}:${operationSequence}`;
+  },
+  setRunning: (operation) =>
+    set({ status: "running", result: null, activeOperation: operation }),
   setResult: (result) =>
     set({ status: "success", result: normalizeQueryResult(result) }),
   setError: (error) =>
@@ -121,7 +168,7 @@ export const useQueryStore = create<QueryState>((set) => ({
         error,
       },
     }),
-  reset: () => set({ status: "idle", result: null }),
+  reset: () => set({ status: "idle", result: null, activeOperation: null }),
 }));
 
 export const useConnectionStore = create<ConnectionState>((set) => ({

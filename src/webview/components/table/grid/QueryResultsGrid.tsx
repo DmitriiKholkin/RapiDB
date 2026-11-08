@@ -44,9 +44,10 @@ import {
   TopSpacerRow,
 } from "../gridSubComponents";
 import { LargeMonacoDialog } from "../TableDialogs";
-import { HEADER_H, ROW_H } from "../tableConstants";
+import { HEADER_H, ROW_H } from "../tableViewHelpers";
 import { useCellSelection } from "../useCellSelection";
 import { useColumnDragReorder } from "../useColumnDragReorder";
+import { exactNumericSortingFn } from "./queryResultSorting";
 
 interface QueryResultsGridProps {
   result: QueryResult;
@@ -77,6 +78,7 @@ export function QueryResultsGrid({
   const [cellPreview, setCellPreview] = useState<{
     columnName: string;
     value: string;
+    isNull: boolean;
   } | null>(null);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
@@ -107,9 +109,12 @@ export function QueryResultsGrid({
       const columnIndex = Number.parseInt(columnId.replace("__col_", ""), 10);
       const isMissing =
         row !== undefined && missingCellKeys.has(`${row.index}:${columnIndex}`);
+      const isNull = !isMissing && raw == null;
       const displayValue = isMissing
         ? "MISSING"
-        : formatScalarValueForDisplay(raw);
+        : isNull
+          ? "NULL"
+          : formatScalarValueForDisplay(raw);
       const category = columnMeta[columnIndex]?.category;
       const isPlainText =
         category === "text" ||
@@ -120,6 +125,7 @@ export function QueryResultsGrid({
         setCellPreview({
           columnName: colNames[columnIndex] ?? columnId,
           value: displayValue,
+          isNull,
         });
         return;
       }
@@ -137,7 +143,7 @@ export function QueryResultsGrid({
       if (!colId) return undefined;
       const columnIndex = Number.parseInt(colId.replace("__col_", ""), 10);
       if (missingCellKeys.has(`${sortedRow.index}:${columnIndex}`)) {
-        return "MISSING";
+        return undefined;
       }
       return sortedRow.original[colId];
     },
@@ -242,6 +248,11 @@ export function QueryResultsGrid({
           id: key,
           accessorKey: key,
           header: name,
+          ...(category === "integer" ||
+          category === "decimal" ||
+          category === "float"
+            ? { sortingFn: exactNumericSortingFn, sortUndefined: false }
+            : {}),
           size: colSizes[key] ?? 160,
           minSize: 1,
           maxSize: 800,
@@ -278,7 +289,11 @@ export function QueryResultsGrid({
     onDragEnded: (activated) => {
       if (!activated) {
         wasDraggedRef.current = false;
+        return;
       }
+      setTimeout(() => {
+        wasDraggedRef.current = false;
+      }, 0);
     },
   });
 
@@ -358,6 +373,13 @@ export function QueryResultsGrid({
                     <th
                       key={header.id}
                       data-column-id={header.id}
+                      aria-sort={
+                        sorted === "asc"
+                          ? "ascending"
+                          : sorted === "desc"
+                            ? "descending"
+                            : "none"
+                      }
                       style={{
                         width: displayHeaderSize,
                         height: HEADER_H,
@@ -394,38 +416,64 @@ export function QueryResultsGrid({
                         isCollapsed={isCollapsed}
                         justifyContent="flex-start"
                       >
-                        <span
+                        <button
+                          type="button"
+                          aria-label={`Sort by ${colNames[Number.parseInt(header.column.id.replace("__col_", ""), 10)] ?? header.column.id}`}
+                          disabled={!header.column.getCanSort()}
                           style={{
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 4,
+                            minWidth: 0,
+                            maxWidth: "100%",
+                            padding: 0,
+                            border: "none",
+                            background: "transparent",
+                            color: "inherit",
+                            font: "inherit",
+                            cursor: "pointer",
+                            textAlign: "left",
+                          }}
+                          onMouseDown={(event) => event.stopPropagation()}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            wasDraggedRef.current = false;
+                            header.column.getToggleSortingHandler()?.(event);
                           }}
                         >
-                          {flexRender(
-                            header.column.columnDef.header,
-                            header.getContext(),
+                          <span
+                            style={{
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                            }}
+                          >
+                            {flexRender(
+                              header.column.columnDef.header,
+                              header.getContext(),
+                            )}
+                          </span>
+                          {sorted === "asc" && (
+                            <Icon
+                              name="triangle-up"
+                              size={10}
+                              style={{ opacity: 0.7 }}
+                            />
                           )}
-                        </span>
-                        {sorted === "asc" && (
-                          <Icon
-                            name="triangle-up"
-                            size={10}
-                            style={{ opacity: 0.7 }}
-                          />
-                        )}
-                        {sorted === "desc" && (
-                          <Icon
-                            name="triangle-down"
-                            size={10}
-                            style={{ opacity: 0.7 }}
-                          />
-                        )}
-                        {!sorted && header.column.getCanSort() && (
-                          <Icon
-                            name="unfold"
-                            size={10}
-                            style={{ opacity: 0.2 }}
-                          />
-                        )}
+                          {sorted === "desc" && (
+                            <Icon
+                              name="triangle-down"
+                              size={10}
+                              style={{ opacity: 0.7 }}
+                            />
+                          )}
+                          {!sorted && header.column.getCanSort() && (
+                            <Icon
+                              name="unfold"
+                              size={10}
+                              style={{ opacity: 0.2 }}
+                            />
+                          )}
+                        </button>
                       </HeaderContent>
 
                       {header.column.getCanResize() && (
@@ -484,7 +532,11 @@ export function QueryResultsGrid({
       {cellPreview && (
         <LargeMonacoDialog
           title={`Cell data: ${cellPreview.columnName}`}
-          description={`Text data in ${cellPreview.columnName}.`}
+          description={
+            cellPreview.isNull
+              ? `${cellPreview.columnName} is NULL (no value).`
+              : `Text data in ${cellPreview.columnName}.`
+          }
           value={cellPreview.value}
           language="plaintext"
           ariaLabel="Cell data"

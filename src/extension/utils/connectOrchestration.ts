@@ -12,6 +12,7 @@ export interface ConnectProgressClient {
     intent?: ConnectionConnectIntent,
   ): ConnectAttempt;
   isConnected(connectionId: string): boolean;
+  disconnectFrom(connectionId: string): Promise<void>;
 }
 
 export async function connectWithProgress(
@@ -37,10 +38,18 @@ export async function connectWithProgress(
 
   await withProgress(
     {
-      location: vscode.ProgressLocation.Window,
+      location: vscode.ProgressLocation.Notification,
       title,
+      cancellable: true,
     },
-    () => attempt.promise,
+    (_progress, token) => {
+      const cancellation = token?.onCancellationRequested(() => {
+        void connectionManager
+          .disconnectFrom(connectionId)
+          .catch(() => undefined);
+      });
+      return attempt.promise.finally(() => cancellation?.dispose());
+    },
   );
 
   return connectionManager.isConnected(connectionId);

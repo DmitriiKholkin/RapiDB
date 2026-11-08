@@ -28,7 +28,7 @@ import "../xyflow.css";
 import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
 import type { ErdGraph } from "../../shared/webviewContracts";
 import { onMessage, postMessage } from "../utils/messaging";
-import { readWebviewState, writeWebviewState } from "../utils/vscodeState";
+import { readWebviewState, updateWebviewState } from "../utils/vscodeState";
 import { GridLoadingOverlay } from "./GridOverlay";
 
 interface ErdGraphMessage {
@@ -86,7 +86,7 @@ const persistedState = (): ErdViewState => {
 };
 
 const persistState = (state: ErdViewState): void => {
-  writeWebviewState(state);
+  updateWebviewState((current) => ({ ...current, ...state }));
 };
 
 function matchesSearch(
@@ -137,6 +137,74 @@ function normalizeHandlePart(columnName: string): string {
 
 function handleId(side: "left" | "right", columnName: string): string {
   return `${side}-${normalizeHandlePart(columnName)}`;
+}
+
+const MAX_NOTICE_ITEMS = 5;
+
+function formatNoticeList<T>(
+  items: readonly T[],
+  format: (item: T) => string,
+): string {
+  const shown = items.slice(0, MAX_NOTICE_ITEMS).map(format).join(", ");
+  return items.length > MAX_NOTICE_ITEMS
+    ? `${shown}, and ${items.length - MAX_NOTICE_ITEMS} more`
+    : shown;
+}
+
+function formatQualifiedName(...parts: string[]): string {
+  return parts.filter(Boolean).join(".");
+}
+
+function formatColumnReference(table: string, columns: string[]): string {
+  return columns.length === 1
+    ? formatQualifiedName(table, columns[0])
+    : `${table}(${columns.join(", ")})`;
+}
+
+function buildGraphNotices(graph: ErdGraph | null): string[] {
+  if (!graph) {
+    return [];
+  }
+
+  const notices: string[] = [];
+  const omittedTables = graph.omittedTables ?? [];
+  if (omittedTables.length > 0) {
+    notices.push(
+      `Could not load ${omittedTables.length} table(s), so they are not shown: ${formatNoticeList(
+        omittedTables,
+        (table) =>
+          `${formatQualifiedName(table.schema, table.table)} (${table.error})`,
+      )}`,
+    );
+  }
+
+  const externalReferences = graph.externalReferences ?? [];
+  if (externalReferences.length > 0) {
+    const tablesById = new Map(graph.nodes.map((node) => [node.id, node]));
+    const qualifySource = !graph.scope.schema;
+    notices.push(
+      `${externalReferences.length} relationship(s) point to tables outside this diagram: ${formatNoticeList(
+        externalReferences,
+        (reference) => {
+          const source = tablesById.get(reference.fromTableId);
+          const sourceName = source
+            ? qualifySource
+              ? formatQualifiedName(source.schema, source.table)
+              : source.table
+            : "";
+          return `${formatColumnReference(
+            sourceName,
+            reference.fromColumns,
+          )} → ${formatColumnReference(
+            formatQualifiedName(reference.schema, reference.table),
+            reference.columns,
+          )}`;
+        },
+      )}`,
+    );
+  }
+
+  return notices;
 }
 
 function mergeNodePositions(
@@ -588,13 +656,13 @@ function mapCardinalityEnds(
 ): { start: CardinalityEnd; end: CardinalityEnd } {
   if (cardinality === "one-to-one") {
     return {
-      start: sourceNullable ? "zeroOrOne" : "oneOnly",
-      end: "zeroOrOne",
+      start: "zeroOrOne",
+      end: sourceNullable ? "zeroOrOne" : "oneOnly",
     };
   }
   if (cardinality === "many-to-one") {
     return {
-      start: sourceNullable ? "zeroOrMany" : "oneOrMany",
+      start: "zeroOrMany",
       end: sourceNullable ? "zeroOrOne" : "oneOnly",
     };
   }
@@ -1067,6 +1135,8 @@ export function ErdView({
 
   const visibilityFilterNodeIds = shouldHideUnmatched ? focusedNodeIds : null;
 
+  const graphNotices = useMemo(() => buildGraphNotices(graph), [graph]);
+
   const visibleGraph = useMemo(() => {
     if (!graph) {
       return {
@@ -1273,17 +1343,40 @@ export function ErdView({
   if (error && !hasCommittedGraph) {
     return (
       <div
+        role="alert"
         style={{
           margin: 12,
           padding: "10px 14px",
           borderRadius: 3,
           fontSize: 13,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 12,
           background: "var(--vscode-inputValidation-errorBackground)",
           border: "1px solid var(--vscode-inputValidation-errorBorder)",
           color: "var(--vscode-errorForeground)",
         }}
       >
-        <strong>Error:</strong> {error}
+        <span>
+          <strong>Error:</strong> {error}
+        </span>
+        <button
+          type="button"
+          onClick={handleReload}
+          style={{
+            flexShrink: 0,
+            cursor: "pointer",
+            fontSize: 12,
+            padding: "4px 10px",
+            border: "1px solid var(--vscode-button-border, transparent)",
+            borderRadius: 4,
+            background: "var(--vscode-button-background)",
+            color: "var(--vscode-button-foreground)",
+          }}
+        >
+          Retry
+        </button>
       </div>
     );
   }
@@ -1435,6 +1528,28 @@ export function ErdView({
           }}
         >
           {error}
+        </div>
+      ) : null}
+
+      {graphNotices.length > 0 ? (
+        <div
+          role="status"
+          aria-label="Diagram warnings"
+          style={{
+            margin: "8px 12px 0",
+            padding: "8px 12px",
+            fontSize: 12,
+            background: "var(--vscode-inputValidation-warningBackground)",
+            border: "1px solid var(--vscode-inputValidation-warningBorder)",
+            borderRadius: 4,
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          {graphNotices.map((notice) => (
+            <div key={notice}>{notice}</div>
+          ))}
         </div>
       ) : null}
 

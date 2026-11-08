@@ -1,4 +1,4 @@
-import React, { CSSProperties, ReactElement } from "react";
+import type { CSSProperties, ReactElement } from "react";
 
 const visuallyHiddenStyle: CSSProperties = {
   position: "absolute",

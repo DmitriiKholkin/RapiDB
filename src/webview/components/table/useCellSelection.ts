@@ -77,20 +77,22 @@ function serializeToTsv(
   isColumnCollapsed?: (colIndex: number) => boolean,
 ): string {
   const { minRow, maxRow, minCol, maxCol } = normalizeRange(range);
-  const rows: string[][] = [];
+  const rows: (string | null)[][] = [];
 
   for (let row = minRow; row <= maxRow; row++) {
-    const cells: string[] = [];
+    const cells: (string | null)[] = [];
     for (let col = minCol; col <= maxCol; col++) {
       if (isColumnCollapsed?.(col)) continue;
       const value = getCellValue(row, col);
       if (value === null || value === undefined) {
-        cells.push("NULL");
+        cells.push(null);
       } else {
         cells.push(formatScalarValueForDisplay(value));
       }
     }
-    rows.push(cells);
+    if (cells.length > 0) {
+      rows.push(cells);
+    }
   }
 
   return serializeTsv(rows);
@@ -464,11 +466,12 @@ export function useCellSelection({
         break;
       }
       case "Tab": {
-        event.preventDefault();
+        if (target !== scrollRef.current) break;
         const newCol = event.shiftKey
           ? Math.max(currentMinCol, activeCol - 1)
           : Math.min(currentColCount - 1, activeCol + 1);
         if (newCol === activeCol) break;
+        event.preventDefault();
         setRange({
           anchorRow: activeRow,
           anchorCol: newCol,

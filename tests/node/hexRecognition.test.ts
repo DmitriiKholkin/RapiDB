@@ -1,9 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import * as baseHex from "../../src/extension/dbDrivers/BaseDBDriver";
-import * as extractedHex from "../../src/extension/dbDrivers/hexUtils";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
-import { canonicalizeBinaryPersistedEditValue } from "../../src/extension/dbDrivers/persistedEditCanonicalizers";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableReadService } from "../../src/extension/table/tableReadService";
@@ -33,10 +32,8 @@ const oddHexValues = [
 ];
 const nonHexValues = ["0xGG", "\\xGG", "plain text", "0xAB CD", " 0xAB"];
 
-describe.each([
-  ["BaseDBDriver", baseHex],
-  ["hexUtils", extractedHex],
-] as const)("%s hex recognizer/parser contract", (_name, hex) => {
+describe("BaseDBDriver hex recognizer/parser contract", () => {
+  const hex = baseHex;
   it.each([
     ...oddHexValues,
     ...nonHexValues,
@@ -177,8 +174,16 @@ describe("binary result formatting", () => {
 
   it.each(
     oddHexValues,
-  )("rejects %j in the extracted binary edit canonicalizer", (value) => {
-    expect(canonicalizeBinaryPersistedEditValue(value)).toBeNull();
+  )("rejects %j in the PostgreSQL binary persisted-edit check", (value) => {
+    const driver = new PostgresDriver({
+      id: "hex-pg",
+      name: "Hex PostgreSQL",
+      type: "pg",
+    });
+    expect(driver.checkPersistedEdit(binaryColumn, value)).toMatchObject({
+      ok: false,
+      shouldVerify: false,
+    });
   });
 
   it("keeps empty text distinct from empty query-result bytes", () => {

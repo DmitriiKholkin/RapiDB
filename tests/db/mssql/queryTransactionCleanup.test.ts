@@ -4,8 +4,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { MSSQLDriver } from "../../../src/extension/dbDrivers/mssql";
 import type { ConnectionConfig } from "../../../src/shared/connectionConfig";
 
-// Explicit opt-in; never uses/reset the shared integration fixtures. Point at
-// a disposable local server only. Creates/drops just its own uniquely named table.
 const port = Number(process.env.RAPIDB_MSSQL_ISOLATION_PORT);
 const password = process.env.RAPIDB_MSSQL_ISOLATION_PASSWORD;
 const suite = port && password ? describe : describe.skip;
@@ -158,8 +156,25 @@ suite("MSSQL physical query-session cleanup (isolated live server)", () => {
         undefined,
         { hardCap },
       );
-      expect(result.columns).toEqual(["total"]);
-      expect(result.rows).toEqual([{ __col_0: 3 }]);
+      expect(result.columns).toEqual(["duplicate", "duplicate"]);
+      expect(result.rows).toEqual(
+        Array.from({ length: hardCap === 1 ? 1 : 3 }, () => ({
+          __col_0: 7,
+          __col_1: 7,
+        })),
+      );
+      expect(result.rowCount).toBe(4);
+      expect(result.resultSets).toHaveLength(2);
+      expect(result.resultSets?.[0]).toMatchObject({
+        rowCount: 3,
+        truncated: hardCap === 1,
+      });
+      expect(result.resultSets?.[1]).toMatchObject({
+        columns: ["total"],
+        rowCount: 1,
+        rows: hardCap === 1 ? [] : [{ __col_0: 3 }],
+        truncated: hardCap === 1,
+      });
       expect(await values()).toEqual([55, 0]);
       const empty = await driver.query(
         "SELECT 1 AS [empty] WHERE 1=0",

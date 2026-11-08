@@ -9,19 +9,39 @@ export class JsonNumericPrecisionError extends Error {
   }
 }
 
-export function parseJsonForWrite(text: string): unknown {
+export function isLosslessJsonNumberToken(token: string): boolean {
+  const number = Number(token);
+  if (!Number.isFinite(number)) return false;
+  if (
+    Number.isInteger(number) &&
+    compareNumericTokens(token, BigInt(number).toString()) === 0
+  )
+    return true;
+  const shortest = String(number);
+  return (
+    /[.eE]/.test(token) &&
+    /[.e]/.test(shortest) &&
+    compareNumericTokens(token, shortest) === 0
+  );
+}
+
+export function isRoundTripJsonNumberToken(token: string): boolean {
+  return (
+    isLosslessJsonNumberToken(token) &&
+    compareNumericTokens(token, String(Number(token))) === 0
+  );
+}
+
+export function parseJsonForWrite(
+  text: string,
+  isSafeToken: (token: string) => boolean = isLosslessJsonNumberToken,
+): unknown {
   const parsed: unknown = JSON.parse(text);
   const tokens = /"(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
   for (const match of text.matchAll(tokens)) {
     const token = match[0];
     if (token.startsWith('"')) continue;
-    const number = Number(token);
-    const actual = Number.isFinite(number)
-      ? Number.isInteger(number)
-        ? BigInt(number).toString()
-        : String(number)
-      : null;
-    if (actual === null || compareNumericTokens(token, actual) !== 0) {
+    if (!isSafeToken(token)) {
       throw new JsonNumericPrecisionError(token);
     }
   }

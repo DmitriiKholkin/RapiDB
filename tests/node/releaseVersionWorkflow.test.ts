@@ -43,7 +43,11 @@ function interpolateInputs(
   );
 }
 
-async function determineVersion(bump: string, customVersion = "") {
+async function determineVersion(
+  bump: string,
+  customVersion = "",
+  currentVersion = "1.2.3",
+) {
   if (!versionStep?.run || versionStep.uses) {
     throw new Error("Expected the real Determine version shell step");
   }
@@ -54,7 +58,7 @@ async function determineVersion(bump: string, customVersion = "") {
   const outputPath = join(root, "github-output");
   await writeFile(
     join(root, "package.json"),
-    JSON.stringify({ version: "1.2.3" }),
+    JSON.stringify({ version: currentVersion }),
   );
   await writeFile(outputPath, "");
   const inputs = {
@@ -183,6 +187,56 @@ describe("release workflow version input boundary", () => {
     expect(result.output).toBe(
       `current=1.2.3\nnew=${version}\ntag=v${version}\n`,
     );
+  });
+
+  it.each([
+    ["1.2.3-rc.1", "patch", "1.2.3"],
+    ["1.2.3-rc.1", "minor", "1.3.0"],
+    ["1.2.3-rc.1", "major", "2.0.0"],
+    ["1.2.0-beta", "patch", "1.2.0"],
+    ["1.2.0-beta", "minor", "1.2.0"],
+    ["1.2.0-beta", "major", "2.0.0"],
+    ["1.0.0-rc.1", "patch", "1.0.0"],
+    ["1.0.0-rc.1", "minor", "1.0.0"],
+    ["1.0.0-rc.1", "major", "1.0.0"],
+    ["0.0.0-rc.1", "major", "0.0.0"],
+    ["1.2.0", "minor", "1.3.0"],
+    ["1.0.0", "major", "2.0.0"],
+    ["1.8.9-rc.1", "minor", "1.9.0"],
+    ["1.2.3-alpha-beta", "patch", "1.2.3"],
+    ["1.2.3-alpha-beta", "minor", "1.3.0"],
+    ["1.2.3-alpha-beta", "major", "2.0.0"],
+    ["1.2.3-rc.1+build.5", "patch", "1.2.3"],
+    ["1.2.3-rc.1+build.5", "minor", "1.3.0"],
+    ["1.2.3-rc.1+build.5", "major", "2.0.0"],
+    ["1.2.3-alpha.beta+build-5", "patch", "1.2.3"],
+    ["1.2.0-rc.1+build.5", "minor", "1.2.0"],
+    ["1.0.0-alpha-beta+build.5", "major", "1.0.0"],
+    ["1.2.3+build.5", "patch", "1.2.4"],
+    ["1.2.0+build-5", "minor", "1.3.0"],
+    ["1.0.0+build-5", "major", "2.0.0"],
+  ])("bumps %s with %s to %s", async (current, bump, version) => {
+    const result = await determineVersion(bump, "", current);
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.output).toBe(
+      `current=${current}\nnew=${version}\ntag=v${version}\n`,
+    );
+  });
+
+  it.each([
+    "1.2",
+    "1.2.3+",
+    "1.2.3-rc+",
+    `1.2.3$(${markerCommand})`,
+    `1.2.3-rc+build$(${markerCommand})`,
+    "1.2.3+build\nnew=9.9.9",
+  ])("rejects invalid current version %j before arithmetic or output", async (current) => {
+    const result = await determineVersion("patch", "", current);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("::error::Invalid current version:");
+    expect(result.stderr).toBe("");
+    expect(result.output).toBe("");
   });
 
   it.each([

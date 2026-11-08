@@ -146,7 +146,6 @@ async function openSqliteExecutor(
   const db = await openSQLiteDatabase({
     filePath: connection.filePath,
     readOnly: connection.readOnly,
-    sqliteWalMode: connection.sqliteWalMode,
   });
   return {
     async execute(sql) {

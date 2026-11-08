@@ -23,19 +23,49 @@ const JSON_EXTENSION = "json";
 const LINE_BREAK = "\n";
 const LAST_EXPORT_DIRECTORY_STATE_KEY = "rapidb.lastExportDirectory";
 const NUMERIC_CSV_VALUE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const CSV_NULL_MARKER = "(NULL)";
 
 type ExportFormat = typeof CSV_EXTENSION | typeof JSON_EXTENSION;
+
+function trackCsvMarker(
+  state: Map<string, { marker: boolean; literal: boolean }>,
+  column: string,
+  marker: string,
+  isMarker: boolean,
+): void {
+  const key = JSON.stringify([column, marker]);
+  const entry = state.get(key) ?? { marker: false, literal: false };
+  if (isMarker) entry.marker = true;
+  else entry.literal = true;
+  if (entry.marker && entry.literal) {
+    throw new Error(
+      `CSV cannot distinguish ${JSON.stringify(marker)} from a missing or NULL value in column ${JSON.stringify(column)}. Export JSON instead.`,
+    );
+  }
+  state.set(key, entry);
+}
 
 function formatCsvExportCell(
   value: unknown,
   category: ColumnTypeMeta["category"] | QueryColumnMeta["category"] | null,
+  markerState: Map<string, { marker: boolean; literal: boolean }>,
+  column: string,
   nativeType?: string,
 ): string {
+  if (value == null) {
+    trackCsvMarker(markerState, column, CSV_NULL_MARKER, true);
+    return csvCell(CSV_NULL_MARKER);
+  }
   const formatted = formatTableCsvExportValue(value, category, nativeType);
+  if (formatted === "MISSING" || formatted === CSV_NULL_MARKER) {
+    trackCsvMarker(markerState, column, formatted, false);
+  }
   const trustedNumeric =
     (category === "integer" ||
       category === "float" ||
-      category === "decimal") &&
+      category === "decimal" ||
+      typeof value === "number" ||
+      typeof value === "bigint") &&
     NUMERIC_CSV_VALUE.test(formatted);
   return csvCell(formatted, trustedNumeric);
 }
@@ -44,14 +74,16 @@ export interface QueryResultExport {
   columns: readonly string[];
   columnMeta?: readonly QueryColumnMeta[];
   rows: readonly Record<string, unknown>[];
+  exportRows?: readonly Record<string, unknown>[];
   missingCells?: readonly QueryMissingCell[];
 }
 
 export interface ChunkedExportData {
   columns: ReadonlyArray<
-    Pick<ColumnTypeMeta, "name" | "category" | "nativeType">
+    Pick<ColumnTypeMeta, "name" | "category" | "exportCategory" | "nativeType">
   >;
   rows: ReadonlyArray<Record<string, unknown>>;
+  missingCells?: readonly QueryMissingCell[];
 }
 
 interface ExportRequest {
@@ -136,7 +168,12 @@ export async function exportTableDataAsCsv(options: {
     errorLabel: "CSV export failed",
     context,
     write: async (filePath, signal, state) => {
-      await writeChunkedCsv(filePath, loadChunks(signal), signal, state);
+      await writeChunkedCsv(
+        filePath,
+        lazyChunks(loadChunks, signal),
+        signal,
+        state,
+      );
     },
   });
 }
@@ -155,9 +192,21 @@ export async function exportTableDataAsJson(options: {
     errorLabel: "JSON export failed",
     context,
     write: async (filePath, signal, state) => {
-      await writeChunkedJson(filePath, loadChunks(signal), signal, state);
+      await writeChunkedJson(
+        filePath,
+        lazyChunks(loadChunks, signal),
+        signal,
+        state,
+      );
     },
   });
+}
+
+async function* lazyChunks(
+  loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>,
+  signal: AbortSignal,
+): AsyncIterable<ChunkedExportData> {
+  yield* loadChunks(signal);
 }
 
 async function runExport(request: ExportRequest): Promise<void> {
@@ -170,6 +219,12 @@ async function runExport(request: ExportRequest): Promise<void> {
   const saveUri = await vscode.window.showSaveDialog({
     defaultUri,
     filters: buildExportFilters(request.format),
+    ...(process.platform === "win32"
+      ? {
+          title:
+            "Export: choose a new file name (existing files cannot be replaced)",
+        }
+      : {}),
   });
   if (!saveUri) {
     return;
@@ -177,6 +232,7 @@ async function runExport(request: ExportRequest): Promise<void> {
 
   try {
     assertNotDirectoryDestination(saveUri.fsPath);
+    assertWindowsDestinationIsNew(saveUri.fsPath);
     if (request.context) {
       await persistLastExportDirectory(request.context, saveUri.fsPath);
     }
@@ -313,19 +369,36 @@ async function writeQueryResultsCsv(
           ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
         ),
       );
+      const markerState = new Map<
+        string,
+        { marker: boolean; literal: boolean }
+      >();
       for (const [rowIndex, row] of result.rows.entries()) {
         throwIfAborted(signal);
+        const exportRow = result.exportRows?.[rowIndex];
         await writeStreamChunk(
           writeStream,
           exportColumns
-            .map((column, columnIndex) =>
-              formatCsvExportCell(
-                missingCells.has(`${rowIndex}:${columnIndex}`)
-                  ? "MISSING"
-                  : row[column.sourceKey],
+            .map((column, columnIndex) => {
+              const missing =
+                missingCells.has(`${rowIndex}:${columnIndex}`) ||
+                (exportRow !== undefined &&
+                  !Object.hasOwn(exportRow, column.sourceKey));
+              if (missing) {
+                trackCsvMarker(markerState, column.key, "MISSING", true);
+                return csvCell("MISSING");
+              }
+              const value =
+                exportRow && Object.hasOwn(exportRow, column.sourceKey)
+                  ? exportRow[column.sourceKey]
+                  : row[column.sourceKey];
+              return formatCsvExportCell(
+                value,
                 column.category ?? null,
-              ),
-            )
+                markerState,
+                column.key,
+              );
+            })
             .join(",") + LINE_BREAK,
           signal,
         );
@@ -361,13 +434,20 @@ async function writeQueryResultsJson(
       for (let index = 0; index < result.rows.length; index++) {
         throwIfAborted(signal);
         const row = result.rows[index];
+        const exportRow = result.exportRows?.[index];
         await writeStreamChunk(
           writeStream,
           `${index === 0 ? "" : ",\n"}${serializeJsonExportRecord(
             exportColumns.map((column, columnIndex) => ({
               ...column,
-              value: row[column.sourceKey],
-              omit: missingCells.has(`${index}:${columnIndex}`),
+              value:
+                exportRow && Object.hasOwn(exportRow, column.sourceKey)
+                  ? exportRow[column.sourceKey]
+                  : row[column.sourceKey],
+              omit:
+                missingCells.has(`${index}:${columnIndex}`) ||
+                (exportRow !== undefined &&
+                  !Object.hasOwn(exportRow, column.sourceKey)),
             })),
           )}`,
           signal,
@@ -392,10 +472,22 @@ async function writeChunkedCsv(
     async (writeStream) => {
       let headerColumns: ChunkedExportData["columns"] | undefined;
       let headerByName: ReturnType<typeof indexExportColumns> | undefined;
+      const markerState = new Map<
+        string,
+        { marker: boolean; literal: boolean }
+      >();
 
       for await (const chunk of chunks) {
         throwIfAborted(signal);
         const currentByName = indexExportColumns(chunk.columns);
+        const currentColumnIndexByName = new Map(
+          chunk.columns.map((column, index) => [column.name, index]),
+        );
+        const missingCells = new Set(
+          chunk.missingCells?.map(
+            ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
+          ),
+        );
         if (!headerColumns) {
           headerColumns = chunk.columns.map((column) => ({ ...column }));
           headerByName = indexExportColumns(headerColumns);
@@ -415,6 +507,7 @@ async function writeChunkedCsv(
           }
           if (
             header.category !== column.category ||
+            header.exportCategory !== column.exportCategory ||
             header.nativeType !== column.nativeType
           ) {
             throw new Error(
@@ -423,19 +516,30 @@ async function writeChunkedCsv(
           }
         }
 
-        for (const row of chunk.rows) {
+        for (const [rowIndex, row] of chunk.rows.entries()) {
           throwIfAborted(signal);
           assertExportRowColumns(row, headerByName ?? currentByName);
           await writeStreamChunk(
             writeStream,
             headerColumns
-              .map((column) =>
-                formatCsvExportCell(
+              .map((column) => {
+                const columnIndex = currentColumnIndexByName.get(column.name);
+                const missing =
+                  !Object.hasOwn(row, column.name) ||
+                  (columnIndex !== undefined &&
+                    missingCells.has(`${rowIndex}:${columnIndex}`));
+                if (missing) {
+                  trackCsvMarker(markerState, column.name, "MISSING", true);
+                  return csvCell("MISSING");
+                }
+                return formatCsvExportCell(
                   row[column.name],
-                  column.category ?? null,
+                  column.exportCategory ?? column.category ?? null,
+                  markerState,
+                  column.name,
                   column.nativeType,
-                ),
-              )
+                );
+              })
               .join(",") + LINE_BREAK,
             signal,
           );
@@ -487,7 +591,15 @@ async function writeChunkedJson(
       for await (const chunk of chunks) {
         throwIfAborted(signal);
         const columnsByName = indexExportColumns(chunk.columns);
-        for (const row of chunk.rows) {
+        const currentColumnIndexByName = new Map(
+          chunk.columns.map((column, index) => [column.name, index]),
+        );
+        const missingCells = new Set(
+          chunk.missingCells?.map(
+            ({ rowIndex, columnIndex }) => `${rowIndex}:${columnIndex}`,
+          ),
+        );
+        for (const [rowIndex, row] of chunk.rows.entries()) {
           throwIfAborted(signal);
           assertExportRowColumns(row, columnsByName);
           await writeStreamChunk(
@@ -496,9 +608,20 @@ async function writeChunkedJson(
               chunk.columns.map((column) => ({
                 key: column.name,
                 sourceKey: column.name,
-                category: column.category ?? null,
+                category: column.exportCategory ?? column.category ?? null,
                 nativeType: column.nativeType,
                 value: row[column.name],
+                omit:
+                  !Object.hasOwn(row, column.name) ||
+                  (() => {
+                    const columnIndex = currentColumnIndexByName.get(
+                      column.name,
+                    );
+                    return (
+                      columnIndex !== undefined &&
+                      missingCells.has(`${rowIndex}:${columnIndex}`)
+                    );
+                  })(),
               })),
             )}`,
             signal,
@@ -541,8 +664,6 @@ async function writeStreamChunk(
   signal: AbortSignal,
 ): Promise<void> {
   throwIfAborted(signal);
-  // I/O can fail while the chunk producer is awaiting the database. In that
-  // case the error event has already fired and no future drain will arrive.
   if (stream.errored) throw stream.errored;
   if (stream.destroyed) {
     throw new Error("Export staging stream closed before completion.");
@@ -592,13 +713,22 @@ async function withWriteStream(
   try {
     await waitForWriteStreamOpen(writeStream);
     temporaryFileCreated = true;
+    const destinationExisted = !!lstatDestinationIfPresent(filePath);
+    if (destinationExisted) assertWindowsDestinationIsNew(filePath);
+    const hardLinksSupported =
+      destinationExisted || probeHardLinkSupport(temporaryPath);
     await writer(writeStream);
     await closeWriteStream(writeStream);
     throwIfAborted(signal);
     state.replacementStarted = true;
-    replaceExportFile(temporaryPath, filePath);
+    replaceExportFile(
+      temporaryPath,
+      filePath,
+      destinationExisted,
+      hardLinksSupported,
+    );
   } catch (error) {
-    writeStream.destroy();
+    await destroyAndWaitForClose(writeStream);
     if (temporaryFileCreated) {
       try {
         fs.rmSync(temporaryPath, { force: true });
@@ -617,65 +747,141 @@ function waitForWriteStreamOpen(writeStream: fs.WriteStream): Promise<void> {
   });
 }
 
-function replaceExportFile(temporaryPath: string, filePath: string): void {
+function replaceExportFile(
+  temporaryPath: string,
+  filePath: string,
+  destinationExisted: boolean,
+  hardLinksSupported: boolean,
+): void {
   assertNotDirectoryDestination(filePath);
-
-  try {
-    fs.renameSync(temporaryPath, filePath);
+  const destination = lstatDestinationIfPresent(filePath);
+  if (!destinationExisted || !destination) {
+    let linked = false;
+    if (hardLinksSupported) {
+      try {
+        fs.linkSync(temporaryPath, filePath);
+        linked = true;
+      } catch (error) {
+        if (!isHardLinkUnsupportedError(error)) throw hardLinkError(error);
+      }
+    }
+    if (!linked) copyNewExportFile(temporaryPath, filePath);
+    try {
+      fs.unlinkSync(temporaryPath);
+    } catch (error) {
+      throw new Error(
+        `Export was installed, but staging cleanup failed: ${normalizeUnknownError(error).message}. Staging file: ${temporaryPath}.`,
+      );
+    }
     return;
-  } catch (directError) {
-    let destinationStats: fs.Stats | undefined;
-    try {
-      destinationStats = lstatDestinationIfPresent(filePath);
-    } catch {
-      throw directError;
-    }
-    if (!destinationStats || destinationStats.isDirectory()) {
-      throw directError;
-    }
   }
+  assertWindowsDestinationIsNew(filePath);
+  preserveDestinationMode(temporaryPath, filePath);
+  fs.renameSync(temporaryPath, filePath);
+}
 
-  const backupPath = `${filePath}.rapidb-${randomUUID()}.bak`;
-  fs.renameSync(filePath, backupPath);
-
-  try {
-    if (fs.lstatSync(backupPath).isDirectory()) {
-      throw new Error("Cannot export to a directory.");
-    }
-    fs.renameSync(temporaryPath, filePath);
-  } catch (operationError) {
-    try {
-      restoreExportBackup(backupPath, filePath);
-    } catch (restoreError) {
-      throw new Error(
-        `Export replacement failed: ${normalizeUnknownError(operationError).message}. ` +
-          `Restoring the original file failed: ${normalizeUnknownError(restoreError).message}. ` +
-          `The original file remains at ${backupPath}.`,
-      );
-    }
-    throw operationError;
-  }
-
-  try {
-    fs.unlinkSync(backupPath);
-  } catch (cleanupError) {
-    if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
-      throw new Error(
-        `Export was installed, but the previous file remains at ${backupPath} ` +
-          `because backup cleanup failed: ${normalizeUnknownError(cleanupError).message}`,
-      );
-    }
+function assertWindowsDestinationIsNew(filePath: string): void {
+  if (process.platform === "win32" && lstatDestinationIfPresent(filePath)) {
+    throw new Error(
+      "Cannot safely replace an existing export on Windows. Choose a new file name instead.",
+    );
   }
 }
 
-function restoreExportBackup(backupPath: string, filePath: string): void {
-  if (lstatDestinationIfPresent(filePath)) {
+function hardLinkError(error: unknown): Error {
+  return new Error(
+    `Cannot publish a new export using a hard link: ${normalizeUnknownError(error).message}. ` +
+      "The destination may already exist or its filesystem may not support hard links. Choose a new name on a supported filesystem.",
+    { cause: error },
+  );
+}
+
+const HARD_LINK_UNSUPPORTED_CODES = new Set([
+  "EPERM",
+  "EACCES",
+  "ENOTSUP",
+  "EOPNOTSUPP",
+  "EXDEV",
+  "ENOSYS",
+  "EISDIR",
+  "EINVAL",
+]);
+
+function isHardLinkUnsupportedError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" && HARD_LINK_UNSUPPORTED_CODES.has(code);
+}
+
+const COPY_NOT_CREATED_CODES = new Set([
+  "EEXIST",
+  "EACCES",
+  "EPERM",
+  "ENOENT",
+  "ENOTDIR",
+  "EISDIR",
+  "EROFS",
+]);
+
+function copyNewExportFile(temporaryPath: string, filePath: string): void {
+  try {
+    fs.copyFileSync(temporaryPath, filePath, fs.constants.COPYFILE_EXCL);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (!code || !COPY_NOT_CREATED_CODES.has(code)) {
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch {}
+    }
     throw new Error(
-      `A destination already exists at ${filePath}; refusing to overwrite it with the backup.`,
+      `Cannot publish a new export: ${normalizeUnknownError(error).message}. The destination may already exist. Choose a new name and retry.`,
+      { cause: error },
     );
   }
+}
 
-  fs.renameSync(backupPath, filePath);
+function probeHardLinkSupport(temporaryPath: string): boolean {
+  const probePath = `${temporaryPath}.${randomUUID()}.probe`;
+  try {
+    fs.linkSync(temporaryPath, probePath);
+  } catch (error) {
+    if (isHardLinkUnsupportedError(error)) return false;
+    throw hardLinkError(error);
+  }
+  try {
+    fs.unlinkSync(probePath);
+  } catch (error) {
+    throw new Error(
+      `Hard-link probe cleanup failed: ${normalizeUnknownError(error).message}. Probe file remains at ${probePath}.`,
+      { cause: error },
+    );
+  }
+  return true;
+}
+
+async function destroyAndWaitForClose(stream: fs.WriteStream): Promise<void> {
+  if (stream.closed) return;
+  await new Promise<void>((resolve) => {
+    stream.once("close", resolve);
+    stream.destroy();
+  });
+}
+
+function preserveDestinationMode(
+  temporaryPath: string,
+  filePath: string,
+): void {
+  const destinationStats = lstatDestinationIfPresent(filePath);
+  if (!destinationStats?.isFile()) {
+    return;
+  }
+  try {
+    fs.chmodSync(temporaryPath, destinationStats.mode & 0o777);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EINVAL") {
+      throw error;
+    }
+  }
 }
 
 function assertNotDirectoryDestination(filePath: string): void {
@@ -697,13 +903,32 @@ function lstatDestinationIfPresent(filePath: string): fs.Stats | undefined {
 
 function closeWriteStream(writeStream: fs.WriteStream): Promise<void> {
   return new Promise<void>((resolve, reject) => {
+    let ended = false;
+    let closed = false;
+    const finish = () => {
+      if (!ended || !closed) return;
+      writeStream.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error) => {
+      writeStream.off("close", onClose);
+      reject(error);
+    };
+    const onClose = () => {
+      closed = true;
+      finish();
+    };
+    writeStream.once("error", onError);
+    writeStream.once("close", onClose);
     writeStream.end((error?: Error | null) => {
       if (error) {
+        writeStream.off("close", onClose);
+        writeStream.off("error", onError);
         reject(error);
-        return;
+      } else {
+        ended = true;
+        finish();
       }
-
-      resolve();
     });
   });
 }

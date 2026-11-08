@@ -57,6 +57,16 @@ For MongoDB, a non-empty **Database** field overrides the database in the connec
 
 > Every connection has a **read-only mode** toggle. When enabled, table edits are blocked and query execution is limited to read operations. **SQL Server (MSSQL) and Oracle exceptions:** query editor execution is blocked in read-only mode because client-side classification cannot enforce read-only execution. Oracle autonomous transactions can commit writes even inside `SET TRANSACTION READ ONLY`, and caller rollback cannot undo them. Use a database account with enforced read-only permissions (including restrictions on executable routines) and a regular connection to run queries. Table data and schema browsing remain available. This toggle is an application safeguard, not a replacement for database permissions; database-defined views, policies, and routines may have side effects even during reads.
 
+#### SSH tunneling and local trust boundary
+
+For fixed-target SSH connections, RapiDB opens a TCP listener on `127.0.0.1` at an OS-assigned port on the **VS Code extension host** (which may be a remote machine or container). Like standard SSH local port forwarding, it relays database protocol bytes to the configured host and port through SSH. Elasticsearch Cloud ID uses in-process HTTP(S) agents instead, without a local TCP listener.
+
+Loopback prevents direct access from other machines; it does **not** authenticate local clients. Other processes able to reach that loopback interface, potentially including other OS users, can use the forward while it is open without SSH credentials. The random port is not a secret or an access-control mechanism. Each TCP connection is forwarded separately: the tunnel does not supply RapiDB's database credentials or reuse its authenticated database session for another client.
+
+- Require database/service authentication and least-privilege permissions, even over SSH. Do not rely solely on the bastion's source IP or passwordless/trust rules for connections from the bastion: forwarded clients share that network access. RapiDB's read-only toggle does not restrict external clients.
+- Use database TLS with server identity verification where supported, especially when the database is on a different host from the SSH server; SSH encryption ends at the SSH server.
+- Run the extension host in a trusted environment. If untrusted local users or processes must be isolated, use OS-enforced network isolation (for example, a separate VM), not loopback alone. RapiDB does not provide protection against a malicious process running as the same OS user. Disconnect unused connections to close their forwards.
+
 <br/>
 
 ### 🌲 Browse your schema without a single query
@@ -75,7 +85,15 @@ Redis table reads and exports deduplicate `SCAN` replies and use exact-key tie-b
 
 ### 🗂️ Query History & Bookmarks
 
-Every query you run lands in **Query History** - click any entry to reopen it in the editor. Queries you want to keep forever go into **Bookmarks** with a single press. Query History limit is configurable.
+With history enabled, queries submitted from the query editor are added to **Query History**; click an entry to reopen it. The editor's **Bookmark** button explicitly saves the full editor text without requiring execution.
+
+#### Query text privacy and cleanup
+
+- **Storage:** History and bookmarks persist SQL/query text (only outer whitespace is trimmed), connection IDs, and timestamps in VS Code's extension `globalState`, shared across workspaces rather than stored in workspace files. This is not credential `SecretStorage`: literals, comments, and any secrets in query text are not redacted. History recording is requested before the driver executes, so failed or cancelled queries can remain; history is not a log of successful executions.
+- **History:** Set `"rapidb.queryHistoryLimit": 0` in VS Code user settings to stop new history entries (default: 100, shared across connections). Lowering the limit while the extension is active trims excess entries, including clearing history when changed to 0. To explicitly clear existing history, use **Clear History** (trash icon) in the **Query History** view header and confirm **Clear**. There is no individual history-entry deletion command.
+- **Bookmarks:** The history limit does not disable or clear bookmarks. Avoid **Bookmark** if you do not want to save query text. Right-click an entry in **Bookmarks** → **Delete Bookmark** to remove one, or use **Clear Bookmarks** (trash icon) in that view's header and confirm **Clear** to remove all. Clearing history does not clear bookmarks. These cleanup commands are not shown in the Command Palette.
+
+These controls only manage history/bookmark entries, not copies elsewhere. Editor drafts, including unexecuted text, can persist separately in VS Code webview state even with history disabled; clearing history/bookmarks does not clear those drafts. Cleanup does not guarantee secure erasure from storage or backups.
 
 <br/>
 
@@ -133,7 +151,7 @@ MongoDB `BinData(subtype, base64)` requires an integer subtype from 0 to 255 and
 
 MongoDB regular expressions preserve the `i`, `m`, `s`, and `u` flags in BSON. JavaScript-only flags `d`, `g`, `v`, and `y` are rejected before any operation in the script is sent; they must never be silently dropped or converted into different matching rules for an update or delete.
 
-MongoDB `Date` / `ISODate` literals reject invalid dates before any operation in the script is sent. They accept no arguments (current time), one date string or Date value, or one to seven safe integer arguments. Calendar-component arguments follow JavaScript's local-time `Date` constructor; use an ISO string with an explicit time zone for an unambiguous instant. Arguments are never silently discarded, and invalid dates cannot become Unix epoch during BSON serialization.
+MongoDB `Date` / `ISODate` literals reject invalid dates before any operation in the script is sent. `ISODate` follows mongosh: it accepts no arguments (current time), one ISO-8601 date string (interpreted as UTC when no time zone is given; compact forms such as `20260101T000000Z` are accepted), or one Date value. `Date` keeps JavaScript's rules: it accepts no arguments, one date string or Date value, or one to seven safe integer arguments, and both strings without a time zone and calendar-component arguments follow JavaScript's `Date` constructor; use an ISO string with an explicit time zone for an unambiguous instant. Arguments are never silently discarded, and invalid dates cannot become Unix epoch during BSON serialization.
 
 MongoDB updates and deletes require an explicit document filter; use `{}` explicitly to target all documents. Cursor modifiers on non-cursor operations, such as `deleteMany({}).limit(1)`, are rejected rather than silently ignored. Explicit database/collection names must be non-empty strings. BSON `Timestamp(t, i)` and `Timestamp({t, i})` components must be unsigned 32-bit integers, without coercion or rounding (`Timestamp(t)` defaults the increment to zero). Invalid filters, namespaces, modifiers, and timestamps are rejected before any operation in the script is sent.
 
@@ -147,7 +165,11 @@ Redis query scripts are fully tokenized before the first command is sent. Invali
 
 Redis structured table edits (hash, list, set, sorted set) reject JSON numeric literals that would lose precision before any replacement is sent. Use quoted strings for exact large integers or decimal member values, such as `{"account":"9007199254740993"}`. Ordinary Redis string values are not interpreted as JSON.
 
-Table exports keep a stable column schema across chunks. CSV uses the declared columns (including empty cells for missing values); a later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
+Table exports keep a stable column schema across chunks. SQL NULL is written as `(NULL)` in both table and query-result CSV exports; empty strings stay empty. Missing fields are written as `MISSING`. Marker-like strings are not escaped. When a column contains both a marker and the same literal value, CSV export fails, even across chunks. CSV cannot distinguish an isolated marker from an identical literal: use JSON when retaining types or missing values matters. Spreadsheet formula-like strings are protected by an apostrophe prefix. A later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
+
+Exports are staged in the destination directory. New files are published with an exclusive hard link; support is probed before reading export data, and filesystems that do not support it reject the export. A later filesystem or permission change can still make publication fail. On POSIX, replacement of an existing file uses a single rename, subject to the filesystem's rename guarantees. On Windows, replacing an existing file is not supported: choose a new name. No portable compare-and-swap is available for an existing POSIX destination, so avoid changing that path concurrently. These operations do not guarantee durability after power loss.
+
+MongoDB table exports use canonical Extended JSON for BSON values. Literal documents containing reserved EJSON type keys (for example `$oid`) fail explicitly because EJSON cannot preserve their types unambiguously; use a BSON backup for these documents.
 
 <br/>
 

@@ -195,30 +195,6 @@ vi.mock("../../src/webview/components/MonacoEditor", () => ({
       />
     </div>
   ),
-  connTypeToDialect: (type: string) => {
-    switch (type) {
-      case "mysql":
-        return "mysql";
-      case "pg":
-        return "postgresql";
-      case "sqlite":
-        return "sqlite";
-      case "mssql":
-        return "transactsql";
-      case "oracle":
-        return "plsql";
-      case "mongodb":
-        return "javascript";
-      case "redis":
-        return "javascript";
-      case "elasticsearch":
-        return "javascript";
-      case "dynamodb":
-        return "javascript";
-      default:
-        return "sql";
-    }
-  },
 }));
 
 vi.mock("../../src/webview/components/table/TableGrid", () => ({

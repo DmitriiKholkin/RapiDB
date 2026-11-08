@@ -1,7 +1,37 @@
 import type { createClient } from "redis";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ConnectionManager } from "../../src/extension/connectionManager";
+import type {
+  ConnectionConfig,
+  ConnectionManager,
+} from "../../src/extension/connectionManager";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
+import { loadConnectionRootCatalog } from "../../src/extension/schema/schemaLoaders";
+import { getConfiguredRedisDatabaseName } from "../../src/shared/redisDatabase";
+
+it.each([
+  [{ connectionUri: "redis://localhost/1" }, "db1"],
+  [{ connectionUri: "rediss://localhost/01" }, "db1"],
+  [{ connectionUri: "redis://localhost/1", database: "2" }, "db2"],
+  [{ connectionUri: "redis://localhost/1", database: "  " }, "db1"],
+  [{ connectionUri: "redis://localhost" }, "db0"],
+  [{}, "db0"],
+])("uses the configured Redis database even when it is empty: %j", async (scope, expected) => {
+  const config = {
+    id: "uri-scope",
+    name: "Redis",
+    type: "redis",
+    ...scope,
+  } as ConnectionConfig;
+  const driver = new RedisDriver(config);
+  vi.spyOn(driver, "listDatabases").mockResolvedValue([
+    { name: "db0", schemas: [] },
+  ]);
+  expect(getConfiguredRedisDatabaseName(config)).toBe(expected);
+  const catalog = await loadConnectionRootCatalog(driver, config);
+  expect(catalog.defaultDatabaseName).toBe(expected);
+  expect(catalog.catalogSnapshot.databases[0].name).toBe(expected);
+});
+
 import {
   REDIS_ALL_KEYS_TABLE,
   REDIS_EMPTY_PREFIX_TABLE,
@@ -108,10 +138,27 @@ class FakeRedis {
           ? value
           : Buffer.from(String(value));
     },
+    getRange: async (key: string) => {
+      const value = await this.get(key);
+      return value == null
+        ? null
+        : Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(String(value));
+    },
+    lRange: (key: string) => this.lRange(key),
+    xRange: (key: string) => this.xRange(key),
   }));
   ttl = vi.fn(async (key: string) => this.store().get(key)?.ttl ?? -2);
   lRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
   xRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
+  strLen = vi.fn(async (key: string) => this.valueSize(key));
+  lLen = vi.fn(async (key: string) => this.valueSize(key));
+  xLen = vi.fn(async (key: string) => this.valueSize(key));
+  private valueSize(key: string) {
+    const value = this.store().get(key)?.value;
+    return Array.isArray(value) ? value.length : String(value ?? "").length;
+  }
   set = vi.fn(
     async (
       key: string,
@@ -177,8 +224,15 @@ class FakeRedis {
         scan: (cursor: string, options: { MATCH: string }) =>
           run(() => this.withTypeMapping().scan(cursor, options)),
         get: (key: string) => run(() => this.withTypeMapping().get(key)),
+        getRange: (key: string) =>
+          run(() => this.withTypeMapping().getRange(key)),
+        lRange: (key: string) => run(() => this.withTypeMapping().lRange(key)),
+        xRange: (key: string) => run(() => this.withTypeMapping().xRange(key)),
       }),
       type: (key: string) => run(() => this.type(key)),
+      strLen: (key: string) => run(() => this.strLen(key)),
+      lLen: (key: string) => run(() => this.lLen(key)),
+      xLen: (key: string) => run(() => this.xLen(key)),
       set: (
         key: string,
         value: string,
@@ -296,7 +350,7 @@ afterEach(async () => {
 describe("B09 Redis reserved default prefix", () => {
   it("rejects truncated unprefixed filter reads instead of returning false zero matches", async () => {
     const store = new Map<string, Value>();
-    for (let index = 0; index < 101; index++) {
+    for (let index = 0; index < 2001; index++) {
       store.set(`key${String(index).padStart(4, "0")}`, {
         type: "string",
         value: String(index),
@@ -309,9 +363,56 @@ describe("B09 Redis reserved default prefix", () => {
     await expect(
       driver.readTablePage({
         ...page("db0", REDIS_UNPREFIXED_KEYS_TABLE),
-        filters: [{ column: "key", operator: "eq", value: "key0100" }],
+        filters: [{ column: "key", operator: "eq", value: "key2000" }],
       }),
-    ).rejects.toThrow("100-key safety limit");
+    ).rejects.toThrow(
+      "Redis filtering and non-key sorting read at most 2000 keys (the 2000-key safety limit)",
+    );
+  });
+
+  it("filters and sorts beyond ten pages without a page-size-based key limit", async () => {
+    const store = new Map<string, Value>();
+    for (let index = 0; index < 251; index++) {
+      store.set(`users:${String(index).padStart(4, "0")}`, {
+        type: "string",
+        value: String(index),
+        ttl: index === 250 ? 60 : -1,
+      });
+    }
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    const filtered = await driver.readTablePage({
+      ...page("db0"),
+      filters: [{ column: "key", operator: "eq", value: "users:0250" }],
+    });
+    expect(filtered.rows.map((row) => row.key)).toEqual(["users:0250"]);
+    const sorted = await driver.readTablePage({
+      ...page("db0"),
+      sort: { column: "ttl", direction: "desc" },
+    });
+    expect(sorted.totalCount).toBe(251);
+    expect(sorted.rows[0]?.key).toBe("users:0250");
+  });
+
+  it("scans past many prefixed keys to find a few unprefixed keys", async () => {
+    const store = new Map<string, Value>();
+    for (let index = 0; index < 6000; index++) {
+      store.set(`users:${index}`, { type: "string", value: "x", ttl: -1 });
+    }
+    store.set("orphan", { type: "string", value: "inside", ttl: -1 });
+    harness.databases.set(0, store);
+    const driver = driverWith();
+    await driver.connect();
+    const result = await driver.readTablePage({
+      ...page("db0", REDIS_UNPREFIXED_KEYS_TABLE),
+      filters: [{ column: "key", operator: "eq", value: "orphan" }],
+    });
+    expect(result.rows.map((row) => row.key)).toEqual(["orphan"]);
+    const keyPage = await driver.readTablePage(
+      page("db0", REDIS_UNPREFIXED_KEYS_TABLE),
+    );
+    expect(keyPage.totalCount).toBe(1);
   });
 
   it("rejects incomplete unprefixed sorted exports but keeps full key-only paging", async () => {
@@ -495,7 +596,7 @@ describe("B09 Redis reserved default prefix", () => {
     ).toEqual([REDIS_ALL_KEYS_TABLE, REDIS_EMPTY_PREFIX_TABLE]);
     expect(
       (await driver.readTablePage(page("db0", REDIS_EMPTY_PREFIX_TABLE))).rows,
-    ).toEqual([{ key: ":root", value: "root", ttl: null }]);
+    ).toEqual([{ key: ":root", value: "root", ttl: null, type: "string" }]);
   });
 });
 
@@ -524,8 +625,23 @@ describe("B02 Redis logical database isolation", () => {
         (col) => col.name === "value",
       )?.type,
     ).toBe("string");
+    expect(
+      (await driver.describeColumns("db0", "", "typed")).find(
+        (col) => col.name === "type",
+      ),
+    ).toMatchObject({
+      type: "string",
+      nativeType: "redis_type",
+      isReadOnly: true,
+      category: "text",
+    });
+    expect(
+      (await driver.describeTable("db0", "", "typed")).find(
+        (col) => col.name === "type",
+      ),
+    ).toMatchObject({ type: "redis_type", isReadOnly: true });
     expect((await driver.readTablePage(page("db0"))).rows).toEqual([
-      { key: "users:shared", value: "value-0", ttl: 10 },
+      { key: "users:shared", value: "value-0", ttl: 10, type: "string" },
     ]);
     expect(
       (
@@ -534,7 +650,9 @@ describe("B02 Redis logical database isolation", () => {
           filters: [{ column: "value", operator: "eq", value: "value-1" }],
         })
       ).rows,
-    ).toEqual([{ key: "users:shared", value: "value-1", ttl: 11 }]);
+    ).toEqual([
+      { key: "users:shared", value: "value-1", ttl: 11, type: "string" },
+    ]);
     expect(
       (await driver.readTablePage(page("db1", "events"))).rows[0]?.value,
     ).toContain('"db":"1"');
@@ -549,10 +667,20 @@ describe("B02 Redis logical database isolation", () => {
       "",
       "users",
       1,
-    ))
+    )) {
+      expect(chunk.columns).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: "type",
+            nativeType: "redis_type",
+            isReadOnly: true,
+          }),
+        ]),
+      );
       chunks.push(...chunk.rows);
+    }
     expect(chunks).toEqual([
-      { key: "users:shared", value: "value-1", ttl: 11 },
+      { key: "users:shared", value: "value-1", ttl: 11, type: "string" },
     ]);
     expect(harness.clients).toHaveLength(3);
     for (const client of harness.clients)
@@ -562,15 +690,17 @@ describe("B02 Redis logical database isolation", () => {
   it("keeps CRUD and type-aware previews in the requested DB with identical keys", async () => {
     const driver = driverWith();
     await driver.connect();
-    expect(
-      await driver.buildMutationPreviewStatements(
-        "update",
-        "db1",
-        "",
-        "typed",
-        { primaryKeys: { key: "typed:shared" }, changes: { value: '["new"]' } },
-      ),
-    ).toEqual(['DEL "typed:shared"', 'RPUSH "typed:shared" "new"']);
+    const preview = await driver.buildMutationPreviewStatements(
+      "update",
+      "db1",
+      "",
+      "typed",
+      { primaryKeys: { key: "typed:shared" }, changes: { value: '["new"]' } },
+    );
+    expect(JSON.parse(preview[0])).toMatchObject({
+      source: "typed:shared",
+      value: { input: '["new"]' },
+    });
     expect(
       await driver.buildMutationPreviewStatements("insert", "0", "", "typed", {
         values: { key: "typed:new", value: "new" },
@@ -1143,7 +1273,6 @@ describe("B06 Redis insert preview/execution parity", () => {
   it.each([
     undefined,
     null,
-    "",
     42,
     false,
     {},

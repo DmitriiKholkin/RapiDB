@@ -11,11 +11,19 @@ import {
   type ConnectionFormSubmission,
   parseConnectionFormPanelMessage,
 } from "../../shared/webviewContracts";
+import {
+  type ConnectionSavePrecondition,
+  connectionEditState,
+} from "../connectionEditState";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
 import {
   type ConnectionSecretClearOptions,
+  connectionTypeUsesPassword,
   extractCredentialBearingUriSecret,
+  getAmbiguousCredentialBearingUriFields,
   hasConnectionConfigSecrets,
+  omitAmbiguousCredentialBearingUris,
+  resolveStoredCredentialBearingUri,
   restoreCredentialBearingUri,
   restoreMongoUriCredentials,
   sanitizeConnectionConfigForResponse,
@@ -50,42 +58,73 @@ function restoreSubmittedUriValue(
   }
 
   for (const candidate of [storedValue, existingValue]) {
-    const normalizedCandidate = trimOptionalUriValue(candidate);
-    if (!normalizedCandidate) {
-      continue;
-    }
-
-    if (
-      extractCredentialBearingUriSecret(normalizedCandidate) !== undefined &&
-      sanitizeCredentialBearingUri(normalizedCandidate) === normalizedSubmitted
-    ) {
-      return normalizedCandidate;
+    const resolved = resolveStoredCredentialBearingUri(
+      normalizedSubmitted,
+      trimOptionalUriValue(candidate),
+    );
+    if (resolved !== normalizedSubmitted) {
+      return resolved;
     }
   }
 
   return normalizedSubmitted;
 }
 
-function shouldUseSecretStorage(payload: ConnectionFormSubmission): boolean {
-  if (payload.useSecretStorage === false) {
-    return false;
-  }
-  return (
-    payload.ssh !== undefined ||
-    payload.type === "dynamodb" ||
-    payload.type === "elasticsearch" ||
-    payload.useSecretStorage === true ||
-    trimOptionalSecretValue(payload.password) !== undefined ||
-    trimOptionalSecretValue(payload.apiKey) !== undefined ||
-    trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
-    trimOptionalSecretValue(payload.awsSecretAccessKey) !== undefined ||
-    trimOptionalSecretValue(payload.awsSessionToken) !== undefined ||
-    trimOptionalSecretValue(payload.tls?.keyPassphrase) !== undefined ||
-    extractCredentialBearingUriSecret(payload.connectionUri) !== undefined ||
-    extractCredentialBearingUriSecret(payload.uri) !== undefined ||
-    extractCredentialBearingUriSecret(payload.endpoint) !== undefined ||
-    extractCredentialBearingUriSecret(payload.awsEndpoint) !== undefined
+const CONNECTION_ID_MISMATCH_MESSAGE =
+  "This editor belongs to a different connection. Reopen Edit Connection.";
+
+const AMBIGUOUS_STORED_URI_MESSAGE =
+  "The saved connection URL has ambiguous credentials and is not shown. Enter it again with percent-encoded credentials, or choose to remove it.";
+
+const CREDENTIAL_BEARING_URI_ALIASES: Partial<
+  Record<
+    ConnectionConfig["type"],
+    ReturnType<typeof getAmbiguousCredentialBearingUriFields>
+  >
+> = {
+  mongodb: ["connectionUri", "uri"],
+  elasticsearch: ["connectionUri", "endpoint"],
+  dynamodb: ["endpoint", "awsEndpoint"],
+};
+
+function hasUnresolvedAmbiguousStoredUri(
+  stored: ConnectionConfig | undefined,
+  submitted: ConnectionConfig,
+  clear: boolean | undefined,
+): boolean {
+  if (!stored || clear) return false;
+  const aliases = CREDENTIAL_BEARING_URI_ALIASES[submitted.type] ?? [];
+  return getAmbiguousCredentialBearingUriFields(stored).some((field) =>
+    (aliases.includes(field) ? aliases : [field]).every(
+      (key) => trimOptionalUriValue(submitted[key]) === undefined,
+    ),
   );
+}
+
+function usesStoredSecrets(config: ConnectionConfig | undefined): boolean {
+  return (
+    config !== undefined &&
+    config.useSecretStorage !== false &&
+    config.type !== "sqlite"
+  );
+}
+
+function readRawMessageIdentity(message: unknown): {
+  type?: unknown;
+  requestId?: string;
+} {
+  if (typeof message !== "object" || message === null) {
+    return {};
+  }
+  const { type, payload } = message as { type?: unknown; payload?: unknown };
+  const requestId =
+    typeof payload === "object" && payload !== null
+      ? (payload as { requestId?: unknown }).requestId
+      : undefined;
+  return {
+    type,
+    requestId: typeof requestId === "string" ? requestId : undefined,
+  };
 }
 
 function getExistingMongoUri(
@@ -94,29 +133,17 @@ function getExistingMongoUri(
 ): string | undefined {
   const value = getMongoConnectionUri(existing);
   const usesCanonicalUri = Boolean(existing.connectionUri?.trim());
-  const secret = usesCanonicalUri ? secrets.connectionUri : secrets.uri;
-  return secret &&
-    sanitizeCredentialBearingUri(secret) === sanitizeCredentialBearingUri(value)
-    ? secret
-    : value;
+  return resolveStoredCredentialBearingUri(
+    value,
+    usesCanonicalUri ? secrets.connectionUri : secrets.uri,
+  );
 }
 
-function getExistingUriValue(
-  value: string | undefined,
-  secret: string | undefined,
-): string | undefined {
-  return secret &&
-    sanitizeCredentialBearingUri(secret) === sanitizeCredentialBearingUri(value)
-    ? secret
-    : value;
-}
-
-/** Preserve legacy Redis URI authentication when moving to the URI editor. */
 function getExistingRedisUri(
   existing: ConnectionConfig,
   secrets: StoredConnectionSecrets,
 ): string | undefined {
-  const value = getExistingUriValue(
+  const value = resolveStoredCredentialBearingUri(
     existing.connectionUri,
     secrets.connectionUri,
   );
@@ -129,7 +156,6 @@ function getExistingRedisUri(
     }
     const database = existing.database?.trim();
     if (database) parsed.pathname = `/${database.replace(/^db/, "")}`;
-    // Redis URI credentials take priority over separate authentication fields.
     if (parsed.username || parsed.password) return parsed.toString();
     const username = existing.username?.trim();
     const password = secrets.password ?? existing.password;
@@ -147,8 +173,11 @@ function getExistingElasticEndpoint(
   secrets: StoredConnectionSecrets,
 ): string | undefined {
   return existing.connectionUri !== undefined
-    ? getExistingUriValue(existing.connectionUri, secrets.connectionUri)
-    : getExistingUriValue(existing.endpoint, secrets.endpoint);
+    ? resolveStoredCredentialBearingUri(
+        existing.connectionUri,
+        secrets.connectionUri,
+      )
+    : resolveStoredCredentialBearingUri(existing.endpoint, secrets.endpoint);
 }
 
 function sanitizeExistingForForm(
@@ -276,6 +305,7 @@ export class ConnectionFormPanel {
   private readonly connectionManager: ConnectionManager;
   private resolveFn?: (result: ConnectionConfig | undefined) => void;
   private disposed = false;
+  private saveInProgress = false;
   private testAbortController: AbortController | null = null;
 
   private constructor(
@@ -283,6 +313,9 @@ export class ConnectionFormPanel {
     context: vscode.ExtensionContext,
     connectionManager: ConnectionManager,
     existing?: ConnectionConfig,
+    private readonly savePrecondition: ConnectionSavePrecondition = {
+      kind: "create",
+    },
   ) {
     this.panel = panel;
     this.context = context;
@@ -293,19 +326,27 @@ export class ConnectionFormPanel {
       this.panel,
       (message) => this.handleMessage(message),
       (error, message) => {
+        if (this.disposed) return;
         const normalized = logErrorWithContext(
           "ConnectionFormPanel unhandled error",
           error,
         );
-        const isSaveConnectionMessage =
-          typeof message === "object" &&
-          message !== null &&
-          "type" in message &&
-          (message as { type?: unknown }).type === "saveConnection";
-        this.panel.webview.postMessage({
-          type: isSaveConnectionMessage ? "saveResult" : "testResult",
-          payload: { success: false, error: normalized.message },
-        });
+        const { type, requestId } = readRawMessageIdentity(message);
+        if (type === "saveConnection") {
+          this.panel.webview.postMessage({
+            type: "saveResult",
+            payload: { success: false, error: normalized.message },
+          });
+        } else if (type === "testConnection") {
+          this.panel.webview.postMessage({
+            type: "testResult",
+            payload: { requestId, success: false, error: normalized.message },
+          });
+        } else {
+          vscode.window.showErrorMessage(
+            `[RapiDB] Unexpected error: ${normalized.message}`,
+          );
+        }
       },
     );
     this.panel.onDidDispose(() => {
@@ -313,6 +354,7 @@ export class ConnectionFormPanel {
       this.testAbortController?.abort();
       this.testAbortController = null;
       this.resolveFn?.(undefined);
+      this.resolveFn = undefined;
     });
   }
 
@@ -324,17 +366,38 @@ export class ConnectionFormPanel {
     const title = existing ? `Edit — ${existing.name}` : "New Connection";
 
     let existingForForm: ConnectionFormExistingState | undefined;
+    let precondition: ConnectionSavePrecondition = { kind: "create" };
     if (existing) {
+      existing = structuredClone(existing);
       let storedSecrets: StoredConnectionSecrets = {};
-      if (existing.id) {
+      let secretsRead = true;
+      if (existing.id && usesStoredSecrets(existing)) {
         try {
           storedSecrets = parseStoredConnectionSecrets(
             await context.secrets.get(existing.id),
           );
-        } catch {}
+        } catch {
+          secretsRead = false;
+        }
       }
 
-      existingForForm = sanitizeExistingForForm(existing, storedSecrets);
+      precondition = {
+        kind: "edit",
+        id: existing.id,
+        state: secretsRead
+          ? connectionEditState(existing, storedSecrets)
+          : undefined,
+      };
+      existingForForm = {
+        ...sanitizeExistingForForm(
+          omitAmbiguousCredentialBearingUris(existing),
+          storedSecrets,
+        ),
+        useSecretStorage: existing.useSecretStorage ?? true,
+        hasAmbiguousStoredUri:
+          getAmbiguousCredentialBearingUriFields(existing).length > 0 ||
+          undefined,
+      };
     }
 
     const panel = vscode.window.createWebviewPanel(
@@ -349,6 +412,7 @@ export class ConnectionFormPanel {
       context,
       connectionManager,
       existingForForm,
+      precondition,
     );
 
     return new Promise<ConnectionConfig | undefined>((resolve) => {
@@ -364,7 +428,9 @@ export class ConnectionFormPanel {
     if (payload.password !== undefined && payload.password !== "") {
       return payload.password;
     }
-    if (payload.clearPassword) return "";
+    if (payload.clearPassword || this.changesStoredConnectionType(payload)) {
+      return "";
+    }
 
     if (useSecretStorage && storedSecrets.password !== undefined) {
       return storedSecrets.password;
@@ -374,8 +440,28 @@ export class ConnectionFormPanel {
       return storedSecrets.password;
     }
 
-    const existing = this.connectionManager.getConnection(payload.id);
+    const existing = this.getStoredConnection(payload.id);
     return existing?.password ?? payload.password ?? "";
+  }
+
+  private getStoredConnection(id: string): ConnectionConfig | undefined {
+    return this.savePrecondition.kind === "edit" &&
+      id === this.savePrecondition.id
+      ? this.connectionManager.getConnection(id)
+      : undefined;
+  }
+
+  private changesStoredConnectionType(
+    config: Pick<ConnectionConfig, "id" | "type">,
+  ): boolean {
+    const stored = this.getStoredConnection(config.id);
+    return stored !== undefined && stored.type !== config.type;
+  }
+
+  private rejectsConnectionId(id: string): boolean {
+    return (
+      this.savePrecondition.kind === "edit" && id !== this.savePrecondition.id
+    );
   }
 
   private resolveSubmittedSecret(
@@ -411,32 +497,27 @@ export class ConnectionFormPanel {
     payload: ConnectionFormSubmission,
     storedSecrets?: StoredConnectionSecrets,
   ): Promise<ConnectionConfig> {
-    const resolvedStoredSecrets =
-      storedSecrets ??
-      parseStoredConnectionSecrets(await this.context.secrets.get(payload.id));
-    const existing = this.connectionManager.getConnection(payload.id);
-    const useSecretStorage =
-      payload.useSecretStorage !== false &&
-      (shouldUseSecretStorage(payload) ||
-        resolvedStoredSecrets.connectionUri !== undefined ||
-        resolvedStoredSecrets.uri !== undefined ||
-        resolvedStoredSecrets.endpoint !== undefined ||
-        resolvedStoredSecrets.awsEndpoint !== undefined ||
-        extractCredentialBearingUriSecret(existing?.connectionUri) !==
-          undefined ||
-        extractCredentialBearingUriSecret(existing?.uri) !== undefined ||
-        extractCredentialBearingUriSecret(existing?.endpoint) !== undefined ||
-        extractCredentialBearingUriSecret(existing?.awsEndpoint) !== undefined);
+    const storedExisting = this.getStoredConnection(payload.id);
+    const resolvedStoredSecrets = !usesStoredSecrets(storedExisting)
+      ? {}
+      : (storedSecrets ??
+        parseStoredConnectionSecrets(
+          await this.context.secrets.get(payload.id),
+        ));
+    const existing =
+      storedExisting && omitAmbiguousCredentialBearingUris(storedExisting);
+    const useSecretStorage = payload.useSecretStorage !== false;
     const isRedisUriSubmission =
       payload.type === "redis" &&
       trimOptionalUriValue(payload.connectionUri) !== undefined;
-    const password = isRedisUriSubmission
-      ? undefined
-      : await this.resolveSubmittedPassword(
-          payload,
-          resolvedStoredSecrets,
-          useSecretStorage,
-        );
+    const password =
+      isRedisUriSubmission || !connectionTypeUsesPassword(payload)
+        ? undefined
+        : await this.resolveSubmittedPassword(
+            payload,
+            resolvedStoredSecrets,
+            useSecretStorage,
+          );
     const {
       hasStoredSecret: _hasStoredSecret,
       hasStoredMongoUriCredentials: _hasStoredMongoUriCredentials,
@@ -447,6 +528,9 @@ export class ConnectionFormPanel {
       clearPassword: _clearPassword,
       clearApiKey: _clearApiKey,
       clearAwsCredentials: _clearAwsCredentials,
+      clearSshPassphrase: _clearSshPassphrase,
+      clearTlsKeyPassphrase: _clearTlsKeyPassphrase,
+      clearAmbiguousStoredUri: _clearAmbiguousStoredUri,
       hasStoredApiKey: _hasStoredApiKey,
       hasStoredSshPassword: _hasStoredSshPassword,
       hasStoredSshPrivateKey: _hasStoredSshPrivateKey,
@@ -487,8 +571,12 @@ export class ConnectionFormPanel {
             submittedSsh.authMethod === "privateKey"
               ? this.resolveSubmittedSecret(
                   submittedSsh.passphrase,
-                  resolvedStoredSecrets.sshPassphrase,
-                  existing?.ssh?.passphrase,
+                  payload.clearSshPassphrase
+                    ? undefined
+                    : resolvedStoredSecrets.sshPassphrase,
+                  payload.clearSshPassphrase
+                    ? undefined
+                    : existing?.ssh?.passphrase,
                 )
               : undefined,
         }
@@ -501,8 +589,12 @@ export class ConnectionFormPanel {
               rest.tls.mode === "mutualTls"
                 ? this.resolveSubmittedSecret(
                     rest.tls.keyPassphrase,
-                    resolvedStoredSecrets.tlsKeyPassphrase,
-                    existing?.tls?.keyPassphrase,
+                    payload.clearTlsKeyPassphrase
+                      ? undefined
+                      : resolvedStoredSecrets.tlsKeyPassphrase,
+                    payload.clearTlsKeyPassphrase
+                      ? undefined
+                      : existing?.tls?.keyPassphrase,
                   )
                 : undefined,
           }
@@ -572,6 +664,10 @@ export class ConnectionFormPanel {
       existing?.type === "elasticsearch"
         ? getExistingElasticEndpoint(existing, resolvedStoredSecrets)
         : undefined;
+    const usesLegacyAwsEndpoint =
+      payload.type === "dynamodb" &&
+      existing?.type === "dynamodb" &&
+      trimOptionalUriValue(existing.endpoint) === undefined;
     const resolvedEndpoint =
       payload.type === "elasticsearch"
         ? restoreCredentialBearingUri(
@@ -584,8 +680,10 @@ export class ConnectionFormPanel {
           )
         : restoreSubmittedUriValue(
             submittedEndpoint,
-            resolvedStoredSecrets.endpoint,
-            existing?.endpoint,
+            usesLegacyAwsEndpoint
+              ? resolvedStoredSecrets.awsEndpoint
+              : resolvedStoredSecrets.endpoint,
+            usesLegacyAwsEndpoint ? existing?.awsEndpoint : existing?.endpoint,
           );
     return normalizeMongoConnectionConfig({
       ...rest,
@@ -644,144 +742,199 @@ export class ConnectionFormPanel {
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
+    if (this.disposed) return;
     const parsed = parseConnectionFormPanelMessage(msg);
     if (!parsed) {
+      const { type, requestId } = readRawMessageIdentity(msg);
+      if (type === "testConnection") {
+        this.panel.webview.postMessage({
+          type: "testResult",
+          payload: {
+            requestId,
+            success: false,
+            error: "Connection settings are invalid.",
+          },
+        });
+      }
       return;
     }
 
     switch (parsed.type) {
       case "saveConnection": {
         const payload = parsed.payload;
-        if (!payload) {
+        if (!payload || this.saveInProgress) {
           return;
         }
-        const previousSecretSnapshot = await this.readStoredSecretsSnapshot(
-          payload.id,
-        );
-        const existing = this.connectionManager.getConnection(payload.id);
-        if (previousSecretSnapshot.readError && existing?.useSecretStorage) {
+        if (this.rejectsConnectionId(payload.id)) {
           this.panel.webview.postMessage({
             type: "saveResult",
-            payload: {
-              success: false,
-              error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing connection data was not changed.`,
-            },
+            payload: { success: false, error: CONNECTION_ID_MISMATCH_MESSAGE },
           });
           return;
         }
-        const raw = await this.resolveSubmittedConfig(
-          payload,
-          previousSecretSnapshot.parsed,
-        );
-        const validation = this.validationService.validate(raw);
-        if (!validation.valid) {
-          this.panel.webview.postMessage({
-            type: "saveResult",
-            payload: {
-              success: false,
-              error: validation.message ?? "Connection settings are invalid.",
-              validation,
-            },
-          });
-          return;
-        }
-
-        const inlinePassword = trimOptionalSecretValue(raw.password);
-        const usesSeparatePassword = !(
-          (raw.type === "redis" && trimOptionalUriValue(raw.connectionUri)) ||
-          (raw.type === "mongodb" &&
-            (raw.mongoConnectionMode === "uri" ||
-              raw.mongoAuthMethod === "none"))
-        );
-        const requiresStoredPasswordRecovery =
-          usesSeparatePassword &&
-          !raw.useSecretStorage &&
-          payload.hasStoredSecret === true &&
-          payload.clearPassword !== true;
-        if (
-          requiresStoredPasswordRecovery &&
-          inlinePassword === undefined &&
-          previousSecretSnapshot.parsed.password === undefined
-        ) {
-          this.panel.webview.postMessage({
-            type: "saveResult",
-            payload: {
-              success: false,
-              error: previousSecretSnapshot.readError
-                ? `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; re-enter password to continue.`
-                : "Existing stored password could not be loaded. Existing credentials were preserved; re-enter password to continue.",
-            },
-          });
-          return;
-        }
-
+        this.saveInProgress = true;
         try {
-          if (
-            raw.useSecretStorage === false &&
-            hasConnectionConfigSecrets(raw)
-          ) {
-            const consent = await vscode.window.showWarningMessage(
-              "Save credentials in plaintext? Passwords, API/AWS keys, SSH secrets, TLS key passphrases and credentials in connection URLs will be saved in settings.json without encryption. They may be exposed by sharing or syncing settings.",
-              { modal: true },
-              "Save in Plaintext",
-            );
-            if (this.disposed) return;
-            if (consent !== "Save in Plaintext") {
-              this.panel.webview.postMessage({
-                type: "saveResult",
-                payload: {
-                  success: false,
-                  error:
-                    "Saving plaintext credentials was cancelled. Connection data was not changed.",
-                },
-              });
-              return;
-            }
+          const previousSecretSnapshot: {
+            parsed: StoredConnectionSecrets;
+            readError?: string;
+          } = usesStoredSecrets(this.getStoredConnection(payload.id))
+            ? await this.readStoredSecretsSnapshot(payload.id)
+            : { parsed: {} };
+          if (this.disposed) return;
+          const existing = this.getStoredConnection(payload.id);
+          if (previousSecretSnapshot.readError && usesStoredSecrets(existing)) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing connection data was not changed.`,
+              },
+            });
+            return;
           }
-          const hasSubmittedAwsKeyMaterial =
-            raw.type === "dynamodb" &&
-            (trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
-              trimOptionalSecretValue(payload.awsSecretAccessKey) !==
-                undefined);
-          const clearStoredSecrets: ConnectionSecretClearOptions = {
-            password:
-              payload.clearPassword === true ||
-              (raw.type === "redis" &&
-                trimOptionalUriValue(payload.connectionUri) !== undefined),
-            apiKey: payload.clearApiKey === true,
-            credentialBearingUris:
-              (payload.type === "redis" || payload.type === "elasticsearch") &&
-              payload.keepConnectionUriCredentials === false,
-            awsCredentials:
-              payload.clearAwsCredentials === true ||
-              (raw.type === "dynamodb" &&
-                (hasSubmittedAwsKeyMaterial ||
-                  (Boolean(raw.awsProfile?.trim()) &&
-                    !(
-                      trimOptionalSecretValue(raw.awsAccessKeyId) &&
-                      trimOptionalSecretValue(raw.awsSecretAccessKey)
-                    )))),
-          };
-          const saved =
-            (await this.connectionManager.saveConnection(
+          const raw = await this.resolveSubmittedConfig(
+            payload,
+            previousSecretSnapshot.parsed,
+          );
+          if (this.disposed) return;
+          if (
+            hasUnresolvedAmbiguousStoredUri(
+              existing,
               raw,
-              clearStoredSecrets,
-            )) ?? raw;
-          this.resolveFn?.(sanitizeConnectionConfigForResponse(saved));
-        } catch (err: unknown) {
-          const error = normalizeUnknownError(err);
-          this.panel.webview.postMessage({
-            type: "saveResult",
-            payload: {
-              success: false,
-              error: `Could not save connection: ${error.message}`,
-            },
-          });
-          return;
-        }
+              payload.clearAmbiguousStoredUri,
+            )
+          ) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: { success: false, error: AMBIGUOUS_STORED_URI_MESSAGE },
+            });
+            return;
+          }
+          const validation = this.validationService.validate(raw);
+          if (!validation.valid) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error: validation.message ?? "Connection settings are invalid.",
+                validation,
+              },
+            });
+            return;
+          }
 
-        this.resolveFn = undefined;
-        this.panel.dispose();
+          const inlinePassword = trimOptionalSecretValue(raw.password);
+          const changesConnectionType = this.changesStoredConnectionType(raw);
+          const usesSeparatePassword = !(
+            (raw.type === "redis" && trimOptionalUriValue(raw.connectionUri)) ||
+            (raw.type === "mongodb" &&
+              (raw.mongoConnectionMode === "uri" ||
+                raw.mongoAuthMethod === "none"))
+          );
+          const requiresStoredPasswordRecovery =
+            usesSeparatePassword &&
+            !changesConnectionType &&
+            connectionTypeUsesPassword(raw) &&
+            !raw.useSecretStorage &&
+            payload.hasStoredSecret === true &&
+            payload.clearPassword !== true;
+          if (
+            requiresStoredPasswordRecovery &&
+            inlinePassword === undefined &&
+            previousSecretSnapshot.parsed.password === undefined
+          ) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error: previousSecretSnapshot.readError
+                  ? `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; re-enter password to continue.`
+                  : "Existing stored password could not be loaded. Existing credentials were preserved; re-enter password to continue.",
+              },
+            });
+            return;
+          }
+
+          try {
+            if (
+              raw.useSecretStorage === false &&
+              hasConnectionConfigSecrets(raw)
+            ) {
+              const consent = await vscode.window.showWarningMessage(
+                "Save credentials in plaintext? Passwords, API/AWS keys, SSH secrets, TLS key passphrases and credentials in connection URLs will be saved in settings.json without encryption. They may be exposed by sharing or syncing settings.",
+                { modal: true },
+                "Save in Plaintext",
+              );
+              if (this.disposed) return;
+              if (consent !== "Save in Plaintext") {
+                this.panel.webview.postMessage({
+                  type: "saveResult",
+                  payload: {
+                    success: false,
+                    error:
+                      "Saving plaintext credentials was cancelled. Connection data was not changed.",
+                  },
+                });
+                return;
+              }
+            }
+            const hasSubmittedAwsKeyMaterial =
+              raw.type === "dynamodb" &&
+              (trimOptionalSecretValue(payload.awsAccessKeyId) !== undefined ||
+                trimOptionalSecretValue(payload.awsSecretAccessKey) !==
+                  undefined);
+            const clearStoredSecrets: ConnectionSecretClearOptions = {
+              ...(payload.clearSshPassphrase ? { sshPassphrase: true } : {}),
+              ...(payload.clearTlsKeyPassphrase
+                ? { tlsKeyPassphrase: true }
+                : {}),
+              password:
+                payload.clearPassword === true ||
+                changesConnectionType ||
+                (raw.type === "redis" &&
+                  trimOptionalUriValue(payload.connectionUri) !== undefined),
+              apiKey: payload.clearApiKey === true,
+              credentialBearingUris:
+                (payload.type === "redis" ||
+                  payload.type === "elasticsearch") &&
+                payload.keepConnectionUriCredentials === false,
+              awsCredentials:
+                payload.clearAwsCredentials === true ||
+                (raw.type === "dynamodb" &&
+                  (hasSubmittedAwsKeyMaterial ||
+                    (Boolean(raw.awsProfile?.trim()) &&
+                      !(
+                        trimOptionalSecretValue(raw.awsAccessKeyId) &&
+                        trimOptionalSecretValue(raw.awsSecretAccessKey)
+                      )))),
+            };
+            if (this.disposed) return;
+            const saved =
+              (await this.connectionManager.saveConnection(
+                raw,
+                clearStoredSecrets,
+                this.savePrecondition,
+              )) ?? raw;
+            if (this.disposed) return;
+            this.resolveFn?.(sanitizeConnectionConfigForResponse(saved));
+          } catch (err: unknown) {
+            if (this.disposed) return;
+            const error = normalizeUnknownError(err);
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error: `Could not save connection: ${error.message}`,
+              },
+            });
+            return;
+          }
+
+          this.resolveFn = undefined;
+          this.panel.dispose();
+        } finally {
+          this.saveInProgress = false;
+        }
         break;
       }
       case "cancelTestConnection": {
@@ -790,8 +943,19 @@ export class ConnectionFormPanel {
         break;
       }
       case "testConnection": {
-        const payload = parsed.payload;
-        if (!payload) {
+        if (!parsed.payload) {
+          return;
+        }
+        const { requestId, ...payload } = parsed.payload;
+        if (this.rejectsConnectionId(payload.id)) {
+          this.panel.webview.postMessage({
+            type: "testResult",
+            payload: {
+              requestId,
+              success: false,
+              error: CONNECTION_ID_MISMATCH_MESSAGE,
+            },
+          });
           return;
         }
         this.testAbortController?.abort();
@@ -801,11 +965,29 @@ export class ConnectionFormPanel {
         try {
           const raw = await this.resolveSubmittedConfig(payload);
           if (signal.aborted) break;
+          if (
+            hasUnresolvedAmbiguousStoredUri(
+              this.getStoredConnection(payload.id),
+              raw,
+              payload.clearAmbiguousStoredUri,
+            )
+          ) {
+            this.panel.webview.postMessage({
+              type: "testResult",
+              payload: {
+                requestId,
+                success: false,
+                error: AMBIGUOUS_STORED_URI_MESSAGE,
+              },
+            });
+            return;
+          }
           const validation = this.validationService.validate(raw);
           if (!validation.valid) {
             this.panel.webview.postMessage({
               type: "testResult",
               payload: {
+                requestId,
                 success: false,
                 error: validation.message ?? "Connection settings are invalid.",
                 validation,
@@ -821,7 +1003,23 @@ export class ConnectionFormPanel {
           if (signal.aborted) break;
           this.panel.webview.postMessage({
             type: "testResult",
-            payload: result,
+            payload: { ...result, requestId },
+          });
+        } catch (error: unknown) {
+          if (
+            this.disposed ||
+            signal.aborted ||
+            this.testAbortController !== controller
+          ) {
+            return;
+          }
+          const normalized = logErrorWithContext(
+            "ConnectionFormPanel test error",
+            error,
+          );
+          this.panel.webview.postMessage({
+            type: "testResult",
+            payload: { requestId, success: false, error: normalized.message },
           });
         } finally {
           if (this.testAbortController === controller) {
@@ -831,6 +1029,7 @@ export class ConnectionFormPanel {
         break;
       }
       case "cancel": {
+        if (this.saveInProgress) return;
         this.resolveFn?.(undefined);
         this.resolveFn = undefined;
         this.panel.dispose();

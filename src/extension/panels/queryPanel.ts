@@ -73,7 +73,6 @@ export class QueryPanel {
   private editorLanguage: QueryEditorLanguage | undefined;
   private lastQueryResult: QueryPanelCachedResult | null = null;
   private activeConnectionId: string;
-  private readonly initialQueryText: string | undefined;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -88,7 +87,6 @@ export class QueryPanel {
   ) {
     this.panel = panel;
     this.connectionManager = connectionManager;
-    this.initialQueryText = initialQueryText;
     this.initialConnectionId = connectionId;
     this.activeConnectionId = connectionId;
     this.formatOnOpen = formatOnOpen;

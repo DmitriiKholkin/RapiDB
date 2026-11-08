@@ -1,20 +1,3 @@
-export {
-  buildFilterExpression,
-  type ColumnTypeMeta as ColumnMeta,
-  defaultFilterOperator,
-  type FilterExpression,
-  type FilterOperator,
-  type ForeignKeyMeta,
-  type IndexMeta,
-  inferQueryColumnCategory,
-  inferValueCategory,
-  isNumericCategory,
-  NULL_SENTINEL,
-  type QueryColumnMeta,
-  type TypeCategory,
-  valueFilterOperator,
-} from "../shared/tableTypes";
-
 import type { TypeCategory } from "../shared/tableTypes";
 export type Row = Record<string, unknown>;
 export type PendingEdits = Map<number, Map<string, unknown>>;
@@ -49,16 +32,6 @@ export interface BadgePresentation {
   badgeBorder: "none";
 }
 export interface CategoryPresentation extends BadgePresentation {
-  label: string;
-}
-export type StructuralBadgeKind =
-  | "pk"
-  | "fk"
-  | "ai"
-  | "primary"
-  | "unique"
-  | "index";
-export interface StructuralBadgePresentation extends BadgePresentation {
   label: string;
 }
 type CategoryPresentationKey =
@@ -145,41 +118,6 @@ const CATEGORY_PRESENTATIONS: Record<
     "rgba(128,128,128,0.12)",
   ),
 };
-const STRUCTURAL_BADGE_PRESENTATIONS: Record<
-  StructuralBadgeKind,
-  StructuralBadgePresentation
-> = {
-  pk: makeStructuralBadgePresentation(
-    "PK",
-    "var(--vscode-editorWarning-foreground, #8f5b00)",
-    "rgba(143, 91, 0, 0.16)",
-  ),
-  fk: makeStructuralBadgePresentation(
-    "FK",
-    "var(--vscode-textLink-foreground, #2f6f9f)",
-    "rgba(47, 111, 159, 0.16)",
-  ),
-  ai: makeStructuralBadgePresentation(
-    "AI",
-    "var(--vscode-terminal-ansiMagenta, #7c4ea3)",
-    "rgba(124, 78, 163, 0.16)",
-  ),
-  primary: makeStructuralBadgePresentation(
-    "PRIMARY",
-    "var(--vscode-editorWarning-foreground, #8f5b00)",
-    "rgba(143, 91, 0, 0.16)",
-  ),
-  unique: makeStructuralBadgePresentation(
-    "UNIQUE",
-    "var(--vscode-textLink-foreground, #2f6f9f)",
-    "rgba(47, 111, 159, 0.16)",
-  ),
-  index: makeStructuralBadgePresentation(
-    "INDEX",
-    "var(--vscode-descriptionForeground, #6b7280)",
-    "rgba(107, 114, 128, 0.12)",
-  ),
-};
 export function placeholderForCategory(cat: TypeCategory): string {
   switch (cat) {
     case "boolean":
@@ -196,21 +134,10 @@ export function placeholderForCategory(cat: TypeCategory): string {
       return "";
   }
 }
-export function categoryLabel(cat: TypeCategory): string {
-  return getCategoryPresentation(cat).label;
-}
-export function categoryColor(cat: TypeCategory): string {
-  return getCategoryPresentation(cat).foreground;
-}
 export function getCategoryPresentation(
   cat: TypeCategory,
 ): CategoryPresentation {
   return CATEGORY_PRESENTATIONS[getCategoryPresentationKey(cat)];
-}
-export function getStructuralBadgePresentation(
-  kind: StructuralBadgeKind,
-): StructuralBadgePresentation {
-  return STRUCTURAL_BADGE_PRESENTATIONS[kind];
 }
 function getCategoryPresentationKey(
   cat: TypeCategory,
@@ -253,13 +180,6 @@ function makeCategoryPresentation(
   foreground: string,
   badgeBackground: string,
 ): CategoryPresentation {
-  return makeBadgePresentation(label, foreground, badgeBackground);
-}
-function makeStructuralBadgePresentation(
-  label: string,
-  foreground: string,
-  badgeBackground: string,
-): StructuralBadgePresentation {
   return makeBadgePresentation(label, foreground, badgeBackground);
 }
 function makeBadgePresentation(

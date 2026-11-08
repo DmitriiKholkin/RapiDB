@@ -1,9 +1,14 @@
-import React, { useCallback, useEffect, useId, useRef } from "react";
+import type React from "react";
+import { useCallback, useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import type { TableMutationPreviewPayload } from "../../../shared/webviewContracts";
+import { isImeComposing } from "../../utils/ime";
 import { Icon } from "../Icon";
 import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
-import type { StructuredCellDialogState } from "./structuredCellDialog";
+import {
+  getStructuredCellDraftValidationError,
+  type StructuredCellDialogState,
+} from "./structuredCellDialog";
 import { PREVIEW_DIALOG_EDITOR_H, tableButtonStyle } from "./tableViewHelpers";
 
 const DIALOG_FOCUSABLE_SELECTOR =
@@ -41,6 +46,7 @@ function useDialogFocusTrap(options: {
 
   return useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
+      if (isImeComposing(event)) return;
       if (event.key === "Escape") {
         onEscape?.();
         return;
@@ -262,6 +268,8 @@ export interface LargeMonacoDialogProps {
   onCancel: () => void;
   onConfirm: () => void;
   extraActions?: React.ReactNode;
+  validationMessage?: string | null;
+  confirmDisabled?: boolean;
   focusEditorOnOpen?: boolean;
   hideCancelAction?: boolean;
   fullWindow?: boolean;
@@ -280,6 +288,8 @@ export function LargeMonacoDialog({
   onCancel,
   onConfirm,
   extraActions,
+  validationMessage,
+  confirmDisabled = false,
   focusEditorOnOpen = false,
   hideCancelAction = false,
   fullWindow = false,
@@ -414,6 +424,19 @@ export function LargeMonacoDialog({
             />
           </div>
 
+          {validationMessage && (
+            <div
+              role="alert"
+              aria-live="polite"
+              style={{
+                color: "var(--vscode-errorForeground)",
+                fontSize: 12,
+              }}
+            >
+              {validationMessage}
+            </div>
+          )}
+
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
             {extraActions}
             {!hideCancelAction && (
@@ -427,7 +450,13 @@ export function LargeMonacoDialog({
             )}
             <button
               type="button"
-              style={tableButtonStyle("primary")}
+              style={{
+                ...tableButtonStyle("primary"),
+                ...(confirmDisabled
+                  ? { opacity: 0.55, cursor: "not-allowed" }
+                  : {}),
+              }}
+              disabled={confirmDisabled}
               onClick={onConfirm}
             >
               {confirmLabel}
@@ -458,9 +487,9 @@ function MutationPreviewDialog({
       title={preview.title}
       description={
         <>
-          {preview.statementCount} statement
-          {preview.statementCount === 1 ? "" : "s"} will be executed. The
-          preview below is read only and matches the prepared mutation plan.
+          {preview.statementCount} planned operation
+          {preview.statementCount === 1 ? "" : "s"}. The preview below is read
+          only; descriptions marked non-executable are not commands to run.
         </>
       }
       value={preview.text ?? preview.sql}
@@ -498,6 +527,14 @@ function StructuredCellDialog({
   onSetDefault,
   onSetNull,
 }: StructuredCellDialogProps) {
+  const validationMessage = dialog.readOnly
+    ? null
+    : getStructuredCellDraftValidationError(
+        dialog.draftText,
+        dialog.column,
+        dialog.isNull,
+      );
+
   return (
     <LargeMonacoDialog
       title={dialog.title}
@@ -511,6 +548,8 @@ function StructuredCellDialog({
       onChange={onChange}
       onCancel={onCancel}
       onConfirm={onConfirm}
+      validationMessage={validationMessage}
+      confirmDisabled={validationMessage !== null}
       focusEditorOnOpen
       extraActions={
         !dialog.readOnly ? (

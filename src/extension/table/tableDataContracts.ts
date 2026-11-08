@@ -16,6 +16,7 @@ export interface TablePage {
   rows: Record<string, unknown>[];
   mongoIdTypes?: Array<"objectId" | "string" | null>;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
+  rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   totalCount: number;
   executionTimeMs?: number;
 }

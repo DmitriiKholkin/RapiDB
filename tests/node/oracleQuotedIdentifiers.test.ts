@@ -11,8 +11,13 @@ function setup(fallback = false) {
     type: "oracle",
   });
   const execute = vi.fn(async (sql: string, params?: unknown[]) => {
+    if (sql.includes("DBMS_METADATA.GET_DDL('TRIGGER'")) {
+      expect(params).toEqual(['Mixed"Trigger', schema]);
+      if (fallback) throw new Error("Metadata unavailable");
+      return { rows: [{ DDL: "exact trigger DDL" }] };
+    }
     if (sql.includes("DBMS_METADATA.GET_DDL")) {
-      expect(params).toEqual([schema, table]);
+      expect(params).toEqual([table, schema]);
       if (fallback) throw new Error("Metadata unavailable");
       return { rows: [{ DDL: "exact DDL" }] };
     }
@@ -23,13 +28,15 @@ function setup(fallback = false) {
     if (sql.includes("SELECT object_type FROM all_objects")) {
       return { rows: [{ OBJECT_TYPE: "TABLE" }] };
     }
-    if (sql.includes("SELECT trigger_type, triggering_event")) {
+    if (sql.includes("SELECT owner, description, when_clause, trigger_body")) {
       expect(params?.[2]).toBe('Mixed"Trigger');
       return {
         rows: [
           {
-            TRIGGER_TYPE: "BEFORE EACH ROW",
-            TRIGGERING_EVENT: "UPDATE",
+            OWNER: schema,
+            DESCRIPTION:
+              '"Mixed""Trigger"\nBEFORE UPDATE ON "Mixed""Owner"."Mixed""Table"\nFOR EACH ROW\n',
+            WHEN_CLAUSE: null,
             TRIGGER_BODY: "BEGIN NULL; END;",
           },
         ],
@@ -105,7 +112,10 @@ describe("Oracle catalog identifier case", () => {
   });
 
   it("preserves and quotes trigger names in reconstructed DDL", async () => {
-    const { driver } = setup();
+    expect(
+      await setup().driver.getTriggerDDL("", schema, table, 'Mixed"Trigger'),
+    ).toBe("exact trigger DDL");
+    const { driver } = setup(true);
     const ddl = await driver.getTriggerDDL("", schema, table, 'Mixed"Trigger');
     expect(ddl).toContain('TRIGGER "Mixed""Owner"."Mixed""Trigger"');
     expect(ddl).toContain('ON "Mixed""Owner"."Mixed""Table"');

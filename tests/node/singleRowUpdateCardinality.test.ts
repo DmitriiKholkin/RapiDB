@@ -40,7 +40,6 @@ describe("single-row UPDATE cardinality", () => {
         columns,
       );
       if (!prepared.executable) throw new Error("Expected UPDATE plan");
-      // An external migration can remove a key without notifying an open panel.
       await driver.query(
         "DROP TABLE events; CREATE TABLE events (id INTEGER NOT NULL, happened DATE); INSERT INTO events VALUES (1, '2020-01-01'), (1, '2020-01-02')",
       );

@@ -3,7 +3,6 @@ import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
   isRecord,
   parseEnvelope,
-  parseEnvelopeTextPayload,
   parseOptionalPayloadRecord,
   parseRequiredPayloadRecord,
   readOptionalBoolean,
@@ -65,6 +64,11 @@ export interface TableMutationPreviewPayload {
   statementCount: number;
 }
 
+export interface TableSortPayload {
+  column: string;
+  direction: "asc" | "desc";
+}
+
 export interface TableMutationPreviewDecisionPayload {
   operationId: string;
   previewToken: string;
@@ -79,12 +83,25 @@ export interface ClipboardTextPayload extends ClipboardReadPayload {
   text: string;
 }
 
-export interface TableMutationResultPayload {
-  operationId: string;
+export interface ClipboardWritePayload {
+  text: string;
+  requestId?: string;
+  recipient?: string;
+}
+
+export interface ClipboardWrittenPayload extends ClipboardReadPayload {
   success: boolean;
-  error?: string;
-  status?: "prevalidation_failed";
-  columns?: string[];
+}
+
+export function parseClipboardWritePayload(
+  payload: unknown,
+): ClipboardWritePayload | null {
+  if (!isRecord(payload) || typeof payload.text !== "string") return null;
+  const requestId = readRequiredString(payload, "requestId");
+  const recipient = readRequiredString(payload, "recipient");
+  return requestId && recipient
+    ? { text: payload.text, requestId, recipient }
+    : { text: payload.text };
 }
 
 export interface DeleteRowOutcome {
@@ -117,6 +134,7 @@ export interface TableInitialState extends PanelRetentionState {
   connectionReadOnly?: boolean;
   mongoRowIdentity?: boolean;
   defaultPageSize?: number;
+  connectionSessionKey?: string;
 }
 
 export function parseTableInitialState(
@@ -155,6 +173,7 @@ export function parseTableInitialState(
     connectionReadOnly: readOptionalBoolean(input, "connectionReadOnly"),
     mongoRowIdentity: readOptionalBoolean(input, "mongoRowIdentity"),
     defaultPageSize: readOptionalNumber(input, "defaultPageSize"),
+    connectionSessionKey: readOptionalString(input, "connectionSessionKey"),
   };
 }
 
@@ -167,7 +186,7 @@ export type TablePanelMessage =
         page?: number | string;
         pageSize?: number | string;
         filters?: unknown;
-        sort?: unknown;
+        sort?: TableSortPayload | null;
         refreshMetadata?: boolean;
       }
     >
@@ -193,7 +212,7 @@ export type TablePanelMessage =
   | WebviewMessageEnvelope<
       "exportCSV",
       {
-        sort?: unknown;
+        sort?: TableSortPayload | null;
         filters?: unknown[];
         limitToPage?: { page: number; pageSize: number };
         columnOrder?: string[];
@@ -202,7 +221,7 @@ export type TablePanelMessage =
   | WebviewMessageEnvelope<
       "exportJSON",
       {
-        sort?: unknown;
+        sort?: TableSortPayload | null;
         filters?: unknown[];
         limitToPage?: { page: number; pageSize: number };
         columnOrder?: string[];
@@ -217,7 +236,11 @@ export type TablePanelMessage =
       TableMutationPreviewDecisionPayload
     >
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
-  | WebviewMessageEnvelope<"writeClipboard", { text: string }>;
+  | WebviewMessageEnvelope<"writeClipboard", ClipboardWritePayload>
+  | WebviewMessageEnvelope<
+      "unsavedChangesState",
+      { hasUnsavedChanges: boolean }
+    >;
 
 function isRowUpdateMessagePayload(
   value: unknown,
@@ -286,6 +309,20 @@ function readLimitToPage(
   return { page, pageSize };
 }
 
+function readSort(value: unknown): TableSortPayload | null | undefined | false {
+  if (value === undefined || value === null) {
+    return value;
+  }
+  if (
+    !isRecord(value) ||
+    typeof value.column !== "string" ||
+    (value.direction !== "asc" && value.direction !== "desc")
+  ) {
+    return false;
+  }
+  return { column: value.column, direction: value.direction };
+}
+
 function readOperationId(payload: Record<string, unknown>): string | null {
   return readRequiredString(payload, "operationId");
 }
@@ -315,6 +352,10 @@ export function parseTablePanelMessage(
       if (!payload) {
         return null;
       }
+      const sort = readSort(payload.sort);
+      if (sort === false) {
+        return null;
+      }
       return {
         type: envelope.type,
         payload: {
@@ -322,7 +363,7 @@ export function parseTablePanelMessage(
           page: payload.page as number | string | undefined,
           pageSize: payload.pageSize as number | string | undefined,
           filters: payload.filters,
-          sort: payload.sort,
+          sort,
           refreshMetadata: payload.refreshMetadata === true,
         },
       };
@@ -412,6 +453,10 @@ export function parseTablePanelMessage(
       if (payload.filters !== undefined && !Array.isArray(payload.filters)) {
         return null;
       }
+      const sort = readSort(payload.sort);
+      if (sort === false) {
+        return null;
+      }
       const columnOrder = payload.columnOrder;
       if (
         columnOrder !== undefined &&
@@ -423,7 +468,7 @@ export function parseTablePanelMessage(
       return {
         type: envelope.type,
         payload: {
-          sort: payload.sort,
+          sort,
           filters: payload.filters as unknown[] | undefined,
           limitToPage: readLimitToPage(payload.limitToPage),
           columnOrder: columnOrder as string[] | undefined,
@@ -451,8 +496,18 @@ export function parseTablePanelMessage(
     }
 
     case "writeClipboard": {
-      const payload = parseEnvelopeTextPayload(envelope);
+      const payload = parseClipboardWritePayload(envelope.payload);
       return payload ? { type: envelope.type, payload } : null;
+    }
+
+    case "unsavedChangesState": {
+      const payload = parseRequiredPayloadRecord(envelope);
+      return payload && typeof payload.hasUnsavedChanges === "boolean"
+        ? {
+            type: envelope.type,
+            payload: { hasUnsavedChanges: payload.hasUnsavedChanges },
+          }
+        : null;
     }
 
     default:
@@ -465,4 +520,5 @@ export interface TableInitPayload {
   primaryKeyColumns: string[];
   isView?: boolean;
   connectionReadOnly?: boolean;
+  connectionSessionKey?: string;
 }

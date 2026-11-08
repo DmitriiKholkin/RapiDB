@@ -329,6 +329,26 @@ describe("useColumnDragReorder", () => {
     }
   });
 
+  it("does not drop a column onto an excluded column header", () => {
+    const widths = { __sel: 40, a: 100, b: 100 };
+    installRectMock(widths);
+    const rig = mountGrid(["__sel", "a", "b"], {
+      widths,
+      excludedIds: ["__sel"],
+    });
+    try {
+      rig.pressDown("a", 90);
+      for (let x = 90; x >= 0; x -= 5) {
+        rig.moveTo(x);
+      }
+      expect(rig.getOrder()).toEqual(["__sel", "a", "b"]);
+      expect(rig.getSetOrderCallCount()).toBe(0);
+      rig.release(0);
+    } finally {
+      rig.cleanup();
+    }
+  });
+
   it("calls onDragEnded exactly once after a successful drag", () => {
     const widths = { a: 40, b: 200, c: 80 };
     installRectMock(widths);

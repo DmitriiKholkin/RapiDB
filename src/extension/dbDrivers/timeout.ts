@@ -125,6 +125,7 @@ const DB_OPERATION_METHODS = new Set([
   "deleteRows",
   "runTransaction",
   "getMutationAtomicityRisk",
+  "getTableRowIdentityOrderExpressions",
 ]);
 const CANCELLABLE_MUTATION_METHODS = new Set([
   "updateRows",
@@ -199,6 +200,17 @@ function timeoutMsForKind(
     : settings.dbOperationTimeoutMs;
 }
 
+function earlierSuppliedDeadline(
+  supplied: number | undefined,
+  configuredDeadline: number,
+): number | undefined {
+  return typeof supplied === "number" &&
+    !Number.isNaN(supplied) &&
+    supplied < configuredDeadline
+    ? supplied
+    : undefined;
+}
+
 async function withDriverTimeout<T>(
   promiseFactory: () => Promise<T>,
   options: {
@@ -206,6 +218,7 @@ async function withDriverTimeout<T>(
     operationName: string;
     timeoutSettingsProvider: DriverTimeoutSettingsProvider;
     deadline?: number;
+    expireLateSettlement?: boolean;
     onDeadline?: (error: DriverTimeoutError) => void;
     decorateTimeoutError?: (error: DriverTimeoutError) => void;
     onTimeout?: () => void | Promise<void>;
@@ -235,6 +248,11 @@ async function withDriverTimeout<T>(
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
     return promiseFactory();
   }
+
+  const expireLateSettlement = () =>
+    options.expireLateSettlement !== false &&
+    options.deadline !== undefined &&
+    Date.now() >= options.deadline;
 
   return await new Promise<T>((resolve, reject) => {
     let settled = false;
@@ -268,7 +286,7 @@ async function withDriverTimeout<T>(
 
     void pendingPromise.then(
       (value) => {
-        if (options.deadline !== undefined && Date.now() >= options.deadline) {
+        if (expireLateSettlement()) {
           expire();
         }
         if (settled) {
@@ -285,7 +303,7 @@ async function withDriverTimeout<T>(
         resolve(value);
       },
       (error) => {
-        if (options.deadline !== undefined && Date.now() >= options.deadline) {
+        if (expireLateSettlement()) {
           expire();
         }
         if (settled) {
@@ -333,6 +351,7 @@ export function createTimeoutAwareDriver<T extends object>(
       const wrapped = (...args: unknown[]) => {
         let pendingOperation: Promise<unknown> | undefined;
         let deleteProgress: DriverMutationResult | undefined;
+        let operationDeadline: number | undefined;
         const isMetadata =
           timeoutKind === "dbOperation" && !NON_METADATA_METHODS.has(property);
         const metadataTimeoutMs = isMetadata
@@ -370,6 +389,8 @@ export function createTimeoutAwareDriver<T extends object>(
           } satisfies QueryExecutionOptions;
         } else if (operationAbort && property === "readTablePage") {
           const request = args[0] as DriverTablePageRequest;
+          const configuredDeadline =
+            Date.now() + timeoutSettingsProvider().dbOperationTimeoutMs;
           args[0] = {
             ...request,
             signal: request.signal
@@ -377,12 +398,22 @@ export function createTimeoutAwareDriver<T extends object>(
               : operationAbort.signal,
             deadline: Math.min(
               request.deadline ?? Infinity,
-              Date.now() + timeoutSettingsProvider().dbOperationTimeoutMs,
+              configuredDeadline,
             ),
           } satisfies DriverTablePageRequest;
+          operationDeadline = earlierSuppliedDeadline(
+            request.deadline,
+            configuredDeadline,
+          );
         } else if (operationAbort && !isMetadata) {
           const timeoutMs = timeoutSettingsProvider().dbOperationTimeoutMs;
           const supplied = args[1] as DriverOperationContext | undefined;
+          const configuredDeadline =
+            timeoutMs > 0 ? Date.now() + timeoutMs : Infinity;
+          operationDeadline = earlierSuppliedDeadline(
+            supplied?.deadline,
+            configuredDeadline,
+          );
           args[1] = {
             ...supplied,
             signal: supplied
@@ -390,7 +421,7 @@ export function createTimeoutAwareDriver<T extends object>(
               : operationAbort.signal,
             deadline: Math.min(
               supplied?.deadline ?? Infinity,
-              timeoutMs > 0 ? Date.now() + timeoutMs : Infinity,
+              configuredDeadline,
             ),
             ...(property === "deleteRows"
               ? {
@@ -423,7 +454,8 @@ export function createTimeoutAwareDriver<T extends object>(
             deadline:
               property === "query"
                 ? (args[2] as QueryExecutionOptions).deadline
-                : metadataDeadline,
+                : (operationDeadline ?? metadataDeadline),
+            expireLateSettlement: !CANCELLABLE_MUTATION_METHODS.has(property),
             decorateTimeoutError: (error) => {
               if (property === "deleteRows")
                 error.deleteResult = deleteProgress;

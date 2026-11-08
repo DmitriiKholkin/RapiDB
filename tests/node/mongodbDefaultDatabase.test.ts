@@ -4,7 +4,6 @@ import { ConnectionManager } from "../../src/extension/connectionManager";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { getConfiguredDefaultDatabaseName } from "../../src/extension/schema/schemaHelpers";
 import { loadConnectionRootCatalog } from "../../src/extension/schema/schemaLoaders";
-import { getConfiguredDefaultDatabaseName as getCacheDefaultDatabaseName } from "../../src/extension/schemaCacheUtils";
 import type {
   ConnectionSshSettings,
   SshRuntimeRequest,
@@ -61,9 +60,6 @@ describe("MongoDB database resolution", () => {
     expect(
       getConfiguredDefaultDatabaseName(config({ connectionUri: uri })),
     ).toBe(database);
-    expect(getCacheDefaultDatabaseName(config({ connectionUri: uri }))).toBe(
-      database,
-    );
   });
 
   it.each([
@@ -77,7 +73,6 @@ describe("MongoDB database resolution", () => {
     const fields = { connectionUri };
     expect(resolveMongoDatabaseName(fields)).toBe("admin");
     expect(getConfiguredDefaultDatabaseName(config(fields))).toBe("admin");
-    expect(getCacheDefaultDatabaseName(config(fields))).toBe("admin");
   });
 
   it("preserves explicit database precedence and prefers a nonblank canonical URI", () => {
@@ -115,7 +110,6 @@ describe("MongoDB database resolution", () => {
     const fields = { database, connectionUri: "mongodb://host/app" };
     expect(resolveMongoDatabaseName(fields)).toBe("app");
     expect(getConfiguredDefaultDatabaseName(config(fields))).toBe("app");
-    expect(getCacheDefaultDatabaseName(config(fields))).toBe("app");
     expect(resolveMongoDatabaseName({ database })).toBe("admin");
   });
 
@@ -147,8 +141,6 @@ describe("MongoDB default scopes with real SDK database and collection objects",
     indexes = [];
     denyAdmin = false;
     denyListDatabases = false;
-    // Stub I/O only: the real constructor, db(), collection(), databaseName,
-    // and namespace ensure this test cannot mask an explicit wrong DB argument.
     vi.spyOn(MongoClient.prototype, "connect").mockImplementation(
       async function (this: MongoClient) {
         clients.push(this);

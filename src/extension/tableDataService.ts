@@ -1,5 +1,9 @@
 import type { ConnectionManager } from "./connectionManager";
-import type { ColumnTypeMeta, FilterExpression } from "./dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  DriverTableExportChunk,
+  FilterExpression,
+} from "./dbDrivers/types";
 import type {
   PreparedDeletePlan,
   PreparedInsertPlan,
@@ -9,16 +13,11 @@ import type {
 import { TableMutationService } from "./table/tableMutationService";
 import { TableReadService } from "./table/tableReadService";
 
-export { formatDatetimeForDisplay } from "./dbDrivers/BaseDBDriver";
 export type {
-  ApplyResult,
   PreparedApplyPlan,
-  PreparedApplyPlanResult,
   PreparedDeletePlan,
   PreparedInsertPlan,
-  RowUpdate,
   SortConfig,
-  TablePage,
 } from "./table/tableDataContracts";
 export {
   applyChangesTransactional,
@@ -71,6 +70,31 @@ export class TableDataService {
       sort,
       skipCount,
       signal,
+    );
+  }
+  getPageChunks(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    page: number,
+    pageSize: number,
+    filters: FilterExpression[],
+    sort: SortConfig | null = null,
+    signal?: AbortSignal,
+    assertExportSession?: () => void,
+  ): AsyncGenerator<DriverTableExportChunk> {
+    return this.readService.getPageChunks(
+      connectionId,
+      database,
+      schema,
+      table,
+      page,
+      pageSize,
+      filters,
+      sort,
+      signal,
+      assertExportSession,
     );
   }
   updateRow(
@@ -165,10 +189,8 @@ export class TableDataService {
     sort: SortConfig | null = null,
     filters: FilterExpression[] = [],
     signal?: AbortSignal,
-  ): AsyncGenerator<{
-    columns: ColumnTypeMeta[];
-    rows: Record<string, unknown>[];
-  }> {
+    selectedColumns?: readonly string[],
+  ): AsyncGenerator<DriverTableExportChunk> {
     return this.readService.exportAll(
       connectionId,
       database,
@@ -178,6 +200,7 @@ export class TableDataService {
       sort,
       filters,
       signal,
+      selectedColumns,
     );
   }
 }

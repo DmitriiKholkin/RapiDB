@@ -1,5 +1,12 @@
+import {
+  createTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  type SortingFn,
+} from "@tanstack/react-table";
 import * as vscode from "vscode";
 import type { ConnectionType } from "../../shared/connectionTypes";
+import { compareExactNumericValues } from "../../shared/exactNumericComparison";
 import {
   type OperationCancellationContext,
   QUERY_LIMIT_POLICY,
@@ -12,8 +19,10 @@ import {
   type QueryBookmarkPayload,
   type QueryEditorSqlDialect,
   type QueryResultExportPayload,
+  type QuerySchemaPayload,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
+import type { SchemaObjectEntry } from "../connectionManagerModels";
 import { colKey, type QueryColumnMeta } from "../dbDrivers/types";
 import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
 import { normalizeUnknownError } from "../utils/errorHandling";
@@ -22,18 +31,24 @@ import {
   exportQueryResultsAsJson,
 } from "../utils/exportService";
 import { logger } from "../utils/logger";
-import { formatQueryResult } from "../utils/queryResultFormatting";
+import {
+  type FormattedQueryResultSet,
+  formatQueryResult,
+} from "../utils/queryResultFormatting";
 import {
   decideReadOnlyQueryExecution,
   mayChangeDatabaseSchema,
 } from "../utils/readOnlyGuards";
 import { applyHardCapToSqlQuery } from "../utils/sqlHardCap";
+import { hasExecutableMysqlComment } from "../utils/sqlStatementScan";
 
 const SUPERSEDED_QUERY_REJECTED_MESSAGE =
   "[RapiDB] Cannot execute query while a previous query is still running for this connection.";
 const SUPERSEDED_QUERY_CANCEL_TIMEOUT_MS = 1_500;
 const MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE =
   "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.";
+const MYSQL_EXECUTABLE_COMMENT_MESSAGE =
+  "[RapiDB] MySQL/MariaDB executable comments are blocked because the server executes their contents. Remove the `/*!...*/` or `/*M!...*/` wrapper and run the intended statement explicitly.";
 const CONNECTION_TYPE_TO_SCHEMA_DIALECT: Record<
   ConnectionType,
   QueryEditorSqlDialect
@@ -54,6 +69,10 @@ export interface QueryPanelCachedResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
+  exportRows?: Record<string, unknown>[];
+  partial?: boolean;
+  resultSets?: FormattedQueryResultSet[];
+  resultSetsTruncated?: boolean;
   missingCells?: QueryMissingCell[];
   truncated?: boolean;
   truncatedAt?: number;
@@ -81,7 +100,11 @@ interface ActiveQueryExecution extends QueryExecutionCancellationHandle {
 export class QueryPanelController {
   private schemaRequestToken = 0;
 
+  private connectionChangeToken = 0;
+  private requestedConnectionId: string | undefined;
+
   private queryRequestToken = 0;
+  private acceptedQueryRequestToken = 0;
 
   private readonly activeQueryExecutions = new Map<
     string,
@@ -97,19 +120,10 @@ export class QueryPanelController {
   private resolveConnectionId(connectionIdOverride?: string): string {
     return (
       connectionIdOverride ||
+      this.requestedConnectionId ||
       this.view.getActiveConnectionId() ||
       this.view.getInitialConnectionId()
     );
-  }
-
-  private getCachedResultForExport(): QueryPanelCachedResult | null {
-    const cached = this.view.getLastQueryResult();
-    if (cached && cached.columns.length > 0) {
-      return cached;
-    }
-
-    vscode.window.showWarningMessage("[RapiDB] No query results to export.");
-    return null;
   }
 
   async handleMessage(message: unknown): Promise<void> {
@@ -149,6 +163,7 @@ export class QueryPanelController {
           "csv",
           parsed.payload?.columnOrder,
           parsed.payload?.sort,
+          parsed.payload?.resultSetIndex,
         );
         break;
       case "exportResultsJSON":
@@ -156,6 +171,7 @@ export class QueryPanelController {
           "json",
           parsed.payload?.columnOrder,
           parsed.payload?.sort,
+          parsed.payload?.resultSetIndex,
         );
         break;
       case "readClipboard":
@@ -163,7 +179,7 @@ export class QueryPanelController {
         break;
       case "writeClipboard":
         if (parsed.payload) {
-          await this.handleWriteClipboard(parsed.payload.text);
+          await this.handleWriteClipboard(parsed.payload);
         }
         break;
       case "addBookmark":
@@ -193,18 +209,28 @@ export class QueryPanelController {
     const schema = this.connectionManager.getSchema(connectionId);
     this.view.postMessage({
       type: "schema",
-      payload: { connectionId, schema },
+      payload: this.buildSchemaPayload(connectionId, schema),
     });
   }
 
   private async handleActiveConnectionChanged(
     connectionId: string,
   ): Promise<void> {
-    if (connectionId === this.view.getActiveConnectionId()) {
+    if (
+      connectionId ===
+      (this.requestedConnectionId ?? this.view.getActiveConnectionId())
+    ) {
       return;
     }
+    const changeToken = ++this.connectionChangeToken;
+    this.requestedConnectionId = connectionId;
     this.queryRequestToken = 0;
+    this.acceptedQueryRequestToken = 0;
     await this.cancelOwnedQueryExecutions("superseded");
+    if (changeToken !== this.connectionChangeToken) {
+      return;
+    }
+    this.requestedConnectionId = undefined;
     this.view.setActiveConnectionId(connectionId);
     this.view.syncTitle();
     void this.pushSchema(connectionId);
@@ -235,12 +261,26 @@ export class QueryPanelController {
         requestToken,
         resultIdentity,
       );
+      if (this.queryRequestToken === requestToken) {
+        this.queryRequestToken = this.acceptedQueryRequestToken;
+      }
       return;
     }
+    this.acceptedQueryRequestToken =
+      this.queryRequestToken === requestToken ? requestToken : 0;
     const reconnectBlock =
       this.connectionManager.getAutomaticReconnectBlockReason?.(connectionId);
     if (reconnectBlock) {
       this.postQueryError(reconnectBlock, requestToken, resultIdentity);
+      return;
+    }
+    const connection = this.connectionManager.getConnection(connectionId);
+    if (connection?.type === "mysql" && hasExecutableMysqlComment(queryText)) {
+      this.postQueryError(
+        MYSQL_EXECUTABLE_COMMENT_MESSAGE,
+        requestToken,
+        resultIdentity,
+      );
       return;
     }
     const readOnlyDecision = decideReadOnlyQueryExecution(
@@ -256,7 +296,6 @@ export class QueryPanelController {
       );
       return;
     }
-    const connection = this.connectionManager.getConnection(connectionId);
     if (connection?.readOnly === true && connection.type === "mssql") {
       this.postQueryError(
         MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE,
@@ -340,8 +379,6 @@ export class QueryPanelController {
       return;
     }
 
-    // Connecting may prompt for credentials or wait on a concurrent attempt.
-    // Never carry pre-connect permissions into the newly available session.
     const executionConnection =
       this.connectionManager.getConnection(connectionId);
     const executionDecision = decideReadOnlyQueryExecution(
@@ -426,13 +463,25 @@ export class QueryPanelController {
         columns: formattedResult.columns,
         columnMeta: formattedResult.columnMeta,
         rows: formattedResult.rows,
+        ...(formattedResult.exportRows
+          ? { exportRows: formattedResult.exportRows }
+          : {}),
+        ...(formattedResult.resultSets
+          ? { resultSets: formattedResult.resultSets }
+          : {}),
+        ...(formattedResult.resultSetsTruncated
+          ? { resultSetsTruncated: true }
+          : {}),
         missingCells: formattedResult.missingCells,
+        ...(formattedResult.error ? { partial: true } : {}),
         truncated: formattedResult.truncated,
         truncatedAt: formattedResult.truncatedAt,
       });
+      const webviewResult = { ...formattedResult };
+      delete webviewResult.exportRows;
       this.view.postMessage({
         type: "queryResult",
-        payload: { ...formattedResult, ...resultIdentity },
+        payload: { ...webviewResult, ...resultIdentity },
       });
     } catch (error: unknown) {
       const activeExecution = this.activeQueryExecutions.get(connectionId);
@@ -444,11 +493,13 @@ export class QueryPanelController {
         activeExecution?.requestToken === requestToken &&
         activeExecution.cancelRequested
       ) {
-        this.postQueryError(
-          `[RapiDB] Query failed after a cancellation request. ${normalized.message} The operation outcome may be unknown; cancellation does not confirm rollback.`,
-          requestToken,
-          resultIdentity,
-        );
+        const isRedisClientDisconnect =
+          connection?.type === "redis" &&
+          /^disconnects client\.?$/i.test(normalized.message.trim());
+        const cancellationMessage = isRedisClientDisconnect
+          ? "[RapiDB] Query cancellation was requested. The Redis query client was disconnected to stop the active request. The operation outcome may be unknown; cancellation does not confirm rollback."
+          : `[RapiDB] Query failed after a cancellation request. ${normalized.message} The operation outcome may be unknown; cancellation does not confirm rollback.`;
+        this.postQueryError(cancellationMessage, requestToken, resultIdentity);
         return;
       }
       this.postQueryError(normalized.message, requestToken, resultIdentity);
@@ -460,8 +511,6 @@ export class QueryPanelController {
         this.connectionManager.getDriver(connectionId) === driver
       ) {
         try {
-          // A cancelled SQLite worker loses session state. Retire the closed
-          // driver so Explorer and the open panels receive the disconnect.
           await this.connectionManager.disconnectFrom(connectionId);
         } catch (error) {
           logger.error("Failed to retire a lost database session", error);
@@ -534,6 +583,9 @@ export class QueryPanelController {
       });
       if (this.queryRequestToken === execution.requestToken) {
         this.queryRequestToken = ++nextQueryRequestToken;
+      }
+      if (this.acceptedQueryRequestToken === execution.requestToken) {
+        this.acceptedQueryRequestToken = 0;
       }
       const current = this.activeQueryExecutions.get(execution.connectionId);
       if (current?.requestToken === execution.requestToken) {
@@ -703,7 +755,9 @@ export class QueryPanelController {
   }
 
   async dispose(): Promise<void> {
+    ++this.connectionChangeToken;
     this.queryRequestToken = 0;
+    this.acceptedQueryRequestToken = 0;
     await this.cancelOwnedQueryExecutions("lifecycle_shutdown");
   }
 
@@ -731,7 +785,11 @@ export class QueryPanelController {
       }
       this.view.postMessage({
         type: "schema",
-        payload: { connectionId, schema: [] },
+        payload: {
+          connectionId,
+          schema: [],
+          error: "Not connected.",
+        } satisfies QuerySchemaPayload<SchemaObjectEntry>,
       });
       return;
     }
@@ -743,7 +801,7 @@ export class QueryPanelController {
       }
       this.view.postMessage({
         type: "schema",
-        payload: { connectionId, schema },
+        payload: this.buildSchemaPayload(connectionId, schema),
       });
     } catch (error: unknown) {
       if (!this.isCurrentSchemaRequest(requestToken)) {
@@ -752,9 +810,28 @@ export class QueryPanelController {
       logger.error("Failed to load schema", error);
       this.view.postMessage({
         type: "schema",
-        payload: { connectionId, schema: [] },
+        payload: {
+          connectionId,
+          schema: [],
+          error: normalizeUnknownError(error).message,
+        } satisfies QuerySchemaPayload<SchemaObjectEntry>,
       });
     }
+  }
+
+  private buildSchemaPayload(
+    connectionId: string,
+    schema: SchemaObjectEntry[],
+  ): QuerySchemaPayload<SchemaObjectEntry> {
+    const schemaState =
+      this.connectionManager.getSchemaSnapshotState(connectionId);
+    return {
+      connectionId,
+      schema,
+      ...(schemaState.status === "error"
+        ? { error: schemaState.error ?? "Schema loading failed." }
+        : {}),
+    };
   }
 
   private isCurrentSchemaRequest(requestToken: number): boolean {
@@ -798,21 +875,43 @@ export class QueryPanelController {
     format: "csv" | "json",
     columnOrder?: string[],
     sort?: QueryResultExportPayload["sort"],
+    resultSetIndex?: number,
   ): Promise<void> {
-    const cached = this.getCachedResultForExport();
+    const cached = this.getCachedResultForExport(resultSetIndex);
     if (!cached) {
       return;
     }
 
-    if (cached.truncated) {
-      const exportSample = "Export displayed rows";
-      const displayedRowCount = cached.rows.length;
-      const confirmation = await vscode.window.showWarningMessage(
-        `[RapiDB] This query result was truncated. The export will contain only the first ${displayedRowCount.toLocaleString()} displayed ${displayedRowCount === 1 ? "row" : "rows"}, not the full result.`,
-        { modal: true },
-        exportSample,
+    if (columnOrder?.length === 0 && cached.columns.length > 0) {
+      vscode.window.showWarningMessage(
+        "[RapiDB] All result columns are collapsed. Expand at least one column to export.",
       );
-      if (confirmation !== exportSample) return;
+      return;
+    }
+
+    if (cached.partial || cached.truncated) {
+      const warnings: string[] = [];
+      if (cached.partial) {
+        warnings.push(
+          "This result set may be incomplete because execution stopped after an error. The export will contain only rows received before the error.",
+        );
+      }
+      if (cached.truncated) {
+        const displayedRowCount = cached.rows.length;
+        warnings.push(
+          `This query result was truncated. The export will contain only the first ${displayedRowCount.toLocaleString()} displayed ${displayedRowCount === 1 ? "row" : "rows"}, not the full result.`,
+        );
+      }
+      const exportLabel =
+        cached.partial && !cached.truncated
+          ? "Export partial result"
+          : "Export displayed rows";
+      const confirmation = await vscode.window.showWarningMessage(
+        `[RapiDB] ${warnings.join(" ")}`,
+        { modal: true },
+        exportLabel,
+      );
+      if (confirmation !== exportLabel) return;
     }
 
     const columnIds = new Set(cached.columns.map((_, i) => colKey(i)));
@@ -841,6 +940,27 @@ export class QueryPanelController {
     await exportQueryResultsAsJson(orderedResult, { context: this.context });
   }
 
+  private getCachedResultForExport(
+    resultSetIndex?: number,
+  ): QueryPanelCachedResult | null {
+    const cached = this.view.getLastQueryResult();
+    if (cached?.resultSets?.length) {
+      const selectedIndex = resultSetIndex ?? 0;
+      const selected = cached.resultSets[selectedIndex];
+      if (!selected) {
+        vscode.window.showWarningMessage(
+          "[RapiDB] The selected query result set is no longer available.",
+        );
+        return null;
+      }
+      return cached.partial ? { ...selected, partial: true } : selected;
+    }
+    if (cached && cached.columns.length > 0) return cached;
+
+    vscode.window.showWarningMessage("[RapiDB] No query results to export.");
+    return null;
+  }
+
   private reorderResultColumns(
     result: QueryPanelCachedResult,
     columnOrder: string[],
@@ -853,6 +973,16 @@ export class QueryPanelController {
       const newRow: Record<string, unknown> = {};
       for (let i = 0; i < columnOrder.length; i++) {
         newRow[colKey(i)] = row[columnOrder[i]];
+      }
+      return newRow;
+    });
+    const reorderedExportRows = result.exportRows?.map((row) => {
+      const newRow: Record<string, unknown> = {};
+      for (let index = 0; index < indices.length; index++) {
+        const sourceKey = colKey(indices[index]);
+        if (Object.hasOwn(row, sourceKey)) {
+          newRow[colKey(index)] = row[sourceKey];
+        }
       }
       return newRow;
     });
@@ -870,6 +1000,7 @@ export class QueryPanelController {
       columns: indices.map((i) => result.columns[i]),
       ...(columnMeta ? { columnMeta: indices.map((i) => columnMeta[i]) } : {}),
       rows: reorderedRows,
+      ...(reorderedExportRows ? { exportRows: reorderedExportRows } : {}),
       ...(reorderedMissingCells ? { missingCells: reorderedMissingCells } : {}),
     };
   }
@@ -878,24 +1009,36 @@ export class QueryPanelController {
     result: QueryPanelCachedResult,
     sort: NonNullable<QueryResultExportPayload["sort"]>,
   ): QueryPanelCachedResult {
-    const indexedRows = result.rows.map((row, rowIndex) => ({ row, rowIndex }));
-    const sortedRows = [...indexedRows].sort((a, b) => {
-      for (const { id, desc } of sort) {
-        const aVal = a.row[id];
-        const bVal = b.row[id];
-        let cmp = 0;
-        if (aVal == null && bVal == null) cmp = 0;
-        else if (aVal == null) cmp = -1;
-        else if (bVal == null) cmp = 1;
-        else if (typeof aVal === "number" && typeof bVal === "number")
-          cmp = aVal - bVal;
-        else if (typeof aVal === "string" && typeof bVal === "string")
-          cmp = aVal.localeCompare(bVal);
-        else cmp = String(aVal).localeCompare(String(bVal));
-        if (cmp !== 0) return desc ? -cmp : cmp;
-      }
-      return 0;
+    const numericSort: SortingFn<Record<string, unknown>> = (a, b, id) =>
+      compareExactNumericValues(a.getValue(id), b.getValue(id));
+    const table = createTable({
+      data: result.rows,
+      columns: result.columns.map((_name, index) => {
+        const key = colKey(index);
+        const category = result.columnMeta?.[index]?.category;
+        return {
+          id: key,
+          accessorKey: key,
+          ...(category === "integer" ||
+          category === "decimal" ||
+          category === "float"
+            ? {
+                sortingFn: numericSort,
+                sortUndefined: false as const,
+              }
+            : {}),
+        };
+      }),
+      state: { sorting: sort },
+      onStateChange: () => {},
+      renderFallbackValue: null,
+      getCoreRowModel: getCoreRowModel(),
+      getSortedRowModel: getSortedRowModel(),
     });
+    const sortedRows = table.getRowModel().rows.map(({ original, index }) => ({
+      row: original,
+      rowIndex: index,
+    }));
     const nextRowIndexByPrevious = new Map(
       sortedRows.map(({ rowIndex }, nextRowIndex) => [rowIndex, nextRowIndex]),
     );
@@ -910,6 +1053,13 @@ export class QueryPanelController {
     return {
       ...result,
       rows: sortedRows.map(({ row }) => row),
+      ...(result.exportRows
+        ? {
+            exportRows: sortedRows.map(
+              ({ rowIndex }) => result.exportRows?.[rowIndex] ?? {},
+            ),
+          }
+        : {}),
       ...(missingCells ? { missingCells } : {}),
     };
   }
@@ -924,8 +1074,23 @@ export class QueryPanelController {
     });
   }
 
-  private async handleWriteClipboard(text: string): Promise<void> {
-    await writeClipboardText(text);
+  private async handleWriteClipboard({
+    text,
+    requestId,
+    recipient,
+  }: import("../../shared/webviewContracts/table").ClipboardWritePayload): Promise<void> {
+    let success = false;
+    try {
+      await writeClipboardText(text);
+      success = true;
+    } finally {
+      if (requestId && recipient) {
+        this.view.postMessage({
+          type: "clipboardWritten",
+          payload: { requestId, recipient, success },
+        });
+      }
+    }
   }
 
   private async handleAddBookmark({

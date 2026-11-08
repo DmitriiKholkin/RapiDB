@@ -4,17 +4,20 @@ import type {
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
+import { isPostgresStatementRejectedAndRolledBack } from "../dbDrivers/postgresStatementRejection";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
   DriverMutationResult,
   DriverUpdateRowOutcome,
+  IDBDriver,
   TransactionOptions,
   TransactionVerification,
 } from "../dbDrivers/types";
 import { DriverUpdateRowsError } from "../dbDrivers/updateRowOutcomes";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import {
+  applyRowTypeHints,
   buildPrevalidationFailedResult,
   validatePersistedEditRecord,
 } from "./persistedEditValidation";
@@ -22,6 +25,7 @@ import type {
   ApplyResult,
   PreparedApplyPlan,
   PreparedApplyPlanResult,
+  PreparedInsertPlan,
   RowUpdate,
   VerificationTarget,
 } from "./tableDataContracts";
@@ -56,32 +60,46 @@ export async function applyChangesTransactional(
   return executePreparedApplyPlan(connectionManager, prepared.plan);
 }
 
+export function getAtomicApplyRefusal(
+  driver: Pick<IDBDriver, "supportsAtomicUpdateRows"> | undefined,
+  apply: PreparedApplyPlan | null,
+  inserts: readonly PreparedInsertPlan[],
+): string | null {
+  if (
+    apply?.mode !== "driver" &&
+    !inserts.some((plan) => plan.mode === "driver")
+  ) {
+    return null;
+  }
+  if (
+    apply?.mode === "driver" &&
+    inserts.length === 0 &&
+    driver?.supportsAtomicUpdateRows === true
+  ) {
+    return null;
+  }
+  return "This backend cannot guarantee an atomic multi-operation apply. Apply one row at a time.";
+}
+
 export async function executeAtomicSqlApplyPlan(
   connectionManager: ConnectionManager,
   apply: PreparedApplyPlan | null,
-  inserts: readonly import("./tableDataContracts").PreparedInsertPlan[],
+  inserts: readonly PreparedInsertPlan[],
 ): Promise<ApplyResultPayload> {
   const connectionId = apply?.connectionId ?? inserts[0]?.connectionId;
   if (!connectionId) {
     return { success: true, rowOutcomes: [] };
   }
-  if (
-    apply?.mode === "driver" ||
-    inserts.some((plan) => plan.mode === "driver")
-  ) {
-    const driver = connectionManager.getDriver(connectionId);
-    if (
-      apply?.mode === "driver" &&
-      inserts.length === 0 &&
-      driver?.supportsAtomicUpdateRows === true
-    ) {
-      return executePreparedApplyPlan(connectionManager, apply);
-    }
-    return {
-      success: false,
-      error:
-        "This backend cannot guarantee an atomic multi-operation apply. Apply one row at a time.",
-    };
+  const atomicApplyRefusal = getAtomicApplyRefusal(
+    connectionManager.getDriver(connectionId),
+    apply,
+    inserts,
+  );
+  if (atomicApplyRefusal) {
+    return { success: false, error: atomicApplyRefusal };
+  }
+  if (apply?.mode === "driver") {
+    return executePreparedApplyPlan(connectionManager, apply);
   }
   let executionStarted = false;
   try {
@@ -178,15 +196,33 @@ export async function executeAtomicSqlApplyPlan(
       return verificationFailedResult(apply, error);
     }
     if (error instanceof TransactionVerificationError) {
-      return { success: false, error: error.message, rowOutcomes: [] };
+      return {
+        success: false,
+        error: error.rollbackConfirmed
+          ? error.message
+          : `${error.message} Transaction outcome is unknown. Refresh and verify before retrying.`,
+        changesPossible: !error.rollbackConfirmed,
+        outcomeUnknown: !error.rollbackConfirmed,
+        rowOutcomes: [],
+      };
     }
-    const notExecuted = isMutationNotExecutedError(error);
+    const postgresRejectedAndRolledBack =
+      executionStarted &&
+      isConfirmedPostgresStatementRejection(
+        connectionManager,
+        connectionId,
+        error,
+      );
+    const notExecuted =
+      isMutationNotExecutedError(error) || postgresRejectedAndRolledBack;
     const detail = error instanceof Error ? error.message : String(error);
     const message = !executionStarted
       ? detail
-      : notExecuted
-        ? `Transaction was not executed; no changes were made. ${detail}`
-        : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
+      : postgresRejectedAndRolledBack
+        ? `PostgreSQL rejected the statement and rolled back the transaction; no changes were made. ${detail}`
+        : notExecuted
+          ? `Transaction was not executed; no changes were made. ${detail}`
+          : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
     return {
       success: false,
       error: message,
@@ -221,7 +257,11 @@ export function prepareApplyChangesPlan(
 
   const columnMap = new Map(columns.map((column) => [column.name, column]));
   const failures = updates.map((update) =>
-    validatePersistedEditRecord(driver, update.changes, columnMap),
+    validatePersistedEditRecord(
+      driver,
+      update.changes,
+      applyRowTypeHints(driver, columnMap, update.originalTypes),
+    ),
   );
   if (failures.some(Boolean)) {
     return {
@@ -242,20 +282,11 @@ export function prepareApplyChangesPlan(
     );
     const skippedRows = new Set<number>();
     const coercedUpdates = updates.map((update, rowIndex) => {
-      const rowColumnMetaByName = new Map(columnMetaByName);
-      if (driver.getCapabilities?.().tabularRead === "nosql") {
-        for (const [name, hint] of Object.entries(update.originalTypes ?? {})) {
-          if (
-            hint.nativeType === "null" ||
-            hint.nativeType === "undefined" ||
-            hint.nativeType === "missing"
-          ) {
-            continue;
-          }
-          const column = rowColumnMetaByName.get(name);
-          if (column) rowColumnMetaByName.set(name, { ...column, ...hint });
-        }
-      }
+      const rowColumnMetaByName = applyRowTypeHints(
+        driver,
+        columnMetaByName,
+        update.originalTypes,
+      );
       const writableChanges = filterWritableRecord(
         update.changes,
         rowColumnMetaByName,
@@ -421,8 +452,6 @@ export function prepareApplyChangesPlan(
       sql: operation.sql,
       params: operation.params,
       checkAffectedRows: true,
-      // Metadata may outlive a key constraint changed by an external client.
-      // Enforce single-row targeting in the transaction, before it can commit.
       expectedAffectedRows: 1,
     });
     previewStatements.push(
@@ -580,13 +609,23 @@ export async function executePreparedApplyPlan(
     if (error instanceof TransactionVerificationError) {
       return verificationFailedResult(plan, error);
     }
-    const notExecuted = isMutationNotExecutedError(error);
+    const postgresRejectedAndRolledBack =
+      executionStarted &&
+      isConfirmedPostgresStatementRejection(
+        connectionManager,
+        plan.connectionId,
+        error,
+      );
+    const notExecuted =
+      isMutationNotExecutedError(error) || postgresRejectedAndRolledBack;
     const detail = error instanceof Error ? error.message : String(error);
     const message = !executionStarted
       ? detail
-      : notExecuted
-        ? `Transaction was not executed; no changes were made. ${detail}`
-        : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
+      : postgresRejectedAndRolledBack
+        ? `PostgreSQL rejected the statement and rolled back the transaction; no changes were made. ${detail}`
+        : notExecuted
+          ? `Transaction was not executed; no changes were made. ${detail}`
+          : `Transaction failed; its outcome may be unknown. Refresh and verify the data before retrying. ${detail}`;
     return {
       success: false,
       error: message,
@@ -599,6 +638,17 @@ export async function executePreparedApplyPlan(
       ),
     };
   }
+}
+
+function isConfirmedPostgresStatementRejection(
+  connectionManager: ConnectionManager,
+  connectionId: string,
+  error: unknown,
+): boolean {
+  return (
+    connectionManager.getConnection(connectionId)?.type === "pg" &&
+    isPostgresStatementRejectedAndRolledBack(error)
+  );
 }
 
 function buildDriverApplyResult(
@@ -618,6 +668,13 @@ function buildDriverApplyResult(
       requestIndex,
     ]),
   );
+  const appliedCount = resolvedOutcomes.filter(
+    (status) => status === "applied",
+  ).length;
+  const notAppliedMessage =
+    error !== undefined && appliedCount === 0
+      ? `This row was not updated. The apply failed: ${error}`
+      : "This row was not updated; it may have changed or been deleted since it was loaded.";
   const rowOutcomes = plan.updates.map((_, rowIndex) => {
     if (skippedRows.has(rowIndex)) {
       return buildSkippedOutcome(rowIndex, "No changes to apply.");
@@ -637,7 +694,7 @@ function buildDriverApplyResult(
       message:
         status === "unknown"
           ? "This row may have been updated; refresh and verify before retrying."
-          : "This row was not updated; it may have changed or been deleted since it was loaded.",
+          : notAppliedMessage,
     } satisfies ApplyRowOutcome;
   });
   const failedRows = rowOutcomes.flatMap((outcome) =>
@@ -645,23 +702,22 @@ function buildDriverApplyResult(
       ? [outcome.rowIndex]
       : [],
   );
-  const appliedCount = resolvedOutcomes.filter(
-    (status) => status === "applied",
-  ).length;
   const unknownCount = resolvedOutcomes.filter(
     (status) => status === "unknown",
   ).length;
-  if (failedRows.length === 0) {
+  if (failedRows.length === 0 && error === undefined) {
     return { success: true, rowOutcomes };
   }
 
   const message =
-    error ??
-    (unknownCount > 0
-      ? "One or more row outcomes are unknown. Refresh the table and verify before retrying."
-      : appliedCount > 0
-        ? `The update partially succeeded (${appliedCount} of ${executableRowIndexes.length} row(s)). Refresh the table and verify before retrying.`
-        : "One or more rows changed after they were loaded. Refresh the table and retry.");
+    failedRows.length === 0
+      ? `The update was applied to ${appliedCount} row(s), but the driver reported an error. Refresh the table and verify the data. ${error}`
+      : (error ??
+        (unknownCount > 0
+          ? "One or more row outcomes are unknown. Refresh the table and verify before retrying."
+          : appliedCount > 0
+            ? `The update partially succeeded (${appliedCount} of ${executableRowIndexes.length} row(s)). Refresh the table and verify before retrying.`
+            : "One or more rows changed after they were loaded. Refresh the table and retry."));
   return {
     success: false,
     error: message,
@@ -760,26 +816,30 @@ function verificationFailedResult(
   const skippedRows = new Set(plan.skippedRows);
   return {
     success: false,
-    error: `${error.message} Refresh and verify the data before retrying.`,
+    error: `${error.message}${error.rollbackConfirmed ? " The transaction was rolled back." : " Transaction outcome is unknown."} Refresh and verify the data before retrying.`,
+    changesPossible: !error.rollbackConfirmed,
+    outcomeUnknown: !error.rollbackConfirmed,
     ...(failure.mutation !== "insert"
       ? { failedRows: [failure.rowIndex] }
       : {}),
     rowOutcomes: plan.updates.map((_, rowIndex) =>
-      failure.mutation !== "insert" && rowIndex === failure.rowIndex
-        ? {
-            rowIndex,
-            success: false,
-            status: "verification_failed",
-            columns: failure.columns,
-            message: failure.message,
-          }
-        : buildSkippedOutcome(
-            rowIndex,
-            skippedRows.has(rowIndex)
-              ? "No changes to apply."
-              : "The transaction was aborted because another row failed verification.",
-            skippedRows.has(rowIndex),
-          ),
+      !skippedRows.has(rowIndex) && !error.rollbackConfirmed
+        ? buildDriverFailureOutcome(rowIndex, false, error.message)
+        : failure.mutation !== "insert" && rowIndex === failure.rowIndex
+          ? {
+              rowIndex,
+              success: false,
+              status: "verification_failed",
+              columns: failure.columns,
+              message: failure.message,
+            }
+          : buildSkippedOutcome(
+              rowIndex,
+              skippedRows.has(rowIndex)
+                ? "No changes to apply."
+                : "The transaction was aborted because another row failed verification.",
+              skippedRows.has(rowIndex),
+            ),
     ),
   };
 }

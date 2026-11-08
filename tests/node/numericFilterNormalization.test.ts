@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
+import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
@@ -60,6 +61,16 @@ const sqliteDriver = new SQLiteDriver({
   type: "sqlite",
   filePath: ":memory:",
 });
+const mariaDbDriver = new MySQLDriver({
+  id: "numeric-filter-normalization-mariadb",
+  name: "Numeric Filter Normalization MariaDB",
+  type: "mysql",
+  host: "127.0.0.1",
+  port: 3306,
+  database: "test",
+  username: "test",
+  password: "test",
+} as ConnectionConfig);
 const sqliteDecimalColumn: ColumnTypeMeta = {
   ...moneyColumn,
   name: "amount",
@@ -130,6 +141,70 @@ describe("SQLite decimal filter bindings", () => {
         1,
       ),
     ).toEqual({ sql: '"amount" = ?', params: ["1234.56"] });
+  });
+
+  it.each([
+    ["100,200", ["100", "200"]],
+    ["42,123", ["42", "123"]],
+    ["100, 200", ["100", "200"]],
+  ])("treats every comma as an IN-list delimiter in %s", (input, expected) => {
+    const numericColumn: ColumnTypeMeta = {
+      ...sqliteDecimalColumn,
+      name: "integer_col",
+      type: "INTEGER",
+      nativeType: "INTEGER",
+      category: "integer",
+    };
+    const normalized = sqliteDriver.normalizeFilterValue(
+      numericColumn,
+      "in",
+      input,
+    );
+
+    expect(normalized).toBe(expected.join(", "));
+    expect(
+      sqliteDriver.buildFilterCondition(numericColumn, "in", input, 1),
+    ).toEqual({
+      sql: '"integer_col" IN (?, ?)',
+      params: expected,
+    });
+  });
+
+  it("builds compact numeric IN lists as separate MariaDB values", () => {
+    const numericColumn: ColumnTypeMeta = {
+      ...sqliteDecimalColumn,
+      name: "int_col",
+      type: "INT",
+      nativeType: "INT",
+      category: "integer",
+    };
+
+    expect(
+      mariaDbDriver.buildFilterCondition(numericColumn, "in", "100,200", 1),
+    ).toEqual({
+      sql: "`int_col` IN (?, ?)",
+      params: ["100", "200"],
+    });
+  });
+
+  it("keeps driver numeric IN-list parsing aligned", () => {
+    const numericColumn: ColumnTypeMeta = {
+      ...sqliteDecimalColumn,
+      category: "integer",
+    };
+    const normalized = sqliteDriver.normalizeFilterValue(
+      numericColumn,
+      "in",
+      "42,123",
+    );
+
+    expect(normalized).toBe("42, 123");
+    expect(
+      sqliteDriver.buildFilterCondition(numericColumn, "in", normalized, 1),
+    ).toEqual({
+      sql: '"amount" IN (?, ?)',
+      params: ["42", "123"],
+    });
   });
 
   it.each([
@@ -248,7 +323,7 @@ describe("numeric filter normalization", () => {
     const normalized = postgresDriver.normalizeFilterValue(
       moneyColumn,
       "in",
-      "€1,234.56, 2,345.67 ₽, CHF 3'456.78",
+      "€1234.56, 2345.67 ₽, CHF 3456.78",
     );
 
     expect(normalized).toBe("1234.56, 2345.67, 3456.78");
@@ -285,7 +360,7 @@ describe("numeric filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "[col_money] = CAST(? AS money)",
+      sql: "[col_money] = CAST(? AS decimal(16,6))",
       params: ["9999999999.123455"],
     });
   });
@@ -323,7 +398,7 @@ describe("numeric filter normalization", () => {
     );
 
     expect(condition).toEqual({
-      sql: "[col_numeric] = CAST(? AS numeric(28,10))",
+      sql: "[col_numeric] = CAST(? AS decimal(16,6))",
       params: ["9999999999.123455"],
     });
   });

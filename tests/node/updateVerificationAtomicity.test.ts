@@ -3,6 +3,7 @@ import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteCoreDriver } from "../../src/extension/dbDrivers/sqliteCore";
+import { TransactionVerificationError } from "../../src/extension/dbDrivers/transactionVerification";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import type {
   PreparedApplyPlan,
@@ -56,6 +57,11 @@ function harness(risk: string | null = riskMessage, mismatch = true) {
   const stored = new Map<number, unknown>();
   const query = vi.fn(async (input: { sql: string; values?: unknown[] }) => {
     const params = input.values ?? [];
+    if (input.sql === "ROLLBACK") {
+      events.push("ROLLBACK");
+      if (risk === null) stored.clear();
+      return [{ warningStatus: 0 }];
+    }
     if (input.sql.startsWith("UPDATE")) {
       events.push("UPDATE");
       stored.set(Number(params[1]), mismatch ? "999.00" : params[0]);
@@ -155,6 +161,24 @@ afterEach(() => vi.restoreAllMocks());
 
 describe("verified UPDATE rollback preflight", () => {
   for (const path of paths) {
+    it(`${path}: treats an unconfirmed verification rollback as unknown`, async () => {
+      const h = harness(null);
+      h.transaction.mockRejectedValue(
+        new TransactionVerificationError({
+          rowIndex: 0,
+          columns: ["amount"],
+          message: "connection lost",
+        }),
+      );
+      const result = await execute(path, h.manager, h.prepare([update(1)]));
+      expect(result).toMatchObject({
+        success: false,
+        changesPossible: true,
+        outcomeUnknown: true,
+        rowOutcomes: [{ status: "unknown" }],
+      });
+      expect(result.error).not.toContain("was rolled back");
+    });
     it.each([
       1, 2,
     ])(`${path}: rejects %i verified UPDATE(s) before DML on MyISAM`, async (count) => {
@@ -292,6 +316,10 @@ describe("verified UPDATE rollback preflight", () => {
             columns: ["amount"],
           },
         ],
+      });
+      expect(result).toMatchObject({
+        changesPossible: false,
+        outcomeUnknown: false,
       });
       expect(h.riskCheck).toHaveBeenCalledTimes(1);
       expect(h.events).toEqual(["BEGIN", "UPDATE", "VERIFY", "ROLLBACK"]);

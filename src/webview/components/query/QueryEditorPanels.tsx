@@ -1,5 +1,5 @@
+import type React from "react";
 import type { RefObject } from "react";
-import React from "react";
 import type { QueryEditorSqlDialect } from "../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus, SchemaObject } from "../../store";
 import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
@@ -48,6 +48,7 @@ export function QueryEditorPanels({
           dialect={sqlDialect}
           language={language}
           ariaLabel={editorLabel}
+          readOnly={status === "running"}
           onExecute={onExecute}
           onChange={onEditorChange}
           onSelectionChange={onEditorSelectionChange}

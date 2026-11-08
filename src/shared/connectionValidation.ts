@@ -47,13 +47,13 @@ export const CONNECTION_VALIDATION_POLICY: Readonly<
     required: ["name", "type", "host", "database", "username"],
   },
   mysql: {
-    required: ["name", "type", "host", "database", "username"],
+    required: ["name", "type", "host", "username"],
   },
   sqlite: {
     required: ["name", "type", "filePath"],
   },
   mssql: {
-    required: ["name", "type", "host", "database"],
+    required: ["name", "type", "host"],
   },
   oracle: {
     required: ["name", "type"],
@@ -69,7 +69,7 @@ export const CONNECTION_VALIDATION_POLICY: Readonly<
   },
   elasticsearch: {
     required: ["name", "type"],
-    anyOf: [["connectionUri", "endpoint", "cloudId"]],
+    anyOf: [["connectionUri", "endpoint", "cloudId", "host"]],
   },
   dynamodb: {
     required: ["name", "type", "awsRegion"],
@@ -243,16 +243,6 @@ function resolveSshHostVerificationMode(
   return config.ssh?.hostVerificationMode === "trustOnFirstUse"
     ? "trustOnFirstUse"
     : "manual";
-}
-
-function resolveSqliteWalMode(
-  config: Partial<ConnectionConfig>,
-): NonNullable<ConnectionConfig["sqliteWalMode"]> | undefined {
-  if (config.type !== "sqlite") {
-    return undefined;
-  }
-
-  return config.sqliteWalMode === "off" ? "off" : "auto";
 }
 
 function hasMongoSrvUri(value: string | undefined): boolean {
@@ -521,40 +511,6 @@ export function buildSshValidationIssues(
   return issues;
 }
 
-function buildSqliteValidationIssues(
-  config: Partial<ConnectionConfig>,
-): ConnectionValidationIssue[] {
-  if (config.sqliteWalMode === undefined) {
-    return [];
-  }
-
-  if (config.type !== "sqlite") {
-    return [
-      {
-        code: "invalid",
-        fields: ["sqliteWalMode"],
-        message:
-          'Field "sqliteWalMode" is supported only for sqlite connections.',
-      },
-    ];
-  }
-
-  const normalizedWalMode = resolveSqliteWalMode(config);
-  if (normalizedWalMode === undefined) {
-    return [];
-  }
-
-  return config.sqliteWalMode === normalizedWalMode
-    ? []
-    : [
-        {
-          code: "invalid",
-          fields: ["sqliteWalMode"],
-          message: 'Field "sqliteWalMode" must be either "auto" or "off".',
-        },
-      ];
-}
-
 function buildTlsValidationIssues(
   config: Partial<ConnectionConfig>,
 ): ConnectionValidationIssue[] {
@@ -710,13 +666,13 @@ export function validateConnectionConfig(
     ...buildDynamoValidationIssues(config, {
       hasStoredAwsKeyPair: options.hasStoredAwsKeyPair,
     }),
-    ...buildSqliteValidationIssues(config),
     ...buildSshValidationIssues(config, {
       hasStoredPassword: options.hasStoredSshPassword,
       hasStoredPrivateKey: options.hasStoredSshPrivateKey,
     }),
     ...buildTlsValidationIssues(config),
     ...buildUriCredentialValidationIssues(config),
+    ...buildHttpEndpointValidationIssues(config),
   ];
 
   if (issues.length === 0) {
@@ -735,6 +691,43 @@ export function validateConnectionConfig(
     missingAnyOf,
     issues,
   };
+}
+
+function buildHttpEndpointValidationIssues(
+  config: Partial<ConnectionConfig>,
+): ConnectionValidationIssue[] {
+  const fields =
+    config.type === "elasticsearch"
+      ? config.cloudId
+        ? []
+        : ([
+            config.connectionUri !== undefined ? "connectionUri" : "endpoint",
+          ] as const)
+      : config.type === "dynamodb"
+        ? ([
+            config.endpoint !== undefined ? "endpoint" : "awsEndpoint",
+          ] as const)
+        : [];
+  return fields.flatMap((field) => {
+    const value = config[field as "endpoint" | "connectionUri" | "awsEndpoint"];
+    if (!hasValue(value)) return [];
+    try {
+      const url = new URL(value as string);
+      if (
+        (url.protocol === "http:" || url.protocol === "https:") &&
+        url.hostname &&
+        !url.hash
+      )
+        return [];
+    } catch {}
+    return [
+      createValidationIssue(
+        "invalid",
+        [field],
+        "Endpoint must be a valid HTTP or HTTPS URL with a host and no fragment.",
+      ),
+    ];
+  });
 }
 
 export function buildUriCredentialValidationIssues(
@@ -895,9 +888,7 @@ export function buildRedisConnectionValidationIssues(
       ];
     }
     return [];
-  } catch {
-    // Return the same actionable URI error as for unsupported schemes.
-  }
+  } catch {}
   return [
     createValidationIssue(
       "invalid",

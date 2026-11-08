@@ -40,6 +40,7 @@ export type TriggerOrientation = "row" | "statement" | "unknown";
 
 export interface QueryColumnMeta {
   category: TypeCategory | null;
+  nativeType?: string;
 }
 
 export interface QueryMissingCell {
@@ -169,18 +170,6 @@ export function inferValueCategory(value: unknown): TypeCategory | null {
   return null;
 }
 
-export function inferQueryColumnCategory(
-  values: readonly unknown[],
-): TypeCategory | null {
-  for (const value of values) {
-    const category = inferValueCategory(value);
-    if (category) {
-      return category;
-    }
-  }
-  return null;
-}
-
 export type FilterOperator =
   | "eq"
   | "neq"
@@ -253,6 +242,7 @@ export type PrimaryKeyRole = "partition" | "sort";
 export interface ColumnMeta {
   name: string;
   type: string;
+  exportCategory?: TypeCategory;
   rangeSubtype?: string;
   collectionKind?: "varray" | "nestedTable";
   collectionElementType?: string;
@@ -318,6 +308,7 @@ export interface IndexMeta {
   columns: string[];
   unique: boolean;
   primary: boolean;
+  partial?: boolean;
   ddlSupport?: IndexDdlSupport;
 }
 
@@ -515,15 +506,6 @@ export function defaultFilterOperator(
   return EQ_FILTER_CATEGORIES.has(column.category) ? "eq" : "like";
 }
 
-export function valueFilterOperator(
-  column: Pick<ColumnTypeMeta, "category" | "filterable" | "filterOperators">,
-): "eq" | "like" | null {
-  if (!column.filterable) return null;
-
-  const operator = defaultFilterOperator(column);
-  return column.filterOperators.includes(operator) ? operator : null;
-}
-
 function hasFilterOperator(
   column: Pick<ColumnTypeMeta, "filterOperators">,
   operator: FilterOperator,
@@ -577,6 +559,12 @@ export function buildFilterExpressionFromDraft(
 
       const value = normalizeFilterValue(draft.value);
       if (!value) return null;
+      if (
+        draft.operator === "in" &&
+        !value.split(",").some((entry) => entry.trim().length > 0)
+      ) {
+        return null;
+      }
 
       return {
         column: column.name,
@@ -614,26 +602,6 @@ export function deriveApplicableFilterDrafts(
     activeDrafts[column.name] = draft;
     return activeDrafts;
   }, {});
-}
-
-export function buildFilterExpression(
-  column: Pick<
-    ColumnTypeMeta,
-    "name" | "category" | "filterable" | "filterOperators"
-  >,
-  rawValue: string,
-): FilterExpression | null {
-  const value = normalizeFilterValue(rawValue);
-  if (!value) return null;
-
-  if (value === NULL_SENTINEL) {
-    return buildFilterExpressionFromDraft(column, { operator: "is_null" });
-  }
-
-  const operator = valueFilterOperator(column);
-  if (!operator) return null;
-
-  return buildFilterExpressionFromDraft(column, { operator, value });
 }
 
 export function coerceFilterExpressions(

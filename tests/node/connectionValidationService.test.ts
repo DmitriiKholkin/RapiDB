@@ -5,6 +5,30 @@ import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 const service = new ConnectionValidationService();
 
 describe("ConnectionValidationService", () => {
+  it.each([
+    "elasticsearch",
+    "dynamodb",
+  ] as const)("validates active HTTP endpoints for %s and accepts legacy aliases", (type) => {
+    const base = { id: "http", name: "HTTP", type, awsRegion: "us-east-1" };
+    for (const endpoint of [
+      "ftp://host",
+      "host:9200",
+      "https://",
+      "https://host/#fragment",
+    ]) {
+      expect(service.validate({ ...base, endpoint }).valid).toBe(false);
+    }
+    expect(
+      service.validate({ ...base, endpoint: "https://host:9443/base" }).valid,
+    ).toBe(true);
+    expect(
+      service.validate(
+        type === "elasticsearch"
+          ? { ...base, connectionUri: "https://host" }
+          : { ...base, awsEndpoint: "http://localhost:8000" },
+      ).valid,
+    ).toBe(true);
+  });
   it("summarizes required and anyOf fields once while preserving structured issues", () => {
     const result = service.validate({ type: "oracle", port: 0 });
     expect(result.message).toBe(
@@ -223,7 +247,7 @@ describe("ConnectionValidationService", () => {
       },
       {
         config: { type: "mysql", name: "MySQL" },
-        expectedRequired: ["host", "database", "username"],
+        expectedRequired: ["host", "username"],
       },
       {
         config: { type: "sqlite", name: "SQLite" },
@@ -231,7 +255,7 @@ describe("ConnectionValidationService", () => {
       },
       {
         config: { type: "mssql", name: "MSSQL" },
-        expectedRequired: ["host", "database"],
+        expectedRequired: ["host"],
       },
       {
         config: { type: "oracle", name: "Oracle" },
@@ -313,61 +337,16 @@ describe("ConnectionValidationService", () => {
     expect(elasticsearchWithCloudId.valid).toBe(true);
   });
 
-  it("accepts sqlite WAL mode defaults and rejects invalid values", () => {
-    const defaultWalMode = service.validate({
-      id: "sqlite-default-wal",
-      name: "SQLite Default WAL",
+  it("ignores legacy sqliteWalMode values on stored connections", () => {
+    const legacySqlite = service.validate({
+      id: "sqlite-legacy-wal",
+      name: "SQLite Legacy WAL",
       type: "sqlite",
-      filePath: "/tmp/default-wal.db",
-    });
-    const explicitWalOff = service.validate({
-      id: "sqlite-wal-off",
-      name: "SQLite WAL Off",
-      type: "sqlite",
-      filePath: "/tmp/wal-off.db",
-      sqliteWalMode: "off",
-    });
-    const invalidWalMode = service.validate({
-      id: "sqlite-invalid-wal",
-      name: "SQLite Invalid WAL",
-      type: "sqlite",
-      filePath: "/tmp/invalid-wal.db",
-      sqliteWalMode: "always" as ConnectionConfig["sqliteWalMode"],
-    });
+      filePath: "/tmp/legacy-wal.db",
+      sqliteWalMode: "always",
+    } as Partial<ConnectionConfig>);
 
-    expect(defaultWalMode.valid).toBe(true);
-    expect(explicitWalOff.valid).toBe(true);
-    expect(invalidWalMode.valid).toBe(false);
-    expect(invalidWalMode.issues).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          code: "invalid",
-          fields: ["sqliteWalMode"],
-        }),
-      ]),
-    );
-  });
-
-  it("rejects sqlite WAL mode for non-sqlite connections", () => {
-    const result = service.validate({
-      id: "pg-with-sqlite-wal",
-      name: "PG",
-      type: "pg",
-      host: "localhost",
-      database: "app",
-      username: "postgres",
-      sqliteWalMode: "auto",
-    });
-
-    expect(result.valid).toBe(false);
-    expect(result.issues).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          code: "invalid",
-          fields: ["sqliteWalMode"],
-        }),
-      ]),
-    );
+    expect(legacySqlite.valid).toBe(true);
   });
 
   it("requires SSH fingerprint and auth secrets when SSH is enabled", () => {

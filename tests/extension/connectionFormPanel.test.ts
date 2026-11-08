@@ -53,6 +53,7 @@ const vscodeMock = vi.hoisted(() => {
       window: {
         createWebviewPanel,
         showWarningMessage: vi.fn(async () => "Save in Plaintext"),
+        showErrorMessage: vi.fn(async () => undefined),
       },
     },
   };
@@ -90,7 +91,342 @@ type ConnectionFormPanelPrototype = {
   handleMessage(message: unknown): Promise<void>;
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((complete, fail) => {
+    resolve = complete;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("ConnectionFormPanel", () => {
+  it.each([
+    "cancel",
+    "replace",
+    "dispose",
+  ])("ignores a delayed test preparation rejection after %s", async (action) => {
+    const first = deferred<string | undefined>();
+    const second = deferred<string | undefined>();
+    const existing: ConnectionConfig = {
+      id: "delayed-test",
+      name: "Delayed",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "reader",
+    };
+    const context = {
+      secrets: {
+        get: vi
+          .fn()
+          .mockResolvedValueOnce(undefined)
+          .mockReturnValueOnce(first.promise)
+          .mockReturnValueOnce(second.promise),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async () => ({ success: true })),
+      saveConnection: vi.fn(),
+    };
+    const result = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected form");
+    const message = { type: "testConnection", payload: existing };
+    const testingFirst = panel.webview.dispatchMessage(message);
+    if (action === "dispose") {
+      panel.dispose();
+    } else if (action === "cancel") {
+      await panel.webview.dispatchMessage({ type: "cancelTestConnection" });
+    }
+    const testingSecond =
+      action === "dispose" ? undefined : panel.webview.dispatchMessage(message);
+    first.reject(new Error("Stale SecretStorage failure"));
+    await testingFirst;
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    if (testingSecond) {
+      second.reject(new Error("Current SecretStorage failure"));
+      await testingSecond;
+      expect(panel.webview.postMessage).toHaveBeenCalledExactlyOnceWith({
+        type: "testResult",
+        payload: { success: false, error: "Current SecretStorage failure" },
+      });
+      panel.dispose();
+    }
+    expect(manager.testConnection).not.toHaveBeenCalled();
+    expect(manager.saveConnection).not.toHaveBeenCalled();
+    await result;
+  });
+
+  it.each([
+    "secrets",
+    "consent",
+    "write",
+  ])("ignores Cancel and duplicate Save during delayed %s", async (stage) => {
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const pause = async () => {
+      reached.resolve();
+      await release.promise;
+    };
+    const existing: ConnectionConfig = {
+      id: "delayed-save",
+      name: "Delayed",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "reader",
+    };
+    const context = {
+      secrets: {
+        get: vi
+          .fn()
+          .mockResolvedValueOnce(undefined)
+          .mockImplementation(async () => {
+            if (stage === "secrets") await pause();
+            return undefined;
+          }),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      saveConnection: vi.fn(async (config: ConnectionConfig) => {
+        if (stage === "write") await pause();
+        return config;
+      }),
+    };
+    if (stage === "consent") {
+      vscodeMock.module.window.showWarningMessage.mockImplementationOnce(
+        async () => {
+          await pause();
+          return "Save in Plaintext";
+        },
+      );
+    }
+    const result = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    const settled = vi.fn();
+    void result.then(settled);
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected form");
+    const dispose = vi.spyOn(panel, "dispose");
+    const message = {
+      type: "saveConnection",
+      payload: {
+        ...existing,
+        ...(stage === "consent"
+          ? { password: "secret", useSecretStorage: false }
+          : {}),
+      },
+    };
+    const saving = panel.webview.dispatchMessage(message);
+    await reached.promise;
+    await panel.webview.dispatchMessage({ type: "cancel" });
+    const duplicate = panel.webview.dispatchMessage(message);
+    expect(dispose).not.toHaveBeenCalled();
+    expect(settled).not.toHaveBeenCalled();
+    release.resolve();
+    await Promise.all([saving, duplicate]);
+    expect(await result).toMatchObject({ id: "delayed-save" });
+    expect(manager.saveConnection).toHaveBeenCalledOnce();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "secrets",
+    "write",
+    "write-error",
+  ])("handles external disposal during delayed %s", async (stage) => {
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const existing: ConnectionConfig = {
+      id: "disposed-save",
+      name: "Disposed",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "reader",
+    };
+    const context = {
+      secrets: {
+        get: vi
+          .fn()
+          .mockResolvedValueOnce(undefined)
+          .mockImplementation(async () => {
+            if (stage === "secrets") {
+              reached.resolve();
+              await release.promise;
+            }
+            return undefined;
+          }),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      saveConnection: vi.fn(async (config: ConnectionConfig) => {
+        if (stage !== "secrets") {
+          reached.resolve();
+          await release.promise;
+        }
+        if (stage === "write-error") throw new Error("Delayed write failed");
+        return config;
+      }),
+    };
+    const result = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected form");
+    const dispose = vi.spyOn(panel, "dispose");
+    const saving = panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: existing,
+    });
+    await reached.promise;
+    panel.dispose();
+    await expect(result).resolves.toBeUndefined();
+    release.resolve();
+    await saving;
+    expect(manager.saveConnection).toHaveBeenCalledTimes(
+      stage === "secrets" ? 0 : 1,
+    );
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(dispose).toHaveBeenCalledOnce();
+  });
+
+  it("allows Cancel after a delayed Save fails", async () => {
+    const reached = deferred<void>();
+    const release = deferred<void>();
+    const context = { secrets: { get: vi.fn() } };
+    const manager = {
+      getConnection: vi.fn(),
+      saveConnection: vi.fn(async () => {
+        reached.resolve();
+        await release.promise;
+        throw new Error("Delayed failure");
+      }),
+    };
+    const result = ConnectionFormPanel.show(context as never, manager as never);
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected form");
+    const saving = panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: "failed-save",
+        name: "Failed",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "reader",
+      },
+    });
+    await reached.promise;
+    release.resolve();
+    await saving;
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: {
+        success: false,
+        error: "Could not save connection: Delayed failure",
+      },
+    });
+    await panel.webview.dispatchMessage({ type: "cancel" });
+    await expect(result).resolves.toBeUndefined();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("clears stored SSH/TLS passphrases consistently for Test and Save (replace=%s)", async (replace) => {
+    const existing: ConnectionConfig = {
+      id: "passphrases",
+      name: "Keys",
+      type: "pg",
+      host: "db.local",
+      database: "app",
+      username: "reader",
+      useSecretStorage: true,
+      ssh: {
+        host: "bastion",
+        username: "qa",
+        authMethod: "privateKey",
+        hostVerificationMode: "trustOnFirstUse",
+      },
+      tls: {
+        mode: "mutualTls",
+        certFilePath: "/tmp/client.crt",
+        keyFilePath: "/tmp/client.key",
+      },
+    };
+    const secrets = JSON.stringify({
+      sshPrivateKey: "private-key",
+      sshPassphrase: "old-ssh",
+      tlsKeyPassphrase: "old-tls",
+    });
+    const context = { secrets: { get: vi.fn(async () => secrets) } };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: ConnectionConfig) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(
+        async (
+          _config: ConnectionConfig,
+          _clear: ConnectionSecretClearOptions,
+        ) => undefined,
+      ),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected form");
+    const payload = {
+      ...existing,
+      clearSshPassphrase: true,
+      clearTlsKeyPassphrase: true,
+      ssh: { ...existing.ssh, passphrase: replace ? "new-ssh" : "" },
+      tls: { ...existing.tls, keyPassphrase: replace ? "new-tls" : "" },
+    };
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    const tested = manager.testConnection.mock.calls[0]?.[0];
+    expect(tested?.ssh?.passphrase).toBe(replace ? "new-ssh" : undefined);
+    expect(tested?.tls?.keyPassphrase).toBe(replace ? "new-tls" : undefined);
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
+    const clear = manager.saveConnection.mock.calls[0]?.[1];
+    expect(clear).toMatchObject({
+      sshPassphrase: true,
+      tlsKeyPassphrase: true,
+    });
+    const persisted = JSON.parse(
+      serializeConnectionSecretsForStoredConfig(
+        tested as ConnectionConfig,
+        secrets,
+        clear,
+      ) ?? "{}",
+    );
+    expect(persisted.sshPassphrase).toBe(replace ? "new-ssh" : undefined);
+    expect(persisted.tlsKeyPassphrase).toBe(replace ? "new-tls" : undefined);
+    await pending;
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     vscodeMock.module.window.showWarningMessage.mockResolvedValue(
@@ -200,6 +536,7 @@ describe("ConnectionFormPanel", () => {
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
       expect.objectContaining(payload),
       noSecretClears,
+      { kind: "create" },
     );
   });
 
@@ -297,7 +634,9 @@ describe("ConnectionFormPanel", () => {
     const promise = ConnectionFormPanel.show(
       context as never,
       connectionManager as never,
+      existing as never,
     );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
     const payload = {
       ...existing,
       useSecretStorage: false,
@@ -384,6 +723,7 @@ describe("ConnectionFormPanel", () => {
         useSecretStorage: false,
       }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: existing.id }),
     );
     expect((await promise)?.password).toBeUndefined();
   });
@@ -451,6 +791,7 @@ describe("ConnectionFormPanel", () => {
       expect(action).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({ tls }),
         noSecretClears,
+        { kind: "create" },
       );
     }
     panel.dispose();
@@ -542,6 +883,7 @@ describe("ConnectionFormPanel", () => {
         }),
       }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: "conn-tls" }),
     );
   });
 
@@ -622,6 +964,7 @@ describe("ConnectionFormPanel", () => {
         useSecretStorage: true,
       }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: "conn-1" }),
     );
     expect(context.secrets.store).not.toHaveBeenCalled();
   });
@@ -692,6 +1035,7 @@ describe("ConnectionFormPanel", () => {
         apiKey: undefined,
       }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: "conn-es-basic" }),
     );
   });
 
@@ -750,6 +1094,7 @@ describe("ConnectionFormPanel", () => {
         database: undefined,
       }),
       noSecretClears,
+      { kind: "create" },
     );
   });
 
@@ -878,6 +1223,83 @@ describe("ConnectionFormPanel", () => {
     expect(JSON.stringify(panel.webview.postMessage.mock.calls)).not.toContain(
       "ss@host",
     );
+    panel.dispose();
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  it("correlates test results and does not report unrelated failures as test results", async () => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+      globalState: {
+        get: vi.fn(() => {
+          throw new Error("state unavailable");
+        }),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(async () => ({ success: true })),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    const panel = createdPanel();
+    if (!panel) {
+      throw new Error("Expected a webview panel to be created.");
+    }
+
+    await panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: {
+        id: "conn-3",
+        name: "Primary",
+        type: "mysql",
+        host: "db.local",
+        database: "app",
+        username: "reader",
+        password: "pw",
+        requestId: "request-1",
+      },
+    });
+    expect(connectionManager.testConnection).toHaveBeenCalledWith(
+      expect.not.objectContaining({ requestId: expect.anything() }),
+      expect.any(AbortSignal),
+    );
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "testResult",
+      payload: { success: true, requestId: "request-1" },
+    });
+
+    await panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: { id: "conn-3", type: "mysql", requestId: "request-2" },
+    });
+    expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+      type: "testResult",
+      payload: {
+        requestId: "request-2",
+        success: false,
+        error: "Connection settings are invalid.",
+      },
+    });
+    expect(connectionManager.testConnection).toHaveBeenCalledOnce();
+
+    panel.webview.postMessage.mockClear();
+    await panel.webview.dispatchMessage({
+      type: "browseFile",
+      payload: { target: "filePath" },
+    });
+    expect(panel.webview.postMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.module.window.showErrorMessage).toHaveBeenCalledWith(
+      "[RapiDB] Unexpected error: state unavailable",
+    );
+
     panel.dispose();
     await expect(promise).resolves.toBeUndefined();
   });
@@ -1049,6 +1471,7 @@ describe("ConnectionFormPanel", () => {
         awsSessionToken: expect.anything(),
       }),
       { ...noSecretClears, awsCredentials: true },
+      { kind: "create" },
     );
   });
 
@@ -1104,7 +1527,7 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it("preserves SQLite WAL mode in edit state and save payloads", async () => {
+  it("drops legacy SQLite WAL mode from save payloads", async () => {
     const context = {
       secrets: {
         get: vi.fn(async () => undefined),
@@ -1126,7 +1549,6 @@ describe("ConnectionFormPanel", () => {
         name: "Local SQLite",
         type: "sqlite",
         filePath: "/tmp/app.db",
-        sqliteWalMode: "off",
       },
     );
 
@@ -1139,7 +1561,6 @@ describe("ConnectionFormPanel", () => {
         existing: expect.objectContaining({
           id: "conn-sqlite",
           filePath: "/tmp/app.db",
-          sqliteWalMode: "off",
         }),
       }),
     );
@@ -1160,20 +1581,23 @@ describe("ConnectionFormPanel", () => {
       },
     });
 
-    await expect(promise).resolves.toEqual(
+    const saved = await promise;
+    expect(saved).toEqual(
       expect.objectContaining({
         id: "conn-sqlite",
         type: "sqlite",
-        sqliteWalMode: "off",
+        filePath: "/tmp/app.db",
       }),
     );
+    expect(saved).not.toHaveProperty("sqliteWalMode");
     expect(connectionManager.saveConnection).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: "conn-sqlite",
-        sqliteWalMode: "off",
-      }),
+      expect.objectContaining({ id: "conn-sqlite", filePath: "/tmp/app.db" }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: "conn-sqlite" }),
     );
+    expect(
+      vi.mocked(connectionManager.saveConnection).mock.calls.at(-1)?.[0],
+    ).not.toHaveProperty("sqliteWalMode");
   });
 
   it("returns validation details on test and does not call manager testConnection for invalid payload", async () => {
@@ -1285,6 +1709,7 @@ describe("ConnectionFormPanel", () => {
         useSecretStorage: false,
       }),
       noSecretClears,
+      { kind: "create" },
     );
   });
 
@@ -1401,6 +1826,7 @@ describe("ConnectionFormPanel", () => {
         useSecretStorage: false,
       }),
       noSecretClears,
+      expect.objectContaining({ kind: "edit", id: "conn-ssh" }),
     );
   });
 
@@ -1606,7 +2032,7 @@ describe("ConnectionFormPanel", () => {
     await expect(promise).resolves.toBeUndefined();
   });
 
-  it("falls back to a testResult message when unhandled errors occur for malformed input", async () => {
+  it("falls back to a correlated testResult only for unhandled test connection errors", async () => {
     const context = {
       secrets: {
         get: vi.fn(async () => undefined),
@@ -1644,10 +2070,23 @@ describe("ConnectionFormPanel", () => {
       await expect(
         panel.webview.dispatchMessage(null),
       ).resolves.toBeUndefined();
+      expect(panel.webview.postMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.module.window.showErrorMessage).toHaveBeenCalledWith(
+        "[RapiDB] Unexpected error: boom",
+      );
 
+      await panel.webview.dispatchMessage({
+        type: "testConnection",
+        payload: {
+          id: "conn-1",
+          name: "Primary",
+          type: "pg",
+          requestId: "request-1",
+        },
+      });
       expect(panel.webview.postMessage).toHaveBeenCalledWith({
         type: "testResult",
-        payload: { success: false, error: "boom" },
+        payload: { requestId: "request-1", success: false, error: "boom" },
       });
 
       panel.dispose();
@@ -1711,7 +2150,9 @@ describe("MongoDB form credential lifecycle", () => {
     const pending = ConnectionFormPanel.show(
       context as never,
       manager as never,
+      existing as never,
     );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
     const panel = createdPanel();
     if (!panel) throw new Error("Expected connection form");
     const payload = {
@@ -1883,6 +2324,193 @@ describe("Redis and Elasticsearch URI credential editing", () => {
     await pending;
   });
 
+  it("requires re-entering or removing an omitted ambiguous stored endpoint before Save or Test", async () => {
+    const existing: ConnectionConfig = {
+      id: "dynamo-ambiguous",
+      name: "Dynamo local",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsEndpoint: "http://u:p/w@localhost:8000",
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+      saveConnection: vi.fn(async (_config: ConnectionConfig) => undefined),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected edit form");
+    expect(state.existing.hasAmbiguousStoredUri).toBe(true);
+    expect(state.existing.awsEndpoint).toBeUndefined();
+    expect(JSON.stringify(state)).not.toContain("p/w");
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const payload = { ...state.existing, name: "Renamed" };
+
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+
+    expect(manager.testConnection).not.toHaveBeenCalled();
+    expect(manager.saveConnection).not.toHaveBeenCalled();
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: {
+        success: false,
+        error: expect.stringContaining("ambiguous credentials"),
+      },
+    });
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { ...payload, clearAmbiguousStoredUri: true },
+    });
+
+    const saved = manager.saveConnection.mock.calls[0]?.[0];
+    expect(saved).toMatchObject({ id: existing.id, name: "Renamed" });
+    expect(saved?.awsEndpoint).toBeUndefined();
+    expect(saved).not.toHaveProperty("clearAmbiguousStoredUri");
+    await pending;
+  });
+
+  it("accepts a re-entered DynamoDB endpoint for an ambiguous stored awsEndpoint", async () => {
+    const existing: ConnectionConfig = {
+      id: "dynamo-reentered",
+      name: "Dynamo local",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsEndpoint: "http://u:p/w@localhost:8000",
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(async (_config: ConnectionConfig) => ({
+        success: true,
+      })),
+      saveConnection: vi.fn(async (_config: ConnectionConfig) => undefined),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected edit form");
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const endpoint = "http://localhost:8000";
+    const payload = { ...state.existing, endpoint };
+
+    await panel.webview.dispatchMessage({ type: "testConnection", payload });
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+
+    expect(manager.testConnection.mock.calls[0]?.[0]).toMatchObject({
+      endpoint,
+    });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toMatchObject({
+      id: existing.id,
+      endpoint,
+    });
+    expect(
+      manager.saveConnection.mock.calls[0]?.[0]?.awsEndpoint,
+    ).toBeUndefined();
+    await pending;
+  });
+
+  it("opens Edit when a stored URI secret has ambiguous credentials", async () => {
+    const existing: ConnectionConfig = {
+      id: "redis-ambiguous-secret",
+      name: "Redis",
+      type: "redis",
+      connectionUri: "redis://cache.local:6379/0",
+      useSecretStorage: true,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({
+            connectionUri: "redis://user:pa/ss@cache.local:6379/0",
+          }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+      saveConnection: vi.fn(),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected edit form");
+    expect(state.existing.connectionUri).toBe(existing.connectionUri);
+    expect(JSON.stringify(state)).not.toContain("pa/ss");
+    createdPanel()?.dispose();
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it("opens and saves a stored Redis URI with ambiguous credentials without exposing them", async () => {
+    const existing: ConnectionConfig = {
+      id: "redis-ambiguous",
+      name: "Redis ambiguous",
+      type: "redis",
+      connectionUri: "redis://user:pa/ss@cache.local:6379/0",
+    };
+    const context = {
+      secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
+    };
+    const manager = {
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+      saveConnection: vi.fn(async (_config: ConnectionConfig) => undefined),
+    };
+    const pending = ConnectionFormPanel.show(
+      context as never,
+      manager as never,
+      existing,
+    );
+    await Promise.resolve();
+    const state = vi.mocked(createWebviewShell).mock.calls[0]?.[0].initialState;
+    if (state?.view !== "connection" || !state.existing)
+      throw new Error("Expected edit form");
+    expect(JSON.stringify(state)).not.toContain("pa/ss");
+    expect(state.existing.connectionUri).toBeUndefined();
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected connection form");
+    const connectionUri = "redis://user:pa%2Fss@cache.local:6379/0";
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { ...state.existing, connectionUri },
+    });
+    expect(manager.saveConnection.mock.calls[0]?.[0]).toMatchObject({
+      id: existing.id,
+      connectionUri,
+    });
+    expect(JSON.stringify(panel.webview.postMessage.mock.calls)).not.toContain(
+      "pa/ss",
+    );
+    await pending;
+  });
+
   it.each(
     [
       { username: "cache user", password: " pass:@/雪% ", storage: true },
@@ -2045,7 +2673,9 @@ describe("Redis and Elasticsearch URI credential editing", () => {
       const pending = ConnectionFormPanel.show(
         context as never,
         manager as never,
+        existing as never,
       );
+      await vi.waitFor(() => expect(createdPanel()).toBeDefined());
       const panel = createdPanel();
       if (!panel) throw new Error("Expected connection form");
       const payload = {
@@ -2125,12 +2755,16 @@ describe("explicit saved credential removal", () => {
     const tested = manager.testConnection.mock.calls[0]?.[0];
     expect(tested?.password).toBe("");
     await panel.webview.dispatchMessage({ type: "saveConnection", payload });
-    expect(manager.saveConnection).toHaveBeenCalledWith(tested, {
-      password: true,
-      apiKey: false,
-      credentialBearingUris: false,
-      awsCredentials: false,
-    });
+    expect(manager.saveConnection).toHaveBeenCalledWith(
+      tested,
+      {
+        password: true,
+        apiKey: false,
+        credentialBearingUris: false,
+        awsCredentials: false,
+      },
+      expect.objectContaining({ kind: "edit", id: existing.id }),
+    );
     expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
     expect(panel.webview.postMessage).not.toHaveBeenCalledWith(
       expect.objectContaining({ type: "saveResult" }),
@@ -2246,5 +2880,438 @@ describe("explicit saved credential removal", () => {
     await panel.webview.dispatchMessage({ type: "saveConnection", payload });
     expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
     await pending;
+  });
+});
+
+describe("uniform secret storage choice", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const payloads = [
+    {
+      name: "Elasticsearch",
+      payload: {
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        apiKey: "es-key",
+      },
+    },
+    {
+      name: "DynamoDB",
+      payload: {
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        awsAccessKeyId: "AKIA123",
+        awsSecretAccessKey: "secret-key",
+      },
+    },
+    {
+      name: "SSH",
+      payload: {
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        password: "db-secret",
+        ssh: {
+          host: "bastion.example.com",
+          port: 22,
+          username: "tunnel",
+          authMethod: "password",
+          password: "ssh-secret",
+          hostVerificationMode: "manual",
+          hostFingerprintSha256:
+            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        },
+      },
+    },
+    {
+      name: "TLS key passphrase",
+      payload: {
+        type: "pg",
+        host: "db.internal",
+        database: "app",
+        username: "postgres",
+        tls: {
+          mode: "mutualTls",
+          certFilePath: "/tmp/client.crt",
+          keyFilePath: "/tmp/client.key",
+          keyPassphrase: "tls-secret",
+        },
+      },
+    },
+    {
+      name: "credential URI",
+      payload: {
+        type: "redis",
+        connectionUri: "redis://user:redis-secret@localhost:6379/0",
+      },
+    },
+  ];
+
+  it.each(
+    payloads.flatMap((entry) =>
+      [false, true].map((useSecretStorage) => ({ ...entry, useSecretStorage })),
+    ),
+  )("saves $name with the submitted storage choice $useSecretStorage", async ({
+    payload,
+    useSecretStorage,
+  }) => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+    );
+    await Promise.resolve();
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected a webview panel to be created.");
+
+    await panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { id: "uniform", name: "Uniform", ...payload, useSecretStorage },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({ id: "uniform", useSecretStorage }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ useSecretStorage }),
+      expect.any(Object),
+      { kind: "create" },
+    );
+    expect(vscodeMock.module.window.showWarningMessage).toHaveBeenCalledTimes(
+      useSecretStorage ? 0 : 1,
+    );
+    expect(context.secrets.store).not.toHaveBeenCalled();
+  });
+
+  it("moves stored secrets into the plaintext config when the choice is turned off", async () => {
+    const existing: ConnectionConfig = {
+      id: "toggle-off",
+      name: "Toggle off",
+      type: "elasticsearch",
+      endpoint: "https://es.example.com",
+      useSecretStorage: true,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () => JSON.stringify({ apiKey: "stored-key" })),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: existing.id,
+        name: existing.name,
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        hasStoredApiKey: true,
+        useSecretStorage: false,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({ useSecretStorage: false }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "stored-key",
+        useSecretStorage: false,
+      }),
+      expect.any(Object),
+      expect.objectContaining({ kind: "edit" }),
+    );
+  });
+
+  it("blocks saving a flagless profile when Secret Storage cannot be read at save", async () => {
+    const existing: ConnectionConfig = {
+      id: "flagless-locked",
+      name: "Flagless locked",
+      type: "elasticsearch",
+      endpoint: "https://es.example.com",
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () => JSON.stringify({ apiKey: "stored-key" })),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    void ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    context.secrets.get.mockRejectedValueOnce(new Error("keychain locked"));
+
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: existing.id,
+        name: existing.name,
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        hasStoredApiKey: true,
+        useSecretStorage: false,
+      },
+    });
+
+    expect(connectionManager.saveConnection).not.toHaveBeenCalled();
+    expect(createdPanel().webview.postMessage).toHaveBeenCalledWith({
+      type: "saveResult",
+      payload: {
+        success: false,
+        error:
+          "SecretStorage unavailable: keychain locked. Existing connection data was not changed.",
+      },
+    });
+    expect(context.secrets.delete).not.toHaveBeenCalled();
+    createdPanel().dispose();
+  });
+
+  it("does not read Secret Storage when saving a plaintext profile", async () => {
+    const existing: ConnectionConfig = {
+      id: "plaintext-save",
+      name: "Plaintext",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      password: "plain",
+      useSecretStorage: false,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () => {
+          throw new Error("keychain prompt");
+        }),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: existing.id,
+        name: "Renamed",
+        type: "pg",
+        host: "localhost",
+        database: "app",
+        username: "postgres",
+        hasStoredSecret: true,
+        useSecretStorage: false,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({ name: "Renamed" }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({ password: "plain", useSecretStorage: false }),
+      expect.any(Object),
+      expect.objectContaining({ kind: "edit" }),
+    );
+    expect(context.secrets.get).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale Secret Storage entry for a plaintext profile", async () => {
+    const existing: ConnectionConfig = {
+      id: "stale-plaintext",
+      name: "Stale plaintext",
+      type: "elasticsearch",
+      endpoint: "https://es.example.com",
+      apiKey: "current-key",
+      useSecretStorage: false,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () =>
+          JSON.stringify({ apiKey: "stale-key", password: "stale-password" }),
+        ),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+    const shellCall = vi.mocked(createWebviewShell).mock.calls[0]?.[0] as
+      | {
+          initialState?: {
+            existing?: { hasStoredApiKey?: boolean; hasStoredSecret?: boolean };
+          };
+        }
+      | undefined;
+    expect(shellCall?.initialState?.existing?.hasStoredApiKey).toBe(true);
+    expect(shellCall?.initialState?.existing?.hasStoredSecret).toBeUndefined();
+
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: existing.id,
+        name: existing.name,
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+        hasStoredApiKey: true,
+        useSecretStorage: false,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({ useSecretStorage: false }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiKey: "current-key",
+        useSecretStorage: false,
+      }),
+      expect.any(Object),
+      expect.objectContaining({ kind: "edit" }),
+    );
+    expect(connectionManager.saveConnection.mock.calls[0][0].password).not.toBe(
+      "stale-password",
+    );
+  });
+
+  it("moves plaintext secrets into the submitted config when the choice is turned on", async () => {
+    const existing: ConnectionConfig = {
+      id: "toggle-on",
+      name: "Toggle on",
+      type: "dynamodb",
+      awsRegion: "us-east-1",
+      awsAccessKeyId: "plain-access",
+      awsSecretAccessKey: "plain-secret",
+      useSecretStorage: false,
+    };
+    const context = {
+      secrets: {
+        get: vi.fn(async () => undefined),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn().mockResolvedValue(undefined),
+      getConnection: vi.fn(() => existing),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      existing,
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+
+    await createdPanel().webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        id: existing.id,
+        name: existing.name,
+        type: "dynamodb",
+        awsRegion: "us-east-1",
+        hasStoredAwsCredentials: true,
+        useSecretStorage: true,
+      },
+    });
+
+    await expect(promise).resolves.toEqual(
+      expect.objectContaining({ useSecretStorage: true }),
+    );
+    expect(connectionManager.saveConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        awsAccessKeyId: "plain-access",
+        awsSecretAccessKey: "plain-secret",
+        useSecretStorage: true,
+      }),
+      expect.any(Object),
+      expect.objectContaining({ kind: "edit" }),
+    );
+    expect(vscodeMock.module.window.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [JSON.stringify({ apiKey: "stored-key" }), true],
+    [undefined, true],
+  ])("ticks the storage choice for a flagless profile (%s)", async (stored, expected) => {
+    const context = {
+      secrets: {
+        get: vi.fn(async () => stored),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    };
+    const connectionManager = {
+      saveConnection: vi.fn(),
+      getConnection: vi.fn(() => undefined),
+      testConnection: vi.fn(),
+    };
+    const promise = ConnectionFormPanel.show(
+      context as never,
+      connectionManager as never,
+      {
+        id: "flagless",
+        name: "Flagless",
+        type: "elasticsearch",
+        endpoint: "https://es.example.com",
+      },
+    );
+    await vi.waitFor(() => expect(createdPanel()).toBeDefined());
+
+    const shellCall = vi.mocked(createWebviewShell).mock.calls[0]?.[0] as
+      | { initialState?: { existing?: { useSecretStorage?: boolean } } }
+      | undefined;
+    expect(shellCall?.initialState?.existing?.useSecretStorage).toBe(expected);
+    createdPanel()?.dispose();
+    await expect(promise).resolves.toBeUndefined();
   });
 });

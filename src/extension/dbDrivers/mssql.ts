@@ -2,6 +2,7 @@ import * as mssql from "mssql";
 import { normalizeConnectionTlsConfig } from "../../shared/connectionConfig";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   getMssqlServerName,
@@ -17,15 +18,17 @@ import {
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
 } from "./BaseDBDriver";
-import { BoundedQueryRows, queryCollectionLimit } from "./boundedQueryRows";
+import { queryCollectionLimit } from "./boundedQueryRows";
 import { closeDriverResource } from "./driverCleanup";
 import { exactNumericFilterLiteral } from "./exactNumericFilter";
+import { literalContainsPattern } from "./literalContains";
 import {
   getMetadataContext,
   withMetadataResource,
 } from "./metadataCancellation";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import { MssqlQuerySession } from "./mssqlQuerySession";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   type QuestionMarkPlaceholderOptions,
   questionMarkPlaceholderOffsets,
@@ -42,6 +45,7 @@ import {
 } from "./timeout";
 import {
   TransactionIdentityStore,
+  TransactionVerificationError,
   verifyTransaction,
 } from "./transactionVerification";
 import type {
@@ -54,6 +58,7 @@ import type {
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
+  QueryColumnMeta,
   QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
@@ -72,13 +77,20 @@ import {
 const MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY = Symbol.for(
   "rapidb.mssqlTediousExactNumericPatch",
 );
+const MSSQL_MAX_RETAINED_RESULT_SETS = 100;
+const MSSQL_MAX_RETAINED_RESULT_COLUMNS = 4096;
 
-interface MssqlBatch {
+interface MssqlResultBudget {
+  remainingSets: number;
+  remainingColumns: number;
+}
+
+export interface MssqlBatch {
   sql: string;
   repeatCount: number;
 }
 
-function parseMssqlBatches(sql: string): MssqlBatch[] {
+export function parseMssqlBatches(sql: string): MssqlBatch[] {
   const separators = new Set(
     scanSqlForCap(sql, "mssql")
       .filter(
@@ -88,7 +100,9 @@ function parseMssqlBatches(sql: string): MssqlBatch[] {
   );
   const batches: MssqlBatch[] = [];
   let start = 0;
-  for (const match of sql.matchAll(/^[\t ]*GO(?:[\t ]+(-?\d+))?[\t \r]*$/gim)) {
+  for (const match of sql.matchAll(
+    /^[\t ]*GO(?:[\t ]+(-?\d+))?(?:[\t ]*\/\*(?:(?!\*\/).)*\*\/)*(?:[\t ]*--[^\r\n]*)?[\t \r]*$/gim,
+  )) {
     if (!separators.has(match.index + match[0].search(/\S/))) continue;
     const repeatCount = match[1] === undefined ? 1 : Number(match[1]);
     if (!Number.isSafeInteger(repeatCount) || repeatCount < 1) {
@@ -103,10 +117,6 @@ function parseMssqlBatches(sql: string): MssqlBatch[] {
   const finalBatch = sql.slice(start).trim();
   if (finalBatch) batches.push({ sql: finalBatch, repeatCount: 1 });
   return batches;
-}
-
-export function splitMssqlBatches(sql: string): string[] {
-  return parseMssqlBatches(sql).map((batch) => batch.sql);
 }
 
 type TediousReadValueResult = {
@@ -397,6 +407,18 @@ interface IndexRow {
   col_name: string;
   is_unique: boolean | number;
   is_pk: boolean | number;
+  has_filter?: boolean | number | null;
+}
+interface IndexDdlRow {
+  index_type: number;
+  is_unique: boolean | number;
+  is_primary_key: boolean | number;
+  is_unique_constraint: boolean | number;
+  ignore_dup_key: boolean | number;
+  filter_definition: string | null;
+  column_name: string;
+  is_descending_key: boolean | number;
+  is_included_column: boolean | number;
 }
 interface ForeignKeyRow {
   constraint_name: string;
@@ -404,6 +426,8 @@ interface ForeignKeyRow {
   ref_schema: string;
   ref_table: string;
   ref_column: string;
+  delete_action?: string | null;
+  update_action?: string | null;
 }
 interface DdlColumnRow {
   COLUMN_NAME: string;
@@ -417,11 +441,70 @@ interface DdlColumnRow {
   COMPUTED_DEFINITION: string | null;
   is_persisted: boolean | number;
   COLUMN_DEFAULT: string | null;
+  COLLATION_NAME: string | null;
+  IDENTITY_SEED: string | null;
+  IDENTITY_INCREMENT: string | null;
   IS_PK: number;
   PK_ORDINAL: number | null;
 }
 interface ObjectTypeRow {
   TABLE_TYPE: string;
+}
+interface MssqlUserTypeRow {
+  is_table_type: boolean | number;
+  type_table_object_id: number | null;
+  is_memory_optimized: boolean | number;
+  base_type: string | null;
+  max_length: number;
+  precision: number;
+  scale: number;
+  is_nullable: boolean | number;
+}
+interface MssqlServerVersionRow {
+  major_version: number | null;
+}
+interface MssqlTableTypeColumnRow {
+  column_name: string;
+  data_type: string;
+  max_length: number;
+  precision: number;
+  scale: number;
+  is_nullable: boolean | number;
+  is_user_defined: boolean | number;
+  type_schema: string | null;
+  is_computed: boolean | number;
+  computed_definition: string | null;
+  is_persisted: boolean | number;
+  is_identity: boolean | number;
+  identity_seed: string | number | null;
+  identity_increment: string | number | null;
+  is_rowguidcol: boolean | number;
+  collation_name: string | null;
+  xml_collection_schema: string | null;
+  xml_collection_name: string | null;
+  xml_collection_id: number;
+  is_xml_document: boolean | number;
+  default_object_id: number;
+  column_default: string | null;
+}
+interface MssqlTableTypeIndexColumnRow {
+  index_id: number;
+  index_name: string;
+  is_primary_key: boolean | number;
+  is_unique_constraint: boolean | number;
+  is_unique: boolean | number;
+  ignore_dup_key: boolean | number;
+  type_desc: string;
+  is_hash: boolean | number;
+  bucket_count: number | null;
+  column_name: string;
+  key_ordinal: number;
+  is_descending_key: boolean | number;
+  is_included_column: boolean | number;
+}
+interface MssqlTableTypeCheckConstraintRow {
+  name: string;
+  definition: string;
 }
 function canonicalizeMssqlBitPersistedEditValue(value: unknown): {
   canonical: string;
@@ -1032,6 +1115,59 @@ function readTediousDateTime2Value(
   );
 }
 
+function readTediousLegacyDateTimeValue(
+  buf: Buffer,
+  offset: number,
+  dataLength: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  ensureTediousBufferLength(buf, offset, dataLength, helpers);
+  const smallDateTime = dataLength === 4;
+  const days = smallDateTime
+    ? buf.readUInt16LE(offset)
+    : buf.readInt32LE(offset);
+  const milliseconds = smallDateTime
+    ? buf.readUInt16LE(offset + 2) * 60_000
+    : Math.round((buf.readUInt32LE(offset + 4) * 10) / 3);
+  const date = new Date(Date.UTC(1900, 0, 1 + days) + milliseconds);
+  const ms = date.getUTCMilliseconds();
+  const fraction =
+    ms > 0 ? `.${String(ms).padStart(3, "0").replace(/0+$/, "")}` : "";
+  return new helpers.Result(
+    formatMssqlDateTimeParts(
+      {
+        year: date.getUTCFullYear(),
+        month: date.getUTCMonth() + 1,
+        day: date.getUTCDate(),
+      },
+      {
+        hours: date.getUTCHours(),
+        minutes: date.getUTCMinutes(),
+        seconds: date.getUTCSeconds(),
+        fraction,
+      },
+    ),
+    offset + dataLength,
+  );
+}
+
+function readTediousDateTimeNValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
+  const dataLength = dataLengthResult.value as number;
+  offset = dataLengthResult.offset;
+  if (dataLength === 0) {
+    return new helpers.Result(null, offset);
+  }
+  if (dataLength !== 4 && dataLength !== 8) {
+    throw new Error(`Unsupported DateTimeN dataLength ${String(dataLength)}`);
+  }
+  return readTediousLegacyDateTimeValue(buf, offset, dataLength, helpers);
+}
+
 function formatScaledBigInt(value: bigint, scale: number): string {
   const negative = value < 0n;
   const absoluteValue = negative ? -value : value;
@@ -1117,6 +1253,51 @@ function readTediousMoneyNValue(
   throw new Error(`Unsupported MoneyN dataLength ${String(dataLength)}`);
 }
 
+const TEDIOUS_VARIANT_MONEY = 0x3c;
+const TEDIOUS_VARIANT_SMALL_MONEY = 0x7a;
+const TEDIOUS_VARIANT_DECIMAL_N = 0x6a;
+const TEDIOUS_VARIANT_NUMERIC_N = 0x6c;
+
+function readTediousExactVariantValue(
+  buf: Buffer,
+  offset: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult | undefined {
+  ensureTediousBufferLength(buf, offset, 4, helpers);
+  const dataLength = buf.readUInt32LE(offset);
+  if (dataLength === 0) {
+    return undefined;
+  }
+  ensureTediousBufferLength(buf, offset + 4, 2, helpers);
+  const baseType = buf.readUInt8(offset + 4);
+  const propBytes = buf.readUInt8(offset + 5);
+  const valueOffset = offset + 6;
+  switch (baseType) {
+    case TEDIOUS_VARIANT_SMALL_MONEY:
+      return readTediousSmallMoneyValue(buf, valueOffset, helpers);
+    case TEDIOUS_VARIANT_MONEY:
+      return readTediousMoneyValue(buf, valueOffset, helpers);
+    case TEDIOUS_VARIANT_DECIMAL_N:
+    case TEDIOUS_VARIANT_NUMERIC_N: {
+      ensureTediousBufferLength(buf, valueOffset, propBytes + 1, helpers);
+      const scale = buf.readUInt8(valueOffset + 1);
+      const sign = buf.readUInt8(valueOffset + propBytes) === 1 ? 1n : -1n;
+      const magnitudeResult = readTediousUnsignedBigIntLE(
+        buf,
+        valueOffset + propBytes + 1,
+        dataLength - propBytes - 3,
+        helpers,
+      );
+      return new helpers.Result(
+        formatScaledBigInt((magnitudeResult.value as bigint) * sign, scale),
+        magnitudeResult.offset,
+      );
+    }
+    default:
+      return undefined;
+  }
+}
+
 function patchMssqlTediousExactNumericParsing(): void {
   const globalScope = globalThis as Record<PropertyKey, unknown>;
   if (globalScope[MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY]) {
@@ -1145,6 +1326,17 @@ function patchMssqlTediousExactNumericParsing(): void {
         return readTediousMoneyValue(buf, offset, tediousHelpers);
       case "MoneyN":
         return readTediousMoneyNValue(buf, offset, tediousHelpers);
+      case "Variant":
+        return (
+          readTediousExactVariantValue(buf, offset, tediousHelpers) ??
+          originalReadValue(buf, offset, metadata, options)
+        );
+      case "SmallDateTime":
+        return readTediousLegacyDateTimeValue(buf, offset, 4, tediousHelpers);
+      case "DateTime":
+        return readTediousLegacyDateTimeValue(buf, offset, 8, tediousHelpers);
+      case "DateTimeN":
+        return readTediousDateTimeNValue(buf, offset, tediousHelpers);
       case "Date":
         return readTediousDateValue(buf, offset, tediousHelpers);
       case "Time":
@@ -1169,22 +1361,50 @@ function patchMssqlTediousExactNumericParsing(): void {
 patchMssqlTediousExactNumericParsing();
 
 const MSSQL_TIME_RE = /^\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?$/;
-const MSSQL_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const INTEGER_RE = /^-?\d+$/;
 const DECIMAL_RE = /^-?\d+(?:\.\d+)?$/;
+const APPROXIMATE_NUMERIC_RE = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/;
 const MSSQL_LIKE_MAX_NVARCHAR_CHARS = 3900;
+const MSSQL_CHARINDEX_MAX_NVARCHAR_CHARS = 4000;
+function mssqlCharindexContains(
+  columnSql: string,
+  value: string,
+): FilterConditionResult {
+  if (value.length > MSSQL_CHARINDEX_MAX_NVARCHAR_CHARS) {
+    throw new TypeError(
+      "[RapiDB Filter] SQL Server Contains supports at most 4000 UTF-16 code units. Shorten the search value.",
+    );
+  }
+  return {
+    sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${columnSql} AS NVARCHAR(MAX))) > 0`,
+    params: [value],
+  };
+}
+function mssqlLiteralContainsPattern(value: string): string {
+  return literalContainsPattern(value).replace(/\[/g, "[[]");
+}
 function approximateNumericFilterTolerance(rawValue: string): number {
   const fraction = /\.(\d+)/.exec(rawValue)?.[1].length ?? 0;
   const precision = Math.min(Math.max(fraction + 2, 6), 12);
   return 10 ** -precision;
+}
+function mssqlExactNumericFilterLiteral(
+  column: ColumnTypeMeta,
+  rawValue: string,
+): { value: string; scale: number } {
+  return exactNumericFilterLiteral(
+    rawValue.replace(/^([+-]?\d+)\.$/, "$1"),
+    column.name,
+    38,
+    38,
+  );
 }
 function mssqlNumericFilterParam(
   column: ColumnTypeMeta,
   rawValue: string,
 ): string | number | bigint {
   if (column.category === "decimal") {
-    return rawValue;
+    return mssqlExactNumericFilterLiteral(column, rawValue).value;
   }
   if (
     column.category === "integer" &&
@@ -1194,7 +1414,7 @@ function mssqlNumericFilterParam(
     return BigInt(rawValue);
   }
   if (column.category === "integer" && !/^[+-]?\d+$/.test(rawValue)) {
-    return exactNumericFilterLiteral(rawValue, column.name, 38, 38).value;
+    return mssqlExactNumericFilterLiteral(column, rawValue).value;
   }
   return Number(rawValue);
 }
@@ -1202,12 +1422,20 @@ function mssqlNumericParamExpr(
   column: ColumnTypeMeta,
   rawValue?: string,
 ): string {
+  if (rawValue !== undefined && column.category === "decimal") {
+    const { value, scale } = mssqlExactNumericFilterLiteral(column, rawValue);
+    const integerDigits = value
+      .replace(/^-/, "")
+      .split(".")[0]
+      .replace(/^0+/, "").length;
+    return `CAST(? AS decimal(${Math.max(1, integerDigits + scale)},${scale}))`;
+  }
   if (
-    column.category === "integer" &&
     rawValue !== undefined &&
+    column.category === "integer" &&
     !/^[+-]?\d+$/.test(rawValue)
   ) {
-    const { scale } = exactNumericFilterLiteral(rawValue, column.name, 38, 38);
+    const { scale } = mssqlExactNumericFilterLiteral(column, rawValue);
     return `CAST(? AS decimal(38,${scale}))`;
   }
   return column.category === "decimal"
@@ -1236,9 +1464,9 @@ function mssqlFloatSignificantDigits(nativeType: string): number {
   }
   const match = /^float(?:\((\d+)\))?/.exec(normalized);
   if (!match?.[1]) {
-    return 15;
+    return 17;
   }
-  return Number.parseInt(match[1], 10) <= 24 ? 7 : 15;
+  return Number.parseInt(match[1], 10) <= 24 ? 7 : 17;
 }
 function mssqlSinglePrecisionFilterType(nativeType: string): string | null {
   const normalized = nativeType.toLowerCase().trim();
@@ -1251,9 +1479,6 @@ function mssqlSinglePrecisionFilterType(nativeType: string): string | null {
   }
   return null;
 }
-type MssqlTemporalDate = Date & {
-  nanosecondDelta?: number;
-};
 function mssqlFullType(
   typeName: string,
   maxLength: number,
@@ -1335,9 +1560,37 @@ function formatMssqlStringPreviewLiteral(
   );
 }
 function normalizeDatetimeLiteral(value: string): string {
-  return normalizeSqlDatetimeOffsetSpacing(
-    normalizeMssqlYearPrefix(value.trim()),
-  );
+  const literal = normalizeMssqlYearPrefix(value.trim());
+  return DATE_ONLY_RE.test(literal)
+    ? literal
+    : normalizeSqlDatetimeOffsetSpacing(literal);
+}
+function isMssqlLegacyDatetimeType(nativeType: string): boolean {
+  const baseType = baseTypeName(nativeType);
+  return baseType === "datetime" || baseType === "smalldatetime";
+}
+function languageNeutralMssqlDatetimeLiteral(
+  value: string,
+  nativeType: string,
+): string {
+  if (!isMssqlLegacyDatetimeType(nativeType)) return value;
+  const literal = normalizeMssqlTemporalClock(value.trim());
+  if (DATE_ONLY_RE.test(literal)) return `${literal}T00:00:00`;
+  return literal.replace(/^(\d{4}-\d{2}-\d{2}) (?=\d{2}:\d{2}:\d{2})/, "$1T");
+}
+function mssqlSqlVariantInputParam(
+  value: unknown,
+  nativeType: string,
+): unknown {
+  if (typeof value !== "string" || value === NULL_SENTINEL) return value;
+  const baseType = baseTypeName(nativeType);
+  if (baseType === "float" || baseType === "real") {
+    const trimmed = value.trim();
+    if (!APPROXIMATE_NUMERIC_RE.test(trimmed)) return value;
+    const numeric = Number(trimmed);
+    return Number.isFinite(numeric) ? numeric : value;
+  }
+  return languageNeutralMssqlDatetimeLiteral(value, nativeType);
 }
 function normalizeDateLiteral(value: string): string {
   const trimmed = normalizeMssqlYearPrefix(value.trim());
@@ -1362,82 +1615,6 @@ function normalizeDateLiteral(value: string): string {
   }
   return trimmed;
 }
-function detectScale(value: unknown): number | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const match = /\.(\d+)/.exec(value);
-  if (!match) return null;
-  return Math.min(match[1].length, 7);
-}
-function parseMssqlTimeLiteral(value: string): MssqlTemporalDate {
-  const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(value);
-  if (!match) {
-    throw new TypeError("Invalid time.");
-  }
-  const hours = Number(match[1]);
-  const minutes = Number(match[2]);
-  const seconds = Number(match[3]);
-  const fraction = match[4] ?? "";
-  if (hours > 23 || minutes > 59 || seconds > 59) {
-    throw new TypeError("Invalid time.");
-  }
-  const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
-  const result = new Date(0) as MssqlTemporalDate;
-  result.setFullYear(1970, 0, 1);
-  result.setHours(hours, minutes, seconds, milliseconds);
-  const subMillisecond = fraction.slice(3);
-  if (subMillisecond.length > 0) {
-    result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
-  }
-  return result;
-}
-function parseMssqlNaiveDatetimeLiteral(value: string): MssqlTemporalDate {
-  const match =
-    /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,7}))?$/.exec(
-      value,
-    );
-  if (!match) {
-    throw new TypeError("Invalid datetime.");
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hours = Number(match[4]);
-  const minutes = Number(match[5]);
-  const seconds = Number(match[6]);
-  const fraction = match[7] ?? "";
-  if (
-    month < 1 ||
-    month > 12 ||
-    day < 1 ||
-    day > 31 ||
-    hours > 23 ||
-    minutes > 59 ||
-    seconds > 59
-  ) {
-    throw new TypeError("Invalid datetime.");
-  }
-  const milliseconds = Number((fraction.slice(0, 3) || "0").padEnd(3, "0"));
-  const result = new Date(0) as MssqlTemporalDate;
-  result.setFullYear(year, month - 1, day);
-  result.setHours(hours, minutes, seconds, milliseconds);
-  if (
-    result.getFullYear() !== year ||
-    result.getMonth() !== month - 1 ||
-    result.getDate() !== day ||
-    result.getHours() !== hours ||
-    result.getMinutes() !== minutes ||
-    result.getSeconds() !== seconds
-  ) {
-    throw new TypeError("Invalid datetime.");
-  }
-  const subMillisecond = fraction.slice(3);
-  if (subMillisecond.length > 0) {
-    result.nanosecondDelta = Number(subMillisecond) / 10 ** fraction.length;
-  }
-  return result;
-}
 function isSetFlag(value: boolean | number | null | undefined): boolean {
   return value === true || value === 1;
 }
@@ -1449,11 +1626,19 @@ function columnTypeName(meta: MssqlArrayColumnMeta | undefined): string {
   }
   return typeof rawType.type === "function" ? rawType.type.name : "";
 }
-function mssqlSqlTypeName(sqlType: MssqlSqlType): string {
-  if (typeof sqlType === "function") {
-    return sqlType.name;
+
+function mssqlQueryColumnMeta(meta: MssqlArrayColumnMeta): QueryColumnMeta {
+  const typeName = columnTypeName(meta).toLowerCase();
+  if (["tinyint", "smallint", "int", "bigint"].includes(typeName)) {
+    return { category: "integer" };
   }
-  return typeof sqlType.type === "function" ? sqlType.type.name : "";
+  if (["decimal", "numeric", "money", "smallmoney"].includes(typeName)) {
+    return { category: "decimal" };
+  }
+  if (["float", "real"].includes(typeName)) {
+    return { category: "float" };
+  }
+  return { category: null };
 }
 function temporalSearchLiteral(value: string): string {
   const trimmed = value.trim();
@@ -1583,6 +1768,7 @@ export class MSSQLDriver extends BaseDBDriver {
     if (value === NULL_SENTINEL) return null;
     if (value === null || value === undefined || value === "") return value;
     if (typeof value !== "string") return value;
+    if (column?.category === "text") return value;
     const trimmed = value.trim();
     if (trimmed === "") return value;
     if (column && this.hasBooleanSemantics(column)) {
@@ -1621,10 +1807,14 @@ export class MSSQLDriver extends BaseDBDriver {
       return MSSQL_TIME_RE.test(trimmed) ? trimmed : value;
     }
     if (column?.category === "datetime") {
-      const normalized = normalizeDatetimeLiteral(trimmed);
+      const normalized = isMssqlLegacyDatetimeType(column.nativeType)
+        ? normalizeMssqlTemporalClock(normalizeDatetimeLiteral(trimmed))
+        : normalizeDatetimeLiteral(trimmed);
       return ISO_DATETIME_RE.test(normalized) ||
-        DATETIME_SQL_RE.test(normalized.replace("T", " "))
-        ? normalized
+        DATETIME_SQL_RE.test(normalized.replace("T", " ")) ||
+        (isMssqlLegacyDatetimeType(column.nativeType) &&
+          DATE_ONLY_RE.test(normalized))
+        ? languageNeutralMssqlDatetimeLiteral(normalized, column.nativeType)
         : value;
     }
     if (DATE_ONLY_RE.test(trimmed) || MSSQL_TIME_RE.test(trimmed)) {
@@ -1658,25 +1848,6 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     if (typeof value === "boolean") return mssql.Bit;
     if (value instanceof Date) return mssql.DateTime2(7);
-    if (typeof value === "string") {
-      if (MSSQL_UUID_RE.test(value)) return mssql.UniqueIdentifier;
-      if (DATE_ONLY_RE.test(value)) return mssql.Date;
-      if (MSSQL_TIME_RE.test(value)) {
-        return mssql.Time(detectScale(value) ?? 7);
-      }
-      const normalized = normalizeDatetimeLiteral(value);
-      if (ISO_DATETIME_RE.test(normalized)) {
-        return hasExplicitTimezone(normalized)
-          ? mssql.DateTimeOffset(detectScale(normalized) ?? 7)
-          : mssql.DateTime2(detectScale(normalized) ?? 7);
-      }
-      if (DATETIME_SQL_RE.test(normalized.replace("T", " "))) {
-        return hasExplicitTimezone(normalized)
-          ? mssql.DateTimeOffset(detectScale(normalized) ?? 7)
-          : mssql.DateTime2(detectScale(normalized) ?? 7);
-      }
-      return this.createNVarCharType(value);
-    }
     return this.createNVarCharType(value);
   }
   private bindRequestInput(
@@ -1684,40 +1855,9 @@ export class MSSQLDriver extends BaseDBDriver {
     name: string,
     rawValue: unknown,
   ): void {
-    const normalizedValue = this.normalizeInputValue(rawValue);
-    const baseValue = normalizedValue === undefined ? null : normalizedValue;
-    const type = this.typeForValue(baseValue);
-    const typeName = mssqlSqlTypeName(type);
-    let value = baseValue;
-    if (typeof baseValue === "string") {
-      if (
-        typeName === "Date" ||
-        typeName === "Time" ||
-        typeName === "DateTime2" ||
-        typeName === "DateTimeOffset"
-      ) {
-        const normalizedTemporalValue =
-          typeName === "Date"
-            ? normalizeDateLiteral(baseValue)
-            : typeName === "Time"
-              ? baseValue.trim()
-              : normalizeDatetimeLiteral(baseValue);
-        request.input(
-          name,
-          this.createNVarCharType(normalizedTemporalValue),
-          normalizedTemporalValue,
-        );
-        return;
-      }
-      if (typeName === "Time") {
-        value = parseMssqlTimeLiteral(baseValue);
-      } else if (typeName === "DateTime2" && !hasExplicitTimezone(baseValue)) {
-        value = parseMssqlNaiveDatetimeLiteral(
-          normalizeDatetimeLiteral(baseValue),
-        );
-      }
-    }
-    request.input(name, type, value);
+    const value =
+      rawValue === NULL_SENTINEL || rawValue === undefined ? null : rawValue;
+    request.input(name, this.typeForValue(value), value);
   }
   private bindPositionalParameters(
     request: mssql.Request,
@@ -2022,7 +2162,6 @@ export class MSSQLDriver extends BaseDBDriver {
            JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
            WHERE s.name = @schema
              AND t.is_user_defined = 1
-             AND t.is_table_type = 0
            ORDER BY t.name`);
       for (const row of typeRes.recordset) {
         objects.push({
@@ -2057,7 +2196,7 @@ export class MSSQLDriver extends BaseDBDriver {
            c.is_computed,
            cc.definition                                        AS COMPUTED_DEFINITION,
            cc.is_persisted,
-           OBJECT_DEFINITION(c.default_object_id)               AS COLUMN_DEFAULT,
+           dc.definition                                        AS COLUMN_DEFAULT,
            CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
            pk.key_ordinal                                       AS PK_ORDINAL,
            CASE WHEN fk.parent_column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_FK
@@ -2068,6 +2207,8 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
          LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
            ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.default_constraints dc
+           ON dc.object_id = c.default_object_id
          LEFT JOIN (
            SELECT ic.object_id, ic.column_id, ic.key_ordinal
            FROM [${escapeMssqlId(database)}].sys.index_columns ic
@@ -2161,6 +2302,8 @@ export class MSSQLDriver extends BaseDBDriver {
       () => this.assertConnectionEpoch(epoch),
     );
     this.querySessions.add(session);
+    let failedResult: QueryResult | undefined;
+    let resultError: Error | undefined;
     try {
       return await session.run(async () => {
         let lastResult: QueryResult = {
@@ -2169,22 +2312,97 @@ export class MSSQLDriver extends BaseDBDriver {
           rowCount: 0,
           executionTimeMs: 0,
         };
+        const resultSets: QueryResultSet[] = [];
+        const resultBudget: MssqlResultBudget = {
+          remainingSets: MSSQL_MAX_RETAINED_RESULT_SETS,
+          remainingColumns: MSSQL_MAX_RETAINED_RESULT_COLUMNS,
+        };
+        let retainedRows = 0;
+        let resultRowCount = 0;
+        let resultSetsTruncated = false;
+        let stopBatches = false;
         for (const { sql: batch, repeatCount } of batches) {
           const currentParams = batches.length === 1 ? params : undefined;
           for (let repetition = 0; repetition < repeatCount; repetition++) {
-            if (hardCap !== undefined) lastResult.rows = [];
-            lastResult = await this._executeBatch(
-              session,
-              batch,
-              currentParams,
-              start,
-              hardCap,
-            );
+            const remainingHardCap =
+              hardCap === undefined
+                ? undefined
+                : Math.max(0, hardCap - retainedRows);
+            let batchResult: QueryResult;
+            try {
+              batchResult = await this._executeBatch(
+                session,
+                batch,
+                currentParams,
+                start,
+                remainingHardCap,
+                resultBudget,
+              );
+            } catch (error) {
+              if (
+                (resultSets.length === 0 && !resultSetsTruncated) ||
+                session.hasStopped()
+              )
+                throw error;
+              batchResult = {
+                columns: [],
+                rows: [],
+                rowCount: 0,
+                executionTimeMs: Date.now() - start,
+                error: normalizeUnknownError(error, this.config).message,
+              };
+            }
+            resultSetsTruncated ||= batchResult.resultSetsTruncated === true;
+            for (const resultSet of batchResult.resultSets ?? []) {
+              retainedRows += resultSet.rows.length;
+              resultRowCount += resultSet.rowCount;
+              resultSets.push({
+                ...resultSet,
+                id: `result-${resultSets.length + 1}`,
+              });
+            }
+            lastResult =
+              resultSets.length > 0
+                ? {
+                    ...batchResult,
+                    columns: resultSets[0].columns,
+                    columnMeta: resultSets[0].columnMeta,
+                    rows: resultSets[0].rows,
+                    rowCount: resultRowCount,
+                    resultSets,
+                  }
+                : batchResult;
+            if (resultSetsTruncated) lastResult.resultSetsTruncated = true;
+            if (batchResult.error) {
+              stopBatches = true;
+              break;
+            }
           }
+          if (stopBatches) break;
         }
         lastResult.executionTimeMs = Date.now() - start;
+        if (lastResult.error) {
+          failedResult = lastResult;
+          resultError = new Error(lastResult.error);
+          throw resultError;
+        }
         return lastResult;
       });
+    } catch (error) {
+      if (failedResult) {
+        this.assertConnectionEpoch(epoch);
+        throwIfQueryCancelled(operationContext);
+        if (error === resultError && !session.hasStopped()) {
+          return failedResult;
+        }
+        if (error !== resultError) {
+          throw new Error(
+            `${failedResult.error} ${normalizeUnknownError(error, this.config).message}`,
+            { cause: error },
+          );
+        }
+      }
+      throw error;
     } finally {
       this.querySessions.delete(session);
     }
@@ -2195,112 +2413,185 @@ export class MSSQLDriver extends BaseDBDriver {
     params?: unknown[],
     start = Date.now(),
     hardCap?: number,
+    resultBudget: MssqlResultBudget = {
+      remainingSets: MSSQL_MAX_RETAINED_RESULT_SETS,
+      remainingColumns: MSSQL_MAX_RETAINED_RESULT_COLUMNS,
+    },
   ): Promise<QueryResult> {
     const req = session.request();
     req.arrayRowMode = true;
-    if (hardCap !== undefined) {
-      return session.execute(req, async (trackedReq) => {
-        const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
-        const retained = new BoundedQueryRows<unknown[]>(hardCap);
-        let columnsMeta: MssqlArrayColumnMeta[] = [];
-        let recordsetIndex = -1;
-        let affectedRows = 0;
-        let streamError: Error | undefined;
-        const onRecordset = (columns: MssqlArrayColumnMeta[]) => {
-          recordsetIndex++;
-          if (recordsetIndex === 0) columnsMeta = columns;
-        };
-        const onRow = (row: unknown) => {
-          if (recordsetIndex === 0)
-            retained.add(mssqlArrayRow(row, columnsMeta));
-        };
-        const onAffected = (count: number) => {
-          affectedRows = count;
-        };
-        const onError = (error: Error) => {
-          streamError ??= error;
-        };
-        trackedReq.stream = true;
-        trackedReq.on("recordset", onRecordset);
-        trackedReq.on("row", onRow);
-        trackedReq.on("rowsaffected", onAffected);
-        trackedReq.on("error", onError);
-        try {
-          const result = params?.length
-            ? await trackedReq.query(finalSql)
-            : await trackedReq.batch(finalSql);
-          if (streamError) throw streamError;
-          affectedRows = result.rowsAffected?.at(-1) ?? affectedRows;
-          return {
-            columns: columnsMeta.map((column) =>
-              column.name === "" ? " " : column.name,
-            ),
-            rows: retained.rows.map((row) =>
-              Object.fromEntries(
-                row.map((value, index) => [
-                  `__col_${index}`,
-                  this.formatQueryValue(value, columnsMeta[index]),
-                ]),
-              ),
-            ),
-            rowCount: columnsMeta.length ? retained.rowCount : affectedRows,
-            affectedRows,
-            truncated: retained.truncated,
-            executionTimeMs: Date.now() - start,
-          };
-        } finally {
-          trackedReq.off("recordset", onRecordset);
-          trackedReq.off("row", onRow);
-          trackedReq.off("rowsaffected", onAffected);
-          trackedReq.off("error", onError);
-        }
-      });
-    }
-    const res = (await session.execute(req, async (trackedReq) => {
+    return session.execute(req, async (trackedReq) => {
       const finalSql = this.bindPositionalParameters(trackedReq, sql, params);
-      return params?.length
-        ? await trackedReq.query(finalSql)
-        : await trackedReq.batch(finalSql);
-    })) as MssqlArrayResult;
-    const executionTimeMs = Date.now() - start;
-    // node-mssql batch() omits top-level columns in arrayRowMode, but retains
-    // them on each recordset (including an empty SELECT).
-    const columnsMeta =
-      res.columns?.[0] ??
-      (
-        res.recordset as unknown as
-          | { columns?: MssqlArrayColumnMeta[] }
-          | undefined
-      )?.columns ??
-      [];
-    const affectedRows = res.rowsAffected.at(-1) ?? 0;
-    if (columnsMeta.length === 0) {
-      return {
-        columns: [],
-        rows: [],
-        rowCount: affectedRows,
-        affectedRows,
-        executionTimeMs,
+      const resultSets: QueryResultSet[] = [];
+      let activeResultSet:
+        | {
+            columnsMeta: MssqlArrayColumnMeta[];
+            output: QueryResultSet;
+            completed: boolean;
+          }
+        | undefined;
+      let retainedRowCount = 0;
+      let receivedRecordset = false;
+      let resultSetsTruncated = false;
+      let affectedRows = 0;
+      let streamError: Error | undefined;
+
+      const onRecordset = (columnsMeta: MssqlArrayColumnMeta[]) => {
+        if (activeResultSet) activeResultSet.completed = true;
+        activeResultSet = undefined;
+        receivedRecordset = true;
+        if (!columnsMeta.length) return;
+        if (
+          resultBudget.remainingSets === 0 ||
+          columnsMeta.length > resultBudget.remainingColumns
+        ) {
+          resultSetsTruncated = true;
+          return;
+        }
+        resultBudget.remainingSets--;
+        resultBudget.remainingColumns -= columnsMeta.length;
+        const output = {
+          id: `result-${resultSets.length + 1}`,
+          columns: columnsMeta.map((column) =>
+            column.name === "" ? " " : column.name,
+          ),
+          columnMeta: columnsMeta.map(mssqlQueryColumnMeta),
+          rows: [] as Record<string, unknown>[],
+          rowCount: 0,
+          truncated: false,
+        };
+        activeResultSet = { columnsMeta, output, completed: false };
+        resultSets.push(output);
       };
-    }
-    const columns = columnsMeta.map((column) =>
-      column.name === "" ? " " : column.name,
-    );
-    const rows = ((res.recordset ?? []) as unknown[][]).map((row) =>
-      Object.fromEntries(
-        mssqlArrayRow(row, columnsMeta).map((value, index) => [
-          `__col_${index}`,
-          this.formatQueryValue(value, columnsMeta[index]),
-        ]),
-      ),
-    );
-    return {
-      columns,
-      rows,
-      rowCount: rows.length,
-      affectedRows,
-      executionTimeMs,
-    };
+      const onRow = (row: unknown) => {
+        const currentResultSet = activeResultSet;
+        if (!currentResultSet) return;
+        currentResultSet.output.rowCount++;
+        if (hardCap !== undefined && retainedRowCount >= hardCap) {
+          currentResultSet.output.truncated = true;
+          return;
+        }
+        const values = mssqlArrayRow(row, currentResultSet.columnsMeta);
+        currentResultSet.output.rows.push(
+          Object.fromEntries(
+            values.map((value, index) => [
+              `__col_${index}`,
+              this.formatQueryValue(value, currentResultSet.columnsMeta[index]),
+            ]),
+          ),
+        );
+        retainedRowCount++;
+      };
+      const onAffected = (count: number) => {
+        affectedRows = count;
+        if (activeResultSet) {
+          activeResultSet.output.affectedRows = count;
+          activeResultSet.completed = true;
+        }
+      };
+      const onError = (error: Error) => {
+        streamError ??= error;
+        if (activeResultSet && !activeResultSet.completed) {
+          activeResultSet.output.partial = true;
+        }
+      };
+      const toFormattedError = (error: unknown): Error => {
+        const lineNumber = (error as { lineNumber?: unknown } | null)
+          ?.lineNumber;
+        if (
+          typeof lineNumber !== "number" ||
+          lineNumber <= 0 ||
+          !Number.isSafeInteger(lineNumber)
+        ) {
+          return error instanceof Error ? error : new Error(String(error));
+        }
+        return new Error(
+          `${normalizeUnknownError(error, this.config).message} (SQL Server line ${lineNumber})`,
+        );
+      };
+      const createResult = (error?: unknown): QueryResult => {
+        const firstResultSet = resultSets[0];
+        const rowCount = firstResultSet
+          ? resultSets.reduce(
+              (total, resultSet) => total + resultSet.rowCount,
+              0,
+            )
+          : affectedRows;
+        return {
+          columns: firstResultSet?.columns ?? [],
+          columnMeta: firstResultSet?.columnMeta ?? [],
+          rows: firstResultSet?.rows ?? [],
+          rowCount,
+          affectedRows,
+          ...(resultSets.length > 0 ? { resultSets } : {}),
+          ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
+          ...(error !== undefined
+            ? { error: normalizeUnknownError(error, this.config).message }
+            : {}),
+          executionTimeMs: Date.now() - start,
+        };
+      };
+
+      trackedReq.stream = true;
+      trackedReq.on("recordset", onRecordset);
+      trackedReq.on("row", onRow);
+      trackedReq.on("rowsaffected", onAffected);
+      trackedReq.on("error", onError);
+      const stopTrackingCompletion = session.trackStatementCompletions(
+        trackedReq,
+        () => {
+          if (activeResultSet) activeResultSet.completed = true;
+        },
+      );
+      try {
+        let response: MssqlArrayResult | undefined;
+        let executionError: unknown;
+        try {
+          response = (await (params?.length
+            ? trackedReq.query(finalSql)
+            : trackedReq.batch(finalSql))) as MssqlArrayResult;
+          affectedRows = response.rowsAffected?.at(-1) ?? affectedRows;
+          if (streamError) executionError = streamError;
+        } catch (error) {
+          executionError = error;
+        }
+
+        if (!receivedRecordset && response) {
+          const bufferedRecordsets =
+            Array.isArray(response.recordsets) && response.recordsets.length > 0
+              ? response.recordsets
+              : response.recordset
+                ? [response.recordset]
+                : [];
+          for (const [index, recordset] of bufferedRecordsets.entries()) {
+            const recordsetColumns = (
+              recordset as unknown as { columns?: MssqlArrayColumnMeta[] }
+            )?.columns;
+            const columnsMeta =
+              response.columns?.[index] ?? recordsetColumns ?? [];
+            if (!columnsMeta.length) continue;
+            onRecordset(columnsMeta);
+            for (const row of (recordset ?? []) as unknown[][]) onRow(row);
+          }
+        }
+
+        if (executionError !== undefined) {
+          if (resultSets.length === 0 && !resultSetsTruncated)
+            throw toFormattedError(executionError);
+          if (activeResultSet && !activeResultSet.completed) {
+            activeResultSet.output.partial = true;
+          }
+          return createResult(toFormattedError(executionError));
+        }
+        return createResult();
+      } finally {
+        stopTrackingCompletion();
+        trackedReq.off("recordset", onRecordset);
+        trackedReq.off("row", onRow);
+        trackedReq.off("rowsaffected", onAffected);
+        trackedReq.off("error", onError);
+      }
+    });
   }
   override getCapabilities() {
     return { ...super.getCapabilities(), boundedQueryResults: true };
@@ -2315,14 +2606,16 @@ export class MSSQLDriver extends BaseDBDriver {
       .input("schema", mssql.NVarChar, schema)
       .input("table", mssql.NVarChar, table)
       .query<IndexRow>(`SELECT i.name AS idx_name, c.name AS col_name,
-                i.is_unique AS is_unique, i.is_primary_key AS is_pk
+                i.is_unique AS is_unique, i.is_primary_key AS is_pk,
+                i.has_filter AS has_filter
          FROM [${escapeMssqlId(database)}].sys.indexes i
          JOIN [${escapeMssqlId(database)}].sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
          JOIN [${escapeMssqlId(database)}].sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
          JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = i.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
          WHERE s.name = @schema AND o.name = @table
-         ORDER BY i.name, ic.key_ordinal`);
+           AND (ic.key_ordinal > 0 OR i.type IN (5, 6))
+         ORDER BY i.name, ic.key_ordinal, ic.index_column_id`);
     const map = new Map<string, import("./types").IndexMeta>();
     for (const row of res.recordset) {
       if (!map.has(row.idx_name)) {
@@ -2331,6 +2624,7 @@ export class MSSQLDriver extends BaseDBDriver {
           columns: [],
           unique: isSetFlag(row.is_unique),
           primary: isSetFlag(row.is_pk),
+          ...(isSetFlag(row.has_filter) ? { partial: true } : {}),
         });
       }
       const entry = map.get(row.idx_name);
@@ -2340,20 +2634,100 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     return [...map.values()];
   }
-  async getForeignKeys(
+  override async getIndexDDL(
     database: string,
     schema: string,
     table: string,
-  ): Promise<import("./types").ForeignKeyMeta[]> {
+    indexName: string,
+  ): Promise<string> {
     const res = await this.requirePool()
       .request()
       .input("schema", mssql.NVarChar, schema)
       .input("table", mssql.NVarChar, table)
-      .query<ForeignKeyRow>(`SELECT fk.name AS constraint_name,
+      .input("index", mssql.NVarChar, indexName)
+      .query<IndexDdlRow>(`SELECT i.type AS index_type, i.is_unique,
+                i.is_primary_key, i.is_unique_constraint, i.ignore_dup_key,
+                i.filter_definition, c.name AS column_name,
+                ic.is_descending_key, ic.is_included_column
+         FROM [${escapeMssqlId(database)}].sys.indexes i
+         JOIN [${escapeMssqlId(database)}].sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+         JOIN [${escapeMssqlId(database)}].sys.columns c ON c.object_id = i.object_id AND c.column_id = ic.column_id
+         JOIN [${escapeMssqlId(database)}].sys.objects o ON o.object_id = i.object_id
+         JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = o.schema_id
+         WHERE s.name = @schema AND o.name = @table AND i.name = @index
+           AND (ic.key_ordinal > 0 OR ic.is_included_column = 1 OR i.type IN (5, 6))
+         ORDER BY CASE WHEN ic.key_ordinal > 0 THEN 0 ELSE 1 END,
+                  ic.key_ordinal, ic.index_column_id`);
+    const rows = res.recordset;
+    const [first] = rows;
+    if (!first) {
+      throw new Error(`Index "${indexName}" not found`);
+    }
+    const indexType = Number(first.index_type);
+    if (![1, 2, 5, 6].includes(indexType)) {
+      return super.getIndexDDL(database, schema, table, indexName);
+    }
+    const qualifiedTableName = this.qualifiedTableName(database, schema, table);
+    const quotedName = this.quoteIdentifier(indexName);
+    const clustering =
+      indexType === 1 || indexType === 5 ? "CLUSTERED" : "NONCLUSTERED";
+    const filter = first.filter_definition
+      ? ` WHERE ${first.filter_definition}`
+      : "";
+    if (indexType === 5 || indexType === 6) {
+      const columns =
+        indexType === 6
+          ? ` (${rows.map((row) => this.quoteIdentifier(row.column_name)).join(", ")})`
+          : "";
+      return `CREATE ${clustering} COLUMNSTORE INDEX ${quotedName} ON ${qualifiedTableName}${columns}${filter};`;
+    }
+    const keys = rows
+      .filter((row) => !isSetFlag(row.is_included_column))
+      .map(
+        (row) =>
+          `${this.quoteIdentifier(row.column_name)}${isSetFlag(row.is_descending_key) ? " DESC" : ""}`,
+      );
+    const included = rows
+      .filter((row) => isSetFlag(row.is_included_column))
+      .map((row) => this.quoteIdentifier(row.column_name));
+    const options = isSetFlag(first.ignore_dup_key)
+      ? " WITH (IGNORE_DUP_KEY = ON)"
+      : "";
+    if (
+      isSetFlag(first.is_primary_key) ||
+      isSetFlag(first.is_unique_constraint)
+    ) {
+      const constraint = isSetFlag(first.is_primary_key)
+        ? "PRIMARY KEY"
+        : "UNIQUE";
+      return `ALTER TABLE ${qualifiedTableName} ADD CONSTRAINT ${quotedName} ${constraint} ${clustering} (${keys.join(", ")})${options};`;
+    }
+    const unique = isSetFlag(first.is_unique) ? "UNIQUE " : "";
+    const include =
+      included.length > 0 ? ` INCLUDE (${included.join(", ")})` : "";
+    return `CREATE ${unique}${clustering} INDEX ${quotedName} ON ${qualifiedTableName} (${keys.join(", ")})${include}${filter}${options};`;
+  }
+  private async queryForeignKeyRows(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName?: string,
+  ): Promise<ForeignKeyRow[]> {
+    const request = this.requirePool()
+      .request()
+      .input("schema", mssql.NVarChar, schema)
+      .input("table", mssql.NVarChar, table);
+    if (constraintName !== undefined) {
+      request.input("constraint", mssql.NVarChar, constraintName);
+    }
+    const res =
+      await request.query<ForeignKeyRow>(`SELECT fk.name AS constraint_name,
                 pc.name AS column_name,
                 rs.name AS ref_schema,
                 ro.name AS ref_table,
-                rc.name AS ref_column
+                rc.name AS ref_column,
+                fk.delete_referential_action_desc AS delete_action,
+                fk.update_referential_action_desc AS update_action
          FROM [${escapeMssqlId(database)}].sys.foreign_keys fk
          JOIN [${escapeMssqlId(database)}].sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
          JOIN [${escapeMssqlId(database)}].sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id
@@ -2362,14 +2736,76 @@ export class MSSQLDriver extends BaseDBDriver {
          JOIN [${escapeMssqlId(database)}].sys.schemas rs ON rs.schema_id = ro.schema_id
          JOIN [${escapeMssqlId(database)}].sys.objects po ON po.object_id = fkc.parent_object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas ps ON ps.schema_id = po.schema_id
-         WHERE ps.name = @schema AND po.name = @table`);
-    return res.recordset.map((row) => ({
+         WHERE ps.name = @schema AND po.name = @table${constraintName !== undefined ? " AND fk.name = @constraint" : ""}
+         ORDER BY fk.name, fkc.constraint_column_id`);
+    return res.recordset;
+  }
+  async getForeignKeys(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<import("./types").ForeignKeyMeta[]> {
+    const rows = await this.queryForeignKeyRows(database, schema, table);
+    return rows.map((row) => ({
       constraintName: row.constraint_name,
       column: row.column_name,
       referencedSchema: row.ref_schema,
       referencedTable: row.ref_table,
       referencedColumn: row.ref_column,
     }));
+  }
+  override async getConstraintDDL(
+    database: string,
+    schema: string,
+    table: string,
+    constraintName: string,
+    constraintKind?: import("./types").TableConstraintMeta["kind"],
+  ): Promise<string> {
+    const kind =
+      constraintKind ??
+      (await this.getConstraints(database, schema, table).then(
+        (constraints) =>
+          constraints.find((entry) => entry.name === constraintName)?.kind,
+        () => "foreign_key" as const,
+      ));
+    if (kind === "primary_key" || kind === "unique") {
+      return this.getIndexDDL(database, schema, table, constraintName);
+    }
+    const foreignKeyRows =
+      kind === "foreign_key"
+        ? await this.queryForeignKeyRows(
+            database,
+            schema,
+            table,
+            constraintName,
+          )
+        : [];
+    const [foreignKey] = foreignKeyRows;
+    if (foreignKey) {
+      const referentialAction = (action: string | null | undefined) =>
+        action && action !== "NO_ACTION" ? action.replace("_", " ") : null;
+      const onDelete = referentialAction(foreignKey.delete_action);
+      const onUpdate = referentialAction(foreignKey.update_action);
+      const columns = foreignKeyRows.map((row) =>
+        this.quoteIdentifier(row.column_name),
+      );
+      const referencedColumns = foreignKeyRows.map((row) =>
+        this.quoteIdentifier(row.ref_column),
+      );
+      const referencedTable = this.qualifiedReferencedTableName(
+        database,
+        foreignKey.ref_schema,
+        foreignKey.ref_table,
+      );
+      return `ALTER TABLE ${this.qualifiedTableName(database, schema, table)} ADD CONSTRAINT ${this.quoteIdentifier(foreignKey.constraint_name)} FOREIGN KEY (${columns.join(", ")}) REFERENCES ${referencedTable} (${referencedColumns.join(", ")})${onDelete ? ` ON DELETE ${onDelete}` : ""}${onUpdate ? ` ON UPDATE ${onUpdate}` : ""};`;
+    }
+    return super.getConstraintDDL(
+      database,
+      schema,
+      table,
+      constraintName,
+      constraintKind,
+    );
   }
   async getConstraints(
     database: string,
@@ -2422,9 +2858,12 @@ export class MSSQLDriver extends BaseDBDriver {
       }>(`SELECT tr.name AS trigger_name,
                tr.is_disabled,
                tr.is_instead_of_trigger,
-               OBJECTPROPERTY(tr.object_id, 'ExecIsInsertTrigger') AS is_insert,
-               OBJECTPROPERTY(tr.object_id, 'ExecIsUpdateTrigger') AS is_update,
-               OBJECTPROPERTY(tr.object_id, 'ExecIsDeleteTrigger') AS is_delete,
+               CASE WHEN EXISTS (SELECT 1 FROM [${escapeMssqlId(database)}].sys.trigger_events te
+                 WHERE te.object_id = tr.object_id AND te.type_desc = 'INSERT') THEN 1 ELSE 0 END AS is_insert,
+               CASE WHEN EXISTS (SELECT 1 FROM [${escapeMssqlId(database)}].sys.trigger_events te
+                 WHERE te.object_id = tr.object_id AND te.type_desc = 'UPDATE') THEN 1 ELSE 0 END AS is_update,
+               CASE WHEN EXISTS (SELECT 1 FROM [${escapeMssqlId(database)}].sys.trigger_events te
+                 WHERE te.object_id = tr.object_id AND te.type_desc = 'DELETE') THEN 1 ELSE 0 END AS is_delete,
                sm.definition AS definition
         FROM [${escapeMssqlId(database)}].sys.triggers tr
         JOIN [${escapeMssqlId(database)}].sys.tables tbl ON tbl.object_id = tr.parent_id
@@ -2504,7 +2943,7 @@ export class MSSQLDriver extends BaseDBDriver {
           this.qualifiedTableName(database, schema, table),
         )
         .query<RoutineDefinitionRow>(
-          "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
+          `SELECT sm.definition AS def FROM [${escapeMssqlId(database)}].sys.sql_modules sm WHERE sm.object_id = OBJECT_ID(@objectName)`,
         );
       return (
         viewDef.recordset[0]?.def ??
@@ -2513,11 +2952,12 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     const cols = await this.requirePool()
       .request()
+      .input("database", mssql.NVarChar, database)
       .input("schema", mssql.NVarChar, schema)
       .input("table", mssql.NVarChar, table)
       .query<DdlColumnRow>(`SELECT
            c.name                              AS COLUMN_NAME,
-           TYPE_NAME(c.user_type_id)           AS DATA_TYPE,
+           t.name                              AS DATA_TYPE,
            c.max_length,
            c.precision,
            c.scale,
@@ -2526,14 +2966,23 @@ export class MSSQLDriver extends BaseDBDriver {
            c.is_computed,
            cc.definition                       AS COMPUTED_DEFINITION,
            cc.is_persisted,
-           OBJECT_DEFINITION(c.default_object_id) AS COLUMN_DEFAULT,
+           dc.definition                       AS COLUMN_DEFAULT,
+           CASE WHEN c.collation_name <> CONVERT(sysname, DATABASEPROPERTYEX(@database, 'Collation'))
+                THEN c.collation_name END      AS COLLATION_NAME,
+           CONVERT(nvarchar(128), idc.seed_value)      AS IDENTITY_SEED,
+           CONVERT(nvarchar(128), idc.increment_value) AS IDENTITY_INCREMENT,
            CASE WHEN pk.column_id IS NOT NULL THEN 1 ELSE 0 END AS IS_PK,
            pk.key_ordinal                      AS PK_ORDINAL
          FROM [${escapeMssqlId(database)}].sys.columns c
+         JOIN [${escapeMssqlId(database)}].sys.types    t ON t.user_type_id = c.user_type_id
          JOIN [${escapeMssqlId(database)}].sys.objects  o ON o.object_id = c.object_id
          JOIN [${escapeMssqlId(database)}].sys.schemas  s ON s.schema_id  = o.schema_id
          LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
            ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.default_constraints dc
+           ON dc.object_id = c.default_object_id
+         LEFT JOIN [${escapeMssqlId(database)}].sys.identity_columns idc
+           ON idc.object_id = c.object_id AND idc.column_id = c.column_id
          LEFT JOIN (
            SELECT ic.object_id, ic.column_id, ic.key_ordinal
            FROM [${escapeMssqlId(database)}].sys.index_columns ic
@@ -2562,11 +3011,17 @@ export class MSSQLDriver extends BaseDBDriver {
         row.precision,
         row.scale,
       );
+      const collation =
+        row.COLLATION_NAME && /^\w+$/.test(row.COLLATION_NAME)
+          ? ` COLLATE ${row.COLLATION_NAME}`
+          : "";
       const nullable = isSetFlag(row.IS_NULLABLE) ? "" : " NOT NULL";
-      const identity = isSetFlag(row.is_identity) ? " IDENTITY(1,1)" : "";
+      const identity = isSetFlag(row.is_identity)
+        ? ` IDENTITY(${row.IDENTITY_SEED ?? 1},${row.IDENTITY_INCREMENT ?? 1})`
+        : "";
       const def = row.COLUMN_DEFAULT ? ` DEFAULT ${row.COLUMN_DEFAULT}` : "";
       const pk = pkCols.length === 1 && row.IS_PK === 1 ? " PRIMARY KEY" : "";
-      return `  ${this.quoteIdentifier(row.COLUMN_NAME)} ${typ}${identity}${nullable}${def}${pk}`;
+      return `  ${this.quoteIdentifier(row.COLUMN_NAME)} ${typ}${collation}${identity}${nullable}${def}${pk}`;
     });
     if (pkCols.length > 1) {
       colDefs.push(`  PRIMARY KEY (${pkCols.join(", ")})`);
@@ -2598,7 +3053,7 @@ export class MSSQLDriver extends BaseDBDriver {
         this.qualifiedTableName(database, schema, name),
       )
       .query<RoutineDefinitionRow>(
-        "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
+        `SELECT sm.definition AS def FROM [${escapeMssqlId(database)}].sys.sql_modules sm WHERE sm.object_id = OBJECT_ID(@objectName)`,
       );
     const def = res.recordset[0]?.def ?? null;
     return def ?? `-- Definition not available for [${schema}].[${name}]`;
@@ -2619,13 +3074,21 @@ export class MSSQLDriver extends BaseDBDriver {
         minimum_value: string | number;
         maximum_value: string | number;
         is_cycling: boolean | number;
-        cache_size: string | number;
-      }>(`SELECT start_value,
-                 increment,
-                 minimum_value,
-                 maximum_value,
-                 is_cycling,
-                 cache_size
+        is_cached: boolean | number;
+        cache_size: string | number | null;
+        type_name?: string | null;
+        precision?: number | null;
+        scale?: number | null;
+      }>(`SELECT CONVERT(nvarchar(100), seq.start_value) AS start_value,
+                 CONVERT(nvarchar(100), seq.increment) AS increment,
+                 CONVERT(nvarchar(100), seq.minimum_value) AS minimum_value,
+                 CONVERT(nvarchar(100), seq.maximum_value) AS maximum_value,
+                 seq.is_cycling,
+                 seq.is_cached,
+                 seq.cache_size,
+                 TYPE_NAME(seq.system_type_id) AS type_name,
+                 seq.precision,
+                 seq.scale
           FROM [${escapeMssqlId(database)}].sys.sequences seq
           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = seq.schema_id
           WHERE s.name = @schema
@@ -2635,14 +3098,26 @@ export class MSSQLDriver extends BaseDBDriver {
       return null;
     }
 
+    const typeName = row.type_name?.toLowerCase();
     const clauses = [
       `CREATE SEQUENCE ${this.qualifiedTableName("", schema, name)}`,
+      ...(typeName
+        ? [
+            typeName === "decimal" || typeName === "numeric"
+              ? `AS ${typeName}(${row.precision ?? 18},${row.scale ?? 0})`
+              : `AS ${typeName}`,
+          ]
+        : []),
       `START WITH ${row.start_value}`,
       `INCREMENT BY ${row.increment}`,
       `MINVALUE ${row.minimum_value}`,
       `MAXVALUE ${row.maximum_value}`,
       isSetFlag(row.is_cycling) ? "CYCLE" : "NO CYCLE",
-      `CACHE ${row.cache_size}`,
+      isSetFlag(row.is_cached)
+        ? row.cache_size === null
+          ? "CACHE"
+          : `CACHE ${row.cache_size}`
+        : "NO CACHE",
     ];
     return `${clauses.join(" ")};`;
   }
@@ -2652,30 +3127,62 @@ export class MSSQLDriver extends BaseDBDriver {
     schema: string,
     name: string,
   ): Promise<string | null> {
-    const res = await this.requirePool()
+    const pool = this.requirePool();
+    const versionResult = await pool
+      .request()
+      .query<MssqlServerVersionRow>(
+        `SELECT CONVERT(int, PARSENAME(CONVERT(varchar(128), SERVERPROPERTY('ProductVersion')), 4)) AS major_version`,
+      );
+    const rawMajorVersion = versionResult.recordset[0]?.major_version;
+    const majorVersion =
+      rawMajorVersion === null || rawMajorVersion === undefined
+        ? Number.NaN
+        : Number(rawMajorVersion);
+    const hasMemoryOptimizedCatalog =
+      Number.isFinite(majorVersion) && majorVersion >= 12;
+    const memoryOptimizedColumn = hasMemoryOptimizedCatalog
+      ? "tt.is_memory_optimized"
+      : "CONVERT(bit, 0)";
+
+    const res = await pool
       .request()
       .input("schema", mssql.NVarChar, schema)
       .input("name", mssql.NVarChar, name)
-      .query<{
-        base_type: string;
-        max_length: number;
-        precision: number;
-        scale: number;
-        is_nullable: boolean | number;
-      }>(`SELECT bt.name AS base_type,
+      .query<MssqlUserTypeRow>(`SELECT t.is_table_type,
+                 tt.type_table_object_id,
+                 ${memoryOptimizedColumn} AS is_memory_optimized,
+                 bt.name AS base_type,
                  t.max_length,
                  t.precision,
                  t.scale,
                  t.is_nullable
           FROM [${escapeMssqlId(database)}].sys.types t
           JOIN [${escapeMssqlId(database)}].sys.schemas s ON s.schema_id = t.schema_id
-          JOIN [${escapeMssqlId(database)}].sys.types bt ON bt.user_type_id = t.system_type_id AND bt.user_type_id = bt.system_type_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.table_types tt ON tt.user_type_id = t.user_type_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.types bt ON bt.user_type_id = t.system_type_id AND bt.user_type_id = bt.system_type_id
           WHERE s.name = @schema
             AND t.name = @name
-            AND t.is_user_defined = 1
-            AND t.is_table_type = 0`);
+            AND t.is_user_defined = 1`);
     const row = res.recordset[0];
     if (!row) {
+      return null;
+    }
+
+    if (isSetFlag(row.is_table_type)) {
+      if (row.type_table_object_id === null || !Number.isFinite(majorVersion)) {
+        return null;
+      }
+      return this.getTableTypeDefinition(
+        database,
+        schema,
+        name,
+        row.type_table_object_id,
+        isSetFlag(row.is_memory_optimized),
+        hasMemoryOptimizedCatalog,
+      );
+    }
+
+    if (!row.base_type) {
       return null;
     }
 
@@ -2687,6 +3194,299 @@ export class MSSQLDriver extends BaseDBDriver {
     );
     const nullability = isSetFlag(row.is_nullable) ? "NULL" : "NOT NULL";
     return `CREATE TYPE ${this.qualifiedTableName("", schema, name)} FROM ${baseType} ${nullability};`;
+  }
+  private async getTableTypeDefinition(
+    database: string,
+    schema: string,
+    name: string,
+    typeTableObjectId: number,
+    isMemoryOptimized: boolean,
+    hasMemoryOptimizedCatalog: boolean,
+  ): Promise<string | null> {
+    const pool = this.requirePool();
+    const columns = await pool
+      .request()
+      .input("objectId", mssql.Int, typeTableObjectId)
+      .query<MssqlTableTypeColumnRow>(`SELECT c.name AS column_name,
+                 ut.name AS data_type,
+                 c.max_length,
+                 c.precision,
+                 c.scale,
+                 c.is_nullable,
+                 ut.is_user_defined,
+                 us.name AS type_schema,
+                 c.is_computed,
+                 cc.definition AS computed_definition,
+                 cc.is_persisted,
+                 CASE WHEN ic.column_id IS NULL THEN 0 ELSE 1 END AS is_identity,
+                 CONVERT(nvarchar(128), ic.seed_value) AS identity_seed,
+                 CONVERT(nvarchar(128), ic.increment_value) AS identity_increment,
+                 c.is_rowguidcol,
+                 c.collation_name,
+                 xml_schema.name AS xml_collection_name,
+                 xml_schema_schema.name AS xml_collection_schema,
+                 c.xml_collection_id,
+                 c.is_xml_document,
+                 c.default_object_id,
+                 dc.definition AS column_default
+          FROM [${escapeMssqlId(database)}].sys.columns c
+          JOIN [${escapeMssqlId(database)}].sys.types ut ON ut.user_type_id = c.user_type_id
+          JOIN [${escapeMssqlId(database)}].sys.schemas us ON us.schema_id = ut.schema_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.computed_columns cc
+            ON cc.object_id = c.object_id AND cc.column_id = c.column_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.identity_columns ic
+            ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.default_constraints dc
+            ON dc.object_id = c.default_object_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.xml_schema_collections xml_schema
+            ON xml_schema.xml_collection_id = c.xml_collection_id
+          LEFT JOIN [${escapeMssqlId(database)}].sys.schemas xml_schema_schema
+            ON xml_schema_schema.schema_id = xml_schema.schema_id
+          WHERE c.object_id = @objectId
+          ORDER BY c.column_id`);
+    if (columns.recordset.length === 0) {
+      return null;
+    }
+
+    const hashIndexMetadata = hasMemoryOptimizedCatalog
+      ? `CASE WHEN hi.index_id IS NULL THEN 0 ELSE 1 END AS is_hash,
+                 hi.bucket_count,`
+      : `CONVERT(bit, 0) AS is_hash,
+                 CONVERT(int, NULL) AS bucket_count,`;
+    const hashIndexJoin = hasMemoryOptimizedCatalog
+      ? `LEFT JOIN [${escapeMssqlId(database)}].sys.hash_indexes hi
+            ON hi.object_id = i.object_id AND hi.index_id = i.index_id`
+      : "";
+    const hashIndexFilter = hasMemoryOptimizedCatalog ? " OR i.type = 7" : "";
+    const indexColumns = await pool
+      .request()
+      .input("objectId", mssql.Int, typeTableObjectId)
+      .query<MssqlTableTypeIndexColumnRow>(`SELECT i.index_id,
+                 i.name AS index_name,
+                 i.is_primary_key,
+                 i.is_unique_constraint,
+                 i.is_unique,
+                 i.ignore_dup_key,
+                 i.type_desc,
+                 ${hashIndexMetadata}
+                 c.name AS column_name,
+                 ic.key_ordinal,
+                 ic.is_descending_key,
+                 ic.is_included_column
+          FROM [${escapeMssqlId(database)}].sys.indexes i
+          ${hashIndexJoin}
+          JOIN [${escapeMssqlId(database)}].sys.index_columns ic
+            ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+          JOIN [${escapeMssqlId(database)}].sys.columns c
+            ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+          WHERE i.object_id = @objectId
+            AND i.index_id > 0
+            AND i.is_hypothetical = 0
+            AND (ic.key_ordinal > 0 OR ic.is_included_column = 1${hashIndexFilter})
+          ORDER BY i.index_id, CASE WHEN ic.key_ordinal > 0 THEN 0 ELSE 1 END,
+                   ic.key_ordinal, ic.index_column_id`);
+
+    const checks = await pool
+      .request()
+      .input("objectId", mssql.Int, typeTableObjectId)
+      .query<MssqlTableTypeCheckConstraintRow>(`SELECT name, definition
+          FROM [${escapeMssqlId(database)}].sys.check_constraints
+          WHERE parent_object_id = @objectId
+          ORDER BY name`);
+
+    const definitions = columns.recordset.map((column) => {
+      const columnName = this.quoteIdentifier(column.column_name);
+      if (isSetFlag(column.is_computed)) {
+        if (isMemoryOptimized) {
+          return null;
+        }
+        if (!column.computed_definition) {
+          return null;
+        }
+        const persisted = isSetFlag(column.is_persisted) ? " PERSISTED" : "";
+        const notNull =
+          persisted && !isSetFlag(column.is_nullable) ? " NOT NULL" : "";
+        return `  ${columnName} AS ${column.computed_definition}${persisted}${notNull}`;
+      }
+
+      const hasXmlCollection = Number(column.xml_collection_id ?? 0) > 0;
+      const isUserDefinedType = isSetFlag(column.is_user_defined);
+      const userDefinedTypeSchema = column.type_schema;
+      const xmlCollectionType =
+        hasXmlCollection &&
+        column.xml_collection_schema &&
+        column.xml_collection_name
+          ? `xml (${isSetFlag(column.is_xml_document) ? "DOCUMENT" : "CONTENT"} ${this.quoteIdentifier(column.xml_collection_schema)}.${this.quoteIdentifier(column.xml_collection_name)})`
+          : null;
+      if (hasXmlCollection && !xmlCollectionType) {
+        return null;
+      }
+      if (isUserDefinedType && !userDefinedTypeSchema) {
+        return null;
+      }
+      if (Number(column.default_object_id ?? 0) > 0 && !column.column_default) {
+        return null;
+      }
+      if (
+        isSetFlag(column.is_identity) &&
+        (column.identity_seed === null ||
+          column.identity_seed === undefined ||
+          column.identity_increment === null ||
+          column.identity_increment === undefined)
+      ) {
+        return null;
+      }
+
+      const dataType =
+        isUserDefinedType && userDefinedTypeSchema
+          ? `${this.quoteIdentifier(userDefinedTypeSchema)}.${this.quoteIdentifier(column.data_type)}`
+          : column.data_type.toLowerCase() === "xml" && xmlCollectionType
+            ? xmlCollectionType
+            : mssqlFullType(
+                column.data_type,
+                column.max_length,
+                column.precision,
+                column.scale,
+              );
+      const collation = column.collation_name
+        ? ` COLLATE ${this.quoteIdentifier(column.collation_name)}`
+        : "";
+      const nullable = isSetFlag(column.is_nullable) ? " NULL" : " NOT NULL";
+      const defaultValue = column.column_default
+        ? ` DEFAULT ${column.column_default}`
+        : "";
+      const identity = isSetFlag(column.is_identity)
+        ? ` IDENTITY${column.identity_seed !== null && column.identity_increment !== null ? ` (${column.identity_seed}, ${column.identity_increment})` : ""}`
+        : "";
+      if (
+        isMemoryOptimized &&
+        isSetFlag(column.is_identity) &&
+        (Number(column.identity_seed) !== 1 ||
+          Number(column.identity_increment) !== 1)
+      ) {
+        return null;
+      }
+      const rowGuid = isSetFlag(column.is_rowguidcol) ? " ROWGUIDCOL" : "";
+      return `  ${columnName} ${dataType}${collation}${nullable}${defaultValue}${identity}${rowGuid}`;
+    });
+    if (definitions.some((definition) => definition === null)) {
+      return null;
+    }
+    const tableDefinitions = definitions.filter(
+      (definition): definition is string => definition !== null,
+    );
+
+    const indexes = new Map<
+      number,
+      {
+        name: string;
+        primary: boolean;
+        unique: boolean;
+        ignoreDupKey: boolean;
+        type: string;
+        hash: boolean;
+        bucketCount: number | null;
+        columns: string[];
+        included: string[];
+      }
+    >();
+    for (const row of indexColumns.recordset) {
+      let index = indexes.get(row.index_id);
+      if (!index) {
+        index = {
+          name: row.index_name,
+          primary: isSetFlag(row.is_primary_key),
+          unique:
+            isSetFlag(row.is_unique_constraint) || isSetFlag(row.is_unique),
+          ignoreDupKey: isSetFlag(row.ignore_dup_key),
+          type: row.type_desc,
+          hash: isSetFlag(row.is_hash),
+          bucketCount: row.bucket_count,
+          columns: [],
+          included: [],
+        };
+        indexes.set(row.index_id, index);
+      }
+      if (isSetFlag(row.is_included_column)) {
+        index.included.push(this.quoteIdentifier(row.column_name));
+      } else {
+        const direction = index.hash
+          ? ""
+          : isSetFlag(row.is_descending_key)
+            ? " DESC"
+            : " ASC";
+        index.columns.push(
+          `${this.quoteIdentifier(row.column_name)}${direction}`,
+        );
+      }
+    }
+    for (const index of indexes.values()) {
+      const keys = index.columns.join(", ");
+      if (index.hash) {
+        const bucketCount = index.bucketCount;
+        if (
+          !isMemoryOptimized ||
+          !bucketCount ||
+          bucketCount <= 0 ||
+          !keys ||
+          index.included.length > 0
+        ) {
+          return null;
+        }
+        const prefix = index.primary
+          ? "PRIMARY KEY"
+          : `INDEX ${this.quoteIdentifier(index.name)}`;
+        tableDefinitions.push(
+          `${prefix} NONCLUSTERED HASH (${keys}) WITH (BUCKET_COUNT = ${bucketCount})`,
+        );
+        continue;
+      }
+
+      if (!keys || !["CLUSTERED", "NONCLUSTERED"].includes(index.type)) {
+        return null;
+      }
+      if (
+        isMemoryOptimized &&
+        (index.type !== "NONCLUSTERED" ||
+          index.included.length > 0 ||
+          (index.unique && !index.primary))
+      ) {
+        return null;
+      }
+      if (index.unique && !index.primary && index.included.length > 0) {
+        return null;
+      }
+
+      const constraint = index.primary
+        ? "PRIMARY KEY"
+        : index.unique
+          ? "UNIQUE"
+          : null;
+      if (!constraint && index.ignoreDupKey) {
+        return null;
+      }
+      const type =
+        index.type === "NONCLUSTERED" ? " NONCLUSTERED" : " CLUSTERED";
+      const keyWithType = `${constraint ?? `INDEX ${this.quoteIdentifier(index.name)}`}${type} (${keys})`;
+      const includes =
+        index.included.length > 0
+          ? ` INCLUDE (${index.included.join(", ")})`
+          : "";
+      const options =
+        constraint && index.ignoreDupKey ? " WITH (IGNORE_DUP_KEY = ON)" : "";
+      tableDefinitions.push(`${keyWithType}${includes}${options}`);
+    }
+    if (isMemoryOptimized && checks.recordset.length > 0) {
+      return null;
+    }
+    for (const check of checks.recordset) {
+      tableDefinitions.push(`  CHECK ${check.definition}`);
+    }
+
+    const memoryOptimized = isMemoryOptimized
+      ? " WITH (MEMORY_OPTIMIZED = ON)"
+      : "";
+    return `CREATE TYPE ${this.qualifiedTableName("", schema, name)} AS TABLE (\n${tableDefinitions.join(",\n")}\n)${memoryOptimized};`;
   }
   async runTransaction(
     operations: import("./types").TransactionOperation[],
@@ -2709,6 +3509,7 @@ export class MSSQLDriver extends BaseDBDriver {
       throw error;
     }
     let activeRequest: mssql.Request | undefined;
+    let commitAttempted = false;
     const cancel = () => {
       try {
         activeRequest?.cancel();
@@ -2818,14 +3619,15 @@ export class MSSQLDriver extends BaseDBDriver {
         context,
       );
       throwIfTransactionCancelled(context);
+      commitAttempted = true;
       await tx.commit();
     } catch (error) {
       const rollbackFence = fenceFailedMssqlRollback(tx);
       try {
         await tx.rollback();
       } catch (rollbackError) {
-        const errors: unknown[] = [error, rollbackError];
         const closeError = rollbackFence?.closeError();
+        const errors: unknown[] = [error, rollbackError];
         if (closeError !== undefined) errors.push(closeError);
         const diagnostics = [
           `original transaction error: ${normalizeUnknownError(error).message}`,
@@ -2838,10 +3640,20 @@ export class MSSQLDriver extends BaseDBDriver {
         ].join("; ");
         throw new AggregateError(
           errors,
-          `MSSQL transaction and rollback failed (${diagnostics}); the failed session was discarded.`,
+          `MSSQL transaction and rollback failed (${diagnostics}).`,
         );
       } finally {
         rollbackFence?.restore();
+      }
+      if (!commitAttempted) {
+        if (error instanceof TransactionVerificationError) {
+          error.rollbackConfirmed = true;
+        } else if (!(error instanceof MutationNotExecutedError)) {
+          throw new MutationNotExecutedError(
+            error instanceof Error ? error.message : String(error),
+            error,
+          );
+        }
       }
       throw error;
     } finally {
@@ -2983,7 +3795,7 @@ export class MSSQLDriver extends BaseDBDriver {
       }
       return {
         sql: mssqlSqlVariantInputExpression(originalValue),
-        params: [value],
+        params: [mssqlSqlVariantInputParam(value, nativeType)],
       };
     }
     if (type !== "geometry" && type !== "geography") return null;
@@ -3341,10 +4153,35 @@ export class MSSQLDriver extends BaseDBDriver {
     if (pkCols.length > 0) {
       return `ORDER BY ${pkCols.map((column) => `${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(column.name)}`).join(", ")}`;
     }
-    if (columns.length > 0) {
-      return `ORDER BY ${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(columns[0].name)}`;
+    const comparableCols = columns.filter((column) =>
+      this.isComparableOrderColumn(column),
+    );
+    if (comparableCols.length > 0) {
+      return `ORDER BY ${comparableCols.map((column) => `${tableReference ? `${tableReference}.` : ""}${this.quoteIdentifier(column.name)}`).join(", ")}`;
     }
     return "ORDER BY (SELECT NULL)";
+  }
+  private isComparableOrderColumn(column: ColumnTypeMeta): boolean {
+    const type = baseTypeName(column.nativeType);
+    if (["text", "ntext", "xml", "image"].includes(type)) return false;
+    return (
+      !["other", "spatial", "lob"].includes(column.category) ||
+      type === "hierarchyid" ||
+      type === "sql_variant"
+    );
+  }
+  async getTableRowIdentityOrderExpressions(
+    database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): Promise<string[]> {
+    const tableReference = this.qualifiedTableName(database, schema, table);
+    return columns
+      .filter((column) => this.isComparableOrderColumn(column))
+      .map((column) =>
+        this.buildTableDataOrderExpression(column.name, tableReference),
+      );
   }
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     return this.normalizeInputValue(value, column);
@@ -3389,6 +4226,12 @@ export class MSSQLDriver extends BaseDBDriver {
       const ct = baseTypeName(column.nativeType);
       if (ct === "datetimeoffset") {
         return normalizeDatetimeLiteral(value).replace("T", " ");
+      }
+      if (ct === "datetime" || ct === "smalldatetime") {
+        return value.replace(
+          /^(\d{4}-\d{2}-\d{2})T(?=\d{2}:\d{2}:\d{2})/,
+          "$1 ",
+        );
       }
     }
     return value;
@@ -3495,6 +4338,17 @@ export class MSSQLDriver extends BaseDBDriver {
       );
     }
     if (column.category === "float") {
+      if (
+        typeof expectedValue === "string" &&
+        expectedValue !== NULL_SENTINEL &&
+        !APPROXIMATE_NUMERIC_RE.test(expectedValue.trim())
+      ) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: `Column "${column.name}" expects a numeric value.`,
+        };
+      }
       return this.checkApproximateNumericPersistedEdit(
         column,
         expectedValue,
@@ -3517,8 +4371,6 @@ export class MSSQLDriver extends BaseDBDriver {
       column.category === "datetime"
     ) {
       const baseType = baseTypeName(column.nativeType);
-      // These types have a decimal second scale. Legacy datetime and
-      // smalldatetime use different rounding rules and are checked on readback.
       const precision =
         /^(?:time|datetime2|datetimeoffset)(?:\(\s*(\d+)\s*\))?$/i.exec(
           column.nativeType.trim(),
@@ -3583,16 +4435,7 @@ export class MSSQLDriver extends BaseDBDriver {
         return null;
       }
       const arrayValue = typeof val === "string" ? val : val[0];
-      if (arrayValue.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
-        return {
-          sql: `CAST(${col} AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))`,
-          params: [arrayValue],
-        };
-      }
-      return {
-        sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
-        params: [arrayValue],
-      };
+      return mssqlCharindexContains(col, arrayValue);
     }
     if (
       column.category === "binary" &&
@@ -3717,20 +4560,23 @@ export class MSSQLDriver extends BaseDBDriver {
       const v = typeof val === "string" ? val : val[0];
       if (Array.isArray(val)) {
         return {
-          sql: `CONVERT(CHAR(10), ${col}, 23) BETWEEN ? AND ?`,
+          sql: `${col} BETWEEN CAST(? AS date) AND CAST(? AS date)`,
           params: [val[0], val[1]],
         };
       }
       if (operator === "in") {
         const parts = v.split(",").map((part) => part.trim());
         return {
-          sql: `CONVERT(CHAR(10), ${col}, 23) IN (${parts.map(() => "?").join(", ")})`,
+          sql: `${col} IN (${parts.map(() => "CAST(? AS date)").join(", ")})`,
           params: parts,
         };
       }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
-        return { sql: `CONVERT(CHAR(10), ${col}, 23) ${sqlOp} ?`, params: [v] };
+        return {
+          sql: `${col} ${sqlOp} CAST(? AS date)`,
+          params: [v],
+        };
       }
       return {
         sql: `CONVERT(CHAR(10), ${col}, 23) LIKE ?`,
@@ -3771,7 +4617,7 @@ export class MSSQLDriver extends BaseDBDriver {
         };
       }
       return {
-        sql: `CONVERT(VARCHAR(16), ${col}, 114) LIKE ?`,
+        sql: `CONVERT(VARCHAR(16), CAST(${col} AS time(7))) LIKE ?`,
         params: [`%${v}%`],
       };
     }
@@ -3779,19 +4625,24 @@ export class MSSQLDriver extends BaseDBDriver {
       const v = typeof val === "string" ? val : val[0];
       const isDateTimeOffset =
         baseTypeName(column.nativeType) === "datetimeoffset";
+      const datetimeFilterLiteral = (raw: string) =>
+        languageNeutralMssqlDatetimeLiteral(
+          normalizeDatetimeLiteral(raw),
+          column.nativeType,
+        );
       if (Array.isArray(val)) {
         return {
           sql: `${col} BETWEEN ? AND ?`,
           params: [
-            normalizeDatetimeLiteral(val[0]),
-            normalizeDatetimeLiteral(val[1]),
+            datetimeFilterLiteral(val[0]),
+            datetimeFilterLiteral(val[1]),
           ],
         };
       }
       if (operator === "in") {
         const parts = v
           .split(",")
-          .map((part) => normalizeDatetimeLiteral(part.trim()));
+          .map((part) => datetimeFilterLiteral(part.trim()));
         return {
           sql: `${col} IN (${parts.map(() => "?").join(", ")})`,
           params: parts,
@@ -3799,7 +4650,7 @@ export class MSSQLDriver extends BaseDBDriver {
       }
       if (["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)) {
         if (operator === "eq" || operator === "neq") {
-          const normalizedValue = normalizeDatetimeLiteral(v);
+          const normalizedValue = datetimeFilterLiteral(v);
           const baseType = baseTypeName(column.nativeType);
           if (baseType === "datetime" || baseType === "smalldatetime") {
             const comparisonExpr = `${col} ${operator === "neq" ? "<>" : "="} CAST(? AS ${baseType})`;
@@ -3821,18 +4672,22 @@ export class MSSQLDriver extends BaseDBDriver {
               baseTypeName(column.nativeType) === "datetimeoffset"
                 ? "datetimeoffset(7)"
                 : "datetime2(7)";
-            const diffExpr = `DATEDIFF(millisecond, CAST(? AS ${castType}), ${col})`;
-            const rangeExpr = `${diffExpr} BETWEEN 0 AND ?`;
+            const startExpr = `CAST(? AS ${castType})`;
+            const rangeExpr = `${col} >= ${startExpr} AND ${col} <= DATEADD(nanosecond, ?, ${startExpr})`;
             return {
               sql: operator === "neq" ? `NOT (${rangeExpr})` : rangeExpr,
-              params: [normalizedValue, diffUpperBound],
+              params: [
+                normalizedValue,
+                (diffUpperBound + 1) * 1_000_000 - 100,
+                normalizedValue,
+              ],
             };
           }
         }
         const sqlOp = operator === "neq" ? "<>" : this.sqlOperator(operator);
         return {
           sql: `${col} ${sqlOp} ?`,
-          params: [normalizeDatetimeLiteral(v)],
+          params: [datetimeFilterLiteral(v)],
         };
       }
       if (isDateTimeOffset) {
@@ -3859,15 +4714,13 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     const v = typeof val === "string" ? val : val[0];
     if (operator === "like" || operator === "ilike") {
-      if (v.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
-        return {
-          sql: `CAST(${col} AS NVARCHAR(MAX)) = CAST(? AS NVARCHAR(MAX))`,
-          params: [v],
-        };
+      const pattern = mssqlLiteralContainsPattern(v);
+      if (pattern.length > MSSQL_LIKE_MAX_NVARCHAR_CHARS) {
+        return mssqlCharindexContains(col, v);
       }
       return {
-        sql: `CHARINDEX(CAST(? AS NVARCHAR(MAX)), CAST(${col} AS NVARCHAR(MAX))) > 0`,
-        params: [v],
+        sql: `CAST(${col} AS NVARCHAR(MAX)) LIKE ? ESCAPE '!'`,
+        params: [pattern],
       };
     }
     if (operator === "eq" || operator === "neq") {

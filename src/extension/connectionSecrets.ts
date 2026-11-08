@@ -3,7 +3,10 @@ import {
   hasAmbiguousUriCredentials,
   splitUriAuthorityPrefix,
 } from "../shared/connectionUriSecurity";
-import type { ConnectionConfig } from "./connectionManagerModels";
+import type {
+  ConnectionConfig,
+  StoredConnectionConfig,
+} from "./connectionManagerModels";
 import {
   CONNECTION_SECRET_KEYS,
   parseStoredConnectionSecretDocument,
@@ -26,10 +29,13 @@ export interface ConnectionSecretSnapshot {
 }
 
 export interface ConnectionSecretClearOptions {
+  sshPassphrase?: boolean;
+  tlsKeyPassphrase?: boolean;
   password?: boolean;
   apiKey?: boolean;
   awsCredentials?: boolean;
   credentialBearingUris?: boolean;
+  retainCredentialBearingUris?: boolean;
 }
 
 const CREDENTIAL_BEARING_URI_FIELDS = [
@@ -143,8 +149,51 @@ export function resolvePersistedCredentialBearingUriSecret(
     return undefined;
   }
 
-  const previousRedacted = sanitizeCredentialBearingUri(previousSecret);
-  return previousRedacted === normalizedCurrent ? previousSecret : undefined;
+  return matchesSanitizedCredentialBearingUri(previousSecret, normalizedCurrent)
+    ? previousSecret
+    : undefined;
+}
+
+function matchesSanitizedCredentialBearingUri(
+  secret: string,
+  value: string | undefined,
+): boolean {
+  try {
+    return (
+      extractCredentialBearingUriSecret(value) === undefined &&
+      sanitizeCredentialBearingUri(secret) ===
+        sanitizeCredentialBearingUri(value)
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function resolveStoredCredentialBearingUri(
+  configValue: string | undefined,
+  secret: string | undefined,
+): string | undefined {
+  return secret && matchesSanitizedCredentialBearingUri(secret, configValue)
+    ? secret
+    : configValue;
+}
+
+export function getAmbiguousCredentialBearingUriFields(
+  config: ConnectionConfig,
+): (typeof CREDENTIAL_BEARING_URI_FIELDS)[number][] {
+  return CREDENTIAL_BEARING_URI_FIELDS.filter((field) =>
+    hasAmbiguousUriCredentials(config[field]),
+  );
+}
+
+export function omitAmbiguousCredentialBearingUris<T extends ConnectionConfig>(
+  config: T,
+): T {
+  const next = { ...config };
+  for (const field of getAmbiguousCredentialBearingUriFields(config)) {
+    delete next[field];
+  }
+  return next;
 }
 
 function serializeConnectionSecrets(
@@ -157,6 +206,20 @@ function serializeConnectionSecrets(
   return Object.keys(filtered).length > 0
     ? JSON.stringify(filtered)
     : undefined;
+}
+
+export function connectionTypeUsesPassword(
+  config: Pick<StoredConnectionConfig, "type" | "username" | "user">,
+): boolean {
+  switch (config.type) {
+    case "sqlite":
+    case "dynamodb":
+      return false;
+    case "elasticsearch":
+      return Boolean((config.username ?? config.user)?.trim());
+    default:
+      return true;
+  }
 }
 
 function extractConnectionSecrets(
@@ -186,11 +249,12 @@ function extractConnectionSecrets(
 
   return {
     password:
-      config.type === "mongodb" &&
-      config.mongoConnectionMode &&
-      (config.mongoConnectionMode === "uri" ||
-        config.mongoAuthMethod === "none" ||
-        config.password === "")
+      !connectionTypeUsesPassword(config) ||
+      (config.type === "mongodb" &&
+        config.mongoConnectionMode &&
+        (config.mongoConnectionMode === "uri" ||
+          config.mongoAuthMethod === "none" ||
+          config.password === ""))
         ? undefined
         : (trimOptionalSecretValue(config.password) ??
           previousSecrets?.password),
@@ -261,42 +325,42 @@ export function hasConnectionConfigSecrets(config: ConnectionConfig): boolean {
   );
 }
 
+function hasPlaintextConnectionSecrets(config: ConnectionConfig): boolean {
+  try {
+    return hasConnectionConfigSecrets(config);
+  } catch {
+    return true;
+  }
+}
+
+export function shouldKeepHandWrittenSecretsInSettings(
+  config: ConnectionConfig,
+): boolean {
+  return (
+    typeof config.useSecretStorage !== "boolean" &&
+    hasPlaintextConnectionSecrets(config)
+  );
+}
+
 export function shouldForceSecretStorage(config: ConnectionConfig): boolean {
   for (const field of CREDENTIAL_BEARING_URI_FIELDS) {
     if (hasAmbiguousUriCredentials(config[field])) {
       throw new Error(AMBIGUOUS_URI_CREDENTIALS_MESSAGE);
     }
   }
-  if (config.useSecretStorage === false) {
-    return false;
-  }
-
-  return (
-    config.ssh !== undefined ||
-    config.type === "dynamodb" ||
-    config.type === "elasticsearch" ||
-    hasCredentialBearingUriSecret(config) ||
-    trimOptionalSecretValue(config.password) !== undefined ||
-    trimOptionalSecretValue(config.tls?.keyPassphrase) !== undefined ||
-    trimOptionalSecretValue(config.apiKey) !== undefined ||
-    trimOptionalSecretValue(config.awsAccessKeyId) !== undefined ||
-    trimOptionalSecretValue(config.awsSecretAccessKey) !== undefined ||
-    trimOptionalSecretValue(config.awsSessionToken) !== undefined ||
-    config.useSecretStorage === true
-  );
+  return config.useSecretStorage === true;
 }
 
 export function sanitizePersistedConnectionConfig(
   config: ConnectionConfig,
 ): ConnectionConfig {
-  if (!shouldForceSecretStorage(config)) {
-    return { ...config };
+  if (shouldForceSecretStorage(config)) {
+    return sanitizeConnectionConfigForResponse(config);
   }
 
-  return sanitizeConnectionConfigForResponse({
-    ...config,
-    useSecretStorage: true,
-  });
+  return shouldKeepHandWrittenSecretsInSettings(config)
+    ? { ...config, useSecretStorage: false }
+    : { ...config };
 }
 
 export function sanitizeConnectionConfigForResponse(
@@ -385,6 +449,18 @@ export function serializeConnectionSecretsForStoredConfig(
 ): string | undefined {
   const previous = parseStoredConnectionSecretDocument(previousSerialized);
   const nextSecrets = extractConnectionSecrets(config, previous.known);
+  if (
+    clearOptions.sshPassphrase &&
+    !trimOptionalSecretValue(config.ssh?.passphrase)
+  ) {
+    nextSecrets.sshPassphrase = undefined;
+  }
+  if (
+    clearOptions.tlsKeyPassphrase &&
+    !trimOptionalSecretValue(config.tls?.keyPassphrase)
+  ) {
+    nextSecrets.tlsKeyPassphrase = undefined;
+  }
   if (clearOptions.password && !trimOptionalSecretValue(config.password)) {
     nextSecrets.password = undefined;
   }
@@ -399,6 +475,17 @@ export function serializeConnectionSecretsForStoredConfig(
     ] as const) {
       if (!trimOptionalSecretValue(config[key])) {
         nextSecrets[key] = undefined;
+      }
+    }
+  }
+  if (clearOptions.retainCredentialBearingUris) {
+    for (const key of CREDENTIAL_BEARING_URI_FIELDS) {
+      if (
+        key !== "connectionUri" ||
+        config.type !== "mongodb" ||
+        config.mongoUriHasCredentials !== false
+      ) {
+        nextSecrets[key] ??= previous.known[key];
       }
     }
   }
@@ -431,7 +518,6 @@ export function serializeConnectionSecretsForStoredConfig(
     : undefined;
 }
 
-/** Retain URI credentials only when an editor explicitly requests it. */
 export function restoreCredentialBearingUri(
   value: string | undefined,
   previous: string | undefined,
@@ -489,7 +575,6 @@ export function restoreCredentialBearingUri(
   return `${parts[1]}${credentials}${parts[2]}${suffix}`;
 }
 
-/** Retain credentials only when the MongoDB URI editor explicitly requests it. */
 export function restoreMongoUriCredentials(
   value: string | undefined,
   previous: string | undefined,

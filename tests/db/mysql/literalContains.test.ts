@@ -178,7 +178,9 @@ describe.runIf(process.env.RAPIDB_LIVE_MYSQL_CONTAINS === "1")(
           ).toBe(false);
           expect(query).toHaveBeenCalledTimes(2);
           expect(query.mock.calls[0]?.[0]).toMatch(/^SELECT COUNT\(\*\)/);
-          expect(query.mock.calls[1]?.[0]).toMatch(/^SELECT `id`, `value`/);
+          expect(query.mock.calls[1]?.[0]).toMatch(
+            /^SELECT `id` AS `__rapidb_col_0`, `value` AS `__rapidb_col_1`/,
+          );
           expect(
             query.mock.settledResults.every(
               (result) => result.type === "fulfilled",

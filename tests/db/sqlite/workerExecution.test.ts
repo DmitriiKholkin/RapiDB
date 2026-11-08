@@ -17,16 +17,10 @@ import { createProjectTempDir } from "../../runtime/tempDirectories";
 const CPU_SUM =
   "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n";
 const drivers: SQLiteDriver[] = [];
-const settings = () =>
-  createDriverTimeoutSettingsSnapshot({
-    connectionTimeoutSeconds: 1,
-    dbOperationTimeoutSeconds: 1,
-  });
-
 async function createDriver(
   filePath?: string,
   readOnly = false,
-  sqliteWalMode?: "off",
+  operationTimeoutSeconds = 1,
 ) {
   const directory = await createProjectTempDir("sqlite-worker-execution");
   const config: ConnectionConfig = {
@@ -35,11 +29,15 @@ async function createDriver(
     type: "sqlite",
     filePath: filePath ?? join(directory, "db.sqlite"),
     readOnly,
-    sqliteWalMode,
   };
+  const driverSettings = () =>
+    createDriverTimeoutSettingsSnapshot({
+      connectionTimeoutSeconds: 1,
+      dbOperationTimeoutSeconds: operationTimeoutSeconds,
+    });
   const driver = createTimeoutAwareDriver(
-    new SQLiteDriver(config, settings),
-    settings,
+    new SQLiteDriver(config, driverSettings),
+    driverSettings,
   );
   drivers.push(driver);
   return driver;
@@ -140,6 +138,59 @@ describe("SQLite off-host execution", () => {
     expectExited(pid);
   });
 
+  it("applies hardCap and an earlier explicit deadline through the real worker", async () => {
+    const directory = await createProjectTempDir("sqlite-query-deadline");
+    const longSettings = () =>
+      createDriverTimeoutSettingsSnapshot({
+        connectionTimeoutSeconds: 1,
+        dbOperationTimeoutSeconds: 10,
+      });
+    const driver = new SQLiteDriver(
+      {
+        id: "query-deadline",
+        name: "Query deadline",
+        type: "sqlite",
+        filePath: join(directory, "db.sqlite"),
+      },
+      longSettings,
+    );
+    drivers.push(driver);
+    await driver.connect();
+    const result = await driver.query(
+      "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3",
+      [],
+      { hardCap: 2, deadline: Date.now() + 5_000 },
+    );
+    expect(result.rows.map((row) => row.__col_0)).toEqual([1, 2]);
+    expect(result.truncated).toBe(true);
+    const pid = workerPid(driver);
+    const start = Date.now();
+    const error = await driver
+      .query(CPU_SUM, [], {
+        hardCap: 1,
+        deadline: start + 200,
+      })
+      .then(
+        () => {
+          throw new Error("Expected query to time out");
+        },
+        (failure: unknown) => failure,
+      );
+    expect(error).toMatchObject({
+      name: "DriverTimeoutError",
+      timeoutMs: expect.any(Number),
+      code: "OUTCOME_UNKNOWN",
+      executionState: "unknown",
+      message: expect.stringMatching(
+        /timed out at its deadline.*connection is closed/,
+      ),
+    });
+    expect((error as { timeoutMs: number }).timeoutMs).toBeGreaterThan(0);
+    expect((error as { timeoutMs: number }).timeoutMs).toBeLessThanOrEqual(200);
+    expect(Date.now() - start).toBeLessThan(3_000);
+    expectExited(pid);
+  });
+
   it("rolls back a long mutation and all earlier transaction operations before reopening file data", async () => {
     const driver = await createDriver();
     await driver.connect();
@@ -197,6 +248,35 @@ describe("SQLite off-host execution", () => {
     const newer = driver.query("SELECT 3", [], { requestToken: 23 });
     await cancelQuery(driver, 21);
     expect((await newer).rows[0].__col_0).toBe(3);
+  });
+
+  it("cancels only the addressed queued query and executes the remaining real worker queue", async () => {
+    const driver = await createDriver(undefined, false, 10);
+    await driver.connect();
+    await driver.query("CREATE TABLE queued_data (value INTEGER)");
+    const active = driver.query(
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000) SELECT sum(x) FROM n",
+      [],
+      { requestToken: 41 },
+    );
+    const cancelled = expect(
+      driver.query("INSERT INTO queued_data VALUES (1)", [], {
+        requestToken: 42,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOT_EXECUTED",
+      executionState: "not-executed",
+      reason: "cancelled",
+    });
+    const remaining = driver.query("INSERT INTO queued_data VALUES (2)", [], {
+      requestToken: 43,
+    });
+    await cancelQuery(driver, 42);
+    await cancelled;
+    await active;
+    await remaining;
+    expect(driver.isConnected()).toBe(true);
+    expect(await value(driver, "SELECT sum(value) FROM queued_data")).toBe(2);
   });
 
   it("disconnects during native execution, rejects the queue, and reopens persisted data", async () => {
@@ -326,14 +406,11 @@ describe("SQLite off-host execution", () => {
   ] as const)("keeps host timers responsive and interrupts native lock waits in %s", async (method) => {
     const directory = await createProjectTempDir("sqlite-metadata-lock");
     const filePath = join(directory, "db.sqlite");
-    const driver = await createDriver(filePath, false, "off");
+    const driver = await createDriver(filePath, false);
     await driver.connect();
     await driver.query("CREATE TABLE data(value INTEGER)");
     await driver.query("PRAGMA busy_timeout=5000");
-    const blocker = await openSQLiteDatabase({
-      filePath,
-      sqliteWalMode: "off",
-    });
+    const blocker = await openSQLiteDatabase({ filePath });
     let ticks = 0;
     const pulse = setInterval(() => ticks++, 20);
     try {

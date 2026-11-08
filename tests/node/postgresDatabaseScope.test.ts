@@ -1,7 +1,10 @@
+import { DatabaseError } from "pg";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
+import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { ErdGraphService } from "../../src/extension/services/erdGraphService";
+import type { PreparedInsertPlan } from "../../src/extension/table/tableDataContracts";
 import {
   executeAtomicSqlApplyPlan,
   executePreparedApplyPlan,
@@ -214,6 +217,33 @@ const managerFor = (driver: PostgresDriver) => ({
   onDidRefreshSchemas: () => ({ dispose() {} }),
 });
 
+const enumEditColumns: ColumnTypeMeta[] = [
+  {
+    name: "id",
+    type: "integer",
+    nativeType: "integer",
+    category: "integer",
+    nullable: false,
+    isPrimaryKey: true,
+    isForeignKey: false,
+    filterable: true,
+    filterOperators: [],
+    valueSemantics: "plain",
+  },
+  {
+    name: "value",
+    type: "text",
+    nativeType: "text",
+    category: "text",
+    nullable: false,
+    isPrimaryKey: false,
+    isForeignKey: false,
+    filterable: true,
+    filterOperators: [],
+    valueSemantics: "plain",
+  },
+];
+
 beforeEach(async () => {
   harness.pools.length = 0;
   driver = new PostgresDriver(config);
@@ -225,6 +255,249 @@ afterEach(async () => {
 });
 
 describe("B01 PostgreSQL database scope (mock pools)", () => {
+  it("maps PostgreSQL query field OIDs to exact numeric metadata", async () => {
+    const pool = poolFor("a");
+    pool.query.mockResolvedValueOnce({
+      fields: [
+        { name: "numeric_value", dataTypeID: 1700 },
+        { name: "integer_value", dataTypeID: 20 },
+        { name: "numeric_text", dataTypeID: 25 },
+        { name: "money_value", dataTypeID: 790 },
+      ],
+      rows: [["10.25", "9007199254740993", "10", "$1,234.56"]],
+      rowCount: 1,
+    });
+
+    const result = await driver.query("SELECT typed numeric values");
+
+    expect(result.columnMeta).toEqual([
+      { category: "decimal" },
+      { category: "integer" },
+      { category: null },
+      { category: "decimal" },
+    ]);
+    expect(result.rows[0]).toEqual({
+      __col_0: "10.25",
+      __col_1: "9007199254740993",
+      __col_2: "10",
+      __col_3: "$1,234.56",
+    });
+  });
+
+  it.each([
+    {
+      label: "server statement rejection",
+      code: "22P02",
+      rollbackFails: false,
+      noChangesConfirmed: true,
+    },
+    {
+      label: "connection loss",
+      code: "08006",
+      rollbackFails: true,
+      noChangesConfirmed: false,
+    },
+  ])("classifies a rejected UPDATE safely for $label", async ({
+    code,
+    rollbackFails,
+    noChangesConfirmed,
+  }) => {
+    const manager = managerFor(driver);
+    const pool = poolFor("a");
+    const statementError = new DatabaseError(
+      "invalid input value for enum: βalpha",
+      0,
+      "error",
+    );
+    statementError.code = code;
+    const poolQuery = pool.query.getMockImplementation();
+    pool.query.mockImplementation(async (input, params = []) => {
+      const sql = typeof input === "string" ? input : input.text;
+      if (sql.startsWith("UPDATE ")) throw statementError;
+      if (sql === "ROLLBACK" && rollbackFails) {
+        throw new Error("connection closed during rollback");
+      }
+      if (typeof poolQuery === "function") {
+        return Reflect.apply(poolQuery, pool, [input, params]);
+      }
+      return { rows: [], rowCount: 0 };
+    });
+
+    const prepared = prepareApplyChangesPlan(
+      manager as never,
+      config.id,
+      "a",
+      "public",
+      "items",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { value: "βalpha" },
+          originalValues: { value: "β" },
+        },
+      ],
+      enumEditColumns,
+    );
+    if (!prepared.executable) throw new Error("Expected an executable plan");
+
+    const result = await executePreparedApplyPlan(
+      manager as never,
+      prepared.plan,
+    );
+    expect(result.success).toBe(false);
+    expect(result.changesPossible).toBe(!noChangesConfirmed);
+    expect(result.outcomeUnknown).toBe(!noChangesConfirmed);
+    expect(result.error).toContain(
+      noChangesConfirmed
+        ? "PostgreSQL rejected the statement and rolled back the transaction; no changes were made."
+        : "Transaction failed; its outcome may be unknown.",
+    );
+    expect(result.rowOutcomes).toMatchObject([
+      {
+        rowIndex: 0,
+        status: "skipped",
+        success: false,
+      },
+    ]);
+    expect(
+      pool.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    ).toEqual([
+      "SELECT current_database() AS name",
+      "BEGIN",
+      expect.stringMatching(/^UPDATE /),
+      "ROLLBACK",
+    ]);
+  });
+
+  it("keeps a PostgreSQL checkout DatabaseError out of the confirmed rollback path", async () => {
+    const manager = managerFor(driver);
+    const pool = poolFor("a");
+    const checkoutError = new DatabaseError(
+      'database "missing_qa_database" does not exist',
+      0,
+      "error",
+    );
+    checkoutError.code = "3D000";
+    pool.connect.mockRejectedValueOnce(checkoutError);
+    const checkoutCallsBeforeApply = pool.connect.mock.calls.length;
+    const prepared = prepareApplyChangesPlan(
+      manager as never,
+      config.id,
+      "a",
+      "public",
+      "items",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { value: "βalpha" },
+          originalValues: { value: "β" },
+        },
+      ],
+      enumEditColumns,
+    );
+    if (!prepared.executable) throw new Error("Expected an executable plan");
+
+    const result = await executePreparedApplyPlan(
+      manager as never,
+      prepared.plan,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining(
+        "Transaction failed; its outcome may be unknown.",
+      ),
+      changesPossible: true,
+      outcomeUnknown: true,
+    });
+    expect(result.error).not.toContain(
+      "PostgreSQL rejected the statement and rolled back the transaction",
+    );
+    expect(pool.connect).toHaveBeenCalledTimes(checkoutCallsBeforeApply + 1);
+    expect(
+      pool.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    ).toEqual(["SELECT current_database() AS name"]);
+  });
+
+  it("reports a rejected UPDATE after an earlier INSERT as rolled back atomically", async () => {
+    const manager = managerFor(driver);
+    const pool = poolFor("a");
+    const statementError = new DatabaseError(
+      "invalid input value for enum: βalpha",
+      0,
+      "error",
+    );
+    statementError.code = "22P02";
+    const poolQuery = pool.query.getMockImplementation();
+    pool.query.mockImplementation(async (input, params = []) => {
+      const sql = typeof input === "string" ? input : input.text;
+      if (sql.startsWith("UPDATE ")) throw statementError;
+      if (typeof poolQuery === "function") {
+        return Reflect.apply(poolQuery, pool, [input, params]);
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const prepared = prepareApplyChangesPlan(
+      manager as never,
+      config.id,
+      "a",
+      "public",
+      "items",
+      [
+        {
+          primaryKeys: { id: 1 },
+          changes: { value: "βalpha" },
+          originalValues: { value: "β" },
+        },
+      ],
+      enumEditColumns,
+    );
+    if (!prepared.executable) throw new Error("Expected an executable plan");
+    const insert: PreparedInsertPlan = {
+      connectionId: config.id,
+      database: "a",
+      schema: "public",
+      table: "items",
+      operation: {
+        sql: 'INSERT INTO "public"."items" ("id", "value") VALUES ($1, $2)',
+        params: [2, "inserted"],
+        checkAffectedRows: true,
+      },
+      previewStatements: [],
+      verificationCriteria: null,
+    };
+
+    const result = await executeAtomicSqlApplyPlan(
+      manager as never,
+      prepared.plan,
+      [insert],
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining(
+        "PostgreSQL rejected the statement and rolled back the transaction; no changes were made.",
+      ),
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
+    expect(
+      pool.query.mock.calls.map(([input]) =>
+        typeof input === "string" ? input : input.text,
+      ),
+    ).toEqual([
+      "SELECT current_database() AS name",
+      "BEGIN",
+      expect.stringMatching(/^INSERT /),
+      expect.stringMatching(/^UPDATE /),
+      "ROLLBACK",
+    ]);
+  });
+
   it.each([
     "T",
     "E",

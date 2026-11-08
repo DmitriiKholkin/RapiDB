@@ -146,8 +146,9 @@ describe("B11 materialized reads over real SDK HTTP", () => {
       expect(fixture.pendingSearches.size).toBe(1);
       expect(fixture.searches[0]).toMatchObject({
         query: { match_all: {} },
-        sort: ["_doc"],
-        size: 10000,
+        pit: { id: "pit-1", keep_alive: "1m" },
+        sort: [{ _shard_doc: "asc" }],
+        size: 500,
         track_total_hits: true,
       });
       if (reason === "abort") controller.abort();
@@ -160,12 +161,11 @@ describe("B11 materialized reads over real SDK HTTP", () => {
       expect(options?.requestTimeout).toBeGreaterThan(0);
       expect(options?.requestTimeout).toBeLessThanOrEqual(1000);
       expect(options?.signal?.aborted).toBe(true);
-      expect(options?.maxRetries).toBe(0);
       fixture.releaseSearches();
       expect(search).toHaveBeenCalledTimes(1);
-      expect(fixture.requests).toHaveLength(1);
+      expect(fixture.requests).toHaveLength(4);
       expect(fixture.pits.size).toBe(0);
-      expect(fixture.closedIds).toEqual([]);
+      expect(fixture.closedIds).toEqual(["pit-1"]);
     } finally {
       await fixture.close();
     }
@@ -230,30 +230,38 @@ describe("B11 materialized reads over real SDK HTTP", () => {
         expect(fixture.activeReaders).toBe(0);
       });
       expect(fixture.searches).toHaveLength(1);
-      expect(fixture.pits.size).toBe(0);
+      expect(fixture.closedIds).toEqual(["pit-1"]);
     } finally {
       await fixture.close();
     }
   });
 
-  it("surfaces an unsafe materialization window error without a retry", async () => {
-    const fixture = await createElasticsearchHttpFixture({ window: 3 });
+  it.each([
+    false,
+    true,
+  ])("materializes all HTTP batches with a small window (metadata denied: %s)", async (denySettings) => {
+    const fixture = await createElasticsearchHttpFixture({
+      window: 3,
+      denySettings,
+    });
     try {
-      await expect(
-        fixture.driver.readTablePage({
-          ...request,
-          ...materializedOptions("filtered"),
-          page: 1,
-          pageSize: 25,
-          skipCount: false,
-        }),
-      ).rejects.toMatchObject({
-        name: "ResponseError",
-        meta: { statusCode: 400 },
+      const result = await fixture.driver.readTablePage({
+        ...request,
+        sort: { column: "_id", direction: "desc" },
+        filters: [
+          { column: "_id", operator: "in", value: "doc-1,doc-9,doc-16" },
+        ],
+        page: 2,
+        pageSize: 2,
+        skipCount: false,
       });
-      expect(fixture.searches).toHaveLength(1);
-      expect(fixture.requests).toHaveLength(1);
+      expect(result.rows.map((row) => row._id)).toEqual(["doc-1"]);
+      expect(result.totalCount).toBe(3);
+      expect(fixture.searches.length).toBeGreaterThan(5);
+      expect(fixture.searches.at(-1)?.size).toBeLessThanOrEqual(3);
       expect(fixture.activeReaders).toBe(0);
+      expect(fixture.pits.size).toBe(0);
+      expect(fixture.closedIds).toHaveLength(1);
     } finally {
       await fixture.close();
     }

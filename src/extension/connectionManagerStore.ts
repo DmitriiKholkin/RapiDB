@@ -12,6 +12,10 @@ import type {
   StoredConnectionConfig,
 } from "./connectionManagerModels";
 import {
+  sanitizeConnectionConfigForResponse,
+  shouldKeepHandWrittenSecretsInSettings,
+} from "./connectionSecrets";
+import {
   CONNECTION_TIMEOUT_SECONDS_DEFAULT,
   createDriverTimeoutSettingsSnapshot,
   DB_OPERATION_TIMEOUT_SECONDS_DEFAULT,
@@ -20,6 +24,10 @@ import {
 
 const HISTORY_STATE_KEY = "rapidb.queryHistory";
 const BOOKMARKS_STATE_KEY = "rapidb.bookmarks";
+const ORPHANED_SECRETS_STATE_KEY = "rapidb.orphanedUserConnectionSecrets";
+const LEGACY_ORPHANED_SECRETS_STATE_KEY = "rapidb.orphanedConnectionSecrets";
+const WORKSPACE_SCOPED_IDS_STATE_KEY = "rapidb.workspaceScopedConnectionIds";
+const SESSION_NONCES_STATE_KEY = "rapidb.connectionSessionNonces";
 const HISTORY_LIMIT_DEFAULT = 100;
 const HISTORY_LIMIT_MAX = 10000;
 const VALID_PAGE_SIZES = [25, 100, 500, 1000] as const;
@@ -50,11 +58,43 @@ export interface ConnectionManagerStore {
   getSecret(id: string): Promise<string | undefined>;
   storeSecret(id: string, value: string): Promise<void>;
   deleteSecret(id: string): Promise<void>;
+  getConnectionIdsByScope?(): ConnectionIdsByScope;
+  hasConnectionIdInAnyScope?(id: string): boolean;
+  readOrphanedSecretIds?(): string[];
+  writeOrphanedSecretIds?(ids: string[]): Promise<void>;
+  readWorkspaceScopedConnectionIds?(): string[];
+  writeWorkspaceScopedConnectionIds?(ids: string[]): Promise<void>;
+  clearLegacyOrphanedSecretIds?(): Promise<void>;
+  isRemoteWindow?(): boolean;
+  readConnectionSessionNonce?(id: string): string | undefined;
+  writeConnectionSessionNonce?(id: string, nonce: string): Promise<void>;
   getHistoryLimit(): number;
   getDefaultPageSize(): number;
   getQueryRowLimit(): number;
   getSkipTableMutationPreview(): boolean;
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
+}
+
+export interface ConnectionIdsByScope {
+  user: string[];
+  workspace: string[];
+  effective: string[];
+}
+
+export function connectionIdsMatch(candidate: string, id: string): boolean {
+  return candidate === id || candidate.trim() === id.trim();
+}
+
+function collectConnectionIds(values: unknown[]): string[] {
+  const ids = new Set<string>();
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    for (const connection of value) {
+      const rawId = (connection as { id?: unknown } | null)?.id;
+      if (typeof rawId === "string" && rawId.trim()) ids.add(rawId);
+    }
+  }
+  return [...ids];
 }
 
 export interface ConnectionStoreMutation<TResult> {
@@ -90,6 +130,70 @@ function computeConnectionsRevision(
 ): string {
   const persisted = JSON.parse(JSON.stringify(connections));
   return createHash("sha256").update(stableSerialize(persisted)).digest("hex");
+}
+
+export function canonicalizeOracleServiceName(
+  config: ConnectionConfig,
+): ConnectionConfig {
+  if (config.type !== "oracle") {
+    return config;
+  }
+
+  const rawServiceName =
+    (typeof config.serviceName === "string" && config.serviceName.trim()) ||
+    (typeof config.database === "string" && config.database.trim()) ||
+    undefined;
+
+  return {
+    ...config,
+    serviceName: rawServiceName,
+    database: undefined,
+  };
+}
+
+export function connectionSessionSettings(config: StoredConnectionConfig) {
+  const {
+    name: _name,
+    folder: _folder,
+    color: _color,
+    useSecretStorage: _storage,
+    ...settings
+  } = canonicalizeOracleServiceName({
+    ...config,
+    username: config.username ?? config.user,
+  });
+  delete (settings as StoredConnectionConfig).user;
+  settings.readOnly = settings.readOnly === true;
+  if (
+    settings.type !== "pg" &&
+    settings.type !== "mongodb" &&
+    settings.tls?.mode === "disabled"
+  ) {
+    delete settings.tls;
+  }
+  for (const field of ["database", "username"] as const) {
+    if (settings[field] === "") delete settings[field];
+  }
+  return JSON.parse(JSON.stringify(settings));
+}
+
+export function connectionSessionKey(
+  config: ConnectionConfig | undefined,
+  sessionNonce?: string,
+): string | null | undefined {
+  if (!config) return undefined;
+  try {
+    const settings = connectionSessionSettings(
+      sanitizeConnectionConfigForResponse(config),
+    );
+    delete settings.readOnly;
+    if (settings.ssh) delete settings.ssh.hostFingerprintSha256;
+    return createHash("sha256")
+      .update(stableSerialize({ settings, sessionNonce: sessionNonce ?? null }))
+      .digest("hex");
+  } catch {
+    return null;
+  }
 }
 
 function migrateLegacyTlsFlags(
@@ -129,11 +233,41 @@ function migrateLegacyTlsFlags(
   return changed ? migrated : connections;
 }
 
+function dropRemovedConnectionFields(
+  connections: StoredConnectionConfig[],
+): StoredConnectionConfig[] {
+  let changed = false;
+  const migrated = connections.map((conn) => {
+    if (!("sqliteWalMode" in conn)) return conn;
+    changed = true;
+    const { sqliteWalMode: _walMode, ...rest } = conn as unknown as Record<
+      string,
+      unknown
+    >;
+    return rest as unknown as StoredConnectionConfig;
+  });
+  return changed ? migrated : connections;
+}
+
+function markHandWrittenPlaintextSecrets(
+  connections: StoredConnectionConfig[],
+): StoredConnectionConfig[] {
+  let changed = false;
+  const migrated = connections.map((conn) => {
+    if (!shouldKeepHandWrittenSecretsInSettings(conn)) return conn;
+    changed = true;
+    return { ...conn, useSecretStorage: false };
+  });
+  return changed ? migrated : connections;
+}
+
 function normalizeStoredConnections(connections: StoredConnectionConfig[]): {
   connections: StoredConnectionConfig[];
   changed: boolean;
 } {
-  const tlsMigrated = migrateLegacyTlsFlags(connections);
+  const tlsMigrated = markHandWrittenPlaintextSecrets(
+    dropRemovedConnectionFields(migrateLegacyTlsFlags(connections)),
+  );
   let changed = tlsMigrated !== connections;
   const usedIds = new Set<string>();
   const normalized = tlsMigrated.map((connection) => {
@@ -454,6 +588,110 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
 
   async deleteSecret(id: string): Promise<void> {
     await this.context.secrets.delete(id);
+  }
+
+  getConnectionIdsByScope(): ConnectionIdsByScope {
+    const configuration = vscode.workspace.getConfiguration("rapidb");
+    const user: unknown[] = [];
+    const workspace: unknown[] = [];
+    const effective: unknown[] = [configuration.get("connections")];
+    if (typeof configuration.inspect === "function") {
+      const inspected = configuration.inspect("connections");
+      user.push(inspected?.globalValue);
+      workspace.push(
+        inspected?.workspaceValue,
+        inspected?.workspaceFolderValue,
+      );
+    }
+    for (const folder of vscode.workspace.workspaceFolders ?? []) {
+      const folderConfiguration = vscode.workspace.getConfiguration(
+        "rapidb",
+        folder.uri,
+      );
+      if (typeof folderConfiguration.inspect === "function") {
+        workspace.push(
+          folderConfiguration.inspect("connections")?.workspaceFolderValue,
+        );
+      }
+    }
+    return {
+      user: collectConnectionIds(user),
+      workspace: collectConnectionIds(workspace),
+      effective: collectConnectionIds(effective),
+    };
+  }
+
+  hasConnectionIdInAnyScope(id: string): boolean {
+    const scopes = this.getConnectionIdsByScope();
+    return [...scopes.user, ...scopes.workspace, ...scopes.effective].some(
+      (candidate) => connectionIdsMatch(candidate, id),
+    );
+  }
+
+  readOrphanedSecretIds(): string[] {
+    return this.readStateIds(ORPHANED_SECRETS_STATE_KEY);
+  }
+
+  async writeOrphanedSecretIds(ids: string[]): Promise<void> {
+    await this.context.globalState.update(
+      ORPHANED_SECRETS_STATE_KEY,
+      ids.length > 0 ? ids : undefined,
+    );
+  }
+
+  readWorkspaceScopedConnectionIds(): string[] {
+    return this.readStateIds(WORKSPACE_SCOPED_IDS_STATE_KEY);
+  }
+
+  async writeWorkspaceScopedConnectionIds(ids: string[]): Promise<void> {
+    await this.context.globalState.update(
+      WORKSPACE_SCOPED_IDS_STATE_KEY,
+      ids.length > 0 ? ids : undefined,
+    );
+  }
+
+  async clearLegacyOrphanedSecretIds(): Promise<void> {
+    if (
+      this.context.globalState.get(LEGACY_ORPHANED_SECRETS_STATE_KEY) ===
+      undefined
+    )
+      return;
+    await this.context.globalState.update(
+      LEGACY_ORPHANED_SECRETS_STATE_KEY,
+      undefined,
+    );
+  }
+
+  isRemoteWindow(): boolean {
+    return vscode.env.remoteName !== undefined;
+  }
+
+  readConnectionSessionNonce(id: string): string | undefined {
+    const nonce = this.readSessionNonces()[id];
+    return typeof nonce === "string" ? nonce : undefined;
+  }
+
+  async writeConnectionSessionNonce(id: string, nonce: string): Promise<void> {
+    await this.context.globalState.update(SESSION_NONCES_STATE_KEY, {
+      ...this.readSessionNonces(),
+      [id]: nonce,
+    });
+  }
+
+  private readSessionNonces(): Record<string, unknown> {
+    const nonces = this.context.globalState.get<unknown>(
+      SESSION_NONCES_STATE_KEY,
+    );
+    return nonces && typeof nonces === "object" && !Array.isArray(nonces)
+      ? (nonces as Record<string, unknown>)
+      : {};
+  }
+
+  private readStateIds(key: string): string[] {
+    const ids = this.context.globalState.get<unknown>(key);
+    return Array.isArray(ids)
+      ? ids.filter((id): id is string => typeof id === "string")
+      : [];
   }
 
   getHistoryLimit(): number {

@@ -85,7 +85,6 @@ describe.skipIf(!liveUri)("MongoDB mutation options on a real server", () => {
         ),
       ).rejects.toThrow(/options are not supported/);
       expect(await collection.countDocuments({})).toBe(2);
-      // The explicit command path preserves the requested server semantics.
       await driver.query(
         'db.runCommand({delete: "items", deletes: [{q: {name: "ALICE"}, limit: 0, collation: {locale: "simple"}}]})',
       );

@@ -141,7 +141,7 @@ describe("Elasticsearch response numeric precision audit (real SDK + HTTP)", () 
           sort: materialized ? { column: "_id", direction: "asc" } : null,
         }),
       ).rejects.toMatchObject({ name: "DeserializationError" });
-      expect(f.closedIds).toEqual(materialized ? [] : ["precision-pit"]);
+      expect(f.closedIds).toEqual(["precision-pit"]);
     } finally {
       await f.close();
     }
@@ -229,6 +229,7 @@ describe("ElasticsearchSerializer portable numeric boundary", () => {
     "-9007199254740993",
     "9223372036854775807",
     "1000000000000000100",
+    "1000000000000000100.0",
     "1000000000000000128",
     "1.0000000000000001",
     "0.123456789012345678901",

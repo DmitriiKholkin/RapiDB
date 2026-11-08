@@ -57,7 +57,7 @@ describe("MSSQL DDL generation", () => {
         : await driver.getRoutineDefinition(database, schema, name, kind);
     expect(result).toBe("definition");
     expect(query).toHaveBeenLastCalledWith(
-      "SELECT OBJECT_DEFINITION(OBJECT_ID(@objectName)) AS def",
+      "SELECT sm.definition AS def FROM [db's]]name].sys.sql_modules sm WHERE sm.object_id = OBJECT_ID(@objectName)",
     );
     expect(input).toHaveBeenCalledWith(
       "objectName",
@@ -75,7 +75,7 @@ describe("MSSQL DDL generation", () => {
       if (sql.includes("INFORMATION_SCHEMA.TABLES")) {
         return { recordset: [{ TABLE_TYPE: "VIEW" }] };
       }
-      if (sql.includes("OBJECT_DEFINITION")) {
+      if (sql.includes("sys.sql_modules")) {
         return {
           recordset: [
             {
@@ -98,7 +98,7 @@ describe("MSSQL DDL generation", () => {
     );
     expect(request).toHaveBeenCalledTimes(2);
     expect(queries[0]).toContain("INFORMATION_SCHEMA.TABLES");
-    expect(queries[1]).toContain("OBJECT_DEFINITION");
+    expect(queries[1]).toContain("[test_db].sys.sql_modules");
   });
 
   it("continues to render table DDL for base tables", async () => {

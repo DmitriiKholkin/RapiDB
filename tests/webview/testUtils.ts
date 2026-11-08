@@ -1,5 +1,5 @@
 import axeCore from "axe-core";
-import { expect, vi } from "vitest";
+import { expect, type vi } from "vitest";
 
 type PostMessageMock = ReturnType<typeof vi.fn>;
 

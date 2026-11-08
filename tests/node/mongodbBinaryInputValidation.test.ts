@@ -45,7 +45,6 @@ const malformedHex = [
   "\\XGG",
   "0xAB CD",
   "0xAB!",
-  ' "0xA" ',
 ];
 
 function setup(column = binaryColumn) {
@@ -87,9 +86,8 @@ describe("R10 Mongo binary input versus tolerant output", () => {
       shouldVerify: false,
       message: expect.stringMatching(/Invalid hex/),
     });
-    const output = value === ' "0xA" ' ? "0xA" : value;
-    expect(driver.formatOutputValue(value, binaryColumn)).toBe(output);
-    expect(driver.coerceOriginalValue(value, binaryColumn)).toBe(output);
+    expect(driver.formatOutputValue(value, binaryColumn)).toBe(value);
+    expect(driver.coerceOriginalValue(value, binaryColumn)).toBe(value);
   });
 
   it.each(
@@ -181,9 +179,6 @@ describe("R10 Mongo binary input versus tolerant output", () => {
     ["0XABCD", "abcd", 128],
     ["\\xABCD", "abcd", 128],
     ["\\XABCD", "abcd", 128],
-    ["ABCD", "abcd", 128],
-    ["1234", "1234", 128],
-    ["q80=", "abcd", 128],
     ['BinData(2, "q80=")', "abcd", 2],
     ["0x", "", 128],
     ["0X", "", 128],
@@ -219,13 +214,13 @@ describe("R10 Mongo binary input versus tolerant output", () => {
     expect(Buffer.from(roundtrip.buffer)).toEqual(Buffer.from(hex, "hex"));
   });
 
-  it("preserves bsonSubtype metadata for bare hex, base64 and empty hex", async () => {
+  it("preserves bsonSubtype metadata for prefixed and empty hex", async () => {
     const s = setup({
       ...binaryColumn,
       nativeType: "binData(2)",
       bsonSubtype: 128,
     });
-    for (const payload of ["ABCD", "q80=", "0x"]) {
+    for (const payload of ["0xABCD", "\\xABCD", "0x"]) {
       await s.service.updateRow(
         "mongo-binary",
         "db",
@@ -242,13 +237,50 @@ describe("R10 Mongo binary input versus tolerant output", () => {
     }
   });
 
-  it.each([
+  const unprefixedText = [
     "plain text",
     "ABC",
     "123",
-    "",
-    NULL_SENTINEL,
-  ])("still permits non-explicit-hex type editing %j", async (value) => {
+    "ABCD",
+    "1234",
+    "cafe",
+    "q80=",
+    "test",
+  ];
+
+  it.each(
+    unprefixedText,
+  )("rejects unquoted non-binary %j instead of changing the type to string", async (value) => {
+    const s = setup();
+    const result = await applyChangesTransactional(
+      s.manager as never,
+      "mongo-binary",
+      "db",
+      "",
+      "items",
+      [{ primaryKeys, changes: { payload: value } }],
+      s.columns,
+    );
+    expect(result).toMatchObject({
+      success: false,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          status: "prevalidation_failed",
+          columns: ["payload"],
+          message: expect.stringMatching(/Quote the value/),
+        },
+      ],
+    });
+    expect(s.updateOne).not.toHaveBeenCalled();
+  });
+
+  it.each<[string, string | null]>([
+    ...unprefixedText.map((value): [string, string] => [`"${value}"`, value]),
+    ['"0xA"', "0xA"],
+    ["", ""],
+    [NULL_SENTINEL, null],
+  ])("still permits explicit type editing %j", async (value, saved) => {
     const s = setup();
     const result = await applyChangesTransactional(
       s.manager as never,
@@ -260,9 +292,7 @@ describe("R10 Mongo binary input versus tolerant output", () => {
       s.columns,
     );
     expect(result.success).toBe(true);
-    expect(s.updateOne.mock.calls[0][1].$set.payload).toBe(
-      value === NULL_SENTINEL ? null : value,
-    );
+    expect(s.updateOne.mock.calls[0][1].$set.payload).toBe(saved);
   });
 
   it.each([
@@ -311,7 +341,7 @@ describe("R10 Mongo binary input versus tolerant output", () => {
       [
         {
           primaryKeys,
-          changes: { payload: "ordinary string" },
+          changes: { payload: '"ordinary string"' },
           originalValues: { payload: value },
         },
       ],

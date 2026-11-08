@@ -1,6 +1,8 @@
+import type { QueryMissingCell } from "../../shared/tableTypes";
 import type { ConnectionManager } from "../connectionManager";
 import type {
   ColumnTypeMeta,
+  DriverTableExportChunk,
   FilterExpression,
   QueryResult,
 } from "../dbDrivers/types";
@@ -18,6 +20,7 @@ type ExportCursor = Record<string, unknown>;
 export class TableReadService {
   private readonly columnCache = new Map<string, ColumnTypeMeta[]>();
   private readonly columnCacheGenerations = new Map<string, number>();
+  private readonly rowIdentityOrderCache = new Map<string, string[]>();
 
   private encodeKeyPart(value: string): string {
     return `${value.length}:${value}`;
@@ -34,6 +37,11 @@ export class TableReadService {
     for (const key of this.columnCache.keys()) {
       if (key.startsWith(`${this.encodeKeyPart(connectionId)}|`)) {
         this.columnCache.delete(key);
+      }
+    }
+    for (const key of this.rowIdentityOrderCache.keys()) {
+      if (key.startsWith(`${this.encodeKeyPart(connectionId)}|`)) {
+        this.rowIdentityOrderCache.delete(key);
       }
     }
   }
@@ -59,6 +67,48 @@ export class TableReadService {
     return columns;
   }
 
+  private async getRowIdentityOrderExpressions(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): Promise<string[]> {
+    const { driver } = this.getConnectionDriver(connectionId);
+    if (
+      !driver.getTableRowIdentityOrderExpressions ||
+      columns.some((column) => column.isPrimaryKey)
+    ) {
+      return [];
+    }
+    const cacheKey = this.columnCacheKey(connectionId, database, schema, table);
+    const cached = this.rowIdentityOrderCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    const generation = this.columnCacheGenerations.get(connectionId) ?? 0;
+    let expressions: string[];
+    try {
+      expressions = await driver.getTableRowIdentityOrderExpressions(
+        database,
+        schema,
+        table,
+        columns,
+      );
+    } catch (error: unknown) {
+      console.error(
+        "[RapiDB] Row identity lookup failed, reading without a row tie-breaker:",
+        normalizeUnknownError(error).message,
+      );
+      return [];
+    }
+    if ((this.columnCacheGenerations.get(connectionId) ?? 0) === generation) {
+      this.rowIdentityOrderCache.set(cacheKey, expressions);
+    }
+    return expressions;
+  }
+
   async getPage(
     connectionId: string,
     database: string,
@@ -70,7 +120,9 @@ export class TableReadService {
     sort: SortConfig | null = null,
     skipCount = false,
     signal?: AbortSignal,
+    assertExportSession?: () => void,
   ): Promise<TablePage> {
+    assertExportSession?.();
     signal?.throwIfAborted();
     if (!Array.isArray(filters)) {
       throw new Error("[RapiDB Filter] Filters must be an array.");
@@ -81,6 +133,8 @@ export class TableReadService {
       filters.length > 0
         ? await this.getColumns(connectionId, database, schema, table)
         : undefined;
+    assertExportSession?.();
+    signal?.throwIfAborted();
     if (columns) {
       validateFilterExpressions(filters, columns);
     }
@@ -110,7 +164,70 @@ export class TableReadService {
       sort,
       skipCount,
       columns,
+      assertExportSession,
+      signal,
     );
+  }
+
+  async *getPageChunks(
+    connectionId: string,
+    database: string,
+    schema: string,
+    table: string,
+    page: number,
+    pageSize: number,
+    filters: FilterExpression[],
+    sort: SortConfig | null = null,
+    signal?: AbortSignal,
+    assertExportSession?: () => void,
+  ): AsyncGenerator<DriverTableExportChunk> {
+    assertExportSession?.();
+    const { driver } = this.getConnectionDriver(connectionId);
+    if (!driver.readTablePageChunks) {
+      const result = await this.getPage(
+        connectionId,
+        database,
+        schema,
+        table,
+        page,
+        pageSize,
+        filters,
+        sort,
+        true,
+        signal,
+        assertExportSession,
+      );
+      yield { columns: result.columns, rows: result.rows };
+      return;
+    }
+    signal?.throwIfAborted();
+    if (!Array.isArray(filters)) {
+      throw new Error("[RapiDB Filter] Filters must be an array.");
+    }
+    if (filters.length > 0) {
+      const columns = await this.getColumns(
+        connectionId,
+        database,
+        schema,
+        table,
+      );
+      assertExportSession?.();
+      signal?.throwIfAborted();
+      validateFilterExpressions(filters, columns);
+    }
+    assertExportSession?.();
+    signal?.throwIfAborted();
+    yield* driver.readTablePageChunks({
+      database,
+      schema,
+      table,
+      page,
+      pageSize,
+      filters,
+      sort,
+      skipCount: true,
+      ...(signal ? { signal } : {}),
+    });
   }
 
   private async readFallbackPage(
@@ -124,7 +241,11 @@ export class TableReadService {
     sort: SortConfig | null,
     skipCount: boolean,
     knownColumns?: ColumnTypeMeta[],
+    assertExportSession?: () => void,
+    signal?: AbortSignal,
   ): Promise<TablePage> {
+    assertExportSession?.();
+    signal?.throwIfAborted();
     const startTime = performance.now();
     const { driver } = this.getConnectionDriver(connectionId);
 
@@ -136,6 +257,8 @@ export class TableReadService {
     const columns =
       knownColumns ??
       (await this.getColumns(connectionId, database, schema, table));
+    assertExportSession?.();
+    signal?.throwIfAborted();
 
     const { clause: whereClause, params: whereParams } = buildWhere(
       driver,
@@ -148,7 +271,16 @@ export class TableReadService {
       columns,
       sort,
       qualifiedTableName,
+      await this.getRowIdentityOrderExpressions(
+        connectionId,
+        database,
+        schema,
+        table,
+        columns,
+      ),
     );
+    assertExportSession?.();
+    signal?.throwIfAborted();
     const count = await this.readFallbackTotalCount(
       driver,
       database,
@@ -156,7 +288,10 @@ export class TableReadService {
       whereClause,
       whereParams,
       skipCount,
+      signal,
     );
+    assertExportSession?.();
+    signal?.throwIfAborted();
     const fetchPageSize = count.countFailed ? pageSize + 1 : pageSize;
     const pagination = driver.buildPagination(
       offset,
@@ -183,7 +318,10 @@ export class TableReadService {
       baseParams,
       columns,
       fallbackSql,
+      assertExportSession,
+      signal,
     );
+    signal?.throwIfAborted();
     const fetchedRows = this.formatQueryRows(driver, columns, dataResult);
     const hasMoreRows = count.countFailed && fetchedRows.length > pageSize;
     const rows = hasMoreRows ? fetchedRows.slice(0, pageSize) : fetchedRows;
@@ -212,9 +350,11 @@ export class TableReadService {
     sort: SortConfig | null = null,
     filters: FilterExpression[] = [],
     signal?: AbortSignal,
+    selectedColumns?: readonly string[],
   ): AsyncGenerator<{
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
+    missingCells?: QueryMissingCell[];
   }> {
     const { driver } = this.getConnectionDriver(connectionId);
     let invalidated = false;
@@ -244,10 +384,11 @@ export class TableReadService {
         sort,
         filters,
         signal,
+        selectedColumns,
+        assertSession,
       )) {
         assertSession();
         yield chunk;
-        // The destination can apply backpressure between chunks.
         assertSession();
       }
       assertSession();
@@ -265,14 +406,31 @@ export class TableReadService {
     sort: SortConfig | null,
     filters: FilterExpression[],
     signal?: AbortSignal,
+    selectedColumns?: readonly string[],
+    assertSession?: () => void,
   ): AsyncGenerator<{
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
+    missingCells?: QueryMissingCell[];
   }> {
     const { driver } = this.getConnectionDriver(connectionId);
-    if (driver.exportTableChunks && filters.length === 0 && sort === null) {
+    if (driver.exportTableChunks) {
+      if (!Array.isArray(filters)) {
+        throw new Error("[RapiDB Filter] Filters must be an array.");
+      }
+      if (filters.length > 0) {
+        const columns = await this.getColumns(
+          connectionId,
+          database,
+          schema,
+          table,
+        );
+        assertSession?.();
+        validateFilterExpressions(filters, columns);
+      }
+      assertSession?.();
       yield* driver.exportTableChunks(
-        { database, schema, table, chunkSize },
+        { database, schema, table, chunkSize, filters, sort },
         signal,
       );
       return;
@@ -285,6 +443,7 @@ export class TableReadService {
         table,
         sort,
       );
+      assertSession?.();
       if (keysetOrder) {
         yield* this.exportAllWithKeysetPagination(
           connectionId,
@@ -295,6 +454,7 @@ export class TableReadService {
           filters,
           keysetOrder,
           signal,
+          assertSession,
         );
         return;
       }
@@ -303,11 +463,14 @@ export class TableReadService {
     let page = 1;
 
     while (true) {
+      assertSession?.();
       if (signal?.aborted) {
         throw new DOMException("Export cancelled by user", "AbortError");
       }
 
-      const result = await this.getPage(
+      let rowCount = 0;
+      let emptyColumns: ColumnTypeMeta[] | undefined;
+      for await (const chunk of this.getPageChunks(
         connectionId,
         database,
         schema,
@@ -316,20 +479,26 @@ export class TableReadService {
         chunkSize,
         filters,
         sort,
-        true,
         signal,
-      );
+        assertSession,
+      )) {
+        assertSession?.();
+        if (chunk.rows.length === 0) {
+          emptyColumns ??= chunk.columns;
+          continue;
+        }
+        rowCount += chunk.rows.length;
+        yield driver.formatTableExportChunk?.(chunk, selectedColumns) ?? chunk;
+      }
 
-      if (result.rows.length === 0) {
+      if (rowCount === 0) {
         if (page === 1) {
-          yield { columns: result.columns, rows: [] };
+          yield { columns: emptyColumns ?? [], rows: [] };
         }
         break;
       }
 
-      yield { columns: result.columns, rows: result.rows };
-
-      if (result.rows.length < chunkSize) {
+      if (rowCount < chunkSize) {
         break;
       }
 
@@ -342,12 +511,17 @@ export class TableReadService {
     columns: ColumnTypeMeta[],
     sort: SortConfig | null,
     tableReference?: string,
+    rowIdentityOrder: readonly string[] = [],
   ): string {
-    if (!sort)
-      return driver.buildOrderByDefault(
+    if (!sort) {
+      const defaultOrderBy = driver.buildOrderByDefault(
         columns,
         driver.buildTableDataOrderExpression ? tableReference : undefined,
       );
+      return defaultOrderBy || rowIdentityOrder.length === 0
+        ? defaultOrderBy
+        : `ORDER BY ${rowIdentityOrder.map((expression) => `${expression} ASC`).join(", ")}`;
+    }
     const name = (columnName: string) =>
       tableReference && driver.buildTableDataOrderExpression
         ? driver.buildTableDataOrderExpression(columnName, tableReference)
@@ -362,6 +536,9 @@ export class TableReadService {
             (right.primaryKeyOrdinal ?? Number.MAX_SAFE_INTEGER),
         )
         .map((column) => `${name(column.name)} ASC`),
+      ...rowIdentityOrder
+        .filter((expression) => expression !== name(sort.column))
+        .map((expression) => `${expression} ASC`),
     ];
     return `ORDER BY ${clauses.join(", ")}`;
   }
@@ -373,6 +550,7 @@ export class TableReadService {
     whereClause: string,
     whereParams: unknown[],
     skipCount: boolean,
+    signal?: AbortSignal,
   ): Promise<{ totalCount: number; countFailed: boolean }> {
     if (skipCount) {
       return { totalCount: 0, countFailed: false };
@@ -382,12 +560,18 @@ export class TableReadService {
       const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
       const countResult = await driver.query(countSql, whereParams, {
         database,
+        ...(signal ? { signal } : {}),
       });
+      signal?.throwIfAborted();
+      if (countResult.error) {
+        throw new Error(countResult.error);
+      }
       return {
         totalCount: this.readCountQueryValue(countResult),
         countFailed: false,
       };
     } catch (error: unknown) {
+      signal?.throwIfAborted();
       console.error(
         "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
         normalizeUnknownError(error).message,
@@ -414,19 +598,44 @@ export class TableReadService {
     params: unknown[],
     columns: ColumnTypeMeta[],
     projectionFallbackSql?: string,
+    assertExportSession?: () => void,
+    signal?: AbortSignal,
   ): Promise<QueryResult> {
     try {
-      return await driver.query(dataSql, params, { database });
+      assertExportSession?.();
+      signal?.throwIfAborted();
+      const result = await driver.query(dataSql, params, {
+        database,
+        ...(signal ? { signal } : {}),
+      });
+      signal?.throwIfAborted();
+      if (result.error) {
+        throw new Error(result.error);
+      }
+      return result;
     } catch (error: unknown) {
+      signal?.throwIfAborted();
       this.rethrowComputedColumnOverflow(error, columns);
       if (
         projectionFallbackSql &&
         driver.shouldFallbackTableDataProjection?.(error)
       ) {
         try {
-          return await driver.query(projectionFallbackSql, params, {
-            database,
-          });
+          assertExportSession?.();
+          signal?.throwIfAborted();
+          const fallbackResult = await driver.query(
+            projectionFallbackSql,
+            params,
+            {
+              database,
+              ...(signal ? { signal } : {}),
+            },
+          );
+          signal?.throwIfAborted();
+          if (fallbackResult.error) {
+            throw new Error(fallbackResult.error);
+          }
+          return fallbackResult;
         } catch (fallbackError: unknown) {
           this.rethrowComputedColumnOverflow(fallbackError, columns);
           throw fallbackError;
@@ -500,6 +709,7 @@ export class TableReadService {
     filters: FilterExpression[],
     order: readonly ExportOrderColumn[],
     signal?: AbortSignal,
+    assertSession?: () => void,
   ): AsyncGenerator<{
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
@@ -516,6 +726,7 @@ export class TableReadService {
       schema,
       table,
     );
+    assertSession?.();
     const orderByClause = this.buildOrderByClause(
       driver,
       order,
@@ -524,6 +735,7 @@ export class TableReadService {
     let cursor: ExportCursor | null = null;
 
     while (true) {
+      assertSession?.();
       if (signal?.aborted) {
         throw new DOMException("Export cancelled by user", "AbortError");
       }
@@ -568,6 +780,8 @@ export class TableReadService {
         params,
         columns,
         fallbackSql,
+        assertSession,
+        signal,
       );
       const rows = this.formatQueryRows(driver, columns, dataResult);
 

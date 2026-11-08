@@ -1,11 +1,10 @@
 import * as https from "node:https";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type AttributeValue,
   BatchGetItemCommand,
-  type BatchGetItemCommandInput,
   type BatchGetItemCommandOutput,
   BatchWriteItemCommand,
-  type BatchWriteItemCommandInput,
   type BatchWriteItemCommandOutput,
   DeleteItemCommand,
   type DeleteItemCommandInput,
@@ -13,7 +12,6 @@ import {
   DescribeTableCommand,
   DynamoDBClient,
   GetItemCommand,
-  type GetItemCommandInput,
   type GetItemCommandOutput,
   type GlobalSecondaryIndexDescription,
   ListTablesCommand,
@@ -31,10 +29,8 @@ import {
   type ScanCommandOutput,
   type TableDescription,
   TransactGetItemsCommand,
-  type TransactGetItemsCommandInput,
   type TransactGetItemsCommandOutput,
   TransactWriteItemsCommand,
-  type TransactWriteItemsCommandInput,
   UpdateItemCommand,
   type UpdateItemCommandInput,
   type UpdateItemCommandOutput,
@@ -43,10 +39,18 @@ import { fromIni } from "@aws-sdk/credential-providers";
 import { marshall, NumberValueImpl, unmarshall } from "@aws-sdk/util-dynamodb";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import {
+  DYNAMODB_NATIVE_CELL_VALUE_PREFIX,
+  getDynamoDbNativeCellValidationError,
+  hasDuplicateDynamoDbNumbers,
+  parseDynamoDbNumberSetJson,
+  parseDynamoDbSetLiteral,
+} from "../../shared/dynamodbCellInput";
+import {
   type DynamoDbNativeOperationName,
   inferDynamoDbNativeOperationName,
   parseDynamoDbNativeQueryInputs,
 } from "../../shared/dynamodbNative";
+import { compareNumericTokens } from "../../shared/numericNormalization";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
 import {
@@ -60,13 +64,15 @@ import {
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import { getMetadataContext } from "./metadataCancellation";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   applyFilters,
   applySort,
   createNoSqlUnsupportedMetadataHandlers,
   inferColumnsFromRows,
+  ownField,
   pageRows,
-  unsupported,
+  splitInFilterValues,
 } from "./nosqlUtils";
 import { throwIfQueryCancelled } from "./timeout";
 import type {
@@ -79,6 +85,7 @@ import type {
   DriverMutationResult,
   DriverOperationContext,
   DriverSortConfig,
+  DriverTableExportChunk,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowOutcome,
@@ -86,17 +93,15 @@ import type {
   FilterConditionResult,
   FilterExpression,
   FilterOperator,
-  ForeignKeyMeta,
   IDBDriver,
   IndexMeta,
+  MongoValueTypeHint,
   PaginationResult,
   QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
-  TableConstraintMeta,
   TableInfo,
   TransactionOperation,
-  TriggerMeta,
   TypeCategory,
   ValueSemantics,
 } from "./types";
@@ -117,6 +122,22 @@ const READ_ONLY_DYNAMODB_OPERATIONS = new Set<DynamoDbNativeOperationName>([
   "TransactGetItems",
 ]);
 
+const DYNAMODB_CREATE_TABLE_REQUEST_FIELDS = [
+  "AttributeDefinitions",
+  "BillingMode",
+  "DeletionProtectionEnabled",
+  "GlobalSecondaryIndexes",
+  "KeySchema",
+  "LocalSecondaryIndexes",
+  "OnDemandThroughput",
+  "ProvisionedThroughput",
+  "SSESpecification",
+  "StreamSpecification",
+  "TableClass",
+  "Tags",
+  "WarmThroughput",
+] as const;
+
 import { NULL_SENTINEL, resolveFilterOperators } from "./types";
 
 const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -131,6 +152,7 @@ const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
 
 const DYNAMODB_CURSOR_FETCH_LIMIT = 200;
 const DYNAMODB_MAX_MATERIALIZED_ROWS = 5000;
+const DYNAMODB_MAX_TRANSACT_ITEMS = 100;
 const DYNAMODB_CURSOR_CACHE_MAX_SESSIONS = 100;
 const DYNAMODB_CURSOR_SESSION_MAX_PAGE_STARTS = 100;
 const DYNAMODB_CURSOR_HISTORY_LIMIT = 256;
@@ -143,6 +165,23 @@ const DYNAMODB_ESCAPED_NATIVE_CELL_TEXT_PATTERN =
   /^\\+DynamoDB native value \(nested sets\/binary\): /;
 const DYNAMODB_NUMBER_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
 const DYNAMODB_TABLE_FILTER_ERROR_PREFIX = "Invalid DynamoDB table filter:";
+const DYNAMODB_READ_MAX_ATTEMPTS = 8;
+const DYNAMODB_READ_RETRY_BASE_DELAY_MS = 50;
+const DYNAMODB_READ_RETRY_MAX_DELAY_MS = 600;
+const DYNAMODB_READ_RETRY_BUDGET_MS = 1800;
+const DYNAMODB_RETRYABLE_READ_ERRORS = new Set([
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "ThrottlingException",
+  "TooManyRequestsException",
+  "InternalServerError",
+  "ServiceUnavailable",
+]);
+const DYNAMODB_THROTTLED_WRITE_ERRORS = new Set([
+  "ProvisionedThroughputExceededException",
+  "RequestLimitExceeded",
+  "ThrottlingException",
+]);
 
 function canonicalDynamoNumber(value: unknown): string | null {
   const text =
@@ -183,8 +222,14 @@ function parseDynamoContainsNeedle(
 ):
   | { kind: "string"; value: string }
   | { kind: "number"; value: string }
-  | { kind: "binary"; value: string } {
+  | { kind: "binary"; value: string }
+  | { kind: "boolean"; value: boolean } {
+  if (nativeType === "string") return { kind: "string", value };
   const trimmed = value.trim();
+  const boolean = /^BOOL\((true|false)\)$/i.exec(trimmed);
+  if (boolean) {
+    return { kind: "boolean", value: boolean[1].toLowerCase() === "true" };
+  }
   try {
     const parsed = JSON.parse(trimmed) as unknown;
     if (typeof parsed === "string") return { kind: "string", value: parsed };
@@ -232,6 +277,8 @@ type DynamoSecondaryIndexSchema = {
   name: string;
   partitionKey: string;
   sortKey?: string;
+  projectionType?: string;
+  indexStatus?: string;
   type: "global" | "local";
 };
 
@@ -429,6 +476,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isUnsupportedDynamoDbCreateTableInput(
+  input: Record<string, unknown>,
+): boolean {
+  return (
+    Object.hasOwn(input, "CreateTable") ||
+    DYNAMODB_CREATE_TABLE_REQUEST_FIELDS.some((field) =>
+      Object.hasOwn(input, field),
+    )
+  );
+}
+
 function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((entry) => stableStringify(entry)).join(",")}]`;
@@ -442,9 +500,6 @@ function stableStringify(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const DYNAMODB_NATIVE_CELL_VALUE_PREFIX =
-  "DynamoDB native value (nested sets/binary): ";
-
 export class DynamoDBDriver implements IDBDriver {
   readonly supportsAtomicUpdateRows = true;
   private client: DynamoDBClient | null = null;
@@ -456,6 +511,8 @@ export class DynamoDBDriver implements IDBDriver {
   private pendingClient: DynamoDBClient | null = null;
   private readonly destroyedClients = new WeakSet<DynamoDBClient>();
   private readonly cursorCache = new Map<string, DynamoCursorSession>();
+  private readonly describedColumnsCache = new Map<string, ColumnTypeMeta[]>();
+  private describedColumnsGeneration = 0;
 
   constructor(private readonly config: ConnectionConfig) {}
 
@@ -499,8 +556,6 @@ export class DynamoDBDriver implements IDBDriver {
     const tlsServername = getTlsServername(this.config);
 
     const client = new DynamoDBClient({
-      // Native requests can contain non-idempotent ADD/list_append updates.
-      // Never replay an ambiguous write, including via AWS_MAX_ATTEMPTS.
       maxAttempts: 1,
       region: this.config.awsRegion || "us-east-1",
       endpoint: this.config.endpoint ?? this.config.awsEndpoint,
@@ -546,6 +601,7 @@ export class DynamoDBDriver implements IDBDriver {
     this.publishedConnectionAttempt = attempt;
     this.connected = true;
     this.cursorCache.clear();
+    this.clearDescribedColumnsCache();
   }
 
   private destroyClient(client: DynamoDBClient): void {
@@ -575,6 +631,7 @@ export class DynamoDBDriver implements IDBDriver {
     this.pendingClient = null;
     this.connected = false;
     this.cursorCache.clear();
+    this.clearDescribedColumnsCache();
     if (client) this.destroyClient(client);
     if (pendingClient) this.destroyClient(pendingClient);
   }
@@ -593,7 +650,11 @@ export class DynamoDBDriver implements IDBDriver {
       queryMode: "text" as const,
       supportsMutations: true,
       isTableFilterError: (message: string) =>
-        message.startsWith(DYNAMODB_TABLE_FILTER_ERROR_PREFIX),
+        message.startsWith(DYNAMODB_TABLE_FILTER_ERROR_PREFIX) ||
+        /^(?:ValidationException:\s*)?Invalid FilterExpression:/i.test(
+          message,
+        ) ||
+        /Condition parameter type does not match schema type/i.test(message),
       readOnlyQueryGuard: (queryText: string) =>
         this.decideReadOnlyQuery(queryText),
       editorPresentation: {
@@ -628,10 +689,14 @@ export class DynamoDBDriver implements IDBDriver {
     const seenContinuations = new Set<string>();
     let continuation: string | undefined;
     do {
-      const result = await client.send(
-        new ListTablesCommand(
-          continuation ? { ExclusiveStartTableName: continuation } : {},
-        ),
+      const result = await this.retryRead(
+        () =>
+          client.send(
+            new ListTablesCommand(
+              continuation ? { ExclusiveStartTableName: continuation } : {},
+            ),
+          ),
+        getMetadataContext()?.signal,
       );
       for (const name of result.TableNames ?? []) tableNames.add(name);
       continuation = result.LastEvaluatedTableName;
@@ -682,11 +747,29 @@ export class DynamoDBDriver implements IDBDriver {
     table: string,
     context: DynamoReadContext = {},
   ): Promise<ColumnTypeMeta[]> {
+    const cached = this.describedColumnsCache.get(table);
+    if (cached) {
+      return cached;
+    }
+    const generation = this.describedColumnsGeneration;
     const [rows, schema] = await Promise.all([
       this.readRowsForDescription(table, 1000, context),
       this.getTableSchema(table, context),
     ]);
-    return this.buildDynamoColumns(rows, schema);
+    const columns = this.buildDynamoColumns(rows, schema);
+    if (generation === this.describedColumnsGeneration) {
+      this.describedColumnsCache.set(table, columns);
+    }
+    return columns;
+  }
+
+  private clearDescribedColumnsCache(table?: string): void {
+    this.describedColumnsGeneration += 1;
+    if (table === undefined) {
+      this.describedColumnsCache.clear();
+    } else {
+      this.describedColumnsCache.delete(table);
+    }
   }
 
   async getIndexes(
@@ -695,8 +778,12 @@ export class DynamoDBDriver implements IDBDriver {
     table: string,
   ): Promise<IndexMeta[]> {
     try {
-      const description = await this.requireClient().send(
-        new DescribeTableCommand({ TableName: table }),
+      const description = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new DescribeTableCommand({ TableName: table }),
+          ),
+        getMetadataContext()?.signal,
       );
       const globalIndexes = (
         description.Table?.GlobalSecondaryIndexes ?? []
@@ -869,7 +956,6 @@ export class DynamoDBDriver implements IDBDriver {
     throwIfQueryCancelled(options);
     const inputs = parseDynamoDbNativeQueryInputs(queryText);
     const operation = this.resolveNativeOperation(inputs);
-    // Decode and validate the whole script before submitting its first write.
     const preparedInputs = inputs.map((input) =>
       this.requireInputRecord(input),
     );
@@ -878,15 +964,40 @@ export class DynamoDBDriver implements IDBDriver {
     const responseMetadata: Record<string, unknown>[] = [];
     let affectedRows = 0;
     let sawMutation = false;
+    let affectedRowsUnknown = false;
+    let partialError: string | undefined;
 
-    for (const input of preparedInputs) {
-      throwIfQueryCancelled(options);
-      const result = await this.dispatchNativeCommand(
-        operation,
-        input,
-        options,
-      );
-      throwIfQueryCancelled(options);
+    const isMutation = !READ_ONLY_DYNAMODB_OPERATIONS.has(operation);
+    const total = preparedInputs.length;
+    const appliedText = (count: number) =>
+      `${count} of ${total} request${total === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} applied`;
+    for (const [index, input] of preparedInputs.entries()) {
+      try {
+        throwIfQueryCancelled(options);
+      } catch (error: unknown) {
+        if (index === 0 || !isMutation) throw error;
+        partialError = `DynamoDB ${operation} script was cancelled after ${appliedText(index)}. The remaining requests were not sent.`;
+        break;
+      }
+      let result: QueryDispatchResult;
+      try {
+        result = await this.dispatchNativeCommand(operation, input, options);
+      } catch (error: unknown) {
+        if (index === 0 || !isMutation) {
+          throw error;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        const request = `request ${index + 1} of ${total}`;
+        partialError = options?.signal?.aborted
+          ? `DynamoDB ${operation} script was cancelled during ${request} after ${appliedText(index)}. The outcome of ${request} is unknown and the remaining requests were not sent.`
+          : this.isConditionalCheckFailure(error) ||
+              this.isValidationException(error) ||
+              this.isTransactionCanceled(error) ||
+              this.isWriteThrottled(error)
+            ? `DynamoDB ${operation} ${request} failed after ${appliedText(index)}. It was not applied and the remaining requests were not sent. ${message}`
+            : `DynamoDB ${operation} ${request} failed after ${appliedText(index)}. Its outcome is unknown and the remaining requests were not sent. ${message}`;
+        break;
+      }
       rawRows.push(...result.rows);
       if (result.responseMetadata) {
         responseMetadata.push(result.responseMetadata);
@@ -894,7 +1005,22 @@ export class DynamoDBDriver implements IDBDriver {
       if (result.affectedRows !== undefined) {
         sawMutation = true;
         affectedRows += result.affectedRows;
+      } else if (isMutation) {
+        affectedRowsUnknown = true;
       }
+      try {
+        throwIfQueryCancelled(options);
+      } catch (error: unknown) {
+        if (!isMutation) throw error;
+        partialError = `DynamoDB ${operation} script was cancelled after ${appliedText(index + 1)}.${index + 1 < total ? " The remaining requests were not sent." : ""}`;
+        break;
+      }
+    }
+    const unprocessedWarnings = responseMetadata.flatMap((metadata) =>
+      typeof metadata.warning === "string" ? [metadata.warning] : [],
+    );
+    if (partialError !== undefined && unprocessedWarnings.length > 0) {
+      partialError = `${partialError} Applied requests also reported: ${unprocessedWarnings.join(" ")}`;
     }
 
     const columns = inferColumnsFromRows(rawRows, "id").map(
@@ -910,15 +1036,24 @@ export class DynamoDBDriver implements IDBDriver {
       columns,
       columnMeta: columns.map((name) => ({
         category:
-          this.describeSampleValues(rawRows.map((row) => row[name]))
+          this.describeSampleValues(rawRows.map((row) => ownField(row, name)))
             ?.category ?? null,
       })),
       rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
+      ...(READ_ONLY_DYNAMODB_OPERATIONS.has(operation)
+        ? {
+            exportRows: rawRows.map((row) =>
+              this.mapRowToQueryExportRow(row, columns),
+            ),
+          }
+        : {}),
       ...(responseMetadata.length > 0 ? { responseMetadata } : {}),
       ...(missingCells.length > 0 ? { missingCells } : {}),
       rowCount: rawRows.length,
-      affectedRows: sawMutation ? affectedRows : undefined,
+      affectedRows:
+        sawMutation && !affectedRowsUnknown ? affectedRows : undefined,
       executionTimeMs: Date.now() - startedAt,
+      ...(partialError !== undefined ? { error: partialError } : {}),
     };
   }
 
@@ -951,6 +1086,7 @@ export class DynamoDBDriver implements IDBDriver {
     );
     throwIfReadCancelled(request);
     this.validateNumericTableFilters(request.filters, describedColumns);
+    this.validateBooleanTableFilters(request.filters, describedColumns);
     const describedByName = new Map(
       describedColumns.map((column) => [column.name, column]),
     );
@@ -984,6 +1120,9 @@ export class DynamoDBDriver implements IDBDriver {
           describedColumns,
         ),
         rows: filteredPage.formattedRows,
+        rowValueTypes: filteredPage.formattedRows.map((row) =>
+          this.getTableRowValueTypes(row),
+        ),
         totalCount: 0,
         executionTimeMs: Math.round(performance.now() - startTime),
       };
@@ -1023,6 +1162,9 @@ export class DynamoDBDriver implements IDBDriver {
           describedColumns,
         ),
         rows: pageRows(sortedRows, request.page, request.pageSize),
+        rowValueTypes: pageRows(sortedRows, request.page, request.pageSize).map(
+          (row) => this.getTableRowValueTypes(row),
+        ),
         totalCount: request.skipCount ? 0 : sortedRows.length,
         executionTimeMs: Math.round(performance.now() - startTime),
       };
@@ -1046,6 +1188,9 @@ export class DynamoDBDriver implements IDBDriver {
         describedColumns,
       ),
       rows: formattedRows,
+      rowValueTypes: formattedRows.map((row) =>
+        this.getTableRowValueTypes(row),
+      ),
       totalCount: request.skipCount
         ? 0
         : await this.countReadPlan(plan, request),
@@ -1070,6 +1215,18 @@ export class DynamoDBDriver implements IDBDriver {
       return input ? [{ input, rowIndex }] : [];
     });
     const inputRowIndexes = new Set(inputs.map(({ rowIndex }) => rowIndex));
+    if (inputs.length > DYNAMODB_MAX_TRANSACT_ITEMS) {
+      throw new DriverUpdateRowsError(
+        `DynamoDB applies multi-row edits in a single transaction, which is limited to ${DYNAMODB_MAX_TRANSACT_ITEMS} items. ${inputs.length} edited rows were not applied; apply at most ${DYNAMODB_MAX_TRANSACT_ITEMS} rows at a time.`,
+        {
+          affectedRows: 0,
+          updateRowOutcomes: request.updates.map((_, rowIndex) => ({
+            rowIndex,
+            status: "not_applied" as const,
+          })),
+        },
+      );
+    }
     if (inputs.length > 1) {
       try {
         await this.requireClient().send(
@@ -1097,6 +1254,13 @@ export class DynamoDBDriver implements IDBDriver {
             })),
           );
         }
+        const notApplied =
+          this.isTransactionCanceled(error) ||
+          this.isValidationException(error) ||
+          this.isWriteThrottled(error);
+        if (!notApplied) {
+          this.invalidateCursorCacheForTable(request.table);
+        }
         throw new DriverUpdateRowsError(
           error instanceof Error ? error.message : String(error),
           {
@@ -1104,8 +1268,7 @@ export class DynamoDBDriver implements IDBDriver {
             updateRowOutcomes: request.updates.map((_, rowIndex) => ({
               rowIndex,
               status:
-                inputRowIndexes.has(rowIndex) &&
-                !this.isTransactionCanceled(error)
+                inputRowIndexes.has(rowIndex) && !notApplied
                   ? ("unknown" as const)
                   : ("not_applied" as const),
             })),
@@ -1132,36 +1295,57 @@ export class DynamoDBDriver implements IDBDriver {
           ? []
           : [{ rowIndex, status: "not_applied" as const }],
     );
-    for (const { input, rowIndex } of inputs) {
-      context?.signal.throwIfAborted();
-      try {
-        const response = await this.requireClient().send(
-          new UpdateItemCommand(input),
-          context ? { abortSignal: context.signal } : undefined,
-        );
-        if (response.Attributes) {
-          affectedRows++;
-          completedOutcomes.push({ rowIndex, status: "applied" });
-        } else {
-          completedOutcomes.push({ rowIndex, status: "unknown" });
+    let tableMayHaveChanged = false;
+    try {
+      for (const { input, rowIndex } of inputs) {
+        context?.signal.throwIfAborted();
+        try {
+          const response = await this.requireClient().send(
+            new UpdateItemCommand(input),
+            context ? { abortSignal: context.signal } : undefined,
+          );
+          tableMayHaveChanged = true;
+          if (response.Attributes) {
+            affectedRows++;
+            completedOutcomes.push({ rowIndex, status: "applied" });
+          } else {
+            completedOutcomes.push({ rowIndex, status: "unknown" });
+          }
+        } catch (error: unknown) {
+          if (this.isConditionalCheckFailure(error)) {
+            completedOutcomes.push({ rowIndex, status: "not_applied" });
+            continue;
+          }
+          if (
+            this.isValidationException(error) ||
+            this.isWriteThrottled(error)
+          ) {
+            throw failedDriverUpdateRows(
+              error,
+              request.updates.length,
+              completedOutcomes,
+              rowIndex,
+              affectedRows,
+              false,
+            );
+          }
+          tableMayHaveChanged = true;
+          throw failedDriverUpdateRows(
+            error,
+            request.updates.length,
+            completedOutcomes,
+            rowIndex,
+            affectedRows,
+            true,
+          );
         }
-      } catch (error: unknown) {
-        if (this.isConditionalCheckFailure(error)) {
-          completedOutcomes.push({ rowIndex, status: "not_applied" });
-          continue;
-        }
-        throw failedDriverUpdateRows(
-          error,
-          request.updates.length,
-          completedOutcomes,
-          rowIndex,
-          affectedRows,
-          true,
-        );
+      }
+    } finally {
+      if (tableMayHaveChanged) {
+        this.invalidateCursorCacheForTable(request.table);
       }
     }
 
-    this.invalidateCursorCacheForTable(request.table);
     return completeDriverUpdateRowsResult(affectedRows, completedOutcomes);
   }
 
@@ -1171,6 +1355,11 @@ export class DynamoDBDriver implements IDBDriver {
   ): Promise<DriverMutationResult> {
     context?.signal.throwIfAborted();
     const schema = await this.getTableSchema(request.table, context);
+    if (schema.keys.length === 0) {
+      throw new MutationNotExecutedError(
+        "DynamoDB key schema is unavailable (DescribeTable denied or table missing); insert was not sent.",
+      );
+    }
     const input = this.buildPutItemInput(
       request.table,
       schema.keys,
@@ -1186,7 +1375,19 @@ export class DynamoDBDriver implements IDBDriver {
       return { affectedRows: 1 };
     } catch (error: unknown) {
       if (this.isConditionalCheckFailure(error)) {
-        return { affectedRows: 0 };
+        throw new MutationNotExecutedError(
+          "Insert rejected because an item with the same primary key already exists. No item was written.",
+          error,
+        );
+      }
+      if (this.isWriteThrottled(error)) {
+        throw new MutationNotExecutedError(
+          `Insert was throttled by DynamoDB and was not written: ${error instanceof Error ? error.message : String(error)}`,
+          error,
+        );
+      }
+      if (!this.isValidationException(error)) {
+        this.invalidateCursorCacheForTable(request.table);
       }
       throw error;
     }
@@ -1221,6 +1422,12 @@ export class DynamoDBDriver implements IDBDriver {
               return response.Attributes ? "deleted" : "notfound";
             } catch (error) {
               if (this.isConditionalCheckFailure(error)) return "notfound";
+              if (this.isWriteThrottled(error)) {
+                throw new MutationNotExecutedError(
+                  `Delete was throttled by DynamoDB and was not applied: ${error instanceof Error ? error.message : String(error)}`,
+                  error,
+                );
+              }
               throw error;
             }
           };
@@ -1240,6 +1447,7 @@ export class DynamoDBDriver implements IDBDriver {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
       originalValues?: Record<string, unknown>;
+      originalTypes?: Record<string, MongoValueTypeHint>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -1322,14 +1530,21 @@ export class DynamoDBDriver implements IDBDriver {
       return value;
     }
 
-    const decoded = decodeDynamoCellInput(value, true);
+    const nativeType = column.nativeType.toLowerCase();
+    const decoded =
+      nativeType === "binary set" ? value : decodeDynamoCellInput(value, true);
     if (decoded !== value) {
       return decoded;
     }
 
     const trimmed = value.trim();
-    const nativeType = column.nativeType.toLowerCase();
-    if (value.startsWith(DYNAMODB_NATIVE_CELL_VALUE_PREFIX)) {
+    if (
+      value.startsWith(DYNAMODB_NATIVE_CELL_VALUE_PREFIX) ||
+      (nativeType !== "string" &&
+        trimmed.startsWith(DYNAMODB_NATIVE_CELL_VALUE_PREFIX))
+    ) {
+      const error = getDynamoDbNativeCellValidationError(trimmed, nativeType);
+      if (error) throw new Error(error);
       return this.parseNativeCellAttributeValue(
         trimmed.slice(DYNAMODB_NATIVE_CELL_VALUE_PREFIX.length),
       );
@@ -1345,27 +1560,59 @@ export class DynamoDBDriver implements IDBDriver {
         if (/^(false|0)$/i.test(trimmed)) {
           return false;
         }
-        return value;
+        throw new Error(
+          `DynamoDB Boolean value for "${column.name}" must be true, false, 1, or 0.`,
+        );
       case "number": {
-        return /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(trimmed)
-          ? NumberValueImpl.from(trimmed)
-          : value;
+        if (!DYNAMODB_NUMBER_RE.test(trimmed)) {
+          throw new Error(
+            `DynamoDB Number value for "${column.name}" must be a valid number.`,
+          );
+        }
+        return NumberValueImpl.from(trimmed);
       }
-      case "binary":
-        return this.parseBinaryInput(trimmed) ?? value;
-      case "string set":
-        return this.parseSetInput(trimmed, "string") ?? value;
-      case "number set":
-        return this.parseSetInput(trimmed, "number") ?? value;
-      case "binary set":
-        return this.parseSetInput(trimmed, "binary") ?? value;
+      case "binary": {
+        if (trimmed === "") return value;
+        const parsed = this.parseBinaryInput(trimmed);
+        if (parsed !== null) return parsed;
+        throw new Error(
+          `DynamoDB Binary value for "${column.name}" must be 0x-prefixed hex or base64.`,
+        );
+      }
+      case "string set": {
+        const parsed = this.parseSetInput(trimmed, "string");
+        if (parsed !== null) return parsed;
+        throw new Error(
+          `DynamoDB String Set value for "${column.name}" must be a <<'...'>> literal or a JSON array of strings.`,
+        );
+      }
+      case "number set": {
+        const parsed = this.parseSetInput(trimmed, "number");
+        if (parsed !== null) return parsed;
+        throw new Error(
+          "Enter a valid DynamoDB number set containing at least one number.",
+        );
+      }
+      case "binary set": {
+        const parsed = this.parseSetInput(trimmed, "binary");
+        if (parsed !== null) return parsed;
+        throw new Error(
+          `DynamoDB Binary Set value for "${column.name}" must contain valid binary values (0x-prefixed hex or base64).`,
+        );
+      }
       case "list": {
         const parsed = this.parseExactJsonValue(trimmed);
-        return Array.isArray(parsed) ? parsed : value;
+        if (Array.isArray(parsed)) return parsed;
+        throw new Error(
+          "Enter a JSON array before applying this DynamoDB List value.",
+        );
       }
       case "map": {
         const parsed = this.parseExactJsonValue(trimmed);
-        return this.isPlainObject(parsed) ? parsed : value;
+        if (this.isPlainObject(parsed)) return parsed;
+        throw new Error(
+          "Enter a JSON object before applying this DynamoDB Map value.",
+        );
       }
       default:
         if (column.category === "array") {
@@ -1381,6 +1628,27 @@ export class DynamoDBDriver implements IDBDriver {
 
   formatOutputValue(value: unknown, _column: ColumnTypeMeta): unknown {
     return this.formatDynamoCellValue(value);
+  }
+
+  formatTableExportChunk(
+    chunk: DriverTableExportChunk,
+  ): DriverTableExportChunk {
+    const missingCells: NonNullable<DriverTableExportChunk["missingCells"]> =
+      [];
+    const rows = chunk.rows.map((displayRow, rowIndex) => {
+      const rawRow = this.tableRawRows.get(displayRow) ?? displayRow;
+      chunk.columns.forEach((column, columnIndex) => {
+        if (!Object.hasOwn(rawRow, column.name)) {
+          missingCells.push({ rowIndex, columnIndex });
+        }
+      });
+      return this.mapDynamoItemToExportRow(rawRow);
+    });
+    return {
+      columns: chunk.columns,
+      rows,
+      ...(missingCells.length > 0 ? { missingCells } : {}),
+    };
   }
 
   checkPersistedEdit(
@@ -1399,13 +1667,7 @@ export class DynamoDBDriver implements IDBDriver {
     if (operator === "is_null" || operator === "is_not_null") {
       return undefined;
     }
-    if (value === undefined) {
-      return undefined;
-    }
-    if (Array.isArray(value)) {
-      return value.map((entry) => entry.trim()) as [string, string];
-    }
-    return value.trim();
+    return value;
   }
 
   buildFilterCondition(
@@ -1523,10 +1785,58 @@ export class DynamoDBDriver implements IDBDriver {
     });
   }
 
+  private async retryRead<T>(
+    read: () => Promise<T>,
+    signal?: AbortSignal,
+    deadline?: number,
+  ): Promise<T> {
+    const retryUntil = Math.min(
+      Date.now() + DYNAMODB_READ_RETRY_BUDGET_MS,
+      deadline ?? Number.POSITIVE_INFINITY,
+    );
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await read();
+      } catch (error: unknown) {
+        const ceiling = Math.min(
+          DYNAMODB_READ_RETRY_MAX_DELAY_MS,
+          DYNAMODB_READ_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1),
+        );
+        const wait = Math.round(ceiling / 2 + (Math.random() * ceiling) / 2);
+        if (
+          attempt >= DYNAMODB_READ_MAX_ATTEMPTS ||
+          signal?.aborted ||
+          !this.isRetryableReadError(error) ||
+          Date.now() + wait >= retryUntil
+        ) {
+          throw error;
+        }
+        await delay(wait, undefined, signal ? { signal } : undefined);
+      }
+    }
+  }
+
+  private isRetryableReadError(error: unknown): boolean {
+    if (!isRecord(error)) {
+      return false;
+    }
+    const statusCode = isRecord(error.$metadata)
+      ? error.$metadata.httpStatusCode
+      : undefined;
+    return (
+      (typeof error.name === "string" &&
+        DYNAMODB_RETRYABLE_READ_ERRORS.has(error.name)) ||
+      isRecord(error.$retryable) ||
+      statusCode === 429 ||
+      (typeof statusCode === "number" && statusCode >= 500)
+    );
+  }
+
   private invalidateCursorCacheForTable(table: string): void {
     if (!table) {
       return;
     }
+    this.clearDescribedColumnsCache(table);
     const serializedTable = JSON.stringify(table).slice(1, -1);
     for (const key of [...this.cursorCache.keys()]) {
       if (key.includes(`"table":"${serializedTable}"`)) {
@@ -1537,13 +1847,18 @@ export class DynamoDBDriver implements IDBDriver {
 
   clearTableReadCache(): void {
     this.cursorCache.clear();
+    this.clearDescribedColumnsCache();
   }
 
   private async describeTableDefinition(
     table: string,
   ): Promise<TableDescription> {
-    const response = await this.requireClient().send(
-      new DescribeTableCommand({ TableName: table }),
+    const response = await this.retryRead(
+      () =>
+        this.requireClient().send(
+          new DescribeTableCommand({ TableName: table }),
+        ),
+      getMetadataContext()?.signal,
     );
     if (!response.Table) {
       throw new Error(`Table "${table}" not found`);
@@ -1639,9 +1954,14 @@ export class DynamoDBDriver implements IDBDriver {
   ): Promise<DynamoTableSchema> {
     throwIfReadCancelled(context);
     try {
-      const description = await this.requireClient().send(
-        new DescribeTableCommand({ TableName: table }),
-        context.signal ? { abortSignal: context.signal } : undefined,
+      const description = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new DescribeTableCommand({ TableName: table }),
+            context.signal ? { abortSignal: context.signal } : undefined,
+          ),
+        context.signal,
+        context.deadline,
       );
       throwIfReadCancelled(context);
       const keyRoles = new Map<string, PrimaryKeyRole>();
@@ -1682,8 +2002,15 @@ export class DynamoDBDriver implements IDBDriver {
           ),
         ],
       };
-    } catch {
+    } catch (error: unknown) {
       throwIfReadCancelled(context);
+      if (
+        !(error instanceof Error) ||
+        (error.name !== "ResourceNotFoundException" &&
+          error.name !== "AccessDeniedException")
+      ) {
+        throw error;
+      }
       return {
         keys: [],
         keyRoles: new Map(),
@@ -1713,6 +2040,10 @@ export class DynamoDBDriver implements IDBDriver {
           name: index.IndexName,
           partitionKey,
           ...(sortKey ? { sortKey } : {}),
+          projectionType: index.Projection?.ProjectionType,
+          ...("IndexStatus" in index && index.IndexStatus
+            ? { indexStatus: index.IndexStatus }
+            : {}),
           type,
         } satisfies DynamoSecondaryIndexSchema;
       })
@@ -1762,12 +2093,21 @@ export class DynamoDBDriver implements IDBDriver {
         indexName: undefined,
         partitionKey: schema.partitionKey,
         sortKey: schema.sortKey,
+        requireSortKeyCondition: false,
       },
-      ...schema.secondaryIndexes.map((index) => ({
-        indexName: index.name,
-        partitionKey: index.partitionKey,
-        sortKey: index.sortKey,
-      })),
+      ...schema.secondaryIndexes
+        .filter(
+          (index) =>
+            index.projectionType === "ALL" &&
+            (index.indexStatus === undefined || index.indexStatus === "ACTIVE"),
+        )
+        .map((index) => ({
+          indexName: index.name,
+          partitionKey: index.partitionKey,
+          sortKey: index.sortKey,
+          requireSortKeyCondition:
+            index.sortKey !== undefined && !schema.keys.includes(index.sortKey),
+        })),
     ];
 
     for (const candidate of queryCandidates) {
@@ -1779,6 +2119,7 @@ export class DynamoDBDriver implements IDBDriver {
         candidate.sortKey,
         indexedFilters,
         columnsByName,
+        candidate.requireSortKeyCondition,
       );
       if (plan) {
         return plan;
@@ -1802,7 +2143,7 @@ export class DynamoDBDriver implements IDBDriver {
       return null;
     }
 
-    const key: Record<string, unknown> = {};
+    const entries: Array<[string, unknown]> = [];
     for (const keyName of keyNames) {
       const keyFilters = indexedFilters.filter(
         ({ filter }) => filter.column === keyName,
@@ -1814,12 +2155,23 @@ export class DynamoDBDriver implements IDBDriver {
       ) {
         return null;
       }
-      key[keyName] = this.coerceFilterValueForColumn(
+      const value = this.coerceFilterValueForColumn(
         columnsByName.get(keyName),
         keyFilters[0].filter.value,
       );
+      if (this.isEmptyKeyValue(value)) {
+        return null;
+      }
+      entries.push([keyName, value]);
     }
-    return key;
+    return Object.fromEntries(entries);
+  }
+
+  private isEmptyKeyValue(value: unknown): boolean {
+    if (Array.isArray(value)) {
+      return value.some((entry) => this.isEmptyKeyValue(entry));
+    }
+    return value === "" || this.toBinaryBuffer(value)?.length === 0;
   }
 
   private buildQueryReadPlan(
@@ -1830,6 +2182,7 @@ export class DynamoDBDriver implements IDBDriver {
     sortKey: string | undefined,
     indexedFilters: readonly IndexedFilter[],
     columnsByName: ReadonlyMap<string, ColumnTypeMeta>,
+    requireSortKeyCondition: boolean,
   ): QueryReadPlan | null {
     if (!partitionKey) {
       return null;
@@ -1846,14 +2199,15 @@ export class DynamoDBDriver implements IDBDriver {
     }
     consumed.add(partitionFilter.index);
 
-    const partitionName = this.addNamePlaceholder(state, partitionKey);
-    const partitionValue = this.addValuePlaceholder(
-      state,
-      this.coerceFilterValueForColumn(
-        columnsByName.get(partitionKey),
-        partitionFilter.filter.value,
-      ),
+    const partitionKeyValue = this.coerceFilterValueForColumn(
+      columnsByName.get(partitionKey),
+      partitionFilter.filter.value,
     );
+    if (this.isEmptyKeyValue(partitionKeyValue)) {
+      return null;
+    }
+    const partitionName = this.addNamePlaceholder(state, partitionKey);
+    const partitionValue = this.addValuePlaceholder(state, partitionKeyValue);
     let keyConditionExpression = `${partitionName} = ${partitionValue}`;
 
     if (sortKey) {
@@ -1868,11 +2222,28 @@ export class DynamoDBDriver implements IDBDriver {
         sortCondition.consumedIndexes.forEach((index) => {
           consumed.add(index);
         });
+      } else if (requireSortKeyCondition) {
+        return null;
       }
     }
 
+    const remainingFilters = indexedFilters.filter(
+      ({ index }) => !consumed.has(index),
+    );
+    if (
+      remainingFilters.some(
+        ({ filter }) =>
+          (filter.column === partitionKey || filter.column === sortKey) &&
+          !this.requiresClientSideFilter(
+            filter,
+            columnsByName.get(filter.column),
+          ),
+      )
+    ) {
+      return null;
+    }
     const filterExpression = this.buildNativeFilterExpression(
-      indexedFilters.filter(({ index }) => !consumed.has(index)),
+      remainingFilters,
       columnsByName,
       state,
     );
@@ -1960,11 +2331,15 @@ export class DynamoDBDriver implements IDBDriver {
 
     const eqFilter = keyFilters.find(({ filter }) => filter.operator === "eq");
     if (eqFilter && "value" in eqFilter.filter) {
-      const name = this.addNamePlaceholder(state, sortKey);
-      const value = this.addValuePlaceholder(
-        state,
-        this.coerceFilterValueForColumn(column, eqFilter.filter.value),
+      const keyValue = this.coerceFilterValueForColumn(
+        column,
+        eqFilter.filter.value,
       );
+      if (this.isEmptyKeyValue(keyValue)) {
+        return null;
+      }
+      const name = this.addNamePlaceholder(state, sortKey);
+      const value = this.addValuePlaceholder(state, keyValue);
       return {
         expression: `${name} = ${value}`,
         consumedIndexes: [eqFilter.index],
@@ -1979,16 +2354,15 @@ export class DynamoDBDriver implements IDBDriver {
       "value" in betweenFilter.filter &&
       Array.isArray(betweenFilter.filter.value)
     ) {
-      const name = this.addNamePlaceholder(state, sortKey);
       const [leftRaw, rightRaw] = betweenFilter.filter.value;
-      const left = this.addValuePlaceholder(
-        state,
-        this.coerceFilterValueForColumn(column, leftRaw),
-      );
-      const right = this.addValuePlaceholder(
-        state,
-        this.coerceFilterValueForColumn(column, rightRaw),
-      );
+      const leftValue = this.coerceFilterValueForColumn(column, leftRaw);
+      const rightValue = this.coerceFilterValueForColumn(column, rightRaw);
+      if (this.isEmptyKeyValue(leftValue) || this.isEmptyKeyValue(rightValue)) {
+        return null;
+      }
+      const name = this.addNamePlaceholder(state, sortKey);
+      const left = this.addValuePlaceholder(state, leftValue);
+      const right = this.addValuePlaceholder(state, rightValue);
       return {
         expression: `${name} BETWEEN ${left} AND ${right}`,
         consumedIndexes: [betweenFilter.index],
@@ -1999,11 +2373,15 @@ export class DynamoDBDriver implements IDBDriver {
       ["gte", "gt", "lte", "lt"].includes(filter.operator),
     );
     if (comparator && "value" in comparator.filter) {
-      const name = this.addNamePlaceholder(state, sortKey);
-      const value = this.addValuePlaceholder(
-        state,
-        this.coerceFilterValueForColumn(column, comparator.filter.value),
+      const keyValue = this.coerceFilterValueForColumn(
+        column,
+        comparator.filter.value,
       );
+      if (this.isEmptyKeyValue(keyValue)) {
+        return null;
+      }
+      const name = this.addNamePlaceholder(state, sortKey);
+      const value = this.addValuePlaceholder(state, keyValue);
       const operator = this.resolveScalarFilterOperator(
         comparator.filter.operator,
       );
@@ -2205,12 +2583,18 @@ export class DynamoDBDriver implements IDBDriver {
     context: DynamoReadContext,
   ): Promise<{ rows: Record<string, unknown>[] }> {
     if (plan.kind === "getItem") {
-      const response = await this.requireClient().send(
-        new GetItemCommand({
-          TableName: plan.table,
-          Key: this.marshallKey(plan.key),
-        }),
-        context.signal ? { abortSignal: context.signal } : undefined,
+      if (page > 1) return { rows: [] };
+      const response = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new GetItemCommand({
+              TableName: plan.table,
+              Key: this.marshallKey(plan.key),
+            }),
+            context.signal ? { abortSignal: context.signal } : undefined,
+          ),
+        context.signal,
+        context.deadline,
       );
       throwIfReadCancelled(context);
       return {
@@ -2249,6 +2633,9 @@ export class DynamoDBDriver implements IDBDriver {
 
     while (currentPage <= page) {
       session.cursorCycle.nextPage = 0;
+      for (const [signature, cursorPage] of session.cursorPages) {
+        if (cursorPage > currentPage) session.cursorPages.delete(signature);
+      }
       const step = await this.executeReadPlanStep(
         plan,
         cursor,
@@ -2271,9 +2658,21 @@ export class DynamoDBDriver implements IDBDriver {
       const nextPage = currentPage + 1;
       cycle.nextPage = nextPage;
       session.cursorCycle = { ...cycle };
+      const recordedNextStart = session.pageStarts.get(nextPage);
       if (step.nextCursor === undefined) {
+        if (recordedNextStart !== undefined) {
+          this.discardCursorPagesAfter(plan, session, currentPage);
+        }
         session.terminalPage = step.rows.length === 0 ? currentPage : nextPage;
       } else {
+        if (
+          (recordedNextStart !== undefined &&
+            stableStringify(recordedNextStart) !==
+              stableStringify(step.nextCursor)) ||
+          (session.terminalPage !== null && session.terminalPage <= nextPage)
+        ) {
+          this.discardCursorPagesAfter(plan, session, nextPage);
+        }
         this.setCursorPageStart(session, nextPage, step.nextCursor);
       }
 
@@ -2289,6 +2688,21 @@ export class DynamoDBDriver implements IDBDriver {
     }
 
     return { rows: [] };
+  }
+
+  private discardCursorPagesAfter(
+    plan: QueryReadPlan | ScanReadPlan,
+    session: DynamoCursorSession,
+    page: number,
+  ): void {
+    for (const startPage of [...session.pageStarts.keys()]) {
+      if (startPage > page) session.pageStarts.delete(startPage);
+    }
+    for (const [signature, cursorPage] of session.cursorPages) {
+      if (cursorPage > page) session.cursorPages.delete(signature);
+    }
+    session.terminalPage = null;
+    this.cursorCache.delete(`${plan.requestSignature}::count`);
   }
 
   private getCursorSession(cacheKey: string): DynamoCursorSession {
@@ -2360,9 +2774,14 @@ export class DynamoDBDriver implements IDBDriver {
           Limit: limit,
           ...(nextCursor ? { ExclusiveStartKey: nextCursor } : {}),
         };
-        const response = await this.requireClient().send(
-          new QueryCommand(input),
-          context.signal ? { abortSignal: context.signal } : undefined,
+        const response = await this.retryRead(
+          () =>
+            this.requireClient().send(
+              new QueryCommand(input),
+              context.signal ? { abortSignal: context.signal } : undefined,
+            ),
+          context.signal,
+          context.deadline,
         );
         throwIfReadCancelled(context);
         rows.push(
@@ -2375,9 +2794,14 @@ export class DynamoDBDriver implements IDBDriver {
           Limit: limit,
           ...(nextCursor ? { ExclusiveStartKey: nextCursor } : {}),
         };
-        const response = await this.requireClient().send(
-          new ScanCommand(input),
-          context.signal ? { abortSignal: context.signal } : undefined,
+        const response = await this.retryRead(
+          () =>
+            this.requireClient().send(
+              new ScanCommand(input),
+              context.signal ? { abortSignal: context.signal } : undefined,
+            ),
+          context.signal,
+          context.deadline,
         );
         throwIfReadCancelled(context);
         rows.push(
@@ -2432,12 +2856,17 @@ export class DynamoDBDriver implements IDBDriver {
   ): Promise<number> {
     throwIfReadCancelled(context);
     if (plan.kind === "getItem") {
-      const response = await this.requireClient().send(
-        new GetItemCommand({
-          TableName: plan.table,
-          Key: this.marshallKey(plan.key),
-        }),
-        context.signal ? { abortSignal: context.signal } : undefined,
+      const response = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new GetItemCommand({
+              TableName: plan.table,
+              Key: this.marshallKey(plan.key),
+            }),
+            context.signal ? { abortSignal: context.signal } : undefined,
+          ),
+        context.signal,
+        context.deadline,
       );
       throwIfReadCancelled(context);
       return response.Item ? 1 : 0;
@@ -2455,25 +2884,35 @@ export class DynamoDBDriver implements IDBDriver {
     do {
       throwIfReadCancelled(context);
       if (plan.kind === "query") {
-        const response = await this.requireClient().send(
-          new QueryCommand({
-            ...plan.baseInput,
-            Select: "COUNT",
-            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-          }),
-          context.signal ? { abortSignal: context.signal } : undefined,
+        const response = await this.retryRead(
+          () =>
+            this.requireClient().send(
+              new QueryCommand({
+                ...plan.baseInput,
+                Select: "COUNT",
+                ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+              }),
+              context.signal ? { abortSignal: context.signal } : undefined,
+            ),
+          context.signal,
+          context.deadline,
         );
         throwIfReadCancelled(context);
         totalCount += response.Count ?? 0;
         cursor = response.LastEvaluatedKey;
       } else {
-        const response = await this.requireClient().send(
-          new ScanCommand({
-            ...plan.baseInput,
-            Select: "COUNT",
-            ...(cursor ? { ExclusiveStartKey: cursor } : {}),
-          }),
-          context.signal ? { abortSignal: context.signal } : undefined,
+        const response = await this.retryRead(
+          () =>
+            this.requireClient().send(
+              new ScanCommand({
+                ...plan.baseInput,
+                Select: "COUNT",
+                ...(cursor ? { ExclusiveStartKey: cursor } : {}),
+              }),
+              context.signal ? { abortSignal: context.signal } : undefined,
+            ),
+          context.signal,
+          context.deadline,
         );
         throwIfReadCancelled(context);
         totalCount += response.Count ?? 0;
@@ -2492,12 +2931,17 @@ export class DynamoDBDriver implements IDBDriver {
     context: DynamoReadContext = {},
   ): Promise<MaterializedReadResult> {
     if (plan.kind === "getItem") {
-      const response = await this.requireClient().send(
-        new GetItemCommand({
-          TableName: plan.table,
-          Key: this.marshallKey(plan.key),
-        }),
-        context.signal ? { abortSignal: context.signal } : undefined,
+      const response = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new GetItemCommand({
+              TableName: plan.table,
+              Key: this.marshallKey(plan.key),
+            }),
+            context.signal ? { abortSignal: context.signal } : undefined,
+          ),
+        context.signal,
+        context.deadline,
       );
       throwIfReadCancelled(context);
       return {
@@ -2546,12 +2990,17 @@ export class DynamoDBDriver implements IDBDriver {
     const requiredMatches = offset + pageSize;
 
     if (plan.kind === "getItem") {
-      const response = await this.requireClient().send(
-        new GetItemCommand({
-          TableName: plan.table,
-          Key: this.marshallKey(plan.key),
-        }),
-        context.signal ? { abortSignal: context.signal } : undefined,
+      const response = await this.retryRead(
+        () =>
+          this.requireClient().send(
+            new GetItemCommand({
+              TableName: plan.table,
+              Key: this.marshallKey(plan.key),
+            }),
+            context.signal ? { abortSignal: context.signal } : undefined,
+          ),
+        context.signal,
+        context.deadline,
       );
       throwIfReadCancelled(context);
       const rawRows = response.Item ? [this.unmarshallItem(response.Item)] : [];
@@ -2645,7 +3094,13 @@ export class DynamoDBDriver implements IDBDriver {
     for (const keyName of keyNames) {
       if (
         Object.hasOwn(update.changes, keyName) &&
-        update.changes[keyName] !== update.primaryKeys[keyName]
+        !(
+          Object.hasOwn(update.primaryKeys, keyName) &&
+          this.sameDynamoValue(
+            update.changes[keyName],
+            update.primaryKeys[keyName],
+          )
+        )
       ) {
         throw new Error(
           `DynamoDB does not support updating key attribute '${keyName}'.`,
@@ -2668,12 +3123,26 @@ export class DynamoDBDriver implements IDBDriver {
     const condition = this.buildExistingItemConditionExpression(keyNames);
     Object.assign(names, condition.names);
     const originalConditions: string[] = [];
-    for (const [name, value] of Object.entries(update.originalValues ?? {})) {
-      if (keyNames.includes(name) || value === undefined) continue;
+    const originalNames = new Set([
+      ...Object.keys(update.originalValues ?? {}),
+      ...Object.keys(update.originalTypes ?? {}),
+    ]);
+    for (const name of originalNames) {
+      const value = ownField(update.originalValues ?? {}, name);
+      const missing =
+        (update.originalTypes && Object.hasOwn(update.originalTypes, name)
+          ? update.originalTypes[name]?.nativeType
+          : undefined) === "missing" &&
+        (value === undefined || value === null);
+      if (keyNames.includes(name) || (value === undefined && !missing)) {
+        continue;
+      }
       const index = originalConditions.length;
       const namePlaceholder = `#o${index}`;
       names[namePlaceholder] = name;
-      if (value === null) {
+      if (missing) {
+        originalConditions.push(`attribute_not_exists(${namePlaceholder})`);
+      } else if (value === null) {
         originalConditions.push(`${namePlaceholder} = :o${index}`);
         values[`:o${index}`] = { NULL: true };
       } else {
@@ -2721,14 +3190,35 @@ export class DynamoDBDriver implements IDBDriver {
     if (keyNames.length === 0) {
       return null;
     }
-    const key: Record<string, unknown> = {};
+    const entries: Array<[string, unknown]> = [];
     for (const keyName of keyNames) {
-      if (source[keyName] === undefined) {
+      const value = Object.hasOwn(source, keyName)
+        ? source[keyName]
+        : undefined;
+      if (value === undefined) {
         return null;
       }
-      key[keyName] = source[keyName];
+      entries.push([keyName, value]);
     }
-    return key;
+    return Object.fromEntries(entries);
+  }
+
+  private sameDynamoValue(left: unknown, right: unknown): boolean {
+    let a: AttributeValue;
+    let b: AttributeValue;
+    try {
+      a = this.toAttributeValue(left);
+      b = this.toAttributeValue(right);
+    } catch {
+      return left === right;
+    }
+    if (a.N !== undefined && b.N !== undefined) {
+      return canonicalDynamoNumber(a.N) === canonicalDynamoNumber(b.N);
+    }
+    if (a.B !== undefined && b.B !== undefined) {
+      return Buffer.from(a.B).equals(Buffer.from(b.B));
+    }
+    return stableStringify(a) === stableStringify(b);
   }
 
   private buildExistingItemConditionExpression(keyNames: readonly string[]): {
@@ -2805,6 +3295,56 @@ export class DynamoDBDriver implements IDBDriver {
       .value as AttributeValue;
   }
 
+  private toDynamoExportValue(value: unknown): Record<string, unknown> {
+    return this.serializeDynamoAttributeValue(this.toAttributeValue(value));
+  }
+
+  private serializeDynamoAttributeValue(
+    value: AttributeValue,
+  ): Record<string, unknown> {
+    if (value.S !== undefined) return { S: value.S };
+    if (value.N !== undefined) return { N: value.N };
+    if (value.BOOL !== undefined) return { BOOL: value.BOOL };
+    if (value.NULL !== undefined) return { NULL: value.NULL };
+    if (value.B !== undefined) {
+      return { B: Buffer.from(value.B).toString("base64") };
+    }
+    if (value.SS !== undefined) return { SS: [...value.SS] };
+    if (value.NS !== undefined) return { NS: [...value.NS] };
+    if (value.BS !== undefined) {
+      return {
+        BS: [...value.BS].map((entry) => Buffer.from(entry).toString("base64")),
+      };
+    }
+    if (value.M !== undefined) {
+      return {
+        M: Object.fromEntries(
+          Object.entries(value.M).map(([name, entry]) => [
+            name,
+            this.serializeDynamoAttributeValue(entry),
+          ]),
+        ),
+      };
+    }
+    if (value.L !== undefined) {
+      return {
+        L: value.L.map((entry) => this.serializeDynamoAttributeValue(entry)),
+      };
+    }
+    throw new Error("Unsupported DynamoDB AttributeValue in export.");
+  }
+
+  private mapDynamoItemToExportRow(
+    row: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return Object.fromEntries(
+      Object.entries(row).map(([name, value]) => [
+        name,
+        this.toDynamoExportValue(value),
+      ]),
+    );
+  }
+
   private unmarshallItem(
     item: Record<string, AttributeValue>,
   ): Record<string, unknown> {
@@ -2833,10 +3373,28 @@ export class DynamoDBDriver implements IDBDriver {
     options?: QueryExecutionOptions,
   ): Promise<QueryDispatchResult> {
     const spec = DYNAMO_NATIVE_DISPATCH_MAP[operation];
-    const output = await this.requireClient().send(
-      new spec.ctor(input as never) as never,
-      ...(options?.signal ? ([{ abortSignal: options.signal }] as const) : []),
-    );
+    const send = () =>
+      this.requireClient().send(
+        new spec.ctor(input as never) as never,
+        ...(options?.signal
+          ? ([{ abortSignal: options.signal }] as const)
+          : []),
+      );
+    let output: Awaited<ReturnType<typeof send>>;
+    try {
+      output = READ_ONLY_DYNAMODB_OPERATIONS.has(operation)
+        ? await this.retryRead(send, options?.signal)
+        : await send();
+    } catch (error: unknown) {
+      if (
+        !this.isConditionalCheckFailure(error) &&
+        !this.isValidationException(error) &&
+        !this.isTransactionCanceled(error)
+      ) {
+        this.applyNativeDispatchInvalidation(spec.invalidation, input);
+      }
+      throw error;
+    }
 
     this.applyNativeDispatchInvalidation(spec.invalidation, input);
 
@@ -2909,6 +3467,12 @@ export class DynamoDBDriver implements IDBDriver {
   private resolveNativeOperation(
     inputs: readonly Record<string, unknown>[],
   ): DynamoDbNativeOperationName {
+    if (inputs.some(isUnsupportedDynamoDbCreateTableInput)) {
+      throw new Error(
+        "DynamoDB Query Editor does not support CreateTable requests. Create tables with AWS administration tooling.",
+      );
+    }
+
     const inferredOperations = new Set<DynamoDbNativeOperationName>();
     for (const input of inputs) {
       const inferred = inferDynamoDbNativeOperationName(input);
@@ -2939,9 +3503,6 @@ export class DynamoDBDriver implements IDBDriver {
   private normalizeNativeInputValue(value: unknown): unknown {
     if (!isRecord(value)) return value;
     const result = { ...value };
-    // Request structures, attribute maps, and AttributeValue envelopes are
-    // different namespaces. An attribute/table named B, BS, M, or Item must
-    // never be mistaken for an envelope or request field.
     for (const key of [
       "Key",
       "Item",
@@ -3199,6 +3760,10 @@ export class DynamoDBDriver implements IDBDriver {
                 : row;
             });
           }),
+          ...this.unprocessedBatchMetadata(
+            "UnprocessedKeys",
+            typedOutput.UnprocessedKeys,
+          ),
         };
       }
       case "TransactGetItems": {
@@ -3220,11 +3785,19 @@ export class DynamoDBDriver implements IDBDriver {
           | PutItemCommandOutput
           | UpdateItemCommandOutput
           | DeleteItemCommandOutput;
+        const affectedRows =
+          operation !== "DeleteItem"
+            ? 1
+            : input?.ReturnValues === "ALL_OLD"
+              ? typedOutput.Attributes
+                ? 1
+                : 0
+              : undefined;
         return {
           rows: typedOutput.Attributes
             ? [this.unmarshallItem(typedOutput.Attributes)]
             : [],
-          affectedRows: 1,
+          ...(affectedRows !== undefined ? { affectedRows } : {}),
         };
       }
       case "BatchWriteItem": {
@@ -3238,13 +3811,19 @@ export class DynamoDBDriver implements IDBDriver {
         return {
           rows: [],
           affectedRows: Math.max(0, requestedCount - unprocessedCount),
+          ...this.unprocessedBatchMetadata(
+            "UnprocessedItems",
+            typedOutput.UnprocessedItems,
+          ),
         };
       }
       case "TransactWriteItems":
         return {
           rows: [],
           affectedRows: Array.isArray(input?.TransactItems)
-            ? input.TransactItems.length
+            ? input.TransactItems.filter(
+                (item) => !isRecord(item) || item.ConditionCheck === undefined,
+              ).length
             : 0,
         };
       default:
@@ -3259,6 +3838,7 @@ export class DynamoDBDriver implements IDBDriver {
       primaryKeys?: Record<string, unknown>;
       changes?: Record<string, unknown>;
       originalValues?: Record<string, unknown>;
+      originalTypes?: Record<string, MongoValueTypeHint>;
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
@@ -3284,6 +3864,7 @@ export class DynamoDBDriver implements IDBDriver {
           ...(data.originalValues
             ? { originalValues: data.originalValues }
             : {}),
+          ...(data.originalTypes ? { originalTypes: data.originalTypes } : {}),
         },
       );
       return input ? [input as unknown as Record<string, unknown>] : [];
@@ -3307,6 +3888,39 @@ export class DynamoDBDriver implements IDBDriver {
     document: Record<string, unknown>,
   ): string {
     return JSON.stringify(this.serializeNativePreviewValue(document), null, 2);
+  }
+
+  private unprocessedBatchMetadata(
+    field: "UnprocessedKeys" | "UnprocessedItems",
+    unprocessed: unknown,
+  ): Pick<QueryDispatchResult, "responseMetadata"> {
+    const count =
+      field === "UnprocessedKeys"
+        ? this.countBatchGetKeys(unprocessed)
+        : this.countBatchWriteRequests(unprocessed);
+    if (count === 0) {
+      return {};
+    }
+    const subject = field === "UnprocessedKeys" ? "key" : "write request";
+    return {
+      responseMetadata: {
+        warning: `DynamoDB did not process ${count} ${subject}${count === 1 ? "" : "s"}. Resend ${field} as RequestItems to complete the batch.`,
+        [field]: this.serializeNativePreviewValue(unprocessed),
+      },
+    };
+  }
+
+  private countBatchGetKeys(requestItems: unknown): number {
+    if (!isRecord(requestItems)) {
+      return 0;
+    }
+
+    return Object.values(requestItems).reduce<number>(
+      (total, value) =>
+        total +
+        (isRecord(value) && Array.isArray(value.Keys) ? value.Keys.length : 0),
+      0,
+    );
   }
 
   private countBatchWriteRequests(requestItems: unknown): number {
@@ -3375,7 +3989,22 @@ export class DynamoDBDriver implements IDBDriver {
   ): Record<string, unknown> {
     const mapped: Record<string, unknown> = {};
     columns.forEach((columnName, index) => {
-      mapped[`__col_${index}`] = this.formatDynamoCellValue(row[columnName]);
+      mapped[`__col_${index}`] = this.formatDynamoCellValue(
+        ownField(row, columnName),
+      );
+    });
+    return mapped;
+  }
+
+  private mapRowToQueryExportRow(
+    row: Record<string, unknown>,
+    columns: string[],
+  ): Record<string, unknown> {
+    const mapped: Record<string, unknown> = {};
+    columns.forEach((columnName, index) => {
+      if (Object.hasOwn(row, columnName)) {
+        mapped[`__col_${index}`] = this.toDynamoExportValue(row[columnName]);
+      }
     });
     return mapped;
   }
@@ -3399,6 +4028,23 @@ export class DynamoDBDriver implements IDBDriver {
     );
   }
 
+  private isValidationException(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "name" in error &&
+      error.name === "ValidationException"
+    );
+  }
+
+  private isWriteThrottled(error: unknown): boolean {
+    return (
+      isRecord(error) &&
+      typeof error.name === "string" &&
+      DYNAMODB_THROTTLED_WRITE_ERRORS.has(error.name)
+    );
+  }
+
   private isTransactionCanceled(error: unknown): boolean {
     return (
       typeof error === "object" &&
@@ -3416,7 +4062,7 @@ export class DynamoDBDriver implements IDBDriver {
     const sourceColumns =
       rows.length > 0
         ? this.buildDynamoColumns(rows, schema).filter((column) =>
-            rows.some((row) => row[column.name] !== undefined),
+            rows.some((row) => ownField(row, column.name) !== undefined),
           )
         : describedColumns;
     return this.mergeDescribedColumns(sourceColumns, describedColumns, schema);
@@ -3459,10 +4105,18 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private splitFilterList(value: string): string[] {
-    return value
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0);
+    return splitInFilterValues(value).map((entry) => {
+      if (/^"(?:[^"\\]|\\.)*"$/s.test(entry)) {
+        try {
+          return JSON.parse(entry) as string;
+        } catch {
+          return entry;
+        }
+      }
+      return /^'(?:[^'\\]|\\.)*'$/s.test(entry)
+        ? entry.slice(1, -1).replace(/\\(['\\])/g, "$1")
+        : entry;
+    });
   }
 
   private validateNumericTableFilters(
@@ -3510,6 +4164,50 @@ export class DynamoDBDriver implements IDBDriver {
     }
   }
 
+  private validateBooleanTableFilters(
+    filters: readonly FilterExpression[],
+    columns: readonly ColumnTypeMeta[],
+  ): void {
+    const booleanColumns = new Set(
+      columns
+        .filter(
+          (column) =>
+            column.category === "boolean" ||
+            column.valueSemantics === "boolean" ||
+            column.nativeType.toLowerCase() === "boolean",
+        )
+        .map((column) => column.name),
+    );
+
+    for (const filter of filters) {
+      if (
+        !booleanColumns.has(filter.column) ||
+        filter.operator === "is_null" ||
+        filter.operator === "is_not_null"
+      ) {
+        continue;
+      }
+      if (!("value" in filter)) {
+        continue;
+      }
+
+      const values =
+        filter.operator === "between"
+          ? [...filter.value]
+          : filter.operator === "in"
+            ? this.splitFilterList(filter.value)
+            : [filter.value];
+      const invalidValue = values.find(
+        (value) => !/^(?:true|false|1|0)$/i.test(value.trim()),
+      );
+      if (invalidValue !== undefined) {
+        throw new Error(
+          `${DYNAMODB_TABLE_FILTER_ERROR_PREFIX} column ${JSON.stringify(filter.column)} requires true, false, 1, or 0; received ${JSON.stringify(invalidValue.trim())}.`,
+        );
+      }
+    }
+  }
+
   private coerceFilterValueForColumn(
     column: ColumnTypeMeta | undefined,
     rawValue: string | [string, string] | undefined,
@@ -3527,11 +4225,16 @@ export class DynamoDBDriver implements IDBDriver {
     column: ColumnTypeMeta | undefined,
     rawValue: string,
   ): unknown {
-    const value = rawValue.trim();
-    const decoded = decodeDynamoCellInput(
-      value,
-      column?.nativeType.toLowerCase() === "binary",
-    );
+    const trimmed = rawValue.trim();
+    if (column?.nativeType.toLowerCase() === "binary") {
+      const decoded = decodeDynamoCellInput(trimmed, true);
+      if (this.isBinaryValue(decoded)) {
+        return this.toBinaryBuffer(decoded);
+      }
+      return this.parseBinaryInput(String(decoded)) ?? decoded;
+    }
+    const value = rawValue;
+    const decoded = decodeDynamoCellInput(rawValue);
     if (decoded !== value) {
       return decoded;
     }
@@ -3543,15 +4246,15 @@ export class DynamoDBDriver implements IDBDriver {
       column.category === "float" ||
       column.category === "decimal"
     ) {
-      return DYNAMODB_NUMBER_RE.test(value)
-        ? NumberValueImpl.from(value)
+      return DYNAMODB_NUMBER_RE.test(trimmed)
+        ? NumberValueImpl.from(trimmed)
         : value;
     }
     if (column.category === "boolean" || column.valueSemantics === "boolean") {
-      if (/^(true|1)$/i.test(value)) {
+      if (/^(true|1)$/i.test(trimmed)) {
         return true;
       }
-      if (/^(false|0)$/i.test(value)) {
+      if (/^(false|0)$/i.test(trimmed)) {
         return false;
       }
     }
@@ -3596,7 +4299,9 @@ export class DynamoDBDriver implements IDBDriver {
         return left.localeCompare(right);
       })
       .map((name) => {
-        const samples = rows.map((row) => row[name]);
+        const samples = rows.map((row) =>
+          Object.hasOwn(row, name) ? row[name] : undefined,
+        );
         const descriptor = this.resolveDynamoColumnDescriptor(
           samples,
           schema.attrTypes.get(name),
@@ -3868,6 +4573,87 @@ export class DynamoDBDriver implements IDBDriver {
     column: string,
   ): TypeCategory | undefined => this.tableRowCategories.get(row)?.get(column);
 
+  private dynamoScalarKind(
+    value: unknown,
+  ): "S" | "N" | "B" | "BOOL" | undefined {
+    if (typeof value === "string") return "S";
+    if (typeof value === "boolean") return "BOOL";
+    if (
+      value instanceof NumberValueImpl ||
+      typeof value === "number" ||
+      typeof value === "bigint"
+    ) {
+      return "N";
+    }
+    return this.isBinaryValue(value) ? "B" : undefined;
+  }
+
+  private matchDynamoScalarEquality(
+    actual: unknown,
+    expected: readonly unknown[],
+  ): boolean | undefined {
+    const actualKind = actual === null ? "NULL" : this.dynamoScalarKind(actual);
+    if (
+      !actualKind ||
+      expected.some((value) => this.dynamoScalarKind(value) === undefined)
+    ) {
+      return undefined;
+    }
+    return expected.some(
+      (value) =>
+        this.dynamoScalarKind(value) === actualKind &&
+        (actualKind === "N"
+          ? canonicalDynamoNumber(actual) === canonicalDynamoNumber(value)
+          : actualKind === "B"
+            ? (this.toBinaryBuffer(actual)?.equals(
+                this.toBinaryBuffer(value) ?? Buffer.alloc(0),
+              ) ?? false)
+            : actual === value),
+    );
+  }
+
+  private matchDynamoRange(
+    actual: unknown,
+    operator: FilterOperator,
+    bounds: readonly unknown[],
+  ): boolean {
+    const actualKind = this.dynamoScalarKind(actual);
+    if (actualKind !== "S" && actualKind !== "N" && actualKind !== "B") {
+      return false;
+    }
+    if (bounds.some((bound) => this.dynamoScalarKind(bound) !== actualKind)) {
+      return false;
+    }
+    const numberText = (value: unknown) =>
+      value instanceof NumberValueImpl ? value.value : String(value);
+    const bytes = (value: unknown) =>
+      typeof value === "string"
+        ? Buffer.from(value, "utf8")
+        : (this.toBinaryBuffer(value) ?? Buffer.alloc(0));
+    const compare = (bound: unknown): number | null =>
+      actualKind === "N"
+        ? compareNumericTokens(numberText(actual), numberText(bound))
+        : Buffer.compare(bytes(actual), bytes(bound));
+    const lower = compare(bounds[0]);
+    if (lower === null) return false;
+    switch (operator) {
+      case "between": {
+        const upper = compare(bounds[1]);
+        return upper !== null && lower >= 0 && upper <= 0;
+      }
+      case "gt":
+        return lower > 0;
+      case "gte":
+        return lower >= 0;
+      case "lt":
+        return lower < 0;
+      case "lte":
+        return lower <= 0;
+      default:
+        return false;
+    }
+  }
+
   private applyDynamoFilters(
     rows: readonly Record<string, unknown>[],
     filters: readonly FilterExpression[],
@@ -3902,8 +4688,43 @@ export class DynamoDBDriver implements IDBDriver {
           : filter.operator === "in"
             ? this.splitFilterList(filter.value)
             : [filter.value];
+        if (
+          (column?.category === "binary" ||
+            column?.nativeType.toLowerCase() === "binary") &&
+          (filter.operator === "eq" ||
+            filter.operator === "neq" ||
+            filter.operator === "in")
+        ) {
+          const rawValue = ownField(
+            this.tableRawRows.get(row) ?? {},
+            filter.column,
+          );
+          if (this.isBinaryValue(rawValue)) {
+            const actual = this.toBinaryBuffer(rawValue);
+            if (actual !== null) {
+              const expected = values.map((value) => {
+                const decoded = decodeDynamoCellInput(value, true);
+                return this.isBinaryValue(decoded)
+                  ? this.toBinaryBuffer(decoded)
+                  : this.parseBinaryInput(value);
+              });
+              if (filter.operator === "eq") {
+                return expected[0] !== null && actual.equals(expected[0]);
+              }
+              if (filter.operator === "neq") {
+                return expected[0] !== null && !actual.equals(expected[0]);
+              }
+              return expected.some(
+                (candidate) => candidate !== null && actual.equals(candidate),
+              );
+            }
+          }
+        }
         if (contains) {
-          const rawValue = this.tableRawRows.get(row)?.[filter.column];
+          const rawValue = ownField(
+            this.tableRawRows.get(row) ?? {},
+            filter.column,
+          );
           const needle = String(decodeDynamoCellInput(values[0]));
           if (rawValue instanceof Set || Array.isArray(rawValue)) {
             const parsedNeedle = parseDynamoContainsNeedle(
@@ -3918,6 +4739,11 @@ export class DynamoDBDriver implements IDBDriver {
                   (filter.operator === "ilike"
                     ? member.toLowerCase() === typedNeedle.value.toLowerCase()
                     : member === typedNeedle.value)
+                );
+              }
+              if (typeof member === "boolean") {
+                return (
+                  typedNeedle.kind === "boolean" && member === typedNeedle.value
                 );
               }
               if (filter.operator !== "like" || typedNeedle.kind !== "number") {
@@ -3945,12 +4771,31 @@ export class DynamoDBDriver implements IDBDriver {
             typeof rawValue === "string"
               ? rawValue
               : actualCategory === "text"
-                ? logicalRow[filter.column]
+                ? ownField(logicalRow, filter.column)
                 : undefined;
           if (typeof text !== "string") return false;
           return filter.operator === "ilike"
             ? text.toLowerCase().includes(needle.toLowerCase())
             : text.includes(needle);
+        }
+        if (
+          (filter.operator === "eq" ||
+            filter.operator === "neq" ||
+            filter.operator === "in") &&
+          values.every(
+            (value) => !DYNAMODB_EMPTY_BINARY_TEXT_PATTERN.test(value),
+          )
+        ) {
+          const rawRow = this.tableRawRows.get(row);
+          const typed = this.matchDynamoScalarEquality(
+            rawRow && Object.hasOwn(rawRow, filter.column)
+              ? ownField(rawRow, filter.column)
+              : undefined,
+            values.map((value) => this.coerceFilterParameter(column, value)),
+          );
+          if (typed !== undefined) {
+            return filter.operator === "neq" ? !typed : typed;
+          }
         }
         const matches = (value: string): boolean => {
           if (!DYNAMODB_EMPTY_BINARY_TEXT_PATTERN.test(value)) return true;
@@ -3962,7 +4807,10 @@ export class DynamoDBDriver implements IDBDriver {
         };
         const eligible = values.filter(matches);
         if (eligible.length !== values.length && filter.operator !== "in") {
-          return filter.operator === "neq" && logicalRow[filter.column] != null;
+          return (
+            filter.operator === "neq" &&
+            ownField(logicalRow, filter.column) != null
+          );
         }
         if (filter.operator === "in" && eligible.length === 0) return false;
         const logicalFilter = {
@@ -3976,35 +4824,13 @@ export class DynamoDBDriver implements IDBDriver {
         const isRange = ["gt", "gte", "lt", "lte", "between"].includes(
           filter.operator,
         );
-        if (
-          isRange &&
-          actualCategory === "text" &&
-          values.every(
-            (value) =>
-              typeof this.coerceFilterParameter(column, value) === "string",
-          )
-        ) {
-          const compare = (bound: string) =>
-            Buffer.compare(
-              Buffer.from(String(logicalRow[filter.column]), "utf8"),
-              Buffer.from(
-                String(this.coerceFilterParameter(column, bound)),
-                "utf8",
-              ),
-            );
-          const lower = compare(values[0]);
-          switch (filter.operator) {
-            case "between":
-              return lower >= 0 && compare(values[1]) <= 0;
-            case "gt":
-              return lower > 0;
-            case "gte":
-              return lower >= 0;
-            case "lt":
-              return lower < 0;
-            case "lte":
-              return lower <= 0;
-          }
+        const rangeRawRow = isRange ? this.tableRawRows.get(row) : undefined;
+        if (rangeRawRow) {
+          return this.matchDynamoRange(
+            ownField(rangeRawRow, filter.column),
+            filter.operator,
+            values.map((value) => this.coerceFilterParameter(column, value)),
+          );
         }
         return (
           applyFilters(
@@ -4012,6 +4838,7 @@ export class DynamoDBDriver implements IDBDriver {
             [logicalFilter],
             columns,
             this.rowValueCategory,
+            () => eligible.map((value) => String(decodeDynamoCellInput(value))),
           ).length > 0
         );
       });
@@ -4038,6 +4865,18 @@ export class DynamoDBDriver implements IDBDriver {
       ),
     );
     return formatted;
+  }
+
+  private getTableRowValueTypes(
+    row: Record<string, unknown>,
+  ): Record<string, MongoValueTypeHint> {
+    const rawRow = this.tableRawRows.get(row) ?? row;
+    return Object.fromEntries(
+      Object.entries(rawRow).map(([name, value]) => {
+        const { category, nativeType } = this.describeDynamoValue(value);
+        return [name, { category, nativeType }];
+      }),
+    );
   }
 
   private formatDynamoCellValue(value: unknown): unknown {
@@ -4166,6 +5005,7 @@ export class DynamoDBDriver implements IDBDriver {
     if (hex !== null) {
       return Buffer.from(hex, "hex");
     }
+    if (/^(?:0x|\\x)/i.test(normalized)) return null;
     if (
       normalized.length > 0 &&
       normalized.length % 4 === 0 &&
@@ -4184,7 +5024,29 @@ export class DynamoDBDriver implements IDBDriver {
     value: string,
     subtype: "string" | "number" | "binary",
   ): Set<unknown> | null {
+    if (value.trim().startsWith("<<")) {
+      let entries: string[];
+      try {
+        entries = parseDynamoDbSetLiteral(value, subtype);
+      } catch (error) {
+        if (subtype === "binary") return null;
+        throw error;
+      }
+      if (subtype === "binary") return this.parseBinarySetEntries(entries);
+      return new Set(
+        entries.map((entry) =>
+          subtype === "number" ? NumberValueImpl.from(entry) : entry,
+        ),
+      );
+    }
     if (subtype === "number") {
+      if (value.trim().startsWith("["))
+        return new Set(
+          parseDynamoDbNumberSetJson(value).map((entry) =>
+            NumberValueImpl.from(entry),
+          ),
+        );
+
       const numericBody = value
         .trim()
         .replace(/^<</, "")
@@ -4195,6 +5057,8 @@ export class DynamoDBDriver implements IDBDriver {
         .split(",")
         .map((entry) => entry.trim())
         .filter(Boolean);
+      if (hasDuplicateDynamoDbNumbers(tokens))
+        throw new Error("DynamoDB number set values must be unique.");
       return tokens.length > 0 &&
         tokens.every((entry) =>
           /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(entry),
@@ -4202,41 +5066,37 @@ export class DynamoDBDriver implements IDBDriver {
         ? new Set(tokens.map((entry) => NumberValueImpl.from(entry)))
         : null;
     }
-    const trimmed = value.trim();
-    if (
-      subtype === "binary" &&
-      trimmed.startsWith("<<") &&
-      trimmed.endsWith(">>")
-    ) {
-      const tokens = trimmed
-        .slice(2, -2)
-        .split(",")
-        .map((entry) => entry.trim());
-      const buffers = tokens.map((entry) => this.parseBinaryInput(entry));
-      return tokens.length > 0 &&
-        buffers.every((entry): entry is Buffer => entry !== null)
-        ? new Set(buffers)
-        : null;
-    }
     const parsedJson = this.parseJsonValue(value);
     if (Array.isArray(parsedJson)) {
+      if (subtype === "binary") {
+        return this.parseBinarySetEntries(parsedJson);
+      }
       return new Set(
         parsedJson.map((entry) => this.coerceSetEntryValue(entry, subtype)),
       );
     }
 
-    const normalized =
-      trimmed.startsWith("<<") && trimmed.endsWith(">>")
-        ? `[${trimmed.slice(2, -2).replace(/'/g, '"')}]`
-        : trimmed;
-    if (!normalized.startsWith("[") || !normalized.endsWith("]")) return null;
-    const parsed = this.parseJsonValue(normalized);
-    if (!Array.isArray(parsed)) {
+    return null;
+  }
+
+  private parseBinarySetEntries(
+    entries: readonly unknown[],
+  ): Set<Buffer> | null {
+    if (entries.length === 0) return null;
+    const buffers = entries.map((entry) =>
+      typeof entry === "string" ? this.parseBinaryInput(entry.trim()) : null,
+    );
+    if (!buffers.every((entry): entry is Buffer => entry !== null)) {
       return null;
     }
-    return new Set(
-      parsed.map((entry) => this.coerceSetEntryValue(entry, subtype)),
-    );
+    const uniqueByBytes = new Map<string, Buffer>();
+    for (const buffer of buffers) {
+      const base64 = buffer.toString("base64");
+      if (!uniqueByBytes.has(base64)) {
+        uniqueByBytes.set(base64, buffer);
+      }
+    }
+    return new Set(uniqueByBytes.values());
   }
 
   private coerceSetEntryValue(
@@ -4343,6 +5203,7 @@ export class DynamoDBDriver implements IDBDriver {
           )
         )
           break;
+        if (value.length === 0 || hasDuplicateDynamoDbNumbers(value)) break;
         return new Set(value.map((entry) => NumberValueImpl.from(entry)));
       case "BS":
         if (
@@ -4431,20 +5292,11 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   private extractBinaryHex(value: string): string | null {
-    let hex = value;
-    const hasPrefix =
-      value.startsWith("0x") ||
-      value.startsWith("0X") ||
-      value.startsWith("\\x") ||
-      value.startsWith("\\X");
-    if (hasPrefix) {
-      hex = value.slice(2);
+    if (!/^(?:0x|\\x)/i.test(value)) {
+      return null;
     }
-    if (
-      (hex.length === 0 && !hasPrefix) ||
-      hex.length % 2 !== 0 ||
-      !/^[0-9a-f]*$/i.test(hex)
-    ) {
+    const hex = value.slice(2);
+    if (hex.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(hex)) {
       return null;
     }
     return hex;

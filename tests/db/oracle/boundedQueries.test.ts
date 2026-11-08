@@ -68,10 +68,11 @@ for (const transport of ["direct", "ssh"] as const) {
       ).toMatchObject({ columns: ["SAME", "SAME"], rows: [], rowCount: 0 });
     });
     it("drains implicit results and completes trailing mutation and q/nq blocks", async () => {
+      const cursorCount = 20;
       const result = await driver.query(
         `DECLARE c SYS_REFCURSOR; s NVARCHAR2(100) := nq'[it's; / ?]';
         BEGIN
-          FOR i IN 1..20 LOOP
+          FOR i IN 1..${cursorCount} LOOP
             OPEN c FOR SELECT id same, hits same FROM ${table};
             DBMS_SQL.RETURN_RESULT(c);
           END LOOP;
@@ -81,7 +82,17 @@ for (const transport of ["direct", "ssh"] as const) {
         undefined,
         { hardCap: 2 },
       );
-      expect(result).toMatchObject({ rowCount: 12050, truncated: true });
+      expect(result).toMatchObject({
+        rowCount: 12050 * cursorCount,
+        truncated: true,
+      });
+      expect(result.resultSets).toHaveLength(cursorCount);
+      expect(result.resultSets?.every((set) => set.rowCount === 12050)).toBe(
+        true,
+      );
+      expect(
+        result.resultSets?.reduce((total, set) => total + set.rows.length, 0),
+      ).toBe(2);
       expect(result.rows).toHaveLength(2);
       expect(
         (await driver.query(`SELECT COUNT(*) n FROM ${table} WHERE hits=1`))
@@ -110,13 +121,17 @@ for (const transport of ["direct", "ssh"] as const) {
       ).rejects.toThrow();
     });
     it("rolls back late script errors after oversized results and recovers", async () => {
-      await expect(
-        driver.query(
-          `UPDATE ${table} SET hits=99; SELECT * FROM ${table}; BEGIN raise_application_error(-20001, 'late failure'); END;`,
-          undefined,
-          { hardCap: 1 },
-        ),
-      ).rejects.toThrow("late failure");
+      const result = await driver.query(
+        `UPDATE ${table} SET hits=99; SELECT * FROM ${table}; BEGIN raise_application_error(-20001, 'late failure'); END;`,
+        undefined,
+        { hardCap: 1 },
+      );
+      expect(result.error).toContain("late failure");
+      expect(result.rows).toHaveLength(1);
+      expect(result.resultSets?.[0]).toMatchObject({
+        rowCount: 12050,
+        truncated: true,
+      });
       expect(
         (await driver.query(`SELECT COUNT(*) FROM ${table} WHERE hits=99`))
           .rows[0].__col_0,

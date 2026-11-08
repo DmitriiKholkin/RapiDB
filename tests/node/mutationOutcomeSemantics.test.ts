@@ -1,5 +1,9 @@
 import { DatabaseError } from "pg";
 import { describe, expect, it, vi } from "vitest";
+import {
+  isMutationNotExecutedError,
+  MutationNotExecutedError,
+} from "../../src/extension/dbDrivers/mutationExecutionState";
 import { TransactionVerificationError } from "../../src/extension/dbDrivers/transactionVerification";
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import type { PreparedInsertPlan } from "../../src/extension/table/tableDataContracts";
@@ -13,10 +17,13 @@ async function confirmSingleDriverInsert(
 ) {
   const insertedRows: Record<string, unknown>[] = [];
   const insertRow = vi.fn(async () => {
-    const code = (error as Error & { code?: string }).code;
     if (
-      code !== "NOT_EXECUTED" &&
-      !(type === "pg" && error instanceof DatabaseError && code === "23502")
+      !isMutationNotExecutedError(error) &&
+      !(
+        type === "pg" &&
+        error instanceof DatabaseError &&
+        (error as Error & { code?: string }).code === "23502"
+      )
     ) {
       insertedRows.push({ name: "new row" });
     }
@@ -68,6 +75,7 @@ async function confirmSingleDriverInsert(
 async function confirmSingleVerifiedInsert(options: {
   atomicityRisk: string | null;
   transactionError?: Error;
+  standalone?: boolean;
 }) {
   const driver = {
     getMutationAtomicityRisk: vi.fn().mockResolvedValue(options.atomicityRisk),
@@ -109,11 +117,13 @@ async function confirmSingleVerifiedInsert(options: {
       values: [],
     },
   };
-  const preview = controller.createApplyChangesPreview("insert-verified", {
-    apply: null,
-    applyResultWhenEmpty: null,
-    inserts: [insert],
-  });
+  const preview = options.standalone
+    ? controller.createInsertPreview("insert-verified", insert)
+    : controller.createApplyChangesPreview("insert-verified", {
+        apply: null,
+        applyResultWhenEmpty: null,
+        inserts: [insert],
+      });
 
   return {
     driver,
@@ -122,6 +132,30 @@ async function confirmSingleVerifiedInsert(options: {
 }
 
 describe("mutation outcome semantics", () => {
+  it.each([
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ])("treats verification rollback confirmation %s explicitly for standalone=%s insert previews", async (confirmed, standalone) => {
+    const error = new TransactionVerificationError({
+      rowIndex: 0,
+      mutation: "insert",
+      columns: [],
+      message: "read failed",
+    });
+    error.rollbackConfirmed = confirmed;
+    const { result } = await confirmSingleVerifiedInsert({
+      atomicityRisk: null,
+      transactionError: error,
+      standalone,
+    });
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: !confirmed,
+      outcomeUnknown: !confirmed,
+    });
+  });
   it("does not replay an unknown INSERT with a fresh preview token or after clear", async () => {
     const { controller, insert, insertRow, result } =
       await confirmSingleDriverInsert(new Error("Acknowledgement lost"));
@@ -160,6 +194,25 @@ describe("mutation outcome semantics", () => {
       outcomeUnknown: false,
     });
     expect(result?.payload.error).toContain("violates not-null constraint");
+    expect(result?.payload.error).not.toContain("outcome is unknown");
+    expect(insertedRows).toEqual([]);
+  });
+
+  it("reports a DynamoDB conditional duplicate as a definite insert failure", async () => {
+    const error = new MutationNotExecutedError(
+      "Insert rejected because an item with the same primary key already exists. No item was written.",
+      Object.assign(new Error("The conditional request failed"), {
+        name: "ConditionalCheckFailedException",
+      }),
+    );
+    const { result, insertedRows } = await confirmSingleDriverInsert(error);
+
+    expect(result?.payload).toMatchObject({
+      success: false,
+      changesPossible: false,
+      outcomeUnknown: false,
+    });
+    expect(result?.payload.error).toContain("same primary key already exists");
     expect(result?.payload.error).not.toContain("outcome is unknown");
     expect(insertedRows).toEqual([]);
   });
@@ -425,6 +478,7 @@ describe("mutation outcome semantics", () => {
       columns: ["name"],
       message: "Persisted value did not match.",
     });
+    verificationError.rollbackConfirmed = true;
     const { driver, result } = await confirmSingleVerifiedInsert({
       atomicityRisk: null,
       transactionError: verificationError,

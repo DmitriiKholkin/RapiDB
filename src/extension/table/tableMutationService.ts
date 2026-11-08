@@ -9,7 +9,12 @@ import {
   isMutationNotExecutedError,
   MutationNotExecutedError,
 } from "../dbDrivers/mutationExecutionState";
-import type { ColumnTypeMeta, TransactionOperation } from "../dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  DriverMutationResult,
+  IDBDriver,
+  TransactionOperation,
+} from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
@@ -33,6 +38,101 @@ import {
 } from "./updateSql";
 
 const DELETE_VERIFICATION_CONCURRENCY_LIMIT = 8;
+
+function coerceTableEditRecord(
+  driver: IDBDriver,
+  record: Record<string, unknown>,
+  columnMetaByName: Map<string, ColumnTypeMeta>,
+): Record<string, unknown> {
+  if (!driver.coerceTableEditValue) {
+    return coerceRecord(driver, record, columnMetaByName);
+  }
+  return Object.fromEntries(
+    Object.entries(record).map(([name, value]) => {
+      const column = columnMetaByName.get(name);
+      if (!column) return [name, value];
+      try {
+        return [name, driver.coerceTableEditValue?.(value, column)];
+      } catch (error) {
+        throw new PersistedEditValidationError({
+          columns: [name],
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }),
+  );
+}
+
+function primaryKeyIdentityPart(value: unknown): string | undefined {
+  if (value instanceof Uint8Array) {
+    return `bytes:${Buffer.from(value).toString("hex")}`;
+  }
+  if (value instanceof Date) {
+    return `date:${value.getTime()}`;
+  }
+  if (value !== null && typeof value === "object") {
+    try {
+      return `object:${JSON.stringify(value)}`;
+    } catch {
+      return undefined;
+    }
+  }
+  return `${typeof value}:${String(value)}`;
+}
+
+function uniquePrimaryKeyIdentities(
+  primaryKeyValuesList: readonly Record<string, unknown>[],
+): { uniqueIndexes: number[]; uniquePositions: number[] } {
+  const positionByKey = new Map<string, number>();
+  const uniqueIndexes: number[] = [];
+  const uniquePositions = primaryKeyValuesList.map((primaryKeys, index) => {
+    const parts = Object.keys(primaryKeys)
+      .sort()
+      .map((columnName) => {
+        const part = primaryKeyIdentityPart(primaryKeys[columnName]);
+        return part === undefined ? undefined : [columnName, part];
+      });
+    const key = parts.some((part) => part === undefined)
+      ? undefined
+      : JSON.stringify(parts);
+    const existing = key === undefined ? undefined : positionByKey.get(key);
+    if (existing !== undefined) {
+      return existing;
+    }
+    const position = uniqueIndexes.push(index) - 1;
+    if (key !== undefined) {
+      positionByKey.set(key, position);
+    }
+    return position;
+  });
+  return { uniqueIndexes, uniquePositions };
+}
+
+function expandUniqueDeleteEvidence(
+  evidence: DriverMutationResult,
+  uniquePositions: readonly number[],
+): DriverMutationResult {
+  if (!evidence.rowOutcomes) {
+    return evidence;
+  }
+  const outcomeByPosition = new Map<
+    number,
+    NonNullable<DriverMutationResult["rowOutcomes"]>[number]
+  >();
+  for (const outcome of evidence.rowOutcomes) {
+    if (!outcomeByPosition.has(outcome.rowIndex)) {
+      outcomeByPosition.set(outcome.rowIndex, outcome);
+    }
+  }
+  return {
+    ...evidence,
+    rowOutcomes: uniquePositions.flatMap((position, rowIndex) => {
+      const outcome = outcomeByPosition.get(position);
+      return outcome ? [{ ...outcome, rowIndex }] : [];
+    }),
+  };
+}
+
 export class TableMutationService {
   constructor(
     private readonly connectionManager: ConnectionManager,
@@ -242,7 +342,7 @@ export class TableMutationService {
       const writableValues = Object.fromEntries(
         writableEntries(values, columnMetaByName),
       );
-      const coercedValues = coerceRecord(
+      const coercedValues = coerceTableEditRecord(
         driver,
         writableValues,
         columnMetaByName,
@@ -326,14 +426,6 @@ export class TableMutationService {
         columns: readonly ColumnTypeMeta[],
       ) => string;
     };
-    const previewSql =
-      typeof oracleLikeDriver.materializePreviewInsertSql === "function"
-        ? oracleLikeDriver.materializePreviewInsertSql(
-            operation.sql,
-            operation.params,
-            insertPreviewColumns,
-          )
-        : driver.materializePreviewSql(operation.sql, operation.params);
     const verification = prepareInsertVerification(
       driver,
       this.connectionManager.getConnection(connectionId)?.type,
@@ -344,6 +436,14 @@ export class TableMutationService {
       columns,
       operation,
     );
+    const previewSql =
+      typeof oracleLikeDriver.materializePreviewInsertSql === "function"
+        ? oracleLikeDriver.materializePreviewInsertSql(
+            operation.sql,
+            operation.params,
+            insertPreviewColumns,
+          )
+        : driver.materializePreviewSql(operation.sql, operation.params);
     return {
       connectionId,
       database,
@@ -437,6 +537,7 @@ export class TableMutationService {
       plan.operation.params,
       { database: plan.database },
     );
+    if (result.error) throw new Error(result.error);
     const affectedRows = result.affectedRows ?? result.rowCount;
     if (affectedRows !== undefined && affectedRows === 0) {
       throw new Error(
@@ -531,7 +632,9 @@ export class TableMutationService {
         rowIdentities: primaryKeyValuesList,
         operations: [],
         previewStatements,
-        verificationCriteriaList: coercedPrimaryKeyValuesList,
+        verificationCriteriaList: uniquePrimaryKeyIdentities(
+          coercedPrimaryKeyValuesList,
+        ).uniqueIndexes.map((index) => coercedPrimaryKeyValuesList[index]),
       };
     }
 
@@ -549,7 +652,7 @@ export class TableMutationService {
     const primaryKeyColumnNames = primaryKeyColumns.map(
       (column) => column.name,
     );
-    const coercedPrimaryKeys = primaryKeyValuesList.map((row) => {
+    const allCoercedPrimaryKeys = primaryKeyValuesList.map((row) => {
       const coerced = coercePrimaryKeyValues(driver, row, columns, "delete");
       const normalizedPrimaryKeys = Object.fromEntries(
         primaryKeyColumnNames.map((columnName) => [
@@ -559,24 +662,32 @@ export class TableMutationService {
       );
       return normalizedPrimaryKeys;
     });
+    const coercedPrimaryKeys = uniquePrimaryKeyIdentities(
+      allCoercedPrimaryKeys,
+    ).uniqueIndexes.map((index) => allCoercedPrimaryKeys[index]);
     if (coercedPrimaryKeys.length === 0) {
       return null;
     }
-    const isSinglePrimaryKey = primaryKeyColumnNames.length === 1;
-    const operations = isSinglePrimaryKey
-      ? this.buildDeleteSinglePrimaryKeyOperations(
-          driver,
-          qualifiedTableName,
-          columnMetaByName,
-          primaryKeyColumnNames[0],
-          coercedPrimaryKeys,
-        )
-      : this.buildDeleteCompositePrimaryKeyOperations(
-          driver,
-          qualifiedTableName,
-          columnMetaByName,
-          coercedPrimaryKeys,
-        );
+    const backend = this.connectionManager.getConnection(connectionId)?.type;
+    const operations =
+      primaryKeyColumnNames.length === 1 &&
+      (backend === "pg" ||
+        backend === "sqlite" ||
+        backend === "mssql" ||
+        backend === "oracle")
+        ? this.buildDeleteUniqueKeyBatchOperations(
+            driver,
+            qualifiedTableName,
+            columnMetaByName,
+            primaryKeyColumnNames[0],
+            coercedPrimaryKeys,
+          )
+        : this.buildDeletePrimaryKeyOperations(
+            driver,
+            qualifiedTableName,
+            columnMetaByName,
+            coercedPrimaryKeys,
+          );
     if (operations.length > 1) {
       const atomicityRisk = await driver.getMutationAtomicityRisk?.(
         database,
@@ -628,14 +739,22 @@ export class TableMutationService {
           ),
         );
       }
+      const primaryKeyValuesList = plan.primaryKeyValuesList ?? [];
+      const { uniqueIndexes, uniquePositions } =
+        uniquePrimaryKeyIdentities(primaryKeyValuesList);
       try {
         const result = await driver.deleteRows({
           database: plan.database,
           schema: plan.schema,
           table: plan.table,
-          primaryKeyValuesList: plan.primaryKeyValuesList ?? [],
+          primaryKeyValuesList: uniqueIndexes.map(
+            (index) => primaryKeyValuesList[index],
+          ),
         });
-        const outcome = buildDeleteResult(identities, result);
+        const outcome = buildDeleteResult(
+          identities,
+          expandUniqueDeleteEvidence(result, uniquePositions),
+        );
         if (!outcome.success) throw new DeleteExecutionError(outcome);
       } catch (error) {
         if (error instanceof DeleteExecutionError) throw error;
@@ -647,10 +766,13 @@ export class TableMutationService {
             ),
           );
         }
+        const evidence = getDeleteEvidence(error);
         throw new DeleteExecutionError(
           buildDeleteResult(
             identities,
-            getDeleteEvidence(error) ?? { affectedRows: 0 },
+            evidence
+              ? expandUniqueDeleteEvidence(evidence, uniquePositions)
+              : { affectedRows: 0 },
             error instanceof Error ? error.message : String(error),
           ),
         );
@@ -659,10 +781,6 @@ export class TableMutationService {
     }
 
     try {
-      // Even one DELETE can remove only part of the selection, or more rows
-      // than expected after an external key change. Its affected-row check
-      // must be able to roll back. Recheck here: previews can outlive an engine
-      // change, and checking only multi-statement plans is not sufficient.
       const risk = await driver.getMutationAtomicityRisk?.(
         plan.database,
         plan.schema,
@@ -794,37 +912,39 @@ export class TableMutationService {
       parameters,
       { database },
     );
+    if (result.error) throw new Error(result.error);
     return result.rows.length > 0;
   }
-  private buildDeleteSinglePrimaryKeyOperations(
+  private buildDeleteUniqueKeyBatchOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     primaryKeyColumn: string,
     rows: Record<string, unknown>[],
   ): TransactionOperation[] {
+    const column = columnMetaByName.get(primaryKeyColumn);
+    const key = driver.quoteIdentifier(primaryKeyColumn);
     const values = rows.map((row) => row[primaryKeyColumn]);
-    const chunkSize = 1000;
+    const chunkSize = 500;
     const operations: TransactionOperation[] = [];
     for (let index = 0; index < values.length; index += chunkSize) {
       const chunk = values.slice(index, index + chunkSize);
       const placeholders = chunk
-        .map((_, placeholderIndex) => {
-          const column = columnMetaByName.get(primaryKeyColumn);
-          return column
+        .map((_, placeholderIndex) =>
+          column
             ? driver.buildInsertValueExpr(column, placeholderIndex + 1)
-            : "?";
-        })
+            : "?",
+        )
         .join(", ");
       operations.push({
-        sql: `DELETE FROM ${qualifiedTableName} WHERE ${driver.quoteIdentifier(primaryKeyColumn)} IN (${placeholders})`,
+        sql: `DELETE FROM ${qualifiedTableName} WHERE ${key} IN (SELECT ${key} FROM ${qualifiedTableName} WHERE ${key} IN (${placeholders}) GROUP BY ${key} HAVING COUNT(*) = 1)`,
         params: chunk,
         expectedAffectedRows: chunk.length,
       });
     }
     return operations;
   }
-  private buildDeleteCompositePrimaryKeyOperations(
+  private buildDeletePrimaryKeyOperations(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,

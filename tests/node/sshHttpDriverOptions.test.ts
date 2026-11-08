@@ -5,7 +5,7 @@ import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const elasticMocks = vi.hoisted(() => ({
   constructorCalls: [] as Array<Record<string, unknown>>,
-  ping: vi.fn().mockResolvedValue(undefined),
+  ping: vi.fn().mockResolvedValue(true),
   close: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -67,9 +67,28 @@ import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 
 describe("SSH HTTP driver options", () => {
+  it.each([
+    "cluster.example.com",
+    "2001:db8::12",
+  ])("keeps the Elasticsearch TLS identity through a TCP tunnel with HTTPS defaults: %s", async (servername) => {
+    const driver = new ElasticsearchDriver({
+      id: "es-defaults",
+      name: "Elastic",
+      type: "elasticsearch",
+      endpoint: "https://127.0.0.1:15432",
+      tls: { mode: "disabled" },
+      runtimeOverrides: { tlsServername: servername },
+    } as ConnectionConfig);
+    await driver.connect();
+    expect(elasticMocks.constructorCalls[0]).toMatchObject({
+      node: "https://127.0.0.1:15432",
+      tls: { servername },
+    });
+    await driver.disconnect();
+  });
   beforeEach(() => {
     elasticMocks.constructorCalls.length = 0;
-    elasticMocks.ping.mockClear().mockResolvedValue(undefined);
+    elasticMocks.ping.mockClear().mockResolvedValue(true);
     elasticMocks.close.mockClear().mockResolvedValue(undefined);
 
     dynamoMocks.constructorCalls.length = 0;
@@ -78,7 +97,10 @@ describe("SSH HTTP driver options", () => {
     dynamoMocks.destroy.mockClear();
   });
 
-  it("injects the SSH HTTP(S) agent into Elasticsearch without rewriting the node URL", async () => {
+  it.each([
+    "https://cluster.example.com",
+    "https://[2001:db8::12]:8443/service?keep=true",
+  ])("injects the SSH HTTP(S) agent into Elasticsearch without rewriting the node URL: %s", async (endpoint) => {
     const httpAgent = new http.Agent();
     const httpsAgent = new https.Agent();
 
@@ -86,7 +108,7 @@ describe("SSH HTTP driver options", () => {
       id: "es-ssh",
       name: "Elastic SSH",
       type: "elasticsearch",
-      endpoint: "https://cluster.example.com",
+      endpoint,
       tls: {
         mode: "requireVerifyFull",
       },
@@ -109,12 +131,12 @@ describe("SSH HTTP driver options", () => {
     expect(Object.getPrototypeOf(options.Connection?.prototype)).toBe(
       HttpConnection.prototype,
     );
-    expect(options.node).toBe("https://cluster.example.com");
+    expect(options.node).toBe(endpoint);
     const ownedHttpsAgent = options.agent?.({
-      url: new URL("https://cluster.example.com"),
+      url: new URL(endpoint),
     });
     const ownedHttpAgent = options.agent?.({
-      url: new URL("http://cluster.example.com"),
+      url: new URL(endpoint.replace("https:", "http:")),
     });
     expect(ownedHttpsAgent).not.toBe(httpsAgent);
     expect(ownedHttpAgent).not.toBe(httpAgent);
@@ -122,7 +144,10 @@ describe("SSH HTTP driver options", () => {
     expect(ownedHttpAgent).toMatchObject({ protocol: "http:" });
   });
 
-  it("injects NodeHttpHandler with SSH agents into DynamoDB without rewriting the endpoint", async () => {
+  it.each([
+    "https://dynamodb.us-east-1.amazonaws.com",
+    "https://[2001:db8::12]:8443/service?keep=true",
+  ])("injects NodeHttpHandler with SSH agents into DynamoDB without rewriting the endpoint: %s", async (endpoint) => {
     const httpAgent = new http.Agent();
     const httpsAgent = new https.Agent();
 
@@ -131,7 +156,7 @@ describe("SSH HTTP driver options", () => {
       name: "Dynamo SSH",
       type: "dynamodb",
       awsRegion: "us-east-1",
-      endpoint: "https://dynamodb.us-east-1.amazonaws.com",
+      endpoint,
       runtimeOverrides: {
         transport: {
           kind: "httpAgent",
@@ -145,12 +170,33 @@ describe("SSH HTTP driver options", () => {
 
     expect(dynamoMocks.constructorCalls[0]).toMatchObject({
       region: "us-east-1",
-      endpoint: "https://dynamodb.us-east-1.amazonaws.com",
+      endpoint,
     });
     expect(dynamoMocks.handlerOptions[0]).toMatchObject({
       httpAgent,
       httpsAgent,
     });
     expect(dynamoMocks.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the remote IPv6 TLS identity in DynamoDB's tunneled HTTPS agent", async () => {
+    const driver = new DynamoDBDriver({
+      id: "ddb-ipv6-tunnel",
+      name: "Dynamo IPv6",
+      type: "dynamodb",
+      endpoint: "https://127.0.0.1:15432/service?keep=true",
+      runtimeOverrides: { tlsServername: "2001:db8::12" },
+    } as ConnectionConfig);
+    try {
+      await driver.connect();
+      expect(dynamoMocks.constructorCalls[0]).toMatchObject({
+        endpoint: "https://127.0.0.1:15432/service?keep=true",
+      });
+      expect(dynamoMocks.handlerOptions[0]?.httpsAgent).toMatchObject({
+        options: { servername: "2001:db8::12" },
+      });
+    } finally {
+      await driver.disconnect();
+    }
   });
 });

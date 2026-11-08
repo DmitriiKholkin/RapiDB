@@ -87,14 +87,27 @@ for (const transport of ["direct", "ssh"] as const) {
       });
       expect(driver.getCapabilities?.().boundedQueryResults).toBe(true);
       expect(result).toMatchObject({
-        columns: ["same", "same"],
+        columns: ["same", "same", "payload"],
+        rowCount: size * 2,
+        truncated: true,
+      });
+      expect(result.rows).toEqual(
+        [1, 2, 3].map((id) => ({
+          __col_0: id,
+          __col_1: String(id + 10),
+          __col_2: "x".repeat(1024),
+        })),
+      );
+      expect(result.resultSets).toHaveLength(2);
+      expect(result.resultSets?.[0]).toMatchObject({
         rowCount: size,
         truncated: true,
-        rows: [
-          { __col_0: size, __col_1: 1 },
-          { __col_0: size - 1, __col_1: 1 },
-          { __col_0: size - 2, __col_1: 1 },
-        ],
+      });
+      expect(result.resultSets?.[1]).toMatchObject({
+        columns: ["same", "same"],
+        rows: [],
+        rowCount: size,
+        truncated: true,
       });
       const completed = await driver.query(
         `SELECT COUNT(*) FROM ${table} WHERE hits = 2`,
@@ -102,7 +115,7 @@ for (const transport of ["direct", "ssh"] as const) {
       expect(Number(completed.rows[0].__col_0)).toBe(size);
     });
 
-    it("preserves last-result script selection, drains later mutations, and counts mutation-only scripts", async () => {
+    it("preserves all script rowsets with the first primary, drains later mutations, and counts mutation-only scripts", async () => {
       const result = await driver.query(
         `SELECT id FROM ${table} ORDER BY id;
         UPDATE ${table} SET hits = 10; SELECT id AS same, hits AS same FROM ${table} ORDER BY id DESC;
@@ -111,14 +124,18 @@ for (const transport of ["direct", "ssh"] as const) {
         { hardCap: 2 },
       );
       expect(result).toMatchObject({
+        columns: ["id"],
+        rowCount: size * 2,
+        truncated: true,
+      });
+      expect(result.rows).toEqual([{ __col_0: 1 }, { __col_0: 2 }]);
+      expect(result.resultSets).toHaveLength(2);
+      expect(result.resultSets?.[1]).toMatchObject({
         columns: ["same", "same"],
+        rows: [],
         rowCount: size,
         truncated: true,
       });
-      expect(result.rows).toEqual([
-        { __col_0: size, __col_1: 10 },
-        { __col_0: size - 1, __col_1: 10 },
-      ]);
       const completed = await driver.query(
         `SELECT COUNT(*) FROM ${table} WHERE hits = 11`,
       );
@@ -174,9 +191,17 @@ for (const transport of ["direct", "ssh"] as const) {
     });
 
     it("propagates a server error after discarding rows and recovers on the next request", async () => {
-      await expect(
-        driver.query(`CALL ${brokenProcedure}()`, undefined, { hardCap: 2 }),
-      ).rejects.toThrow(/late bounded failure/);
+      const result = await driver.query(
+        `CALL ${brokenProcedure}()`,
+        undefined,
+        { hardCap: 2 },
+      );
+      expect(result.error).toContain("late bounded failure");
+      expect(result.rows).toHaveLength(2);
+      expect(result.resultSets?.[0]).toMatchObject({
+        rowCount: size,
+        truncated: true,
+      });
       expect(
         (await driver.query("SELECT 123", undefined, { hardCap: 1 })).rows,
       ).toEqual([{ __col_0: "123" }]);
