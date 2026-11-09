@@ -17,6 +17,7 @@ import {
 } from "./commands";
 import type { ExplorerSchemaScope } from "./connectionManager";
 import { ConnectionManager } from "./connectionManager";
+import { maybeShowFeedbackPrompt } from "./feedbackPrompt";
 import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
 import { TablePanel } from "./panels/tablePanel";
@@ -100,6 +101,10 @@ function activateOnce(context: vscode.ExtensionContext): void {
   }
 
   logger.info("Extension activated");
+
+  void maybeShowFeedbackPrompt(context).catch((e) =>
+    logger.warn(`Feedback prompt failed: ${String(e)}`),
+  );
 
   if (typeof context.globalStorageUri?.fsPath === "string") {
     configureSQLiteInstaller({

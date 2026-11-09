@@ -5,6 +5,7 @@ import {
   REDIS_EMPTY_PREFIX_TABLE,
   REDIS_UNPREFIXED_KEYS_TABLE,
 } from "../../src/extension/dbDrivers/redisKeyspace";
+import { createProjectTempDir } from "../runtime/tempDirectories";
 import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
 import { createMockVscodeModule } from "../support/mockVscode";
 
@@ -249,6 +250,64 @@ describe("extension activation", () => {
         showCollapseAll: true,
       }),
     );
+  });
+
+  it("registers commands without waiting for the feedback notification to close", async () => {
+    const extension = await import("../../src/extension/extension");
+    const { LAST_SEEN_VERSION_STATE_KEY } = await import(
+      "../../src/extension/feedbackPrompt"
+    );
+    const stub = createExtensionContextStub();
+    await stub.globalState.update(LAST_SEEN_VERSION_STATE_KEY, "0.1.17");
+    const context = {
+      ...stub,
+      extension: { packageJSON: { version: "0.2.0" } },
+      globalStorageUri: {
+        fsPath: await createProjectTempDir(
+          "extension-host",
+          "feedback-activation-",
+        ),
+      },
+      globalState: { ...stub.globalState, setKeysForSync: vi.fn() },
+    };
+    vscodeState.showInformationMessage.mockReturnValue(new Promise(() => {}));
+
+    extension.activate(context as never);
+    expect(vscodeState.registerCommand).toHaveBeenCalledTimes(
+      expectedCommands.length,
+    );
+    await vi.waitFor(() =>
+      expect(vscodeState.showInformationMessage).toHaveBeenCalledOnce(),
+    );
+  });
+
+  it("logs feedback persistence errors without breaking activation", async () => {
+    const extension = await import("../../src/extension/extension");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const context = {
+      ...createExtensionContextStub(),
+      extension: { packageJSON: { version: "0.2.0" } },
+      globalState: {
+        get: (_key: string, fallback: unknown) => fallback,
+        setKeysForSync: vi.fn(),
+        update: vi.fn().mockRejectedValue(new Error("storage unavailable")),
+      },
+    };
+    try {
+      expect(() => extension.activate(context as never)).not.toThrow();
+      expect(vscodeState.registerCommand).toHaveBeenCalledTimes(
+        expectedCommands.length,
+      );
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "Feedback prompt failed: Error: storage unavailable",
+          ),
+        ),
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("declares restoration activation events for the real serializers registered during activation", async () => {
