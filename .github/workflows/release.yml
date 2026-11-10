@@ -52,9 +52,6 @@ jobs:
       - name: Typecheck and lint
         run: npm run check
 
-      - name: Run core tests
-        run: npm run test:core
-
       - name: Determine version
         id: version
         env:

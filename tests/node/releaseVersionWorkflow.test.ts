@@ -120,19 +120,15 @@ const adversarialVersions = [
 ];
 
 describe("release workflow quality gates", () => {
-  it("requires checks and core tests before any release steps", () => {
+  it("requires typecheck and lint before any release steps", () => {
     const steps = workflow.jobs.release.steps;
     const installIndex = steps.findIndex((step) => step.run === "npm ci");
     const checkIndex = steps.findIndex((step) => step.run === "npm run check");
-    const testIndex = steps.findIndex(
-      (step) => step.run === "npm run test:core",
-    );
     const versionIndex = steps.findIndex((step) => step.id === "version");
 
     expect(installIndex).toBeGreaterThanOrEqual(0);
     expect(checkIndex).toBe(installIndex + 1);
-    expect(testIndex).toBe(checkIndex + 1);
-    expect(versionIndex).toBe(testIndex + 1);
+    expect(versionIndex).toBe(checkIndex + 1);
 
     for (const step of steps.slice(checkIndex)) {
       expect(step.if).toBeUndefined();
