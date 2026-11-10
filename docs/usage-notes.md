@@ -36,7 +36,7 @@ These controls only manage history/bookmark entries, not copies elsewhere. Edito
 
 ## Query execution
 
-For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script (or `RELEASE` for an outermost SQLite `SAVEPOINT`). Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone.
+For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script (or `RELEASE` for an outermost SQLite `SAVEPOINT`). Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone. After a failed or cancelled write, verify the data before retrying: earlier changes may already have committed.
 
 Elasticsearch and DynamoDB use a single SDK request attempt, including for reads: automatic retries are disabled because a lost response or server error can follow a committed write. This also overrides `AWS_MAX_ATTEMPTS` for DynamoDB. After a failed mutation, refresh and verify the data before retrying; the first request may already have applied.
 
@@ -82,7 +82,7 @@ Redis structured table edits (hash, list, set, sorted set) reject JSON numeric l
 
 ## Results and exports
 
-Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution.
+Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution. Query-result exports include only the displayed rows; use JSON when preserving value types matters.
 
 Table exports keep a stable column schema across chunks. SQL NULL is written as `(NULL)` in both table and query-result CSV exports; empty strings stay empty. Missing fields are written as `MISSING`. Marker-like strings are not escaped. When a column contains both a marker and the same literal value, CSV export fails, even across chunks. CSV cannot distinguish an isolated marker from an identical literal: use JSON when retaining types or missing values matters. Spreadsheet formula-like strings are protected by an apostrophe prefix. A later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 

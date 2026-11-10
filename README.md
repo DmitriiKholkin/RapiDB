@@ -2,14 +2,9 @@
 
 <br/>
 
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-6.png" alt="RapiDB" width="100%" />
-
-<br/>
-<br/>
-
 # RapiDB - Database Client for VS Code
 
-### PostgreSQL · MSSQL · MySQL · MariaDB · SQLite · Oracle
+### PostgreSQL · SQL Server · MySQL · MariaDB · SQLite · Oracle
 ### Redis · MongoDB · Elasticsearch · DynamoDB
 #### All in one place. Never leaving your editor.
 
@@ -36,6 +31,8 @@
 **RapiDB kills that context switch.**
 Your database lives in the sidebar - same window, same shortcuts, same theme.
 
+<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/workspace.png" alt="RapiDB in VS Code: grouped connections, PostgreSQL schema explorer, and order data" width="100%" />
+
 ---
 
 <br/>
@@ -46,75 +43,87 @@ Your database lives in the sidebar - same window, same shortcuts, same theme.
 
 <br/>
 
-### 🔌 Connect to anything
+## 🔌 Connect to anything
 
-PostgreSQL, MS SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB - all supported out of the box. SSL, self-signed certs, SSH tunneling, connection folders to keep things organized.
+PostgreSQL, SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elasticsearch, DynamoDB - all supported out of the box. Pick an engine, give the connection a name and color, and group it into a folder for Production, Staging, or local development.
 
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-3.png" alt="Connection Form" width="100%" />
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/connection-setup.png" alt="Connection setup with a name, folder, color, and nine database engine choices" width="100%" />
+    </td>
+    <td width="50%" valign="top">
+      <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/connection-access.png" alt="PostgreSQL connection details and the optional read-only mode" width="100%" />
+    </td>
+  </tr>
+</table>
 
 > **Read-only mode** blocks table edits and restricts query execution. For SQL Server and Oracle, it allows browsing only; query execution is disabled. Use database-enforced read-only permissions for reliable protection.
+
+<br/>
+
+## 🔐 Credentials, TLS & SSH
+
+Store credentials with **VS Code Secret Storage**, configure encryption, or connect through an **SSH bastion** - all from the same form.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/connection-security.png" alt="Secret Storage, password management, encryption, and SSH tunnel settings" width="620" />
+</p>
 
 > **SSH safety:** run the extension host in a trusted environment, require database authentication, and disconnect unused tunnels. Local processes may access an open SSH forward.
 
 <br/>
 
-### 🌲 Browse your schema without a single query
+## 🌲 Browse your schema without a single query
 
-Group connections into folders and explore databases, schemas, tables, views, materialized views, functions, procedures, sequences, and types. Inspect columns, primary and foreign keys, constraints, indexes, and triggers. Open data or view DDL from the context menu.
+Explore databases, schemas, tables, views, materialized views, functions, procedures, sequences, and types. Expand a table to inspect columns, primary and foreign keys, constraints, indexes, and triggers. Open data or view DDL from the context menu.
 
 Redis keys are grouped by prefix, with separate **All keys** and **Unprefixed keys** views.
 
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-5.png" alt="Database Explorer tree" width="250" />
+<p align="center">
+  <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/structure.png" alt="Invoice table structure with column types, primary and foreign key indicators, constraints, indexes, and triggers" width="440" />
+</p>
 
 <br/>
 
-### 🗂️ Query History & Bookmarks
+## 🧩 ERD with foreign key links
 
-Reopen previous queries from **Query History**, or save editor text with the **Bookmark** button. Clear saved entries from their view's trash icon.
+Open ERD from a database or schema node to see how your tables connect - including relationships across schemas. Search by table, schema, or column, zoom into a relationship, and open table data straight from the diagram. RapiDB follows your editor's light or dark theme.
 
-> Query text may contain sensitive data and is saved without redaction. Set `rapidb.queryHistoryLimit` to `0` to disable history. Bookmarks and editor drafts are stored separately; clearing history does not remove them.
-
-<br/>
-
-### 🧩 ERD with foreign key links
-
-Open ERD from a database or schema node to visualize tables and their foreign key relationships using live schema metadata.
-
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-4.png" alt="Entity relationship diagram" width="100%" />
+<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/erd.png" alt="Light-theme ERD showing 16 tables and foreign key relationships across public, billing, inventory, and audit schemas" width="100%" />
 
 <br/>
 
-### ✏️ A real SQL editor, not a textarea
+## ✏️ Write SQL and see the results
 
 The query editor runs on **Monaco** - the same engine as VS Code itself. You get:
 
 - 🎨 Syntax highlighting & SQL formatting (button / `Shift+Alt+F`)
 - 🧠 Schema-aware autocompletion - knows your actual tables and columns
-- ⌨️ `Ctrl+Enter` / `F5` to run · Select a fragment to run just that part
+- ⌨️ `Ctrl+Enter` / `Cmd+Enter` or `F5` to run · Select a fragment to run just that part
 - ↕️ Drag the divider to resize editor vs results
+- 📊 View query results and execution time directly below your SQL
+- 📤 Export the displayed results to CSV or JSON
 
-> Finish explicit SQL transactions in the same executed script. After a failed or cancelled write, verify the data before retrying: earlier changes may already have committed.
-
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-2.png" alt="SQL Editor with results" width="100%" />
-
-<br/>
-
-### 📊 Results that stay responsive
-
-Results land in a **virtualized table**:
-
-- Sort by any column · Resize columns · Alternating row stripes
-- NULL values are styled differently · Values are colored by types
-- Execution time shown right in the toolbar
-- **Export to CSV or JSON** in one click
-
-Query results display up to **10,000 rows**, with a warning when truncated. This is a display limit, not a limit on rows affected by a write. Query-result exports include only the displayed rows; use JSON when preserving value types matters.
+<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/sql-editor.png" alt="SQL editor running a warehouse inventory query with joins and displaying low-stock results" width="100%" />
 
 <br/>
 
-### ✍️ Browse and edit table data
+## 🗂️ Query History & Bookmarks
 
-Click any table → the **Table Data Viewer** opens:
+Keep useful queries close at hand. **Query History** lets you reopen previous queries with their connection; the editor's **Bookmark** button saves queries you want to reuse.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/query-history-and-bookmarks.png" alt="Query History and Bookmarks in the RapiDB sidebar, with saved queries linked to Core Platform" width="400" />
+</p>
+
+> Query text may contain sensitive data and is saved without redaction. Set `rapidb.queryHistoryLimit` to `0` to disable history. Bookmarks and editor drafts are stored separately; clearing history does not remove them.
+
+<br/>
+
+## ✍️ Browse and edit table data
+
+Open a table to work with your data in a **virtualized grid**. Sort and resize columns, filter individual fields, and distinguish keys, numbers, dates, and NULL values at a glance.
 
 | Feature | Detail |
 |---|---|
@@ -123,11 +132,12 @@ Click any table → the **Table Data Viewer** opens:
 | Inline editing | Click a cell → type → Enter |
 | New rows | Insert bar at the top |
 | Deletion | Select rows and delete |
+| Export | CSV or JSON from the toolbar |
 | Safety | Preview changes before applying; transactional where supported |
 
-Editing support depends on the database engine and column types. Review important changes and keep backups.
+<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/table-data.png" alt="Invoice table with primary and foreign key indicators, per-column filters, typed values, CSV and JSON exports, and pagination" width="100%" />
 
-<img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/img-readme-1.png" alt="Table Data Viewer" width="100%" />
+Editing support depends on the database engine and column types. Review important changes and keep backups.
 
 <br/>
 
