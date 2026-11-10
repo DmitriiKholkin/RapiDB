@@ -27,6 +27,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      vsix: ${{ steps.package.outputs.vsix }}
     steps:
       - name: Require main branch
         if: github.ref != 'refs/heads/main'
@@ -180,3 +182,48 @@ jobs:
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: ${{ steps.package.outputs.vsix }}
+          if-no-files-found: error
+
+  # Trusted publishing exposes an OIDC token to every step of a job, so only
+  # this job gets id-token: write; it installs without lifecycle scripts and
+  # runs nothing but the publishing tools.
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install publishing tools
+        run: npm ci --ignore-scripts
+
+      - name: Download VSIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vsix
+
+      - name: Publish to VS Code Marketplace
+        env:
+          VSIX_FILE: ${{ needs.release.outputs.vsix }}
+        run: npx @vscode/vsce publish --oidc --packagePath "$VSIX_FILE"
+
+      - name: Publish to Open VSX
+        env:
+          VSIX_FILE: ${{ needs.release.outputs.vsix }}
+        run: npx ovsx publish --trusted-publishing "$VSIX_FILE"

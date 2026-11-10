@@ -15,14 +15,24 @@ interface WorkflowStep {
   env?: Record<string, string>;
   run?: string;
   uses?: string;
+  with?: Record<string, string | boolean>;
 }
 
-const workflow = parse(
-  readFileSync(
-    new URL("../../.github/workflows/release.yml", import.meta.url),
-    "utf8",
-  ),
-) as { jobs: { release: { steps: WorkflowStep[] } } };
+interface WorkflowJob {
+  needs?: string;
+  permissions?: Record<string, string>;
+  outputs?: Record<string, string>;
+  steps: WorkflowStep[];
+}
+
+const workflowSource = readFileSync(
+  new URL("../../.github/workflows/release.yml", import.meta.url),
+  "utf8",
+);
+const workflow = parse(workflowSource) as {
+  permissions: Record<string, string>;
+  jobs: { release: WorkflowJob; publish: WorkflowJob };
+};
 const versionStep = workflow.jobs.release.steps.find(
   (step) => step.id === "version",
 );
@@ -125,6 +135,64 @@ describe("release workflow quality gates", () => {
     expect(versionIndex).toBe(testIndex + 1);
 
     for (const step of steps.slice(checkIndex)) {
+      expect(step.if).toBeUndefined();
+      expect(step["continue-on-error"]).toBeUndefined();
+    }
+  });
+
+  it("hands the packaged VSIX to the publish job after the GitHub release", () => {
+    const { release } = workflow.jobs;
+    expect(release.outputs).toEqual({
+      vsix: "${{ steps.package.outputs.vsix }}",
+    });
+    const upload = release.steps[release.steps.length - 1];
+    expect(upload.name).toBe("Upload VSIX artifact");
+    expect(upload.with).toEqual({
+      name: "vsix",
+      path: "${{ steps.package.outputs.vsix }}",
+      "if-no-files-found": "error",
+    });
+    expect(release.steps[release.steps.length - 2].name).toBe(
+      "Create GitHub Release",
+    );
+  });
+
+  it("uses trusted publishing instead of long-lived registry tokens", () => {
+    const secrets = workflowSource.match(/secrets\.[A-Za-z_]+/g) ?? [];
+    expect([...new Set(secrets)]).toEqual(["secrets.GITHUB_TOKEN"]);
+  });
+
+  it("grants the OIDC token only to the publish job, which runs no lifecycle scripts", () => {
+    const { release, publish } = workflow.jobs;
+    expect(workflow.permissions).toEqual({ contents: "write" });
+    expect(release.permissions).toBeUndefined();
+    expect(publish.needs).toBe("release");
+    expect(publish.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+    });
+    expect(publish.steps.map((step) => step.run).filter(Boolean)).toEqual([
+      "npm ci --ignore-scripts",
+      'npx @vscode/vsce publish --oidc --packagePath "$VSIX_FILE"',
+      'npx ovsx publish --trusted-publishing "$VSIX_FILE"',
+    ]);
+
+    const indexOf = (name: string) =>
+      publish.steps.findIndex((step) => step.name === name);
+    const marketplace =
+      publish.steps[indexOf("Publish to VS Code Marketplace")];
+    const openVsx = publish.steps[indexOf("Publish to Open VSX")];
+    expect(indexOf("Publish to VS Code Marketplace")).toBe(
+      indexOf("Download VSIX artifact") + 1,
+    );
+    expect(indexOf("Publish to Open VSX")).toBe(publish.steps.length - 1);
+    expect(marketplace.env).toEqual({
+      VSIX_FILE: "${{ needs.release.outputs.vsix }}",
+    });
+    expect(openVsx.env).toEqual({
+      VSIX_FILE: "${{ needs.release.outputs.vsix }}",
+    });
+    for (const step of publish.steps) {
       expect(step.if).toBeUndefined();
       expect(step["continue-on-error"]).toBeUndefined();
     }
