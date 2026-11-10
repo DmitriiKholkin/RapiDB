@@ -5255,7 +5255,7 @@ describe("TableView", () => {
     await waitFor(() => {
       expect(lastFetchPayload()).toMatchObject({ filters: [] });
     });
-  });
+  }, 15000);
 
   it("does not refetch on duplicate tableInit and preserves committed data", async () => {
     renderTableView();

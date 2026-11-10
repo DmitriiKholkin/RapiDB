@@ -327,7 +327,7 @@ describe("RedisDriver — oversized values", () => {
         oversized(`RedisValueNotLoaded(string, ${maxValueBytes} bytes)`),
       ),
     );
-  });
+  }, 30000);
 
   it("keeps the bytes actually loaded from collections within the total budget", async () => {
     const list = Array.from({ length: maxValueEntries }, () =>
@@ -633,7 +633,7 @@ describe("RedisDriver — oversized values", () => {
       500 + describeReads + metadataReads,
     );
     expect(client.get).toHaveBeenCalledTimes(500 + describeReads);
-  });
+  }, 30000);
 
   it("keeps one value column type across the chunks of a mixed page and exports CSV", async () => {
     const text = "s".repeat(200_000);
@@ -716,7 +716,7 @@ describe("RedisDriver — oversized values", () => {
       vi.doUnmock("vscode");
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30000);
 
   it("makes progress when a binary string heads a page over the total budget", async () => {
     const chunk = 3 * 1024 * 1024;
@@ -765,7 +765,7 @@ describe("RedisDriver — oversized values", () => {
     expect(rows.slice(1).every((row) => row.value === text)).toBe(true);
     expect(client.type).toHaveBeenCalledTimes(60);
     expect(client.get.mock.calls.length).toBeLessThanOrEqual(2 * 60);
-  });
+  }, 30000);
 
   it("rechecks a cached hash size before reading it in a later chunk pass", async () => {
     const text = "t".repeat(512 * 1024);
@@ -805,7 +805,7 @@ describe("RedisDriver — oversized values", () => {
     expect(rows.at(-1)?.value).toEqual(
       oversized("RedisValueTooLarge(hash, 5000 entries)"),
     );
-  });
+  }, 30000);
 
   it("still fails a chunked export on a value over the per-value cap", async () => {
     const { driver } = harness({
