@@ -112,7 +112,7 @@ describe.runIf(live)("Redis edit failure data safety (live Lua)", () => {
     const driver = await makeDriver();
     await expect(
       update(driver, { key: `${prefix}target`, value }),
-    ).rejects.toThrow(/unicode/i);
+    ).rejects.toThrow(/unpaired UTF-16 surrogate/);
     await expectPreserved(original);
   });
 
