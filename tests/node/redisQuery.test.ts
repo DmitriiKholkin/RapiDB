@@ -1,4 +1,4 @@
-import { type createClient, RESP_TYPES } from "redis";
+import { type createClient, ErrorReply, RESP_TYPES } from "redis";
 import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 const queryReplyOptions = {
@@ -19,6 +19,7 @@ import {
   REDIS_ALL_KEYS_TABLE,
   REDIS_UNPREFIXED_KEYS_TABLE,
 } from "../../src/extension/dbDrivers/redisKeyspace";
+import { logger } from "../../src/extension/utils/logger";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
 
 function createDriver() {
@@ -54,6 +55,370 @@ describe("RedisDriver — query()", () => {
     expect(result.rowCount).toBe(1);
     expect(result.columns).toEqual(["result"]);
     expect(result.rows[0]?.__col_0).toBe("OK");
+  });
+
+  it("returns completed statements when a later statement hits a transport failure", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new Error("Socket closed unexpectedly"));
+
+    const result = await driver.query("SET a 1; INCR b; SET c 3");
+
+    expect(sendCommand).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(result.rows[0]?.__col_0))).toEqual(["OK"]);
+    expect(result.error).toBe(
+      "Redis statement 2 of 3 failed: Socket closed unexpectedly. Statement 1 completed and any writes it made were applied; the outcome of statement 2 of 3 is unknown and later statements were not run.",
+    );
+  });
+
+  it("does not double the period when the Redis error text already ends with one", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("ERR something went wrong."));
+
+    const rejected = await driver.query("SET a 1; INCR b; SET c 3");
+
+    expect(rejected.error).toBe(
+      "Redis statement 2 of 3 failed: ERR something went wrong. Statement 1 completed and any writes it made were applied; later statements were not run.",
+    );
+
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new Error("Connection reset by peer. "));
+
+    const transport = await driver.query("SET a 1; INCR b; SET c 3");
+
+    expect(transport.error).toBe(
+      "Redis statement 2 of 3 failed: Connection reset by peer. Statement 1 completed and any writes it made were applied; the outcome of statement 2 of 3 is unknown and later statements were not run.",
+    );
+    expect(transport.error).not.toContain("..");
+  });
+
+  it("reports earlier writes as applied when a later statement is rejected", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("WRONGTYPE wrong kind of value"));
+
+    const result = await driver.query("SET a 1; SET b 2; INCR h; SET c 3");
+
+    expect(sendCommand).toHaveBeenCalledTimes(3);
+    expect(JSON.parse(String(result.rows[0]?.__col_0))).toEqual([
+      "OK",
+      "OK",
+      "(error) WRONGTYPE wrong kind of value",
+    ]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 4 failed: WRONGTYPE wrong kind of value. Statements 1 to 2 completed and any writes they made were applied; later statements were not run.",
+    );
+  });
+
+  it("returns completed statements when the query is aborted mid-statement", async () => {
+    const { driver, sendCommand } = createDriver();
+    const controller = new AbortController();
+    const client = { sendCommand, withAbortSignal: () => client };
+    const cancelClientEntry = vi.fn();
+    Object.assign(driver, {
+      openClient: () => ({
+        client,
+        promise: Promise.resolve(client),
+        cancelled: false,
+        openingSettled: true,
+        abort: new AbortController(),
+      }),
+      cancelClientEntry,
+    });
+    sendCommand.mockResolvedValueOnce("OK").mockImplementationOnce(() => {
+      controller.abort(new Error("Query cancelled"));
+      return new Promise(() => undefined);
+    });
+
+    const result = await driver.query("SET a 1; SET b 2; SET c 3", undefined, {
+      signal: controller.signal,
+    });
+
+    expect(sendCommand).toHaveBeenCalledTimes(2);
+    expect(JSON.parse(String(result.rows[0]?.__col_0))).toEqual(["OK"]);
+    expect(result.error).toBe(
+      "Redis statement 2 of 3 was cancelled. Statement 1 completed and any writes it made were applied; the outcome of statement 2 of 3 is unknown and later statements were not run.",
+    );
+    expect(cancelClientEntry).toHaveBeenCalled();
+  });
+
+  it("returns completed statements when a disconnect interrupts a script", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand.mockImplementationOnce(async () => {
+      (driver as unknown as { epoch: number }).epoch++;
+      return "OK";
+    });
+
+    const result = await driver.query("SET a 1; SET b 2");
+
+    expect(sendCommand).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(result.rows[0]?.__col_0))).toEqual(["OK"]);
+    expect(result.error).toBe(
+      "Redis script was cancelled before statement 2 of 2. Statement 1 completed and any writes it made were applied; later statements were not run.",
+    );
+  });
+
+  it("reports queued commands as not applied when a statement inside MULTI is rejected", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockRejectedValueOnce(new ErrorReply("ERR unknown command 'BADCMD'"));
+
+    const result = await driver.query("MULTI; SET a 1; BADCMD; EXEC");
+
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    expect(sendCommand).toHaveBeenLastCalledWith(["DISCARD"]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 4 failed: ERR unknown command 'BADCMD'. The commands queued after MULTI at statement 1 were not applied because EXEC did not run; later statements were not run.",
+    );
+  });
+
+  it("reports the transaction outcome as unknown when EXEC hits a transport failure", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockRejectedValueOnce(new Error("Socket closed unexpectedly"));
+
+    const result = await driver.query("MULTI; SET a 1; EXEC");
+
+    expect(JSON.parse(String(result.rows[0]?.__col_0))).toEqual([
+      "OK",
+      "QUEUED",
+    ]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 3 failed: Socket closed unexpectedly. The outcome of the transaction started by MULTI at statement 1 is unknown; later statements were not run.",
+    );
+  });
+
+  it("reports the transaction as discarded when EXEC is rejected", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockRejectedValueOnce(
+        new ErrorReply("EXECABORT Transaction discarded because of errors"),
+      );
+
+    const result = await driver.query("MULTI; SET a 1; EXEC; SET b 2");
+
+    expect(sendCommand).toHaveBeenCalledTimes(3);
+    expect(result.error).toBe(
+      "Redis statement 3 of 4 failed: EXECABORT Transaction discarded because of errors. The transaction started by MULTI at statement 1 was discarded and its queued commands were not applied; later statements were not run.",
+    );
+  });
+
+  it("separates writes applied before MULTI from queued commands", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("ERR wrong number of arguments"));
+
+    const result = await driver.query("SET a 1; multi; SET b; EXEC");
+
+    expect(sendCommand).toHaveBeenLastCalledWith(["DISCARD"]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 4 failed: ERR wrong number of arguments. Statement 1 completed and any writes it made were applied. The commands queued after MULTI at statement 2 were not applied because EXEC did not run; later statements were not run.",
+    );
+  });
+
+  it("treats statements after a completed transaction as outside MULTI", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce(["OK"])
+      .mockRejectedValueOnce(new ErrorReply("WRONGTYPE wrong kind of value"));
+
+    const result = await driver.query("MULTI; SET a 1; EXEC; INCR h; SET c 3");
+
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    expect(result.error).toBe(
+      "Redis statement 4 of 5 failed: WRONGTYPE wrong kind of value. Statements 1 to 3 completed and any writes they made were applied; later statements were not run.",
+    );
+  });
+
+  it("still discards the transaction when DISCARD is rejected", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockRejectedValueOnce(
+        new ErrorReply("ERR wrong number of arguments for 'discard' command"),
+      );
+
+    const result = await driver.query("MULTI; SET a 1; DISCARD extra; SET b 2");
+
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    expect(sendCommand).toHaveBeenLastCalledWith(["DISCARD"]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 4 failed: ERR wrong number of arguments for 'discard' command. The commands queued after MULTI at statement 1 were not applied because EXEC did not run; later statements were not run.",
+    );
+  });
+
+  it("still discards the transaction when EXEC is rejected without EXECABORT", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockRejectedValueOnce(
+        new ErrorReply("ERR wrong number of arguments for 'exec' command"),
+      );
+
+    const result = await driver.query("MULTI; SET a 1; EXEC x");
+
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    expect(sendCommand).toHaveBeenLastCalledWith(["DISCARD"]);
+    expect(result.error).toBe(
+      "Redis statement 3 of 3 failed: ERR wrong number of arguments for 'exec' command. The transaction started by MULTI at statement 1 was discarded and its queued commands were not applied; later statements were not run.",
+    );
+  });
+
+  it("reports a WATCH-aborted transaction as not applied when a later statement fails", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new ErrorReply("ERR unknown command 'BADCMD'"));
+
+    const result = await driver.query("WATCH a; MULTI; SET a 1; EXEC; BADCMD");
+
+    expect(sendCommand).toHaveBeenCalledTimes(5);
+    expect(result.error).toBe(
+      "Redis statement 5 of 5 failed: ERR unknown command 'BADCMD'. Statements 1 to 4 completed. The commands queued after MULTI at statement 2 were not applied because EXEC at statement 4 returned nil (a WATCHed key changed). Any other writes they made were applied; later statements were not run.",
+    );
+  });
+
+  it("reports a discarded transaction as not applied when a later statement fails", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("ERR unknown command 'BADCMD'"));
+
+    const result = await driver.query("MULTI; SET a 1; DISCARD; BADCMD");
+
+    expect(sendCommand).toHaveBeenCalledTimes(4);
+    expect(result.error).toBe(
+      "Redis statement 4 of 4 failed: ERR unknown command 'BADCMD'. Statements 1 to 3 completed. The commands queued after MULTI at statement 1 were not applied because DISCARD at statement 3 discarded them. Any other writes they made were applied; later statements were not run.",
+    );
+
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("ERR wrong number of arguments"));
+
+    const reopened = await driver.query(
+      "MULTI; SET a 1; DISCARD; MULTI; SET b; EXEC",
+    );
+
+    expect(sendCommand).toHaveBeenLastCalledWith(["DISCARD"]);
+    expect(reopened.error).toBe(
+      "Redis statement 5 of 6 failed: ERR wrong number of arguments. Statements 1 to 3 completed. The commands queued after MULTI at statement 1 were not applied because DISCARD at statement 3 discarded them. Any other writes they made were applied. The commands queued after MULTI at statement 4 were not applied because EXEC did not run; later statements were not run.",
+    );
+  });
+
+  it("treats RESET inside MULTI as discarding the transaction on a dedicated client", async () => {
+    const { driver, sendCommand: sharedSendCommand } = createDriver();
+    const sendCommand = vi
+      .fn()
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce("RESET")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new ErrorReply("ERR unknown command 'BADCMD'"));
+    const client = { sendCommand };
+    const cancelClientEntry = vi.fn();
+    Object.assign(driver, {
+      openClient: () => ({
+        client,
+        promise: Promise.resolve(client),
+        cancelled: false,
+        openingSettled: true,
+        abort: new AbortController(),
+      }),
+      cancelClientEntry,
+    });
+
+    const result = await driver.query("MULTI; SET a 1; RESET; SET b 2; BADCMD");
+
+    expect(sharedSendCommand).not.toHaveBeenCalled();
+    expect(sendCommand).toHaveBeenCalledTimes(5);
+    expect(sendCommand).not.toHaveBeenCalledWith(["DISCARD"]);
+    expect(cancelClientEntry).toHaveBeenCalled();
+    expect(result.error).toBe(
+      "Redis statement 5 of 5 failed: ERR unknown command 'BADCMD'. Statements 1 to 4 completed. The commands queued after MULTI at statement 1 were not applied because RESET at statement 3 discarded them. Any other writes they made were applied; later statements were not run.",
+    );
+
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce("OK")
+      .mockRejectedValueOnce(new Error("Socket closed unexpectedly"));
+
+    const quit = await driver.query("MULTI; SET a 1; QUIT; SET b 2");
+
+    expect(quit.error).toBe(
+      "Redis statement 4 of 4 failed: Socket closed unexpectedly. Statements 1 to 3 completed. The commands queued after MULTI at statement 1 were not applied because QUIT at statement 3 closed the connection. Any other writes they made were applied; the outcome of statement 4 of 4 is unknown and later statements were not run.",
+    );
+  });
+
+  it("notes per-command errors inside a successful EXEC when a later statement fails", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("OK")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce("QUEUED")
+      .mockResolvedValueOnce([
+        new ErrorReply("ERR value is not an integer or out of range"),
+        "OK",
+      ])
+      .mockRejectedValueOnce(new ErrorReply("ERR unknown command 'BADCMD'"));
+
+    const result = await driver.query("MULTI; INCR s; SET b 2; EXEC; BADCMD");
+
+    expect(sendCommand).toHaveBeenCalledTimes(5);
+    expect(result.error).toBe(
+      "Redis statement 5 of 5 failed: ERR unknown command 'BADCMD'. Statements 1 to 4 completed. Some of the commands queued after MULTI at statement 1 returned errors in the EXEC result at statement 4. Any other writes they made were applied; later statements were not run.",
+    );
+  });
+
+  it("reports queued commands as not applied when cancelled before EXEC", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand.mockResolvedValueOnce("OK").mockImplementationOnce(async () => {
+      (driver as unknown as { epoch: number }).epoch++;
+      return "QUEUED";
+    });
+
+    const result = await driver.query("MULTI; SET a 1; EXEC");
+
+    expect(sendCommand).toHaveBeenCalledTimes(2);
+    expect(result.error).toBe(
+      "Redis script was cancelled before statement 3 of 3. The commands queued after MULTI at statement 1 were not applied because EXEC did not run; later statements were not run.",
+    );
+  });
+
+  it("still throws a transport failure on the first statement", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand.mockRejectedValueOnce(new Error("Socket closed unexpectedly"));
+
+    await expect(driver.query("SET a 1; SET b 2")).rejects.toThrow(
+      "Socket closed unexpectedly",
+    );
+    expect(sendCommand).toHaveBeenCalledTimes(1);
   });
 
   it("runs multiple preview-style Redis commands sequentially", async () => {
@@ -847,6 +1212,74 @@ describe("RedisDriver — metadata and pages", () => {
     expect(client.del).not.toHaveBeenCalled();
   });
 
+  it("re-applies hash field TTLs to the staged replacement before renaming it", async () => {
+    const driver = new RedisDriver({
+      id: "redis-hash-field-ttl-test",
+      name: "Redis Hash Field TTL Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      type: vi.fn().mockResolvedValue("hash"),
+      hLen: vi.fn().mockResolvedValue(2),
+      sendCommand: vi.fn().mockResolvedValue(1),
+    };
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = withRedisReplyMapping(client);
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    await expect(
+      driver.updateRows({
+        database: "db0",
+        schema: "db0",
+        table: "session",
+        updates: [
+          {
+            primaryKeys: { key: "session:1" },
+            changes: { value: '{"token":"abc","user":"bob"}' },
+          },
+        ],
+      }),
+    ).resolves.toEqual({ affectedRows: 1 });
+
+    const [args] = client.sendCommand.mock.calls[0] as [string[]];
+    expect(args.slice(0, 1)).toEqual(["EVAL"]);
+    const script = args[1];
+    const probe = script.indexOf(
+      "pcall(redis.acl_check_cmd, 'HPEXPIRETIME', source, 'FIELDS', '1', 'field')",
+    );
+    const read = script.indexOf(
+      "redis.call('HPEXPIRETIME', source, 'FIELDS', 1, field)[1]",
+    );
+    const reapply = script.indexOf(
+      "call('HPEXPIREAT', staging, entry[2], 'FIELDS', '1', entry[1])",
+    );
+    const permissionCheck = script.indexOf(
+      "buildReplacement(requirePermission)",
+    );
+    const rename = script.indexOf("redis.call('RENAME', staging, target)");
+    expect(probe).toBeGreaterThan(-1);
+    expect(read).toBeGreaterThan(probe);
+    expect(script).toContain(
+      "RAPIDB_NOT_APPLIED Redis hash edits require HPEXPIRETIME permission to preserve field TTLs.",
+    );
+    const fieldTtlFallback = script.indexOf(
+      "elseif pcall(redis.acl_check_cmd, 'HPEXPIRE', source, '1', 'FIELDS', '1', 'field') then",
+    );
+    expect(fieldTtlFallback).toBeGreaterThan(read);
+    expect(script.slice(fieldTtlFallback)).toMatch(
+      /^[^\n]*\n\s*return redis\.error_reply\('RAPIDB_NOT_APPLIED Redis hash edits cannot preserve field TTLs because HPEXPIRETIME is unavailable\.'\)/,
+    );
+    expect(reapply).toBeGreaterThan(read);
+    expect(permissionCheck).toBeGreaterThan(reapply);
+    expect(rename).toBeGreaterThan(permissionCheck);
+    expect(JSON.parse(args[9])).toEqual({ token: "abc", user: "bob" });
+  });
+
   it("applies ttl-only updates without rewriting values", async () => {
     const driver = new RedisDriver({
       id: "redis-ttl-update-test",
@@ -1131,10 +1564,100 @@ describe("RedisDriver — metadata and pages", () => {
     ).client = withRedisReplyMapping(client);
     (driver as unknown as { connected: boolean }).connected = true;
 
-    await driver.listObjects();
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const objects = await driver.listObjects();
+      expect(objects.truncated).toBe(true);
+      expect(objects.map((object) => object.name)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "ns",
+      ]);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `stopped after ${REDIS_READ_BUDGET.maxScanKeys} keys; some prefixes may be missing`,
+        ),
+      );
+    } finally {
+      warn.mockRestore();
+    }
 
-    const expectedCalls = Math.ceil(REDIS_READ_BUDGET.maxScanKeys / batchSize);
+    // One extra SCAN step confirms more keys exist after reaching the cap exactly.
+    const expectedCalls =
+      Math.ceil(REDIS_READ_BUDGET.maxScanKeys / batchSize) + 1;
     expect(client.scan).toHaveBeenCalledTimes(expectedCalls);
+  });
+
+  it("does not warn when the keyspace holds exactly the discovery cap", async () => {
+    const driver = new RedisDriver({
+      id: "redis-object-exact-cap-test",
+      name: "Redis Object Exact Cap Test",
+      type: "redis",
+      host: "localhost",
+    });
+
+    const batchSize = 250;
+    const batches = REDIS_READ_BUDGET.maxScanKeys / batchSize;
+    let iteration = 0;
+    const client = {
+      scan: vi.fn().mockImplementation(async () => {
+        const start = iteration++ * batchSize;
+        if (iteration > batches) return { cursor: "0", keys: [] };
+        return {
+          cursor: String(iteration),
+          keys: Array.from(
+            { length: batchSize },
+            (_, index) => `ns:${start + index}`,
+          ),
+        };
+      }),
+    };
+
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = withRedisReplyMapping(client);
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const objects = await driver.listObjects();
+      expect(objects.truncated).toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+    expect(client.scan).toHaveBeenCalledTimes(batches + 1);
+  });
+
+  it("does not warn when Redis object discovery scans the whole keyspace", async () => {
+    const driver = new RedisDriver({
+      id: "redis-object-complete-test",
+      name: "Redis Object Complete Test",
+      type: "redis",
+      host: "localhost",
+    });
+    const client = {
+      scan: vi.fn().mockResolvedValue({ cursor: "0", keys: ["ns:1", "other"] }),
+    };
+    (
+      driver as unknown as {
+        client: typeof client | null;
+        connected: boolean;
+      }
+    ).client = withRedisReplyMapping(client);
+    (driver as unknown as { connected: boolean }).connected = true;
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+    try {
+      const objects = await driver.listObjects();
+      expect(objects).toHaveLength(3);
+      expect(objects.truncated).toBeUndefined();
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("reports Redis update identities when a later row does not match", async () => {

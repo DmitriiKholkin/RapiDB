@@ -616,6 +616,51 @@ describe("VSCodeConnectionManagerStore", () => {
     expect(store.getQueryRowLimit()).toBe(10);
   });
 
+  it.each([
+    "abc",
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    null,
+  ])("falls back to the defaults for a non-finite history or row limit (%s)", async (value) => {
+    vi.resetModules();
+
+    vi.doMock("vscode", () => ({
+      workspace: {
+        getConfiguration: vi.fn(() => ({
+          get: vi.fn((section: string, fallback?: unknown) =>
+            section === "queryHistoryLimit" || section === "queryRowLimit"
+              ? value
+              : fallback,
+          ),
+          update: vi.fn(),
+        })),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: {
+        Global: 1,
+      },
+    }));
+
+    const { VSCodeConnectionManagerStore } = await import(
+      "../../src/extension/connectionManagerStore"
+    );
+
+    const store = new VSCodeConnectionManagerStore({
+      globalState: {
+        get: vi.fn(),
+        update: vi.fn(),
+      },
+      secrets: {
+        get: vi.fn(),
+        store: vi.fn(),
+        delete: vi.fn(),
+      },
+    } as never);
+
+    expect(store.getHistoryLimit()).toBe(100);
+    expect(store.getQueryRowLimit()).toBe(1000);
+  });
+
   it("reads skipTableMutationPreview from the rapidb configuration", async () => {
     vi.resetModules();
 

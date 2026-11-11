@@ -10,7 +10,7 @@ import { GridLoadingOverlay } from "./GridOverlay";
 import { TableDialogs } from "./table/TableDialogs";
 import type { ExportFormat } from "./table/TableExportActions";
 import { TableFooter } from "./table/TableFooter";
-import { TableGrid } from "./table/TableGrid";
+import { TableGrid, type TableGridLayout } from "./table/TableGrid";
 import {
   TableMutationStatusBar,
   TableStatusBanners,
@@ -112,6 +112,7 @@ export function TableView({
   );
   const columnOrderRef = useRef<string[]>([]);
   const hiddenColumnIdsRef = useRef<Set<string>>(new Set());
+  const gridLayoutRef = useRef<TableGridLayout | null>(null);
   const pasteStructureEpochRef = useRef(0);
   const getExportColumnOrder = () =>
     columnOrderRef.current.filter(
@@ -167,6 +168,7 @@ export function TableView({
     tableDraftKey,
     mongoRowIdentity,
     canEditRows,
+    canInsertRows: !data.readOnlyTable,
     loadingRef: data.loadingRef,
     metadataBlockedRef: data.metadataBlockedRef,
     committedColumnNamesRef: data.committedColumnNamesRef,
@@ -426,9 +428,11 @@ export function TableView({
       />
 
       <TableGrid
-        key={JSON.stringify(data.columns.map((column) => column.name))}
+        key={tableDraftKey}
         columnOrderRef={columnOrderRef}
         hiddenColumnIdsRef={hiddenColumnIdsRef}
+        layoutRef={gridLayoutRef}
+        layoutKey={tableDraftKey}
         pasteStructureEpochRef={pasteStructureEpochRef}
         mongoColumnTypes={mongoRowIdentity}
         canEditRows={

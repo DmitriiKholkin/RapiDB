@@ -319,6 +319,13 @@ function toDraftEditInitialValue(value: unknown): string {
   return valueToEditString(value);
 }
 
+export interface TableGridLayout {
+  key: string;
+  columnNames: string[];
+  columnOrder: string[];
+  columnSizing: Record<string, number>;
+}
+
 interface TableGridProps {
   getRowMutationBlockReason?: (rowIdx: number) => string | null;
   canEditRows: boolean;
@@ -387,6 +394,8 @@ interface TableGridProps {
   sort: TableSortState;
   columnOrderRef?: React.MutableRefObject<string[]>;
   hiddenColumnIdsRef?: React.MutableRefObject<Set<string>>;
+  layoutRef?: React.MutableRefObject<TableGridLayout | null>;
+  layoutKey?: string;
   pasteStructureEpochRef?: React.MutableRefObject<number>;
   mongoColumnTypes?: boolean;
 }
@@ -414,7 +423,7 @@ function TableDataGrid({
   canEditRows,
   canSelectAndDeleteRows,
   rowSelectionDisabled = false,
-  colSizes,
+  colSizes: defaultColSizes,
   columns,
   editCell,
   filterDrafts,
@@ -440,6 +449,8 @@ function TableDataGrid({
   sort,
   columnOrderRef: exportColumnOrderRef,
   hiddenColumnIdsRef,
+  layoutRef,
+  layoutKey = "",
   pasteStructureEpochRef,
   mongoColumnTypes = false,
 }: TableGridProps) {
@@ -455,6 +466,16 @@ function TableDataGrid({
     [columns],
   );
 
+  const colSizes = useMemo(() => {
+    const sizes: Record<string, number> = Object.create(null);
+    for (const name of columnsMap.keys()) {
+      if (Object.hasOwn(defaultColSizes, name)) {
+        sizes[name] = defaultColSizes[name];
+      }
+    }
+    return sizes;
+  }, [defaultColSizes, columnsMap]);
+
   const columnsMapRef = useRef(columnsMap);
 
   const selectionColumnId = useMemo(() => {
@@ -462,15 +483,39 @@ function TableDataGrid({
     while (columnsMap.has(id)) id += "_";
     return id;
   }, [columnsMap]);
+  // Restores the layout of the same table after a reload remounted the grid; the column sync effect reconciles it.
+  const [restoredLayout] = useState(() =>
+    layoutRef?.current?.key === layoutKey ? layoutRef.current : null,
+  );
   const [columnSizingState, setColumnSizing] = useState<Record<string, number>>(
-    {},
+    () => {
+      const { [selectionColumnId]: _, ...sizing } =
+        restoredLayout?.columnSizing ?? {};
+      return sizing;
+    },
   );
   const columnSizing = useMemo<Record<string, number>>(
     () => Object.assign(Object.create(null), columnSizingState),
     [columnSizingState],
   );
-  const [columnOrder, setColumnOrder] = useState<string[]>([]);
+  const [columnOrder, setColumnOrder] = useState<string[]>(
+    () => restoredLayout?.columnOrder ?? [],
+  );
   const columnOrderRef = useRef(columnOrder);
+  const syncedColumnNamesRef = useRef<string[]>(
+    restoredLayout?.columnNames ?? [],
+  );
+
+  useEffect(() => {
+    void columns;
+    if (!layoutRef) return;
+    layoutRef.current = {
+      key: layoutKey,
+      columnNames: syncedColumnNamesRef.current,
+      columnOrder,
+      columnSizing: columnSizingState,
+    };
+  }, [layoutRef, layoutKey, columns, columnOrder, columnSizingState]);
   const columnSizingRef = useRef(columnSizing);
   const colSizesRef = useRef(colSizes);
 
@@ -1127,23 +1172,53 @@ function TableDataGrid({
     selection.contextMenuCellRef,
   ]);
 
-  useEffect(() => {
-    setColumnOrder((previous) => {
-      const columnNames = columns.map((column) => column.name);
-      const available = new Set(columnNames);
-      const retained = previous.filter((id) => available.has(id));
-      const retainedSet = new Set(retained);
-      const next = [
-        ...(canSelectAndDeleteRows ? [selectionColumnId] : []),
-        ...retained,
-        ...columnNames.filter((name) => !retainedSet.has(name)),
-      ];
-      return next.length === previous.length &&
-        next.every((id, index) => id === previous[index])
-        ? previous
-        : next;
+  useLayoutEffect(() => {
+    const columnNames = columns.map((column) => column.name);
+    const previousNames = syncedColumnNamesRef.current;
+    syncedColumnNamesRef.current = columnNames;
+    const previous = columnOrderRef.current;
+    const previousNameSet = new Set(previousNames);
+    // Drops the previous selection column id, which may now collide with a real field.
+    const previousDataOrder = previous.filter((id) => previousNameSet.has(id));
+    const reordered = previousDataOrder.some(
+      (id, index) => id !== previousNames[index],
+    );
+    const available = new Set(columnNames);
+    // A reload clears columns transiently; keep user widths until real columns arrive.
+    setColumnSizing((current) => {
+      const stale = Object.keys(current).filter((id) => !available.has(id));
+      if (stale.length === 0 || available.size === 0) return current;
+      const pruned = { ...current };
+      for (const id of stale) delete pruned[id];
+      return pruned;
     });
-  }, [columns, canSelectAndDeleteRows, selectionColumnId]);
+    const retained = reordered
+      ? previousDataOrder.filter((id) => available.has(id))
+      : columnNames;
+    const retainedSet = new Set(retained);
+    const next = [
+      ...(canSelectAndDeleteRows ? [selectionColumnId] : []),
+      ...retained,
+      ...columnNames.filter((name) => !retainedSet.has(name)),
+    ];
+    if (
+      next.length === previous.length &&
+      next.every((id, index) => id === previous[index])
+    )
+      return;
+    if (previous.some((id, index) => id !== next[index])) {
+      selection.clearSelection();
+      selection.contextMenuCellRef.current = null;
+    }
+    columnOrderRef.current = next;
+    setColumnOrder(next);
+  }, [
+    columns,
+    canSelectAndDeleteRows,
+    selectionColumnId,
+    selection.clearSelection,
+    selection.contextMenuCellRef,
+  ]);
 
   const wasDraggedRef = React.useRef(false);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
@@ -1255,7 +1330,10 @@ function TableDataGrid({
           accessorFn: (row) =>
             Object.hasOwn(row, column.name) ? row[column.name] : undefined,
           meta: column,
-          size: colSizes[column.name] ?? colSizes[`${column.name}key`] ?? 160,
+          size:
+            colSizes[column.name] ??
+            defaultColSizes[`${column.name}key`] ??
+            160,
           minSize: 1,
           maxSize: 800,
           header: () => (
@@ -1343,6 +1421,7 @@ function TableDataGrid({
       getRowMutationBlockReason,
       selectableRowIndexes,
       colSizes,
+      defaultColSizes,
       columns,
       editCell,
       onCancelEdit,

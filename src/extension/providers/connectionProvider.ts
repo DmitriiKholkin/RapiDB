@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
 import {
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
@@ -16,6 +17,7 @@ import {
   getDbObjectKindDisplayLabel,
   isDataDbObjectKind,
 } from "../../shared/dbObjectKinds";
+import { REDIS_READ_BUDGET } from "../../shared/safetyContracts";
 import {
   formatColumnDetailDescription,
   formatColumnDetailTooltip,
@@ -47,6 +49,7 @@ import {
   DEFAULT_DRIVER_ENTITY_MANIFEST as DEFAULT_ENTITY_MANIFEST,
   resolveDriverTableSectionAvailability,
 } from "../dbDrivers/types";
+import { logErrorWithContext } from "../utils/errorHandling";
 import {
   composeOpenDdlAwareContextValue,
   type OpenDdlNodeKind,
@@ -258,6 +261,14 @@ const PRIMARY_KEY_ICON_COLOR = new vscode.ThemeColor("charts.yellow");
 const SORT_KEY_ICON_COLOR = new vscode.ThemeColor("textLink.foreground");
 const CONNECTION_NODE_MIME = "application/vnd.rapidb.connection-nodes";
 const SCHEMA_LESS_CONNECTION_TYPES = new Set(["mongodb", "dynamodb", "redis"]);
+const reportedConnectFailures = new WeakSet<object>();
+
+export function claimConnectFailureReport(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return true;
+  if (reportedConnectFailures.has(error)) return false;
+  reportedConnectFailures.add(error);
+  return true;
+}
 
 type ConnectionProviderManager = ScopeAwareConnectionManagerApi & {
   getConnections(): ConnectionConfig[];
@@ -416,6 +427,7 @@ export class ConnectionProvider
     Map<string, RapiDBNode>
   >();
   private readonly _pendingConnectionRefreshIds = new Set<string>();
+  private readonly _connectionNodeGenerations = new Map<string, number>();
   private _refreshTimer: ReturnType<typeof setTimeout> | null = null;
   private _refreshAllPending = false;
   private _dragActive = false;
@@ -458,6 +470,7 @@ export class ConnectionProvider
       }),
       connectionManager.onDidDisconnect((connectionId) => {
         this.markConnectionRootExpanded(connectionId, false);
+        scheduleRefresh();
       }),
       connectionManager.onDidChangeConnections(() => scheduleRefresh()),
       connectionManager.onDidChangeSchemaState((connectionId) =>
@@ -574,7 +587,15 @@ export class ConnectionProvider
   }
 
   private refreshConnectionSubtree(connectionId: string): void {
-    this.refresh(this._connectionNodes.get(connectionId));
+    const connectionNode = this._connectionNodes.get(connectionId);
+    if (
+      connectionNode &&
+      connectionNode.kind !== this.connectionNodeKind(connectionId)
+    ) {
+      this.refresh();
+      return;
+    }
+    this.refresh(connectionNode);
     for (const node of this._expandedDescendantNodes
       .get(connectionId)
       ?.values() ?? []) {
@@ -780,18 +801,68 @@ export class ConnectionProvider
     return undefined;
   }
 
+  private async reportAutomaticConnectFailure(
+    element: RapiDBNode,
+    error: unknown,
+  ): Promise<void> {
+    if (!claimConnectFailureReport(error)) return;
+    const name =
+      this.connectionManager.getConnection?.(element.connectionId)?.name ??
+      element.connectionId;
+    const normalized = logErrorWithContext(
+      `Automatic connect failed for ${name}`,
+      error,
+    );
+    const action = await vscode.window.showErrorMessage(
+      `[RapiDB] Cannot connect to "${name}": ${normalized.message}`,
+      "Edit Connection",
+    );
+    if (action === "Edit Connection") {
+      await vscode.commands.executeCommand(CMD.editConnection, element);
+    }
+  }
+
   private async getConnectionChildren(
     element: RapiDBNode,
   ): Promise<RapiDBNode[]> {
     if (!this.connectionManager.isConnected(element.connectionId)) {
+      if (element.kind === "connectionNode_connected") {
+        if (!this.connectionManager.isConnecting(element.connectionId)) {
+          this.markConnectionRootExpanded(element.connectionId, false);
+        }
+        this.refresh();
+        return [];
+      }
+
       const attempt = this.connectionManager.beginConnect?.(
         element.connectionId,
       );
       if (attempt) {
-        void attempt.promise.catch(() => {
+        const collapseConnectionNode = () => {
+          this._connectionNodeGenerations.set(
+            element.connectionId,
+            (this._connectionNodeGenerations.get(element.connectionId) ?? 0) +
+              1,
+          );
           this.markConnectionRootExpanded(element.connectionId, false);
-          this.refreshConnectionTree(element.connectionId);
-        });
+          this.refresh();
+        };
+        void attempt.promise.then(
+          () => {
+            if (
+              !this.connectionManager.isConnected(element.connectionId) &&
+              !this.connectionManager.isConnecting(element.connectionId)
+            ) {
+              collapseConnectionNode();
+            }
+          },
+          (error: unknown) => {
+            collapseConnectionNode();
+            if (attempt.isNew) {
+              void this.reportAutomaticConnectFailure(element, error);
+            }
+          },
+        );
       }
 
       if (attempt?.isNew) {
@@ -996,20 +1067,24 @@ export class ConnectionProvider
     element.description = `(${filteredObjects.length})`;
 
     const manifest = this.getEntityManifest(element.connectionId);
+    const objectNodes = filteredObjects.map((object) =>
+      this.makeObjectNode(
+        object.type,
+        element.connectionId,
+        databaseName,
+        schemaName,
+        object.name,
+        object.routineIdentity,
+        manifest,
+      ),
+    );
+    if (schema.objectsTruncated && filteredObjects.length > 0) {
+      objectNodes.unshift(this.makeTruncatedObjectsNode(element));
+    }
 
     return this.appendStateNodes(
       element,
-      filteredObjects.map((object) =>
-        this.makeObjectNode(
-          object.type,
-          element.connectionId,
-          databaseName,
-          schemaName,
-          object.name,
-          object.routineIdentity,
-          manifest,
-        ),
-      ),
+      objectNodes,
       state,
       `Loading ${schemaName}…`,
     );
@@ -1242,6 +1317,11 @@ export class ConnectionProvider
     for (const connectionId of this._expandedDescendantNodes.keys()) {
       if (!liveConnectionIds.has(connectionId)) {
         this._expandedDescendantNodes.delete(connectionId);
+      }
+    }
+    for (const connectionId of this._connectionNodeGenerations.keys()) {
+      if (!liveConnectionIds.has(connectionId)) {
+        this._connectionNodeGenerations.delete(connectionId);
       }
     }
   }
@@ -1671,6 +1751,30 @@ export class ConnectionProvider
     return node;
   }
 
+  private makeTruncatedObjectsNode(parent: RapiDBNode): RapiDBNode {
+    const isRedis = this.getConnectionType(parent.connectionId) === "redis";
+    const label = isRedis
+      ? `Showing prefixes from the first ${REDIS_READ_BUDGET.maxScanKeys.toLocaleString("en-US")} keys — some may be missing`
+      : "Object list is incomplete";
+    const node = new RapiDBNode(
+      label,
+      "status_info",
+      vscode.TreeItemCollapsibleState.None,
+      parent.connectionId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      parent.id,
+    );
+    node.contextValue = "_status";
+    node.tooltip = isRedis
+      ? `Key prefix discovery stopped after ${REDIS_READ_BUDGET.maxScanKeys.toLocaleString("en-US")} keys, so some prefixes may be missing. Open "All keys" to browse the full keyspace.`
+      : "Object discovery stopped early; some objects may be missing.";
+    return node;
+  }
+
   private makeFolderNode(folderName: string): RapiDBNode {
     const conns = this.connectionManager
       .getConnections()
@@ -1691,15 +1795,19 @@ export class ConnectionProvider
     return node;
   }
 
+  private connectionNodeKind(connectionId: string): NodeKind {
+    if (this.connectionManager.isConnected(connectionId)) {
+      return "connectionNode_connected";
+    }
+    return this.connectionManager.isConnecting(connectionId)
+      ? "connectionNode_connecting"
+      : "connectionNode_disconnected";
+  }
+
   private makeConnectionNode(config: ConnectionConfig): RapiDBNode {
-    const connected = this.connectionManager.isConnected(config.id);
-    const connecting =
-      !connected && this.connectionManager.isConnecting(config.id);
-    const kind: NodeKind = connected
-      ? "connectionNode_connected"
-      : connecting
-        ? "connectionNode_connecting"
-        : "connectionNode_disconnected";
+    const kind = this.connectionNodeKind(config.id);
+    const connected = kind === "connectionNode_connected";
+    const connecting = kind === "connectionNode_connecting";
 
     const node = new RapiDBNode(
       config.name,
@@ -1709,6 +1817,11 @@ export class ConnectionProvider
         : vscode.TreeItemCollapsibleState.Collapsed,
       config.id,
     );
+    const generation = this._connectionNodeGenerations.get(config.id);
+    if (generation) {
+      // A fresh id makes VS Code drop the expanded state kept for the failed node.
+      node.id = `${node.id}#${generation}`;
+    }
 
     this._connectionNodes.set(config.id, node);
 

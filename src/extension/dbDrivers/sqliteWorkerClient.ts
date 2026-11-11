@@ -312,6 +312,9 @@ export class SQLiteWorkerClient {
                 ...(response.error.executionState
                   ? { executionState: response.error.executionState }
                   : {}),
+                ...(response.error.executionState === "not-executed"
+                  ? { code: "NOT_EXECUTED" }
+                  : {}),
               })
           : undefined,
         response.value,

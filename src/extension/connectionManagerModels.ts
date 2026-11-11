@@ -60,6 +60,7 @@ export interface SchemaSnapshotObjectEntry {
 export interface SchemaSnapshotSchemaEntry {
   name: string;
   objects: SchemaSnapshotObjectEntry[];
+  objectsTruncated?: boolean;
 }
 
 export interface SchemaSnapshotDatabaseEntry {

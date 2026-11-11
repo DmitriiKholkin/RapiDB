@@ -60,6 +60,7 @@ export interface ConnectionManagerStore {
   deleteSecret(id: string): Promise<void>;
   getConnectionIdsByScope?(): ConnectionIdsByScope;
   hasConnectionIdInAnyScope?(id: string): boolean;
+  hasConnectionIdOutsideActiveScope?(id: string): boolean;
   readOrphanedSecretIds?(): string[];
   writeOrphanedSecretIds?(ids: string[]): Promise<void>;
   readWorkspaceScopedConnectionIds?(): string[];
@@ -95,6 +96,10 @@ function collectConnectionIds(values: unknown[]): string[] {
     }
   }
   return [...ids];
+}
+
+function finiteOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 export interface ConnectionStoreMutation<TResult> {
@@ -591,16 +596,57 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   }
 
   getConnectionIdsByScope(): ConnectionIdsByScope {
+    const { user, workspace, effective } = this.readConnectionScopeValues();
+    return {
+      user: collectConnectionIds(user),
+      workspace: collectConnectionIds(workspace),
+      effective: collectConnectionIds(effective),
+    };
+  }
+
+  hasConnectionIdOutsideActiveScope(id: string): boolean {
+    const { target } = this.readConnectionsSnapshot();
+    const singleFolder = vscode.workspace.workspaceFile === undefined;
+    const sharesWorkspaceFile =
+      singleFolder && target !== vscode.ConfigurationTarget.Global;
+    const otherScopes = this.readConnectionScopeEntries()
+      .filter((entry) =>
+        entry.scope === vscode.ConfigurationTarget.Global
+          ? target !== entry.scope
+          : !(sharesWorkspaceFile || (!entry.folder && target === entry.scope)),
+      )
+      .map((entry) => entry.value);
+    return collectConnectionIds(otherScopes).some((candidate) =>
+      connectionIdsMatch(candidate, id),
+    );
+  }
+
+  private readConnectionScopeEntries(): Array<{
+    scope: vscode.ConfigurationTarget;
+    value: unknown;
+    folder?: boolean;
+  }> {
+    const entries: Array<{
+      scope: vscode.ConfigurationTarget;
+      value: unknown;
+      folder?: boolean;
+    }> = [];
     const configuration = vscode.workspace.getConfiguration("rapidb");
-    const user: unknown[] = [];
-    const workspace: unknown[] = [];
-    const effective: unknown[] = [configuration.get("connections")];
     if (typeof configuration.inspect === "function") {
       const inspected = configuration.inspect("connections");
-      user.push(inspected?.globalValue);
-      workspace.push(
-        inspected?.workspaceValue,
-        inspected?.workspaceFolderValue,
+      entries.push(
+        {
+          scope: vscode.ConfigurationTarget.Global,
+          value: inspected?.globalValue,
+        },
+        {
+          scope: vscode.ConfigurationTarget.Workspace,
+          value: inspected?.workspaceValue,
+        },
+        {
+          scope: vscode.ConfigurationTarget.WorkspaceFolder,
+          value: inspected?.workspaceFolderValue,
+        },
       );
     }
     for (const folder of vscode.workspace.workspaceFolders ?? []) {
@@ -609,16 +655,32 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
         folder.uri,
       );
       if (typeof folderConfiguration.inspect === "function") {
-        workspace.push(
-          folderConfiguration.inspect("connections")?.workspaceFolderValue,
-        );
+        entries.push({
+          scope: vscode.ConfigurationTarget.WorkspaceFolder,
+          value:
+            folderConfiguration.inspect("connections")?.workspaceFolderValue,
+          folder: true,
+        });
       }
     }
-    return {
-      user: collectConnectionIds(user),
-      workspace: collectConnectionIds(workspace),
-      effective: collectConnectionIds(effective),
-    };
+    return entries;
+  }
+
+  private readConnectionScopeValues(): {
+    user: unknown[];
+    workspace: unknown[];
+    effective: unknown[];
+  } {
+    const configuration = vscode.workspace.getConfiguration("rapidb");
+    const user: unknown[] = [];
+    const workspace: unknown[] = [];
+    for (const entry of this.readConnectionScopeEntries()) {
+      (entry.scope === vscode.ConfigurationTarget.Global
+        ? user
+        : workspace
+      ).push(entry.value);
+    }
+    return { user, workspace, effective: [configuration.get("connections")] };
   }
 
   hasConnectionIdInAnyScope(id: string): boolean {
@@ -698,7 +760,8 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     const raw = vscode.workspace
       .getConfiguration("rapidb")
       .get<number>("queryHistoryLimit", HISTORY_LIMIT_DEFAULT);
-    return Math.max(0, Math.min(HISTORY_LIMIT_MAX, Math.round(raw)));
+    const value = finiteOr(raw, HISTORY_LIMIT_DEFAULT);
+    return Math.max(0, Math.min(HISTORY_LIMIT_MAX, Math.round(value)));
   }
 
   getDefaultPageSize(): number {
@@ -712,7 +775,11 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     const raw = vscode.workspace
       .getConfiguration("rapidb")
       .get<number>("queryRowLimit", 1000);
-    return Math.max(10, Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(raw)));
+    const value = finiteOr(raw, 1000);
+    return Math.max(
+      10,
+      Math.min(QUERY_LIMIT_POLICY.hardCap, Math.round(value)),
+    );
   }
 
   getSkipTableMutationPreview(): boolean {

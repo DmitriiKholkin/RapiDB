@@ -16,20 +16,44 @@ const OPERAND_POSITION = new RegExp(
   String.raw`(?:[=<>!+\-*%&|^~,(.]|(?<!\*)\/|${NOT_PART_OF_NAME}(?:SET|SELECT|WHERE|AND|OR|NOT|XOR|ON|BY|AS|VALUES|IS|LIKE|IN|OUT|INOUT|BETWEEN|WHEN|THEN|ELSE|CASE|UNTIL|RETURN|DIV|MOD|REGEXP|RLIKE|INTERVAL|DISTINCT|HAVING|FROM|JOIN|INTO|UPDATE|TABLE|COLUMN|DECLARE|USING))$`,
   "i",
 );
-const ROUTINE_HEADER = new RegExp(
-  String.raw`^\s*(?:CREATE|ALTER)\b[\s\S]*?${NOT_PART_OF_NAME}(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)(?![\w$\u0080-\uffff])`,
-  "i",
-);
+function routineHeader(backslashEscapes: boolean): RegExp {
+  const quoted = (q: string) =>
+    backslashEscapes
+      ? String.raw`${q}(?:[^${q}\\]|\\[\s\S]|${q}${q})*${q}`
+      : `${q}[^${q}]*(?:${q}${q}[^${q}]*)*${q}`;
+  const quotedName = String.raw`(?:\x60[^\x60]*(?:\x60\x60[^\x60]*)*\x60|${quoted("'")}|${quoted('"')})`;
+  const accountPart = String.raw`(?:${quotedName}|[^\s@'"\x60]+)`;
+  const definer = String.raw`DEFINER\s*=\s*(?:CURRENT_USER(?:\s*\(\s*\))?|${accountPart}(?:\s*@\s*${accountPart})?)`;
+  return new RegExp(
+    String.raw`^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?|ALTER\s+)(?:${definer}\s*)?(?:SQL\s+SECURITY\s+\w+\s+)?(?:AGGREGATE\s+)?(?:PROCEDURE|FUNCTION|TRIGGER|EVENT)(?![\w$\u0080-\uffff])`,
+    "i",
+  );
+}
+const ROUTINE_HEADER = routineHeader(true);
+const ROUTINE_HEADER_NO_BACKSLASH_ESCAPES = routineHeader(false);
+const EXECUTABLE_COMMENT_MARKERS = /\/\*\+[\s\S]*?\*\/|\/\*M?!\d*|\*\//g;
 const NOT_ATOMIC_AFTER_BEGIN =
   /(?:\s|\/\*[\s\S]*?\*\/)+NOT(?:\s|\/\*[\s\S]*?\*\/)+ATOMIC\b/iy;
+const DELIMITER_DIRECTIVE = /DELIMITER[ \t]+(\S+)[^\n]*\n?/iy;
 
-export function splitMySQLScript(sql: string): string[] {
+export interface SplitMySQLScriptOptions {
+  backslashEscapes?: boolean;
+}
+
+export function splitMySQLScript(
+  script: string,
+  { backslashEscapes = true }: SplitMySQLScriptOptions = {},
+): string[] {
+  const sql = script.startsWith("\uFEFF") ? script.slice(1) : script;
   const stmts: string[] = [];
   let delim = ";";
   let i = 0;
   const n = sql.length;
   let buf = "";
   const blocks: Array<"block" | "case"> = [];
+  const routineHeaderPattern = backslashEscapes
+    ? ROUTINE_HEADER
+    : ROUTINE_HEADER_NO_BACKSLASH_ESCAPES;
   function isWordChar(p: number): boolean {
     if (p < 0 || p >= n) return false;
     const ch = sql[p];
@@ -59,18 +83,20 @@ export function splitMySQLScript(sql: string): string[] {
   function isOperandPosition(): boolean {
     return OPERAND_POSITION.test(buf.trimEnd());
   }
+  function delimiterDirectiveAt(): RegExpExecArray | null {
+    if ((sql[i] !== "D" && sql[i] !== "d") || blocks.length > 0) return null;
+    let p = i - 1;
+    while (p >= 0 && (sql[p] === " " || sql[p] === "\t")) p--;
+    if ((p >= 0 && sql[p] !== "\n") || /\S/.test(buf)) return null;
+    DELIMITER_DIRECTIVE.lastIndex = i;
+    return DELIMITER_DIRECTIVE.exec(sql);
+  }
   while (i < n) {
-    const atLineStart = i === 0 || sql[i - 1] === "\n";
-    if (atLineStart && /^DELIMITER\b/i.test(sql.slice(i))) {
-      while (i < n && sql[i] !== " " && sql[i] !== "\t") i++;
-      while (i < n && (sql[i] === " " || sql[i] === "\t")) i++;
-      let nd = "";
-      while (i < n && sql[i] !== "\r" && sql[i] !== "\n") {
-        nd += sql[i++];
-      }
-      if (nd) delim = nd;
-      while (i < n && sql[i] !== "\n") i++;
-      if (i < n) i++;
+    const directive = delimiterDirectiveAt();
+    if (directive) {
+      delim = directive[1];
+      i += directive[0].length;
+      buf = "";
       continue;
     }
     if (isMysqlDashCommentStart(sql, i) || sql[i] === "#") {
@@ -108,7 +134,7 @@ export function splitMySQLScript(sql: string): string[] {
       i++;
       while (i < n) {
         const c = sql[i];
-        if (c === "\\" && q !== "`") {
+        if (backslashEscapes && c === "\\" && q !== "`") {
           buf += c + (sql[i + 1] ?? "");
           i += 2;
           continue;
@@ -134,7 +160,10 @@ export function splitMySQLScript(sql: string): string[] {
         blocks.length > 0
           ? isStatementStart()
           : (buf.trim() === "" && NOT_ATOMIC_AFTER_BEGIN.test(sql)) ||
-            (!isOperandPosition() && ROUTINE_HEADER.test(buf));
+            (!isOperandPosition() &&
+              routineHeaderPattern.test(
+                buf.replace(EXECUTABLE_COMMENT_MARKERS, " "),
+              ));
       consumeKeyword("BEGIN");
       if (opensBlock) blocks.push("block");
       continue;

@@ -149,6 +149,13 @@ class WindowStore extends FakeConnectionManagerStore {
     );
   }
 
+  hasConnectionIdOutsideActiveScope(id: string): boolean {
+    return (
+      this.workspaceConnections !== undefined &&
+      ids(this.userConnections()).includes(id)
+    );
+  }
+
   readOrphanedSecretIds(): string[] {
     return [...this.profile.pendingIds];
   }
@@ -335,6 +342,22 @@ describe("Secret Storage cleanup for connections removed outside RapiDB", () => 
     } finally {
       await other.close();
       await window.close();
+    }
+  });
+
+  it("keeps the secret when RapiDB removes a workspace entry whose id is also in user settings", async () => {
+    vi.useFakeTimers();
+    const profile = createProfile();
+    const project = await openWindow(profile, [config]);
+    try {
+      await expect(project.manager.removeConnection(config.id)).resolves.toBe(
+        true,
+      );
+      expect(project.store.workspaceConnections).toEqual([]);
+      expect(ids(profile.userConnections)).toEqual([config.id]);
+      expect(profile.secrets.get(config.id)).toBe(secret);
+    } finally {
+      await project.close();
     }
   });
 
@@ -543,6 +566,117 @@ describe("VSCodeConnectionManagerStore connection scopes", () => {
       await store.writeOrphanedSecretIds(["gone"]);
       expect(store.readWorkspaceScopedConnectionIds()).toEqual(["workspace"]);
       expect(store.readOrphanedSecretIds()).toEqual(["gone"]);
+    } finally {
+      vi.doUnmock("vscode");
+      vi.resetModules();
+    }
+  });
+
+  it("finds connection ids outside the active settings scope", async () => {
+    vi.resetModules();
+    const folderUri = { fsPath: "/folder" };
+    const workspaceValue = [{ id: "shared" }, { id: "workspace-only" }];
+    vi.doMock("vscode", () => ({
+      workspace: {
+        workspaceFolders: [{ uri: folderUri }],
+        getConfiguration: (_section: string, resource?: unknown) => ({
+          get: () => workspaceValue,
+          inspect: () =>
+            resource === folderUri
+              ? { workspaceFolderValue: workspaceValue.map((c) => ({ ...c })) }
+              : {
+                  globalValue: [{ id: "shared" }, { id: "user-only" }],
+                  workspaceValue,
+                },
+        }),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    }));
+    try {
+      const { VSCodeConnectionManagerStore } = await import(
+        "../../src/extension/connectionManagerStore"
+      );
+      const store = new VSCodeConnectionManagerStore({
+        globalState: { get: vi.fn(), update: vi.fn() },
+        secrets: {},
+      } as never);
+      expect(store.hasConnectionIdOutsideActiveScope("shared")).toBe(true);
+      expect(store.hasConnectionIdOutsideActiveScope("user-only")).toBe(true);
+      expect(store.hasConnectionIdOutsideActiveScope("workspace-only")).toBe(
+        false,
+      );
+    } finally {
+      vi.doUnmock("vscode");
+      vi.resetModules();
+    }
+  });
+
+  it.each([
+    ["single-folder", undefined],
+    ["multi-root", { fsPath: "/project.code-workspace" }],
+  ])("keeps ids shared with an identical user-scope array (%s)", async (_label, workspaceFile) => {
+    vi.resetModules();
+    const folderUri = { fsPath: "/folder" };
+    const connections = () => [{ id: "copied" }];
+    vi.doMock("vscode", () => ({
+      workspace: {
+        workspaceFile,
+        workspaceFolders: [{ uri: folderUri }],
+        getConfiguration: (_section: string, resource?: unknown) => ({
+          get: () => connections(),
+          inspect: () =>
+            resource === folderUri
+              ? {}
+              : { globalValue: connections(), workspaceValue: connections() },
+        }),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    }));
+    try {
+      const { VSCodeConnectionManagerStore } = await import(
+        "../../src/extension/connectionManagerStore"
+      );
+      const store = new VSCodeConnectionManagerStore({
+        globalState: { get: vi.fn(), update: vi.fn() },
+        secrets: {},
+      } as never);
+      expect(store.hasConnectionIdOutsideActiveScope("copied")).toBe(true);
+    } finally {
+      vi.doUnmock("vscode");
+      vi.resetModules();
+    }
+  });
+
+  it("treats other folders of a multi-root workspace as separate scopes", async () => {
+    vi.resetModules();
+    const folderUri = { fsPath: "/folder" };
+    const connections = () => [{ id: "copied" }];
+    vi.doMock("vscode", () => ({
+      workspace: {
+        workspaceFile: { fsPath: "/project.code-workspace" },
+        workspaceFolders: [{ uri: folderUri }],
+        getConfiguration: (_section: string, resource?: unknown) => ({
+          get: () => connections(),
+          inspect: () =>
+            resource === folderUri
+              ? { workspaceFolderValue: connections() }
+              : { workspaceValue: connections() },
+        }),
+        onDidChangeConfiguration: vi.fn(),
+      },
+      ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    }));
+    try {
+      const { VSCodeConnectionManagerStore } = await import(
+        "../../src/extension/connectionManagerStore"
+      );
+      const store = new VSCodeConnectionManagerStore({
+        globalState: { get: vi.fn(), update: vi.fn() },
+        secrets: {},
+      } as never);
+      expect(store.hasConnectionIdOutsideActiveScope("copied")).toBe(true);
     } finally {
       vi.doUnmock("vscode");
       vi.resetModules();

@@ -198,6 +198,10 @@ describe("readOnly bypass regressions (stage 1)", () => {
     expect(guard("SELECT pg_notify('c', 'm')").allowed).toBe(false);
     expect(guard("SELECT pg_advisory_lock(1)").allowed).toBe(false);
     expect(guard("SELECT pg_try_advisory_lock(1, 2)").allowed).toBe(false);
+    expect(guard("SELECT pg_try_advisory_lock_shared(1)").allowed).toBe(false);
+    expect(guard("SELECT pg_try_advisory_xact_lock_shared(1, 2)").allowed).toBe(
+      false,
+    );
     expect(guard("SELECT pg_advisory_unlock(1)").allowed).toBe(false);
     expect(guard("SELECT lo_open(1, 131072)").allowed).toBe(false);
     expect(guard("SELECT lowrite(1, 'x')").allowed).toBe(false);

@@ -201,10 +201,10 @@ describe("MySQL-family JSON text aliases", () => {
     expect(queryObjectRows.mock.calls[1]?.[0]).toContain(
       "information_schema.CHECK_CONSTRAINTS",
     );
-    expect(queryObjectRows.mock.calls[1]?.[0]).toContain("NOT EXISTS");
     expect(queryObjectRows.mock.calls[1]?.[0]).toContain(
-      "tc2.TABLE_NAME <> tc.TABLE_NAME",
+      "NATURAL JOIN information_schema.CHECK_CONSTRAINTS",
     );
+    expect(queryObjectRows.mock.calls[1]?.[0]).not.toContain("NOT EXISTS");
     expect(jsonColumn).toMatchObject({
       type: "longtext",
       nativeType: "longtext",
@@ -326,11 +326,36 @@ describe("MySQL-family JSON text aliases", () => {
 
     expect(column).toMatchObject({ type: "longtext", category: "text" });
     expect(column).not.toHaveProperty("exportCategory");
-    expect(queryObjectRows.mock.calls[1]?.[0]).toContain(
-      "tc2.TABLE_SCHEMA <> tc.TABLE_SCHEMA",
+    expect(queryObjectRows.mock.calls[1]?.[0]).toMatch(
+      /TABLE_CONSTRAINTS tc\s+NATURAL JOIN information_schema\.CHECK_CONSTRAINTS cc/,
     );
-    expect(queryObjectRows.mock.calls[1]?.[0]).toContain(
-      "tc2.TABLE_NAME <> tc.TABLE_NAME",
+  });
+
+  it("keeps a MariaDB column-named JSON check when another table reuses the name", async () => {
+    const queryObjectRows = vi.fn(async (sql: string, _params?: unknown[]) =>
+      sql.includes("CHECK_CONSTRAINTS")
+        ? [
+            {
+              CHECK_CLAUSE: "json_valid(`data`)",
+              CONSTRAINT_NAME: "data",
+              TABLE_NAME: "orders",
+            },
+          ]
+        : [{ COLUMN_NAME: "data", COLUMN_TYPE: "longtext" }],
     );
+    const driver = new MySQLDriver({
+      id: "mariadb-json-alias-shared-name",
+      name: "MariaDB shared check name",
+      type: "mysql",
+    });
+    Reflect.set(driver, "queryObjectRows", queryObjectRows);
+
+    const [column] = await driver.describeColumns("shop", "", "orders");
+
+    expect(column).toHaveProperty("exportCategory", "json");
+    const [checkSql, checkParams] = queryObjectRows.mock.calls[1] ?? [];
+    expect(checkSql).toContain("NATURAL JOIN");
+    expect(checkSql).not.toContain("NOT EXISTS");
+    expect(checkParams).toEqual(["shop", "orders"]);
   });
 });

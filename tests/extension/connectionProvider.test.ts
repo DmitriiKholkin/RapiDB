@@ -59,6 +59,9 @@ vi.mock("vscode", () => {
     commands: {
       executeCommand: vi.fn(),
     },
+    window: {
+      showErrorMessage: vi.fn(async () => undefined),
+    },
   };
 });
 
@@ -1395,6 +1398,7 @@ describe("ConnectionProvider", () => {
 
   it("keeps disconnected connection children empty when auto-connect fails", async () => {
     vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     const beginConnect = vi.fn(() => ({
       isNew: true,
@@ -1444,6 +1448,226 @@ describe("ConnectionProvider", () => {
     expect(beginConnect).toHaveBeenCalled();
     expect(initialChildren).toHaveLength(0);
     expect(childrenAfterFailure).toHaveLength(0);
+
+    vi.useRealTimers();
+  });
+
+  function createConnectionStateManager(options: {
+    isConnected: () => boolean;
+    isConnecting?: () => boolean;
+    beginConnect?: () => { isNew: boolean; promise: Promise<void> };
+  }) {
+    const schemaState = createEventSource<string>();
+    const disconnectState = createEventSource<string>();
+    const beginConnect = vi.fn(
+      options.beginConnect ??
+        (() => ({ isNew: true, promise: new Promise<void>(() => {}) })),
+    );
+    const connectionManager = {
+      getConnections: vi.fn(() => [
+        { id: "conn-1", name: "Primary", type: "pg" },
+      ]),
+      beginConnect,
+      isConnected: vi.fn(options.isConnected),
+      isConnecting: vi.fn(options.isConnecting ?? (() => false)),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() => loadedState({ databases: [] })),
+      getConnection: vi.fn(() => ({
+        id: "conn-1",
+        name: "Primary",
+        type: "pg",
+      })),
+      getDriver: vi.fn(() => {
+        throw new Error("ConnectionProvider should not query drivers directly");
+      }),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: disconnectState.event,
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: schemaState.event,
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+    return { connectionManager, schemaState, disconnectState, beginConnect };
+  }
+
+  it("rebuilds a stale connected node as disconnected without reconnecting", async () => {
+    vi.useFakeTimers();
+    let connected = true;
+    const { connectionManager, schemaState, beginConnect } =
+      createConnectionStateManager({ isConnected: () => connected });
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    provider.markConnectionRootExpanded("conn-1", true);
+    const [connectedNode] = await provider.getChildren();
+    expect(connectedNode?.kind).toBe("connectionNode_connected");
+    const treeChangeSpy = vi.fn();
+    provider.onDidChangeTreeData(treeChangeSpy);
+
+    connected = false;
+    schemaState.fire("conn-1");
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(treeChangeSpy).toHaveBeenCalledWith(undefined);
+    expect(treeChangeSpy).not.toHaveBeenCalledWith(connectedNode);
+    expect(await provider.getChildren(connectedNode)).toEqual([]);
+    expect(beginConnect).not.toHaveBeenCalled();
+    const [rebuilt] = await provider.getChildren();
+    expect(rebuilt?.kind).toBe("connectionNode_disconnected");
+    expect(rebuilt?.collapsibleState).toBe(1);
+
+    vi.useRealTimers();
+  });
+
+  it("refreshes the root after a disconnect event", async () => {
+    vi.useFakeTimers();
+    const { connectionManager, disconnectState } = createConnectionStateManager(
+      { isConnected: () => false },
+    );
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    await provider.getChildren();
+    const treeChangeSpy = vi.fn();
+    provider.onDidChangeTreeData(treeChangeSpy);
+
+    disconnectState.fire("conn-1");
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(treeChangeSpy).toHaveBeenCalledWith(undefined);
+
+    vi.useRealTimers();
+  });
+
+  it("reports a failed automatic connect once and rebuilds the node collapsed under a new id", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const vscode = await import("vscode");
+    const failure = new Error("password authentication failed");
+    const { connectionManager, beginConnect } = createConnectionStateManager({
+      isConnected: () => false,
+      beginConnect: () => ({ isNew: true, promise: Promise.reject(failure) }),
+    });
+    const { ConnectionProvider, claimConnectFailureReport } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [node] = await provider.getChildren();
+    await provider.getChildren(node);
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(beginConnect).toHaveBeenCalledTimes(1);
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledTimes(1);
+    expect(vscode.window.showErrorMessage).toHaveBeenCalledWith(
+      '[RapiDB] Cannot connect to "Primary": password authentication failed',
+      "Edit Connection",
+    );
+    expect(claimConnectFailureReport(failure)).toBe(false);
+    const [rebuilt] = await provider.getChildren();
+    expect(rebuilt?.kind).toBe("connectionNode_disconnected");
+    expect(rebuilt?.id).not.toBe(node?.id);
+    expect(rebuilt?.collapsibleState).toBe(1);
+
+    vi.useRealTimers();
+  });
+
+  it("leaves reporting of a joined connect attempt to its initiator", async () => {
+    vi.useFakeTimers();
+    const vscode = await import("vscode");
+    const { connectionManager } = createConnectionStateManager({
+      isConnected: () => false,
+      beginConnect: () => ({
+        isNew: false,
+        promise: Promise.reject(new Error("refused")),
+      }),
+    });
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [node] = await provider.getChildren();
+    await provider.getChildren(node);
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
+    const [rebuilt] = await provider.getChildren();
+    expect(rebuilt?.collapsibleState).toBe(1);
+
+    vi.useRealTimers();
+  });
+
+  it("collapses the node under a new id when an automatic connect ends without connecting", async () => {
+    vi.useFakeTimers();
+    const vscode = await import("vscode");
+    let resolveAttempt!: () => void;
+    const { connectionManager } = createConnectionStateManager({
+      isConnected: () => false,
+      beginConnect: () => ({
+        isNew: true,
+        promise: new Promise<void>((resolve) => {
+          resolveAttempt = resolve;
+        }),
+      }),
+    });
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    const [node] = await provider.getChildren();
+    await provider.getChildren(node);
+    const [connecting] = await provider.getChildren();
+    expect(connecting?.collapsibleState).toBe(2);
+
+    resolveAttempt();
+    await vi.advanceTimersByTimeAsync(60);
+
+    expect(vscode.window.showErrorMessage).not.toHaveBeenCalled();
+    const [rebuilt] = await provider.getChildren();
+    expect(rebuilt?.kind).toBe("connectionNode_disconnected");
+    expect(rebuilt?.id).not.toBe(node?.id);
+    expect(rebuilt?.collapsibleState).toBe(1);
+
+    vi.useRealTimers();
+  });
+
+  it("keeps remembered descendants when a stale connected node is reconnecting", async () => {
+    vi.useFakeTimers();
+    let connected = true;
+    let connecting = false;
+    const { connectionManager, beginConnect } = createConnectionStateManager({
+      isConnected: () => connected,
+      isConnecting: () => connecting,
+    });
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+
+    const provider = new ConnectionProvider(connectionManager as never);
+    provider.markConnectionRootExpanded("conn-1", true);
+    const [connectedNode] = await provider.getChildren();
+    const descendant = { kind: "table", connectionId: "conn-1", id: "t1" };
+    provider.markExplorerNodeExpanded(descendant as never);
+
+    connected = false;
+    connecting = true;
+    expect(await provider.getChildren(connectedNode)).toEqual([]);
+    expect(beginConnect).not.toHaveBeenCalled();
+
+    connected = true;
+    connecting = false;
+    const [reconnected] = await provider.getChildren();
+    expect(reconnected?.collapsibleState).toBe(2);
+    const treeChangeSpy = vi.fn();
+    provider.onDidChangeTreeData(treeChangeSpy);
+    provider.refreshConnectionTree("conn-1");
+    expect(treeChangeSpy).toHaveBeenCalledWith(descendant);
 
     vi.useRealTimers();
   });
@@ -1594,6 +1818,74 @@ describe("ConnectionProvider", () => {
     expect(connectionManager.ensureTableDetailLoading).toHaveBeenCalledWith(
       expect.objectContaining({ table: REDIS_ALL_KEYS_TABLE }),
     );
+  });
+
+  it("shows a non-clickable notice when Redis prefix discovery was truncated", async () => {
+    const connection = { id: "conn-redis", name: "Redis", type: "redis" };
+    let objectsTruncated = true;
+    const connectionManager = {
+      getConnections: vi.fn(() => [connection]),
+      getConnection: vi.fn(() => connection),
+      isConnected: vi.fn(() => true),
+      isConnecting: vi.fn(() => false),
+      ensureSchemaScopeLoading: vi.fn(),
+      getSchemaSnapshotState: vi.fn(() =>
+        loadedState({
+          databases: [
+            {
+              name: "db0",
+              schemas: [
+                {
+                  name: "db0",
+                  objects: [
+                    { name: REDIS_ALL_KEYS_TABLE, type: "table", columns: [] },
+                    { name: "users", type: "table", columns: [] },
+                  ],
+                  ...(objectsTruncated ? { objectsTruncated: true } : {}),
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+      onDidConnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeConnections: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidChangeSchemaState: vi.fn(() => ({ dispose: vi.fn() })),
+      isSchemaScopeExpanded: vi.fn(() => false),
+      onDidRefreshSchemas: vi.fn(() => ({ dispose: vi.fn() })),
+    };
+
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const provider = new ConnectionProvider(connectionManager as never);
+    const roots = await provider.getChildren();
+    const databases = await provider.getChildren(roots[0]);
+    const categories = await provider.getChildren(databases[0]);
+    const tables = categories.find((node) => node.label === "Keyspaces");
+    if (!tables) throw new Error("Expected Redis Keyspaces category");
+    expect(tables.description).toBe("(2)");
+
+    const nodes = await provider.getChildren(tables);
+    expect(nodes.map((node) => node.label)).toEqual([
+      "Showing prefixes from the first 5,000 keys — some may be missing",
+      "All keys",
+      "users:*",
+    ]);
+    const notice = nodes[0];
+    expect(notice?.kind).toBe("status_info");
+    expect(notice?.contextValue).toBe("_status");
+    expect(notice?.command).toBeUndefined();
+    expect(notice?.collapsibleState).toBe(0);
+    expect(notice?.tooltip).toContain('Open "All keys"');
+    expect(nodes[1]?.command).toBeDefined();
+    expect(tables.description).toBe("(2)");
+
+    objectsTruncated = false;
+    expect(
+      (await provider.getChildren(tables)).map((node) => node.label),
+    ).toEqual(["All keys", "users:*"]);
   });
 
   it("renders multi-schema databases from the shared schema snapshot", async () => {

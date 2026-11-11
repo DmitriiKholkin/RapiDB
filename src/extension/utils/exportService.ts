@@ -288,24 +288,54 @@ async function runExport(request: ExportRequest): Promise<void> {
   }
 }
 
+const MAX_FILE_NAME_BYTES = 255;
+
+function truncateFileName(name: string, maxBytes: number): string {
+  if (Buffer.byteLength(name, "utf8") <= maxBytes) return name;
+  let truncated = "";
+  let bytes = 0;
+  for (const codePoint of name) {
+    bytes += Buffer.byteLength(codePoint, "utf8");
+    if (bytes > maxBytes) break;
+    truncated += codePoint;
+  }
+  return truncated.replace(/[\s.]+$/, "");
+}
+
+export function sanitizeExportFileName(name: string, extension = ""): string {
+  const maxBytes = Math.max(
+    1,
+    MAX_FILE_NAME_BYTES - Buffer.byteLength(extension, "utf8"),
+  );
+  const sanitized = truncateFileName(
+    name
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters are invalid in file names
+      .replace(/[/\\:*?"<>|\u0000-\u001f\u007f]/g, "_")
+      .replace(/^[\s.]+/, "")
+      .replace(/[\s.]+$/, ""),
+    maxBytes,
+  );
+  if (!sanitized) return "export";
+  if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(\..*)?$/i.test(sanitized)) {
+    return truncateFileName(`_${sanitized}`, maxBytes);
+  }
+  return sanitized;
+}
+
 function buildDefaultExportUri(
   context: vscode.ExtensionContext | undefined,
   defaultFileName: string,
   format: ExportFormat,
 ): vscode.Uri {
+  const extension = `.${format}`;
+  const fileName = `${sanitizeExportFileName(defaultFileName, extension)}${extension}`;
   const savedDirectory = getLastExportDirectory(context);
   if (savedDirectory) {
-    return vscode.Uri.file(
-      path.join(savedDirectory, `${defaultFileName}.${format}`),
-    );
+    return vscode.Uri.file(path.join(savedDirectory, fileName));
   }
 
   return vscode.Uri.file(
-    path.join(
-      os.homedir(),
-      DOWNLOADS_DIRECTORY,
-      `${defaultFileName}.${format}`,
-    ),
+    path.join(os.homedir(), DOWNLOADS_DIRECTORY, fileName),
   );
 }
 

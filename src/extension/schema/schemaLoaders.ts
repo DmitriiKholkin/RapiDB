@@ -209,6 +209,7 @@ export async function loadSchemaScope(
           }))
         : [],
     })),
+    ...(objects.truncated ? { objectsTruncated: true } : {}),
   };
   if (errors.length > 0) {
     throw new PartialSchemaLoadError(schema, failedObjects, errors);

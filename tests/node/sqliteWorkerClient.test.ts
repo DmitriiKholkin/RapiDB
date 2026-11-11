@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { isMutationNotExecutedError } from "../../src/extension/dbDrivers/mutationExecutionState";
 import { SQLiteWorkerClient } from "../../src/extension/dbDrivers/sqliteWorkerClient";
 import {
   configureSQLiteInstaller,
@@ -61,6 +62,10 @@ process.on("message", (request) => {
   }
   if (sql === "DELAY") {
     setTimeout(() => process.send({ id: request.id, value: sql }), 180);
+    return;
+  }
+  if (sql === "EXPIRED_IN_WORKER") {
+    process.send({ id: request.id, error: { name: "MutationNotExecutedError", message: "SQLite operation deadline exceeded before it started.", executionState: "not-executed" } });
     return;
   }
   if (sql === "CRASH") process.exit(23);
@@ -469,6 +474,20 @@ process.on("disconnect", () => process.exit(0));
     expect((await requests(logPath)).map(({ method }) => method)).toEqual([
       "connect",
     ]);
+    expect(client.connected).toBe(true);
+  });
+
+  it("keeps a worker-side not-executed rejection as NOT_EXECUTED", async () => {
+    const { client } = await startClient();
+    const error = await rejection(
+      client.call("query", ["EXPIRED_IN_WORKER"], 2_000),
+    );
+    expect(diagnostic(error)).toMatchObject({
+      name: "MutationNotExecutedError",
+      code: "NOT_EXECUTED",
+      executionState: "not-executed",
+    });
+    expect(isMutationNotExecutedError(error)).toBe(true);
     expect(client.connected).toBe(true);
   });
 

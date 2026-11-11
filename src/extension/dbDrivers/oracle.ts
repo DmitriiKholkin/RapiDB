@@ -583,9 +583,25 @@ type OracleLobLike = {
   getData?: () => Promise<string | Buffer | null>;
   destroy?: () => void;
   close?: () => Promise<void>;
+  once?: (event: "error", listener: () => void) => unknown;
 };
 function isOracleLobLike(value: unknown): value is OracleLobLike {
   return !!value && typeof value === "object";
+}
+const ORACLE_BFILE_PLACEHOLDER = "(BFILE)";
+function releaseOracleBfile(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  if (isOracleLobLike(value)) {
+    try {
+      if (typeof value.once === "function") value.once("error", () => {});
+      if (typeof value.destroy === "function") {
+        value.destroy();
+      } else if (typeof value.close === "function") {
+        value.close().catch(() => {});
+      }
+    } catch {}
+  }
+  return ORACLE_BFILE_PLACEHOLDER;
 }
 function oracleErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) {
@@ -2247,42 +2263,49 @@ export class OracleDriver extends BaseDBDriver {
   ): Promise<ForeignKeyMeta[]> {
     const conn = await this.getConnection();
     try {
-      const res = await conn.execute<{
-        CONSTRAINT_NAME: string;
-        COLUMN_NAME: string;
-        R_OWNER: string;
-        R_TABLE_NAME: string;
-        R_COLUMN_NAME: string;
-      }>(
-        `SELECT fk.constraint_name,
-                fkcol.column_name,
-                pk.owner       AS r_owner,
-                pk.table_name  AS r_table_name,
-                pkcol.column_name AS r_column_name
-         FROM all_constraints fk
-         JOIN all_cons_columns fkcol
-           ON fkcol.constraint_name = fk.constraint_name AND fkcol.owner = fk.owner
-         JOIN all_constraints pk
-           ON pk.constraint_name = fk.r_constraint_name AND pk.owner = fk.r_owner
-         JOIN all_cons_columns pkcol
-           ON pkcol.constraint_name = pk.constraint_name AND pkcol.owner = pk.owner
-              AND pkcol.position = fkcol.position
-         WHERE fk.constraint_type = 'R'
-           AND fk.owner = :1 AND fk.table_name = :2
-         ORDER BY fk.constraint_name, fkcol.position`,
-        [schema, table],
-        { outFormat: oracledb.OUT_FORMAT_OBJECT },
-      );
-      return (res.rows ?? []).map((r) => ({
-        constraintName: r.CONSTRAINT_NAME,
-        column: r.COLUMN_NAME,
-        referencedSchema: r.R_OWNER,
-        referencedTable: r.R_TABLE_NAME,
-        referencedColumn: r.R_COLUMN_NAME,
-      }));
+      return await this._readForeignKeys(conn, schema, table);
     } finally {
       await conn.close();
     }
+  }
+  private async _readForeignKeys(
+    conn: oracledb.Connection,
+    schema: string,
+    table: string,
+  ): Promise<ForeignKeyMeta[]> {
+    const res = await conn.execute<{
+      CONSTRAINT_NAME: string;
+      COLUMN_NAME: string;
+      R_OWNER: string;
+      R_TABLE_NAME: string;
+      R_COLUMN_NAME: string;
+    }>(
+      `SELECT fk.constraint_name,
+              fkcol.column_name,
+              pk.owner       AS r_owner,
+              pk.table_name  AS r_table_name,
+              pkcol.column_name AS r_column_name
+       FROM all_constraints fk
+       JOIN all_cons_columns fkcol
+         ON fkcol.constraint_name = fk.constraint_name AND fkcol.owner = fk.owner
+       JOIN all_constraints pk
+         ON pk.constraint_name = fk.r_constraint_name AND pk.owner = fk.r_owner
+       JOIN all_cons_columns pkcol
+         ON pkcol.constraint_name = pk.constraint_name AND pkcol.owner = pk.owner
+            AND pkcol.position = fkcol.position
+       WHERE fk.constraint_type = 'R'
+         AND fk.owner = :1 AND fk.table_name = :2
+       ORDER BY fk.constraint_name, fkcol.position`,
+      [schema, table],
+      { outFormat: oracledb.OUT_FORMAT_OBJECT },
+    );
+    return (res.rows ?? []).map((r) => ({
+      constraintName: r.CONSTRAINT_NAME,
+      column: r.COLUMN_NAME,
+      referencedSchema: r.R_OWNER,
+      referencedTable: r.R_TABLE_NAME,
+      referencedColumn: r.R_COLUMN_NAME,
+    }));
   }
   async getConstraints(
     _database: string,
@@ -2327,7 +2350,7 @@ export class OracleDriver extends BaseDBDriver {
         });
       }
 
-      const foreignKeys = await this.getForeignKeys("", schema, table);
+      const foreignKeys = await this._readForeignKeys(conn, schema, table);
       for (const foreignKey of foreignKeys) {
         const existing = constraints.get(foreignKey.constraintName);
         if (existing) {
@@ -3190,6 +3213,9 @@ export class OracleDriver extends BaseDBDriver {
         converter: (value) => normalizeOracleIntervalDSValue(value) ?? value,
       };
     }
+    if (metaData.dbType === oracledb.DB_TYPE_BFILE) {
+      return { converter: releaseOracleBfile };
+    }
     return undefined;
   }
   private async _buildTemporalQueryProjection(
@@ -3700,6 +3726,9 @@ END;`,
       };
     }
     const typeName = oracleTypeName(enriched.nativeType);
+    if (typeName === "BFILE") {
+      return { ...enriched, isReadOnly: true };
+    }
     const baseOperators: FilterOperator[] = enriched.filterOperators.filter(
       (operator) => operator !== "is_null" && operator !== "is_not_null",
     );

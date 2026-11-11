@@ -77,7 +77,7 @@ import type {
   QueryResult,
   SchemaInfo,
   TableConstraintMeta,
-  TableInfo,
+  TableInfoList,
   TransactionContext,
   TransactionOperation,
   TriggerMeta,
@@ -192,6 +192,21 @@ if ARGV[3] == '1' then
     end
     expiry = string.format('%.0f', ttl)
   end
+  local fieldExpiries = {}
+  if kind == 'hash' then
+    local supported, allowed = pcall(redis.acl_check_cmd, 'HPEXPIRETIME', source, 'FIELDS', '1', 'field')
+    if supported then
+      if not allowed then
+        return redis.error_reply('RAPIDB_NOT_APPLIED Redis hash edits require HPEXPIRETIME permission to preserve field TTLs.')
+      end
+      for field in pairs(value) do
+        local at = redis.call('HPEXPIRETIME', source, 'FIELDS', 1, field)[1]
+        if at > 0 then table.insert(fieldExpiries, { field, string.format('%.0f', at) }) end
+      end
+    elseif pcall(redis.acl_check_cmd, 'HPEXPIRE', source, '1', 'FIELDS', '1', 'field') then
+      return redis.error_reply('RAPIDB_NOT_APPLIED Redis hash edits cannot preserve field TTLs because HPEXPIRETIME is unavailable.')
+    end
+  end
   local function buildReplacement(call)
     if kind == 'string' then call('SET', staging, value)
     elseif kind == 'hash' then for field, entry in pairs(value) do call('HSET', staging, field, entry) end
@@ -199,6 +214,7 @@ if ARGV[3] == '1' then
     elseif kind == 'set' then for _, entry in ipairs(value) do call('SADD', staging, entry) end
     elseif kind == 'zset' then for _, entry in ipairs(value) do call('ZADD', staging, entry.score, entry.value) end
     end
+    for _, entry in ipairs(fieldExpiries) do call('HPEXPIREAT', staging, entry[2], 'FIELDS', '1', entry[1]) end
   end
   requirePermission('DEL', staging)
   if source ~= target then requirePermission('DEL', source) end
@@ -568,6 +584,90 @@ function splitRedisStatements(input: string): string[] {
 
   pushCurrent();
   return statements;
+}
+
+function stripTrailingPeriod(message: string): string {
+  return message.trimEnd().replace(/\.+$/, "");
+}
+
+interface RedisClosedTransaction {
+  multiIndex: number;
+  closeIndex: number;
+  outcome:
+    | "applied"
+    | "partial"
+    | "watchAborted"
+    | "discarded"
+    | "reset"
+    | "quit";
+}
+
+// RESET de-authenticates the connection and QUIT closes it, so scripts using
+// them never run on the shared client.
+const REDIS_CONNECTION_RESETTING_COMMANDS = new Set(["QUIT", "RESET"]);
+
+function capitalize(text: string): string {
+  return `${text[0].toUpperCase()}${text.slice(1)}`;
+}
+
+function describeClosedTransaction({
+  multiIndex,
+  closeIndex,
+  outcome,
+}: RedisClosedTransaction): string | undefined {
+  const queued = `the commands queued after MULTI at statement ${multiIndex + 1}`;
+  switch (outcome) {
+    case "watchAborted":
+      return `${queued} were not applied because EXEC at statement ${closeIndex + 1} returned nil (a WATCHed key changed)`;
+    case "discarded":
+      return `${queued} were not applied because DISCARD at statement ${closeIndex + 1} discarded them`;
+    case "reset":
+      return `${queued} were not applied because RESET at statement ${closeIndex + 1} discarded them`;
+    case "quit":
+      return `${queued} were not applied because QUIT at statement ${closeIndex + 1} closed the connection`;
+    case "partial":
+      return `some of ${queued} returned errors in the EXEC result at statement ${closeIndex + 1}`;
+    default:
+      return undefined;
+  }
+}
+
+function describeRedisScriptProgress(
+  statement: string,
+  index: number,
+  multiIndex: number | undefined,
+  closedTransactions: readonly RedisClosedTransaction[],
+  failure: "notRun" | "rejected" | "unknown",
+  isExec: boolean,
+): string {
+  const completedCount = multiIndex ?? index;
+  const notes = closedTransactions.flatMap(
+    (transaction) => describeClosedTransaction(transaction) ?? [],
+  );
+  const subject =
+    completedCount === 1 ? "Statement 1" : `Statements 1 to ${completedCount}`;
+  const writes =
+    completedCount === 1 ? "any writes it made" : "any writes they made";
+  const completed =
+    completedCount === 0
+      ? ""
+      : notes.length === 0
+        ? `${subject} completed and ${writes} were applied`
+        : `${subject} completed. ${notes.map(capitalize).join(". ")}. ${capitalize(writes.replace("any", "any other"))} were applied`;
+  if (multiIndex === undefined) {
+    return failure === "unknown"
+      ? `${completed}; the outcome of ${statement} is unknown and later statements were not run.`
+      : `${completed}; later statements were not run.`;
+  }
+  const transaction = `the transaction started by MULTI at statement ${multiIndex + 1}`;
+  const outcome =
+    isExec && failure === "unknown"
+      ? `the outcome of ${transaction} is unknown`
+      : isExec && failure === "rejected"
+        ? `${transaction} was discarded and its queued commands were not applied`
+        : `the commands queued after MULTI at statement ${multiIndex + 1} were not applied because EXEC did not run`;
+  const sentence = `${capitalize(outcome)}; later statements were not run.`;
+  return completed ? `${completed}. ${sentence}` : sentence;
 }
 
 function formatRedisPreviewCommand(
@@ -1046,15 +1146,27 @@ export class RedisDriver implements IDBDriver {
     return [];
   }
 
-  async listObjects(database?: string, _schema?: string): Promise<TableInfo[]> {
+  async listObjects(
+    database?: string,
+    _schema?: string,
+  ): Promise<TableInfoList> {
     const client = await this.getDatabaseClient(database);
+    let truncated = false;
     const keys = await this.scanKeys(
       client,
       "*",
       REDIS_READ_BUDGET.maxScanKeys,
       false,
       undefined,
-      { skipBinaryKeys: true },
+      {
+        skipBinaryKeys: true,
+        onTruncated: () => {
+          truncated = true;
+          logger.warn(
+            `Redis key prefix discovery stopped after ${REDIS_READ_BUDGET.maxScanKeys} keys; some prefixes may be missing from the object list. Open "All keys" to browse the full keyspace.`,
+          );
+        },
+      },
     );
     const prefixedNames = new Set<string>();
     let hasUnprefixedKeys = false;
@@ -1074,11 +1186,13 @@ export class RedisDriver implements IDBDriver {
       ...(hasUnprefixedKeys ? [REDIS_UNPREFIXED_KEYS_TABLE] : []),
       ...[...prefixedNames].sort((left, right) => left.localeCompare(right)),
     ];
-    return names.map((name) => ({
+    const objects: TableInfoList = names.map((name) => ({
       schema: "",
       name,
       type: "table",
     }));
+    if (truncated) objects.truncated = true;
+    return objects;
   }
 
   async describeTable(
@@ -1204,7 +1318,12 @@ export class RedisDriver implements IDBDriver {
       if (
         options?.database ||
         options?.requestToken !== undefined ||
-        externalSignal !== undefined
+        externalSignal !== undefined ||
+        commands.some(([command]) =>
+          REDIS_CONNECTION_RESETTING_COMMANDS.has(
+            String(command ?? "").toUpperCase(),
+          ),
+        )
       ) {
         entry = this.openClient(this.resolveDbIndex(options?.database));
         const owned = entry;
@@ -1221,11 +1340,32 @@ export class RedisDriver implements IDBDriver {
           ? baseClient.withAbortSignal(querySignal)
           : baseClient;
       let partialError: string | undefined;
+      let multiIndex: number | undefined;
+      const closedTransactions: RedisClosedTransaction[] = [];
       for (const [index, parts] of commands.entries()) {
-        querySignal.throwIfAborted();
-        if (epoch !== this.epoch)
-          throw new Error("Redis query was cancelled by disconnect.");
+        const statement = `statement ${index + 1} of ${commands.length}`;
         const [command, ...args] = parts;
+        const commandName = String(command ?? "").toUpperCase();
+        const closesTransaction =
+          commandName === "EXEC" || commandName === "DISCARD";
+        const progress = (failure: "notRun" | "rejected" | "unknown") =>
+          describeRedisScriptProgress(
+            statement,
+            index,
+            multiIndex,
+            closedTransactions,
+            failure,
+            commandName === "EXEC",
+          );
+        try {
+          querySignal.throwIfAborted();
+          if (epoch !== this.epoch)
+            throw new Error("Redis query was cancelled by disconnect.");
+        } catch (error) {
+          if (results.length === 0) throw error;
+          partialError = `Redis script was cancelled before ${statement}. ${progress("notRun")}`;
+          break;
+        }
         let result: unknown;
         try {
           result = await this.waitForResult(
@@ -1249,13 +1389,55 @@ export class RedisDriver implements IDBDriver {
             querySignal,
           );
         } catch (error) {
-          if (!(error instanceof ErrorReply) || results.length === 0)
-            throw error;
-          partialError = `Redis statement ${index + 1} of ${commands.length} failed: ${error.message}. Earlier statements completed; later statements were not run.`;
-          results.push(formatRedisReplyValue(error));
+          if (results.length === 0) throw error;
+          if (error instanceof ErrorReply) {
+            partialError = `Redis ${statement} failed: ${stripTrailingPeriod(error.message)}. ${progress("rejected")}`;
+            results.push(formatRedisReplyValue(error));
+            // Only EXECABORT ends MULTI; other rejected EXEC/DISCARD calls
+            // (arity errors) leave it open, so the cleanup DISCARD must run.
+            if (commandName === "EXEC" && error.message.startsWith("EXECABORT"))
+              multiIndex = undefined;
+          } else {
+            const failure =
+              querySignal.aborted || epoch !== this.epoch
+                ? "was cancelled"
+                : `failed: ${stripTrailingPeriod(error instanceof Error ? error.message : String(error))}`;
+            partialError = `Redis ${statement} ${failure}. ${progress("unknown")}`;
+          }
           break;
         }
         results.push(formatRedisReplyValue(result));
+        if (closesTransaction && multiIndex !== undefined) {
+          closedTransactions.push({
+            multiIndex,
+            closeIndex: index,
+            outcome:
+              commandName === "DISCARD"
+                ? "discarded"
+                : result === null
+                  ? "watchAborted"
+                  : Array.isArray(result) &&
+                      result.some((reply) => reply instanceof ErrorReply)
+                    ? "partial"
+                    : "applied",
+          });
+          multiIndex = undefined;
+        } else if (commandName === "RESET" || commandName === "QUIT") {
+          // Neither is queued inside MULTI; both end the transaction at once.
+          if (multiIndex !== undefined)
+            closedTransactions.push({
+              multiIndex,
+              closeIndex: index,
+              outcome: commandName === "RESET" ? "reset" : "quit",
+            });
+          multiIndex = undefined;
+        } else if (commandName === "MULTI" && multiIndex === undefined)
+          multiIndex = index;
+      }
+      if (!entry && multiIndex !== undefined && epoch === this.epoch) {
+        void baseClient.sendCommand(["DISCARD"]).catch((error: unknown) => {
+          logger.error("Redis DISCARD after interrupted script failed", error);
+        });
       }
       const queryValue = statements.length === 1 ? results[0] : results;
       const row = flattenRootRecord(
@@ -2736,17 +2918,18 @@ export class RedisDriver implements IDBDriver {
     options: {
       matches?: (bytes: Buffer) => boolean;
       skipBinaryKeys?: boolean;
+      onTruncated?: () => void;
     } = {},
   ): Promise<string[]> {
     const keys = new Set<string>();
     const seenCursors = new Set<string>();
     let cursor = "0";
-    do {
+    const canScan = () =>
+      !seenCursors.has(cursor) &&
+      seenCursors.size < REDIS_READ_BUDGET.maxScanIterations;
+    const scanBatch = async () => {
       throwIfQueryCancelled(context);
-      if (
-        seenCursors.has(cursor) ||
-        seenCursors.size >= REDIS_READ_BUDGET.maxScanIterations
-      ) {
+      if (!canScan()) {
         throw new Error(
           `Redis SCAN did not complete within its safety budget of ${REDIS_READ_BUDGET.maxScanIterations} iterations (about ${REDIS_READ_BUDGET.maxScanIterations * REDIS_SCAN_COUNT} keys examined). The keyspace may be very large or changing; narrow the keyspace and retry.`,
         );
@@ -2774,6 +2957,9 @@ export class RedisDriver implements IDBDriver {
         }
         keys.add(key);
       }
+    };
+    do {
+      await scanBatch();
     } while (
       cursor !== "0" &&
       (failOnTruncation ? keys.size <= limit : keys.size < limit)
@@ -2785,6 +2971,16 @@ export class RedisDriver implements IDBDriver {
           : `Redis key paging reads at most ${limit} keys (the ${limit}-key safety limit), and this keyspace has more. Open a narrower key prefix before continuing or exporting.`,
       );
     }
+    if (
+      options.onTruncated &&
+      keys.size === limit &&
+      cursor !== "0" &&
+      canScan()
+    ) {
+      await scanBatch();
+    }
+    if (keys.size > limit || (cursor !== "0" && keys.size >= limit))
+      options.onTruncated?.();
     return Number.isFinite(limit) ? [...keys].slice(0, limit) : [...keys];
   }
 

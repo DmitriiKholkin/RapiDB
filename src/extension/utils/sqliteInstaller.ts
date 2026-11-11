@@ -4,6 +4,7 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -26,10 +27,12 @@ import {
   verifySQLiteIntegrity,
 } from "./sqliteArchive";
 import {
-  SQLITE_ARTIFACT_POLICY_ID,
   type SQLiteArtifactPin,
+  type SQLiteArtifactTarget,
   type SQLiteHeaderPins,
+  sqliteArtifactPolicyId,
   sqliteHeaderPins,
+  sqlitePrebuiltFileName,
   sqlitePrebuiltPin,
 } from "./sqliteArtifactPins";
 import {
@@ -64,6 +67,22 @@ const DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS = {
   releaseAttempts: 5,
 };
 let installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
+const SQLITE_RUNTIME_LAST_USED_FILE = ".rapidb-last-used";
+const SQLITE_OBSOLETE_RUNTIME_MAX_IDLE_MS = 30 * 24 * 60 * 60 * 1000;
+// Runtimes used this recently cannot be cleanup candidates, so their use can
+// be recorded without the runtime lock.
+const SQLITE_RUNTIME_RECENT_USE_MS = 7 * 24 * 60 * 60 * 1000;
+const SQLITE_RUNTIME_USE_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const SQLITE_OBSOLETE_RUNTIME_MAX_REMOVALS = 3;
+const SQLITE_RUNTIME_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/;
+const SQLITE_RUNTIME_NAME =
+  "(?:electron|node)-abi-[0-9]+(?:-[a-z0-9]+){2,3}(?:-archive-v1|-pins-v[0-9]+-[0-9a-f]{16})?";
+const SQLITE_RUNTIME_DIRECTORY_PATTERN = new RegExp(`^${SQLITE_RUNTIME_NAME}$`);
+const SQLITE_RUNTIME_TRASH_PATTERN = new RegExp(
+  `^${SQLITE_RUNTIME_NAME}\\.obsolete-[0-9]+-[0-9a-f-]{36}$`,
+);
+const SQLITE_USE_TRACKING_POLICY_PATTERN = /-pins-v([0-9]+)-[0-9a-f]{16}$/;
+const SQLITE_USE_TRACKING_MIN_POLICY_VERSION = 5;
 
 interface SQLiteInstallLockOwner {
   pid: number;
@@ -108,6 +127,7 @@ interface InstalledRuntimeManifest {
 
 let installerConfiguration: SQLiteInstallerConfiguration | null = null;
 let inFlightInstall: Promise<string | null> | null = null;
+let obsoleteRuntimeCleanupDone = false;
 
 function installerLog(message: string): void {
   const line = `[RapiDB SQLite] ${message}`;
@@ -160,14 +180,28 @@ function currentTargetLabel(): string {
     .join("-");
 }
 
-function currentRuntimeStorageKey(): string {
+function currentArtifactTarget(
+  betterSqlite3Version: string,
+): SQLiteArtifactTarget {
+  return {
+    betterSqlite3Version,
+    runtime: currentRuntime(),
+    abi: process.versions.modules,
+    platform: process.platform,
+    arch: process.arch,
+    libc: detectLinuxLibc(),
+    electronVersion: process.versions.electron,
+  };
+}
+
+function currentRuntimeStorageKey(betterSqlite3Version: string): string {
   return [
     currentRuntime(),
     `abi-${process.versions.modules}`,
     process.platform,
     detectLinuxLibc() || null,
     process.arch,
-    SQLITE_ARTIFACT_POLICY_ID,
+    sqliteArtifactPolicyId(currentArtifactTarget(betterSqlite3Version)),
   ]
     .filter(
       (part): part is string => typeof part === "string" && part.length > 0,
@@ -277,7 +311,7 @@ function runtimeRootFor(baseDir: string): string | null {
     "sqlite-runtime",
     "better-sqlite3",
     manifest.betterSqlite3Version,
-    currentRuntimeStorageKey(),
+    currentRuntimeStorageKey(manifest.betterSqlite3Version),
   );
 }
 
@@ -624,6 +658,274 @@ function removeAbandonedInstallDirectories(runtimeRoot: string): void {
       rmSync(path, { recursive: true, force: true });
     } catch {}
   }
+}
+
+function isRealDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function refreshRuntimeUse(runtimeRoot: string): boolean {
+  try {
+    const now = new Date();
+    utimesSync(join(runtimeRoot, SQLITE_RUNTIME_LAST_USED_FILE), now, now);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function markRuntimeUsed(runtimeRoot: string): void {
+  if (refreshRuntimeUse(runtimeRoot)) {
+    return;
+  }
+  const marker = join(runtimeRoot, SQLITE_RUNTIME_LAST_USED_FILE);
+  try {
+    writeFileSync(marker, "", { flag: "a" });
+  } catch (error) {
+    installerLog(
+      `Could not record SQLite runtime use at ${marker}: ${errorMessage(error)}.`,
+    );
+  }
+}
+
+function tracksRuntimeUse(name: string): boolean {
+  const policy = SQLITE_USE_TRACKING_POLICY_PATTERN.exec(name);
+  return (
+    policy !== null &&
+    Number(policy[1]) >= SQLITE_USE_TRACKING_MIN_POLICY_VERSION
+  );
+}
+
+function runtimeLastUsedAt(runtimeRoot: string): number | null | undefined {
+  try {
+    if (!lstatSync(join(runtimeRoot, "runtime.json")).isFile()) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  try {
+    const marker = lstatSync(join(runtimeRoot, SQLITE_RUNTIME_LAST_USED_FILE));
+    return marker.isFile() ? marker.mtimeMs : undefined;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? null
+      : undefined;
+  }
+}
+
+function isIdleSince(lastUsedAt: number): boolean {
+  return Date.now() - lastUsedAt > SQLITE_OBSOLETE_RUNTIME_MAX_IDLE_MS;
+}
+
+function wasUsedRecently(runtimeRoot: string): boolean {
+  try {
+    const marker = lstatSync(join(runtimeRoot, SQLITE_RUNTIME_LAST_USED_FILE));
+    const age = Date.now() - marker.mtimeMs;
+    return (
+      marker.isFile() &&
+      age >= -SQLITE_RUNTIME_USE_CLOCK_SKEW_MS &&
+      age < SQLITE_RUNTIME_RECENT_USE_MS
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isOlderThanIdleLimit(path: string): boolean {
+  try {
+    return isIdleSince(lstatSync(path).mtimeMs);
+  } catch {
+    return false;
+  }
+}
+
+async function isRuntimeUnlocked(runtimeRoot: string): Promise<boolean> {
+  const lockRoot = `${runtimeRoot}.lock`;
+  const token = randomUUID();
+  if (!tryCreateInstallLock(lockRoot, token)) {
+    return false;
+  }
+  await releaseInstallLock(lockRoot, token);
+  return true;
+}
+
+async function removeObsoleteRuntime(runtimeRoot: string): Promise<boolean> {
+  const observed = runtimeLastUsedAt(runtimeRoot);
+  if (observed === undefined || (observed !== null && !isIdleSince(observed))) {
+    return false;
+  }
+  const lockRoot = `${runtimeRoot}.lock`;
+  const token = randomUUID();
+  if (!tryCreateInstallLock(lockRoot, token)) {
+    return false;
+  }
+  const trash = `${runtimeRoot}.obsolete-${process.pid}-${randomUUID()}`;
+  try {
+    const lastUsedAt = runtimeLastUsedAt(runtimeRoot);
+    if (lastUsedAt === null) {
+      markRuntimeUsed(runtimeRoot);
+      return false;
+    }
+    if (lastUsedAt === undefined || !isIdleSince(lastUsedAt)) {
+      return false;
+    }
+    renameSync(runtimeRoot, trash);
+    // Readers record stale use under this lock; this still catches lock-free
+    // use if clocks diverged by more than the recent-use margin.
+    if (runtimeLastUsedAt(trash) !== lastUsedAt) {
+      if (!existsSync(runtimeRoot)) {
+        renameSync(trash, runtimeRoot);
+      }
+      installerLog(
+        `Kept SQLite runtime ${runtimeRoot}; it was used while being removed.`,
+      );
+      return false;
+    }
+  } finally {
+    await releaseInstallLock(lockRoot, token);
+  }
+  installerLog(
+    `Removing SQLite runtime ${runtimeRoot}; it has not been used for over 30 days.`,
+  );
+  rmSync(trash, { recursive: true, force: true });
+  return true;
+}
+
+export async function removeObsoleteSQLiteRuntimes(
+  baseDir: string,
+): Promise<string[]> {
+  const removed: string[] = [];
+  try {
+    const currentRoot = runtimeRootFor(baseDir);
+    if (!currentRoot) {
+      return removed;
+    }
+    const cacheRoot = dirname(dirname(currentRoot));
+    if (!isRealDirectory(dirname(cacheRoot)) || !isRealDirectory(cacheRoot)) {
+      return removed;
+    }
+    for (const version of readdirSync(cacheRoot)) {
+      const versionRoot = join(cacheRoot, version);
+      if (
+        !SQLITE_RUNTIME_VERSION_PATTERN.test(version) ||
+        !isRealDirectory(versionRoot)
+      ) {
+        continue;
+      }
+      let entries: string[];
+      try {
+        entries = readdirSync(versionRoot);
+      } catch {
+        continue;
+      }
+      const busy = new Set<string>();
+      const abandoned = new Set<string>();
+      for (const entry of entries) {
+        const name = entry.split(".")[0];
+        if (
+          (entry.startsWith(`${name}.tmp-`) ||
+            entry.startsWith(`${name}.lock.stale-`)) &&
+          SQLITE_RUNTIME_DIRECTORY_PATTERN.test(name)
+        ) {
+          const path = join(versionRoot, entry);
+          if (
+            join(versionRoot, name) !== currentRoot &&
+            isRealDirectory(path) &&
+            isOlderThanIdleLimit(path)
+          ) {
+            abandoned.add(entry);
+          } else {
+            busy.add(name);
+          }
+        }
+      }
+      for (const entry of entries) {
+        if (removed.length >= SQLITE_OBSOLETE_RUNTIME_MAX_REMOVALS) {
+          return removed;
+        }
+        const path = join(versionRoot, entry);
+        if (path === currentRoot || !isRealDirectory(path)) {
+          continue;
+        }
+        try {
+          if (
+            abandoned.has(entry) ||
+            (SQLITE_RUNTIME_TRASH_PATTERN.test(entry) &&
+              (await isRuntimeUnlocked(join(versionRoot, entry.split(".")[0]))))
+          ) {
+            rmSync(path, { recursive: true, force: true });
+            removed.push(path);
+          } else if (
+            SQLITE_RUNTIME_DIRECTORY_PATTERN.test(entry) &&
+            tracksRuntimeUse(entry) &&
+            !busy.has(entry) &&
+            (await removeObsoleteRuntime(path))
+          ) {
+            removed.push(path);
+          }
+        } catch (error) {
+          installerLog(
+            `Could not remove obsolete SQLite runtime ${path}: ${errorMessage(error)}.`,
+          );
+        }
+      }
+    }
+  } catch (error) {
+    installerLog(
+      `Could not clean up obsolete SQLite runtimes: ${errorMessage(error)}.`,
+    );
+  }
+  return removed;
+}
+
+async function removeObsoleteSQLiteRuntimesOnce(
+  baseDir: string,
+): Promise<void> {
+  if (!obsoleteRuntimeCleanupDone) {
+    obsoleteRuntimeCleanupDone = true;
+    await removeObsoleteSQLiteRuntimes(baseDir);
+  }
+}
+
+function refreshInstalledRuntimeUse(baseDir: string): boolean {
+  const runtimeRoot = runtimeRootFor(baseDir);
+  return (
+    runtimeRoot !== null &&
+    manifestMatches(baseDir) &&
+    wasUsedRecently(runtimeRoot) &&
+    refreshRuntimeUse(runtimeRoot) &&
+    existsSync(join(runtimeRoot, "runtime.json"))
+  );
+}
+
+async function recordInstalledRuntimeUse(
+  baseDir: string,
+): Promise<string | null> {
+  const runtimeRoot = runtimeRootFor(baseDir);
+  const installedPackagePath = installedPackagePathFor(baseDir);
+  if (
+    !runtimeRoot ||
+    !installedPackagePath ||
+    !isRealDirectory(dirname(runtimeRoot))
+  ) {
+    return null;
+  }
+  return withInstallLock<string | null>(
+    `${runtimeRoot}.lock`,
+    async () => {
+      if (!manifestMatches(baseDir)) {
+        return null;
+      }
+      markRuntimeUsed(runtimeRoot);
+      return installedPackagePath;
+    },
+    () => (refreshInstalledRuntimeUse(baseDir) ? installedPackagePath : null),
+  );
 }
 
 async function withInstallLock<T>(
@@ -1107,11 +1409,10 @@ async function downloadPatchedPrebuilt(
     throw new Error("Cannot determine better-sqlite3 version.");
   }
 
-  const abi = process.versions.modules;
-  const platform = process.platform;
-  const arch = process.arch;
-  const tagPrefix = "v";
-  const fileName = `better-sqlite3-${tagPrefix}${pkg.version}-electron-${tagPrefix}${abi}-${platform}-${arch}.tar.gz`;
+  const fileName = sqlitePrebuiltFileName(
+    "patched",
+    currentArtifactTarget(pkg.version),
+  );
   const pin = sqlitePrebuiltPin("patched", fileName);
   const downloadUrl = pin.url;
   const tarballPath = join(runtimeRoot, fileName);
@@ -1364,7 +1665,10 @@ async function downloadPrebuiltBinary(
   ) {
     throw new Error("Invalid better-sqlite3 version for runtime installation.");
   }
-  const fileName = `better-sqlite3-v${pkg.version}-${currentRuntime()}-v${process.versions.modules}-${process.platform}${detectLinuxLibc()}-${process.arch}.tar.gz`;
+  const fileName = sqlitePrebuiltFileName(
+    "official",
+    currentArtifactTarget(pkg.version),
+  );
   const tarballPath = join(runtimeRoot, "official-prebuilt.tar.gz");
 
   try {
@@ -1460,6 +1764,7 @@ async function installManagedRuntime(baseDir: string): Promise<string | null> {
       try {
         copyBundledRuntimeScaffold(baseDir, tempRoot);
         await downloadPrebuiltBinary(tempRoot, baseDir);
+        writeFileSync(join(tempRoot, SQLITE_RUNTIME_LAST_USED_FILE), "");
         renameSync(tempRoot, runtimeRoot);
       } catch (error) {
         rmSync(tempRoot, { recursive: true, force: true });
@@ -1489,6 +1794,7 @@ export function configureSQLiteInstaller(
 export function resetSQLiteInstallerForTests(): void {
   installerConfiguration = null;
   inFlightInstall = null;
+  obsoleteRuntimeCleanupDone = false;
   installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
 }
 
@@ -1538,7 +1844,8 @@ export async function ensureSQLiteRuntimeInstalled(
 ): Promise<string | null> {
   const installedPackagePath =
     resolveInstalledBetterSqlite3PackagePath(baseDir);
-  if (installedPackagePath && manifestMatches(baseDir)) {
+  if (installedPackagePath && refreshInstalledRuntimeUse(baseDir)) {
+    await removeObsoleteSQLiteRuntimesOnce(baseDir);
     return installedPackagePath;
   }
   if (!installerConfiguration) {
@@ -1547,12 +1854,19 @@ export async function ensureSQLiteRuntimeInstalled(
   if (!inFlightInstall) {
     const allowInstall = installerConfiguration.allowInstall;
     inFlightInstall = (async () => {
-      if (allowInstall && !(await allowInstall())) {
-        throw new Error(
-          "SQLite runtime installation was not authorized. The database was not opened.",
-        );
+      let installed = await recordInstalledRuntimeUse(baseDir);
+      if (!installed) {
+        if (allowInstall && !(await allowInstall())) {
+          throw new Error(
+            "SQLite runtime installation was not authorized. The database was not opened.",
+          );
+        }
+        installed = await installManagedRuntime(baseDir);
       }
-      return installManagedRuntime(baseDir);
+      if (installed) {
+        await removeObsoleteSQLiteRuntimesOnce(baseDir);
+      }
+      return installed;
     })().finally(() => {
       inFlightInstall = null;
     });

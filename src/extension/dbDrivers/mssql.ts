@@ -566,11 +566,14 @@ function mssqlArrayRow(
 
 type MssqlRollbackCallback = (error?: unknown, ...result: unknown[]) => void;
 
+type MssqlTransactionEnd = (
+  callback: MssqlRollbackCallback,
+  ...args: unknown[]
+) => unknown;
+
 type MssqlRollbackConnection = {
-  rollbackTransaction: (
-    callback: MssqlRollbackCallback,
-    ...args: unknown[]
-  ) => unknown;
+  rollbackTransaction: MssqlTransactionEnd;
+  commitTransaction?: MssqlTransactionEnd;
   close?: () => void;
   hasError?: boolean;
   removeListener?: (event: string, listener: () => void) => unknown;
@@ -601,34 +604,44 @@ function discardFailedMssqlBegin(transaction: mssql.Transaction): void {
 type MssqlRollbackFence = {
   restore: () => void;
   closeError: () => unknown;
+  invoked: () => boolean;
 };
 
-function fenceFailedMssqlRollback(
+// mssql releases the connection to the pool as soon as COMMIT/ROLLBACK fails, so
+// a failed end must poison and close it first or its transaction stays pooled.
+// If the server rolls back during the end, mssql's abort handler has already
+// released the connection and its own continuation would throw, so the result
+// goes to onDetached instead.
+function fenceFailedMssqlTransactionEnd(
   transaction: mssql.Transaction,
+  method: "commitTransaction" | "rollbackTransaction",
+  onDetached?: (error: unknown) => void,
 ): MssqlRollbackFence | undefined {
-  const connection = (
-    transaction as unknown as {
-      _acquiredConnection?: MssqlRollbackConnection;
-    }
-  )._acquiredConnection;
-  if (!connection || typeof connection.rollbackTransaction !== "function") {
+  const state = transaction as unknown as {
+    _acquiredConnection?: MssqlRollbackConnection | null;
+  };
+  const connection = state._acquiredConnection;
+  const endTransaction = connection?.[method];
+  if (!connection || typeof endTransaction !== "function") {
     return undefined;
   }
 
-  const rollbackDescriptor = Object.getOwnPropertyDescriptor(
-    connection,
-    "rollbackTransaction",
-  );
-  const rollbackTransaction = connection.rollbackTransaction;
+  const endDescriptor = Object.getOwnPropertyDescriptor(connection, method);
   let capturedCloseError: unknown;
-  const fencedRollback = function (
+  let invoked = false;
+  const fencedEnd = function (
     this: MssqlRollbackConnection,
     callback: MssqlRollbackCallback,
     ...args: unknown[]
   ) {
-    return rollbackTransaction.call(
+    invoked = true;
+    return endTransaction.call(
       this,
       (error, ...result) => {
+        if (onDetached && state._acquiredConnection !== connection) {
+          onDetached(error);
+          return;
+        }
         if (error) {
           this.hasError = true;
           try {
@@ -642,23 +655,19 @@ function fenceFailedMssqlRollback(
       ...args,
     );
   };
-  connection.rollbackTransaction = fencedRollback;
+  connection[method] = fencedEnd;
 
   return {
     restore: () => {
-      if (connection.rollbackTransaction !== fencedRollback) return;
-      if (rollbackDescriptor) {
-        Object.defineProperty(
-          connection,
-          "rollbackTransaction",
-          rollbackDescriptor,
-        );
+      if (connection[method] !== fencedEnd) return;
+      if (endDescriptor) {
+        Object.defineProperty(connection, method, endDescriptor);
       } else {
-        delete (connection as Partial<MssqlRollbackConnection>)
-          .rollbackTransaction;
+        delete (connection as Partial<MssqlRollbackConnection>)[method];
       }
     },
     closeError: () => capturedCloseError,
+    invoked: () => invoked,
   };
 }
 
@@ -1503,9 +1512,31 @@ function mssqlFullType(
   }
   return typeName;
 }
-function cleanMssqlDefault(raw: string): string {
+function mssqlOuterParenCloses(s: string): number {
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "'" || ch === "[") {
+      const close = ch === "'" ? "'" : "]";
+      i++;
+      while (i < s.length) {
+        if (s[i] === close) {
+          if (s[i + 1] !== close) break;
+          i++;
+        }
+        i++;
+      }
+    } else if (ch === "(") {
+      depth++;
+    } else if (ch === ")" && --depth === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+export function cleanMssqlDefault(raw: string): string {
   let s = raw.trim();
-  while (s.startsWith("(") && s.endsWith(")")) {
+  while (s.startsWith("(") && mssqlOuterParenCloses(s) === s.length - 1) {
     s = s.slice(1, -1).trim();
   }
   if (s.startsWith("N'") && s.endsWith("'")) {
@@ -3510,6 +3541,8 @@ export class MSSQLDriver extends BaseDBDriver {
     }
     let activeRequest: mssql.Request | undefined;
     let commitAttempted = false;
+    let commitFence: MssqlRollbackFence | undefined;
+    let serverRollbackError: MutationNotExecutedError | undefined;
     const cancel = () => {
       try {
         activeRequest?.cancel();
@@ -3620,9 +3653,86 @@ export class MSSQLDriver extends BaseDBDriver {
       );
       throwIfTransactionCancelled(context);
       commitAttempted = true;
-      await tx.commit();
+      let serverRolledBack = false;
+      let detachedSettled = false;
+      let rollbackSettleTimer: NodeJS.Immediate | undefined;
+      let rejectDetachedCommit!: (error: unknown) => void;
+      const detachedCommit = new Promise<never>((_, reject) => {
+        rejectDetachedCommit = reject;
+      });
+      const settleDetachedCommit = (commitError: unknown) => {
+        if (detachedSettled) return;
+        detachedSettled = true;
+        if (rollbackSettleTimer) clearImmediate(rollbackSettleTimer);
+        if (!serverRolledBack) {
+          rejectDetachedCommit(
+            commitError ??
+              new Error(
+                "MSSQL COMMIT returned after its connection was released.",
+              ),
+          );
+          return;
+        }
+        const reason =
+          commitError ??
+          (tx as unknown as { _abortReason?: unknown })._abortReason;
+        serverRollbackError = new MutationNotExecutedError(
+          `[RapiDB] SQL Server rolled back the transaction during COMMIT; no changes were applied.${
+            reason === undefined || reason === null
+              ? ""
+              : ` (${normalizeUnknownError(reason).message})`
+          }`,
+          reason ?? undefined,
+        );
+        rejectDetachedCommit(serverRollbackError);
+      };
+      const onServerRollback = (aborted?: boolean) => {
+        if (aborted !== true || !commitFence?.invoked()) return;
+        serverRolledBack = true;
+        // tedious normally reports the COMMIT error first; this only bounds the wait.
+        rollbackSettleTimer = setImmediate(settleDetachedCommit, undefined);
+      };
+      commitFence = fenceFailedMssqlTransactionEnd(
+        tx,
+        "commitTransaction",
+        settleDetachedCommit,
+      );
+      tx.on("rollback", onServerRollback);
+      try {
+        await Promise.race([tx.commit(), detachedCommit]);
+      } finally {
+        tx.removeListener("rollback", onServerRollback);
+        if (rollbackSettleTimer) clearImmediate(rollbackSettleTimer);
+        commitFence?.restore();
+      }
     } catch (error) {
-      const rollbackFence = fenceFailedMssqlRollback(tx);
+      if (serverRollbackError !== undefined && error === serverRollbackError) {
+        throw error;
+      }
+      // mssql drops the connection once a sent COMMIT fails, so a rollback can
+      // only fail with ENOTBEGUN; report the unknown commit outcome instead.
+      if (commitAttempted && commitFence?.invoked()) {
+        const closeError = commitFence?.closeError();
+        const errors: unknown[] = [error];
+        if (closeError !== undefined) errors.push(closeError);
+        const diagnostics = [
+          `commit error: ${normalizeUnknownError(error).message}`,
+          ...(closeError === undefined
+            ? []
+            : [
+                `session close error: ${normalizeUnknownError(closeError).message}`,
+              ]),
+        ].join("; ");
+        throw new AggregateError(
+          errors,
+          `MSSQL COMMIT failed; the transaction outcome is unknown (${diagnostics}).`,
+          { cause: error },
+        );
+      }
+      const rollbackFence = fenceFailedMssqlTransactionEnd(
+        tx,
+        "rollbackTransaction",
+      );
       try {
         await tx.rollback();
       } catch (rollbackError) {

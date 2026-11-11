@@ -232,7 +232,11 @@ describe("PostgreSQL JSON/Array precision", () => {
   });
 
   it("verifies raw enum array text using catalog-qualified element metadata", () => {
-    const column = { ...textArrayColumn, nativeType: "audit.int8[]" };
+    const column = {
+      ...textArrayColumn,
+      nativeType: "audit.int8[]",
+      baseType: "audit.int8[]",
+    };
     expect(
       driver.checkPersistedEdit(column, '["01","-01","-.5"]', {
         persistedValue: "{01,-01,-.5}",

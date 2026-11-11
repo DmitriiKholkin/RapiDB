@@ -21,6 +21,7 @@ import { buildWhere } from "../table/filterSql";
 import { normalizeUnknownError } from "../utils/errorHandling";
 import { logger } from "../utils/logger";
 import { splitMySQLScript } from "../utils/mysqlScriptSplit";
+import { isMysqlDashCommentStart } from "../utils/sqlStatementScan";
 import { BaseDBDriver, formatDatetimeForDisplay } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
 import { closeDriverResource } from "./driverCleanup";
@@ -259,6 +260,224 @@ function isUnavailableCheckMetadataError(error: unknown): boolean {
 type MysqlSslOptions = Exclude<PoolOptions["ssl"], string | undefined>;
 
 export { splitMySQLScript };
+
+const MYSQL_EXECUTABLE_COMMENT_START = /\/\*M?!\d*/y;
+const MYSQL_WORD = /[\w$\u0080-\uffff]+/y;
+const MYSQL_SET_STATEMENT_PREDECESSORS = new Set([
+  "",
+  ";",
+  "begin",
+  "atomic",
+  "then",
+  "else",
+  "do",
+  "loop",
+  "repeat",
+  "for",
+]);
+const MYSQL_VARIABLE_SCOPES = new Set([
+  "global",
+  "session",
+  "local",
+  "persist",
+  "persist_only",
+]);
+
+// Lowercased words with backtick and double quotes removed; string
+// literals become "'", user variables "@" and system variables "@@".
+// /*! */ contents are code; versioned and /*M! */ contents only when
+// versionedCommentsRun, since the server may ignore them.
+function mysqlCodeTokens(
+  sql: string,
+  backslashEscapes: boolean,
+  versionedCommentsRun: boolean,
+): string[] {
+  const tokens: string[] = [];
+  let i = 0;
+  const skipQuoted = (q: string) => {
+    let text = "";
+    i++;
+    while (i < sql.length) {
+      const c = sql[i];
+      if (backslashEscapes && c === "\\" && q !== "`") {
+        text += sql.slice(i, i + 2);
+        i += 2;
+      } else if (c === q && sql[i + 1] === q) {
+        text += q;
+        i += 2;
+      } else if (c === q) {
+        i++;
+        break;
+      } else {
+        text += c;
+        i++;
+      }
+    }
+    return text;
+  };
+  while (i < sql.length) {
+    const c = sql[i];
+    MYSQL_WORD.lastIndex = i;
+    if (/\s/.test(c)) {
+      i++;
+    } else if (isMysqlDashCommentStart(sql, i) || c === "#") {
+      while (i < sql.length && sql[i] !== "\n") i++;
+    } else if (sql.startsWith("/*", i)) {
+      MYSQL_EXECUTABLE_COMMENT_START.lastIndex = i;
+      const start = MYSQL_EXECUTABLE_COMMENT_START.exec(sql)?.[0];
+      if (start === "/*!" || (start && versionedCommentsRun)) {
+        i += start.length;
+      } else {
+        const end = sql.indexOf("*/", i + 2);
+        i = end < 0 ? sql.length : end + 2;
+      }
+    } else if (sql.startsWith("*/", i)) {
+      i += 2;
+    } else if (sql.startsWith("@@", i)) {
+      tokens.push("@@");
+      i += 2;
+    } else if (c === "@") {
+      i++;
+      if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`") {
+        skipQuoted(sql[i]);
+      } else {
+        while (i < sql.length && /[\w$.\u0080-\uffff]/.test(sql[i])) i++;
+      }
+      tokens.push("@");
+    } else if (c === "'") {
+      skipQuoted(c);
+      tokens.push("'");
+    } else if (c === '"' || c === "`") {
+      tokens.push(skipQuoted(c).toLowerCase());
+    } else if (MYSQL_WORD.test(sql)) {
+      tokens.push(sql.slice(i, MYSQL_WORD.lastIndex).toLowerCase());
+      i = MYSQL_WORD.lastIndex;
+    } else if (sql.startsWith(":=", i)) {
+      tokens.push(":=");
+      i += 2;
+    } else {
+      tokens.push(c);
+      i++;
+    }
+  }
+  return tokens;
+}
+
+function setsSqlMode(tokens: string[]): boolean {
+  if (tokens[0] === "create" || tokens[0] === "alter") return false;
+  const isAssignment = (token: string | undefined) =>
+    token === "=" || token === ":=";
+  for (let i = 0; i < tokens.length; i++) {
+    if (
+      tokens[i] !== "set" ||
+      !MYSQL_SET_STATEMENT_PREDECESSORS.has(tokens[i - 1] ?? "")
+    ) {
+      continue;
+    }
+    i++;
+    const setStatement =
+      tokens[i] === "statement" && !isAssignment(tokens[i + 1]);
+    if (setStatement) i++;
+    while (i < tokens.length) {
+      let target = i;
+      if (MYSQL_VARIABLE_SCOPES.has(tokens[target])) target++;
+      if (tokens[target] === "@@") {
+        target++;
+        if (
+          MYSQL_VARIABLE_SCOPES.has(tokens[target]) &&
+          tokens[target + 1] === "."
+        ) {
+          target += 2;
+        }
+      }
+      if (tokens[target] === "sql_mode" && isAssignment(tokens[target + 1])) {
+        return true;
+      }
+      let depth = 0;
+      for (; i < tokens.length; i++) {
+        const token = tokens[i];
+        if (token === "(") depth++;
+        else if (token === ")") depth--;
+        else if (
+          depth === 0 &&
+          (token === "," || token === ";" || (setStatement && token === "for"))
+        ) {
+          break;
+        }
+      }
+      if (tokens[i] !== ",") break;
+      i++;
+    }
+  }
+  return false;
+}
+
+// Conservatively true for any SET statement (including SET STATEMENT ... FOR
+// and SETs inside anonymous compound blocks) whose assignment targets include
+// sql_mode in any scope, whether or not versioned comments run; routine and
+// event definitions only store their SETs.
+function mayChangeSessionSqlMode(
+  statement: string,
+  backslashEscapes: boolean,
+): boolean {
+  return [true, false].some((versionedCommentsRun) =>
+    setsSqlMode(
+      mysqlCodeTokens(statement, backslashEscapes, versionedCommentsRun),
+    ),
+  );
+}
+
+// Backslashes only change statement boundaries under the session's
+// NO_BACKSLASH_ESCAPES mode, so the mode is resolved only when they do.
+function splitMySQLQueryScript(
+  sql: string,
+): string[] | ((backslashEscapes: boolean) => string[]) {
+  if (!sql.includes("\\")) return splitMySQLScript(sql);
+  const [escaped, literal] = [true, false].map((backslashEscapes) => {
+    try {
+      return splitMySQLScript(sql, { backslashEscapes });
+    } catch (error) {
+      return error instanceof Error ? error : new Error(String(error));
+    }
+  });
+  if (escaped instanceof Error && literal instanceof Error) throw escaped;
+  if (
+    Array.isArray(escaped) &&
+    Array.isArray(literal) &&
+    escaped.length === literal.length &&
+    escaped.every((statement, index) => statement === literal[index])
+  ) {
+    return escaped;
+  }
+  const changesSqlMode = (
+    statements: string[] | Error,
+    backslashEscapes: boolean,
+  ) =>
+    Array.isArray(statements) &&
+    statements.some((statement) =>
+      mayChangeSessionSqlMode(statement, backslashEscapes),
+    );
+  if (changesSqlMode(escaped, true) || changesSqlMode(literal, false)) {
+    throw new Error(
+      "Script changes sql_mode and contains backslashes whose meaning depends on NO_BACKSLASH_ESCAPES, so its statement boundaries are ambiguous; script was not submitted. Change sql_mode in a separate run.",
+    );
+  }
+  return (backslashEscapes) => {
+    const statements = backslashEscapes ? escaped : literal;
+    if (statements instanceof Error) throw statements;
+    return statements;
+  };
+}
+
+function emptyMysqlQueryResult(hardCap: number | undefined): QueryResult {
+  return {
+    columns: [],
+    rows: [],
+    rowCount: 0,
+    executionTimeMs: 0,
+    ...(hardCap !== undefined ? { truncated: false } : {}),
+  };
+}
 
 const MYSQL_SPATIAL_TYPES = new Set([
   "point",
@@ -2017,6 +2236,7 @@ export class MySQLDriver extends BaseDBDriver {
          WHERE kcu.TABLE_SCHEMA = ?
            AND kcu.TABLE_NAME = ?
            AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+           AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
        ) fk ON fk.COLUMN_NAME = c.COLUMN_NAME
        WHERE c.TABLE_SCHEMA = ?
          AND c.TABLE_NAME = ?
@@ -2032,23 +2252,14 @@ export class MySQLDriver extends BaseDBDriver {
             ENFORCED?: string | null;
           }
         >(
+          // NATURAL JOIN also matches TABLE_NAME on MariaDB, whose
+          // CHECK_CONSTRAINTS names are only unique per table.
           `SELECT cc.CHECK_CLAUSE, tc.*
            FROM information_schema.TABLE_CONSTRAINTS tc
-           JOIN information_schema.CHECK_CONSTRAINTS cc
-             ON cc.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-            AND cc.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+           NATURAL JOIN information_schema.CHECK_CONSTRAINTS cc
            WHERE tc.TABLE_SCHEMA = ?
              AND tc.TABLE_NAME = ?
-             AND tc.CONSTRAINT_TYPE = 'CHECK'
-             AND NOT EXISTS (
-               SELECT 1
-               FROM information_schema.TABLE_CONSTRAINTS tc2
-               WHERE tc2.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
-                 AND tc2.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
-                 AND tc2.CONSTRAINT_TYPE = 'CHECK'
-                 AND (tc2.TABLE_SCHEMA <> tc.TABLE_SCHEMA
-                   OR tc2.TABLE_NAME <> tc.TABLE_NAME)
-             )`,
+             AND tc.CONSTRAINT_TYPE = 'CHECK'`,
           [database, table],
         );
         checkClauses = checkRows
@@ -2115,99 +2326,126 @@ export class MySQLDriver extends BaseDBDriver {
   ): Promise<QueryResult> {
     const start = Date.now();
     const hardCap = queryCollectionLimit(operationContext?.hardCap);
-    if (hardCap !== undefined) {
-      const statements = params?.length ? [sql] : splitMySQLScript(sql);
-      if (statements.length === 0) {
-        return {
-          columns: [],
-          rows: [],
-          rowCount: 0,
-          executionTimeMs: 0,
-          truncated: false,
-        };
-      }
-      return this.withTrackedQueryConnection((connection) => {
-        createMysqlStreamingQuery(
-          connection.connection as unknown as NativeMysqlConnection,
-          { sql: "", rowsAsArray: true },
-        );
-        return this.withReadOnlyTransaction(
-          connection,
-          operationContext,
-          async () => {
-            await this.assertUnambiguousQueryTimestampWrites(
-              connection,
-              statements,
-              params,
-            );
-            return this.executeBoundedScript(
-              connection,
-              statements,
-              params,
-              hardCap,
-              start,
-            );
-          },
-        );
-      }, operationContext);
-    }
     if (params && params.length > 0) {
       return this.withTrackedQueryConnection(
         (connection) =>
-          this.withReadOnlyTransaction(
+          this.executeQueryStatements(
             connection,
+            [sql],
+            params,
+            hardCap,
             operationContext,
-            async () => {
-              await this.assertUnambiguousQueryTimestampWrites(
-                connection,
-                [sql],
-                params,
-              );
-              const [rawRows, fields] = await this.queryArrayRows(connection, {
-                sql,
-                values: params as QueryOptions["values"],
-              });
-              return this._parseQueryResponse(
-                rawRows,
-                fields,
-                Date.now() - start,
-              );
-            },
+            start,
           ),
         operationContext,
       );
     }
-    const stmts = splitMySQLScript(sql);
-    if (stmts.length === 0) {
-      return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
+    const split = splitMySQLQueryScript(sql);
+    if (Array.isArray(split) && split.length === 0) {
+      return emptyMysqlQueryResult(hardCap);
     }
-    if (stmts.length === 1) {
-      return this.withTrackedQueryConnection(
-        (connection) =>
-          this.withReadOnlyTransaction(
-            connection,
-            operationContext,
-            async () => {
-              const [rawRows, fields] = await this.queryArrayRows(connection, {
-                sql: stmts[0],
-              });
-              return this._parseQueryResponse(
-                rawRows,
-                fields,
-                Date.now() - start,
-              );
-            },
-          ),
+    return this.withTrackedQueryConnection(async (connection) => {
+      let statements: string[];
+      if (Array.isArray(split)) {
+        statements = split;
+      } else {
+        const modes = await this.readSessionSqlModes(connection);
+        if (!modes) {
+          throw new Error(
+            "Cannot determine the session SQL mode needed to split a script containing backslashes; script was not submitted.",
+          );
+        }
+        statements = split(!modes.includes("NO_BACKSLASH_ESCAPES"));
+        if (statements.length === 0) return emptyMysqlQueryResult(hardCap);
+      }
+      return this.executeQueryStatements(
+        connection,
+        statements,
+        undefined,
+        hardCap,
         operationContext,
+        start,
+      );
+    }, operationContext);
+  }
+
+  private executeQueryStatements(
+    connection: PoolConnection,
+    statements: string[],
+    params: unknown[] | undefined,
+    hardCap: number | undefined,
+    operationContext: QueryExecutionOptions | undefined,
+    start: number,
+  ): Promise<QueryResult> {
+    if (hardCap !== undefined) {
+      createMysqlStreamingQuery(
+        connection.connection as unknown as NativeMysqlConnection,
+        { sql: "", rowsAsArray: true },
+      );
+      return this.withReadOnlyTransaction(
+        connection,
+        operationContext,
+        async () => {
+          await this.assertUnambiguousQueryTimestampWrites(
+            connection,
+            statements,
+            params,
+          );
+          return this.executeBoundedScript(
+            connection,
+            statements,
+            params,
+            hardCap,
+            start,
+          );
+        },
       );
     }
-    return this.withTrackedQueryConnection(
-      (connection) =>
-        this.withReadOnlyTransaction(connection, operationContext, () =>
-          this._executeScript(connection, stmts, start),
-        ),
-      operationContext,
+    if (params && params.length > 0) {
+      return this.withReadOnlyTransaction(
+        connection,
+        operationContext,
+        async () => {
+          await this.assertUnambiguousQueryTimestampWrites(
+            connection,
+            statements,
+            params,
+          );
+          const [rawRows, fields] = await this.queryArrayRows(connection, {
+            sql: statements[0],
+            values: params as QueryOptions["values"],
+          });
+          return this._parseQueryResponse(rawRows, fields, Date.now() - start);
+        },
+      );
+    }
+    if (statements.length === 1) {
+      return this.withReadOnlyTransaction(
+        connection,
+        operationContext,
+        async () => {
+          const [rawRows, fields] = await this.queryArrayRows(connection, {
+            sql: statements[0],
+          });
+          return this._parseQueryResponse(rawRows, fields, Date.now() - start);
+        },
+      );
+    }
+    return this.withReadOnlyTransaction(connection, operationContext, () =>
+      this._executeScript(connection, statements, start),
     );
+  }
+
+  private async readSessionSqlModes(
+    conn: PoolConnection,
+  ): Promise<string[] | undefined> {
+    const [modes] = await conn.query<RowDataPacket[]>(
+      this.createQueryOptions("SELECT @@SESSION.sql_mode AS __rapidb_sql_mode"),
+    );
+    const mode: unknown = modes[0]?.__rapidb_sql_mode;
+    return modes.length === 1 && typeof mode === "string"
+      ? mode.split(",").map((part) => part.trim().toUpperCase())
+      : undefined;
   }
 
   override getCapabilities() {
@@ -3207,7 +3445,8 @@ export class MySQLDriver extends BaseDBDriver {
          AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
          AND tc.TABLE_NAME = kcu.TABLE_NAME
        WHERE kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ?
-         AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'`,
+         AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+         AND kcu.REFERENCED_TABLE_NAME IS NOT NULL`,
       [database, table],
     );
     return rows.map((r) => ({
@@ -3245,10 +3484,12 @@ export class MySQLDriver extends BaseDBDriver {
         AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
         AND kcu.TABLE_NAME = tc.TABLE_NAME
         AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+        AND tc.CONSTRAINT_TYPE <> 'CHECK'
+        AND (kcu.REFERENCED_TABLE_NAME IS NOT NULL) = (tc.CONSTRAINT_TYPE = 'FOREIGN KEY')
        WHERE tc.TABLE_SCHEMA = ?
          AND tc.TABLE_NAME = ?
          AND tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY', 'CHECK')
-       ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`,
+       ORDER BY tc.CONSTRAINT_NAME, tc.CONSTRAINT_TYPE, kcu.ORDINAL_POSITION`,
       [database, table],
     );
     const checkClauses = new Map<string, string>();
@@ -3292,7 +3533,8 @@ export class MySQLDriver extends BaseDBDriver {
     const map = new Map<string, import("./types").TableConstraintMeta>();
     for (const row of rows) {
       const name = row.CONSTRAINT_NAME;
-      const existing = map.get(name);
+      const key = `${row.CONSTRAINT_TYPE}\0${name}`;
+      const existing = map.get(key);
       if (existing) {
         if (row.COLUMN_NAME) {
           existing.columns.push(row.COLUMN_NAME);
@@ -3306,7 +3548,7 @@ export class MySQLDriver extends BaseDBDriver {
         continue;
       }
 
-      map.set(name, {
+      map.set(key, {
         name,
         kind:
           row.CONSTRAINT_TYPE === "PRIMARY KEY"
@@ -3497,22 +3739,13 @@ export class MySQLDriver extends BaseDBDriver {
         const capture = op.captureIdentity?.mysqlInsertId;
         let literalZero = false;
         if (capture?.zero) {
-          const [modes] = await conn.query<RowDataPacket[]>(
-            this.createQueryOptions(
-              "SELECT @@SESSION.sql_mode AS __rapidb_sql_mode",
-            ),
-          );
+          const modes = await this.readSessionSqlModes(conn);
           throwIfTransactionCancelled(context);
-          const mode: unknown = modes[0]?.__rapidb_sql_mode;
-          if (modes.length !== 1 || typeof mode !== "string")
+          if (!modes)
             throw new Error(
               "INSERT verification cannot determine the transaction session SQL mode; the transaction was not committed.",
             );
-          literalZero = mode
-            .split(",")
-            .some(
-              (part) => part.trim().toUpperCase() === "NO_AUTO_VALUE_ON_ZERO",
-            );
+          literalZero = modes.includes("NO_AUTO_VALUE_ON_ZERO");
           if (!literalZero) generatedZeros.add(index);
         }
         const guard =

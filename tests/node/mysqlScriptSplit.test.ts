@@ -192,4 +192,174 @@ VALUES (
       "COMMIT",
     ]);
   });
+
+  it.each([
+    "DELIMITER $$ \nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ; \nSELECT 2;\nSELECT 3;",
+    "DELIMITER $$\t-- switch\r\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\r\nDELIMITER ;\t\r\nSELECT 2;\r\nSELECT 3;",
+    "  DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\n\tdelimiter ;\nSELECT 2;\nSELECT 3;",
+    "-- setup\nDELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END $$\nDELIMITER ;\nSELECT 2;\nSELECT 3;",
+  ])("reads the DELIMITER argument as one token: %j", (sql) => {
+    expect(splitMySQLScript(sql)).toEqual([
+      "CREATE PROCEDURE p() BEGIN SELECT 1; END",
+      "SELECT 2",
+      "SELECT 3",
+    ]);
+  });
+
+  it("does not treat a DELIMITER line inside a statement as a directive", () => {
+    expect(
+      splitMySQLScript("SELECT id,\ndelimiter\nFROM t;\nSELECT 2;\nSELECT 3;"),
+    ).toEqual(["SELECT id,\ndelimiter\nFROM t", "SELECT 2", "SELECT 3"]);
+    expect(
+      splitMySQLScript("SELECT id,\n  delimiter AS d\nFROM t;\nSELECT 2;"),
+    ).toEqual(["SELECT id,\n  delimiter AS d\nFROM t", "SELECT 2"]);
+    expect(
+      splitMySQLScript(
+        "CREATE PROCEDURE p() BEGIN\nDELIMITER $$\nSELECT 1; END; SELECT 2;",
+      ),
+    ).toEqual([
+      "CREATE PROCEDURE p() BEGIN\nDELIMITER $$\nSELECT 1; END",
+      "SELECT 2",
+    ]);
+  });
+
+  it("requires the DELIMITER argument on the same line", () => {
+    expect(splitMySQLScript("DELIMITER\n$$;\nSELECT 2;")).toEqual([
+      "DELIMITER\n$$",
+      "SELECT 2",
+    ]);
+  });
+
+  it.each([
+    "ALTER TABLE event ADD begin INT",
+    "ALTER TABLE `procedure` ADD begin INT",
+    "ALTER TABLE t ADD begin INT COMMENT 'function'",
+  ])("does not open a block for BEGIN in non-routine DDL: %s", (sql) => {
+    expect(splitMySQLScript(`${sql}; SELECT 2; SELECT 3`)).toEqual([
+      sql,
+      "SELECT 2",
+      "SELECT 3",
+    ]);
+  });
+
+  it.each([
+    "CREATE OR REPLACE DEFINER = CURRENT_USER() PROCEDURE p() BEGIN DELETE FROM log; SELECT 1; END",
+    "CREATE DEFINER='app'@'localhost' FUNCTION f() RETURNS INT BEGIN DELETE FROM log; RETURN 1; END",
+    "CREATE DEFINER=app@localhost EVENT IF NOT EXISTS e ON SCHEDULE EVERY 1 DAY DO BEGIN DELETE FROM log; SELECT 1; END",
+    "CREATE AGGREGATE FUNCTION agg(x INT) RETURNS INT BEGIN DECLARE s INT DEFAULT 0; RETURN s; END",
+    "ALTER DEFINER = `a``b`@`%` EVENT e DO BEGIN DELETE FROM log; SELECT 1; END",
+    "/* header */ CREATE /*!50017 DEFINER=`app`@`%` */ TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
+  ])("still recognizes routine headers with modifiers: %s", (body) => {
+    const statements = splitMySQLScript(`${body}; SELECT 2;`);
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toMatch(/END$/);
+    expect(statements[1]).toBe("SELECT 2");
+  });
+
+  it("recognizes a DEFINER account with backslash-escaped quotes", () => {
+    const body =
+      "CREATE DEFINER='o\\'neil'@'%' PROCEDURE p() BEGIN DELETE FROM log; SELECT 1; END";
+    expect(splitMySQLScript(`${body}; SELECT 2;`)).toEqual([body, "SELECT 2"]);
+    const doubled =
+      "CREATE DEFINER='o''neil'@'%' PROCEDURE p() BEGIN DELETE FROM log; SELECT 1; END";
+    expect(
+      splitMySQLScript(`${doubled}; SELECT 2;`, { backslashEscapes: false }),
+    ).toEqual([doubled, "SELECT 2"]);
+    expect(
+      splitMySQLScript(
+        'CREATE DEFINER="a\\"b"@"%" FUNCTION f() RETURNS INT BEGIN DELETE FROM log; RETURN 1; END; SELECT 2;',
+      ),
+    ).toHaveLength(2);
+  });
+
+  it.each([
+    "CREATE PROCEDURE IF NOT EXISTS p() BEGIN DELETE FROM log; SELECT 1; END",
+    "CREATE OR REPLACE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN SET NEW.a = 1; SET NEW.b = 2; END",
+    "CREATE PROCEDURE p() lbl: BEGIN DELETE FROM log; LEAVE lbl; END lbl",
+  ])("opens a routine block without DELIMITER: %s", (body) => {
+    expect(splitMySQLScript(`${body}; SELECT 2;`)).toEqual([body, "SELECT 2"]);
+  });
+
+  it("accepts DELIMITER ; at end of input without a trailing newline", () => {
+    expect(
+      splitMySQLScript(
+        "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;",
+      ),
+    ).toEqual(["CREATE PROCEDURE p() BEGIN SELECT 1; END"]);
+  });
+
+  it("splits a mysqldump trigger section using DELIMITER ;;", () => {
+    const trigger =
+      "/*!50003 CREATE*/ /*!50017 DEFINER=`root`@`localhost`*/ /*!50003 TRIGGER `t_bi` BEFORE INSERT ON `t` FOR EACH ROW BEGIN\n  SET NEW.a = 1;\n  SET NEW.b = 2;\nEND */";
+    for (const eol of ["\n", "\r\n"]) {
+      const eolTrigger = trigger.replace(/\n/g, eol);
+      const dump = [
+        "/*!50003 SET @saved_cs_client = @@character_set_client */ ;",
+        "/*!50003 SET sql_mode = 'STRICT_TRANS_TABLES' */ ;",
+        "DELIMITER ;;",
+        `${eolTrigger};;`,
+        "DELIMITER ;",
+        "/*!50003 SET sql_mode = @saved_sql_mode */ ;",
+        "INSERT INTO t VALUES (1);",
+        "",
+      ].join(eol);
+      expect(splitMySQLScript(dump)).toEqual([
+        "/*!50003 SET @saved_cs_client = @@character_set_client */",
+        "/*!50003 SET sql_mode = 'STRICT_TRANS_TABLES' */",
+        eolTrigger,
+        "/*!50003 SET sql_mode = @saved_sql_mode */",
+        "INSERT INTO t VALUES (1)",
+      ]);
+    }
+  });
+
+  it("handles DELIMITER ;; with CRLF line endings", () => {
+    expect(
+      splitMySQLScript(
+        "DELIMITER ;;\r\nCREATE PROCEDURE p()\r\nBEGIN\r\n  SELECT 1;\r\n  SELECT 2;\r\nEND;;\r\nDELIMITER ;\r\nSELECT 3;\r\n",
+      ),
+    ).toEqual([
+      "CREATE PROCEDURE p()\r\nBEGIN\r\n  SELECT 1;\r\n  SELECT 2;\r\nEND",
+      "SELECT 3",
+    ]);
+  });
+
+  it("keeps comments and quoted delimiters out of statement boundaries", () => {
+    expect(
+      splitMySQLScript(
+        "SELECT 'a;b', \"c;d\", `e;f` -- x;y\nFROM t; # z;w\nSELECT 'it''s; fine';",
+      ),
+    ).toEqual([
+      "SELECT 'a;b', \"c;d\", `e;f`  \nFROM t",
+      "SELECT 'it''s; fine'",
+    ]);
+  });
+
+  it("honors backslash escapes in strings unless disabled", () => {
+    const sql = "SELECT 'a\\'; SELECT 2;";
+    expect(splitMySQLScript(sql)).toEqual(["SELECT 'a\\'; SELECT 2;"]);
+    expect(splitMySQLScript(sql, { backslashEscapes: false })).toEqual([
+      "SELECT 'a\\'",
+      "SELECT 2",
+    ]);
+    expect(
+      splitMySQLScript('SELECT "x\\"; SELECT 2;', { backslashEscapes: false }),
+    ).toEqual(['SELECT "x\\"', "SELECT 2"]);
+    expect(splitMySQLScript("SELECT 'a\\'b'; SELECT 2;")).toEqual([
+      "SELECT 'a\\'b'",
+      "SELECT 2",
+    ]);
+  });
+
+  it("ignores a leading UTF-8 byte order mark", () => {
+    expect(
+      splitMySQLScript(
+        "\uFEFFDELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$\nDELIMITER ;\nSELECT 2;",
+      ),
+    ).toEqual(["CREATE PROCEDURE p() BEGIN SELECT 1; END", "SELECT 2"]);
+    expect(splitMySQLScript("\uFEFFSELECT '\uFEFF'; SELECT 2;")).toEqual([
+      "SELECT '\uFEFF'",
+      "SELECT 2",
+    ]);
+  });
 });

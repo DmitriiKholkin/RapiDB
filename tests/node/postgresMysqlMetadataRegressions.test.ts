@@ -672,6 +672,88 @@ describe("MySQL/MariaDB check constraints", () => {
       expect.objectContaining({ name: "CONSTRAINT_1", kind: "check" }),
     ]);
   });
+
+  it("keeps same-named UNIQUE and FOREIGN KEY constraints separate", async () => {
+    const queryObjectRows = vi.fn(async (sql: string) =>
+      sql.includes("information_schema.STATISTICS")
+        ? [
+            {
+              INDEX_NAME: "author_ref",
+              COLUMN_NAME: "author_id",
+              NON_UNIQUE: 0,
+              SUB_PART: null,
+              INDEX_TYPE: "BTREE",
+              COLLATION: "A",
+              EXPRESSION: null,
+            },
+          ]
+        : [
+            {
+              CONSTRAINT_NAME: "author_ref",
+              CONSTRAINT_TYPE: "FOREIGN KEY",
+              COLUMN_NAME: "author_id",
+              REFERENCED_TABLE_SCHEMA: "db",
+              REFERENCED_TABLE_NAME: "authors",
+              REFERENCED_COLUMN_NAME: "id",
+            },
+            {
+              CONSTRAINT_NAME: "author_ref",
+              CONSTRAINT_TYPE: "UNIQUE",
+              COLUMN_NAME: "author_id",
+              REFERENCED_TABLE_SCHEMA: null,
+              REFERENCED_TABLE_NAME: null,
+              REFERENCED_COLUMN_NAME: null,
+            },
+          ],
+    );
+    const driver = mysqlDriver(queryObjectRows);
+
+    const constraints = await driver.getConstraints("db", "", "posts");
+
+    expect(constraints).toEqual([
+      expect.objectContaining({
+        name: "author_ref",
+        kind: "foreign_key",
+        columns: ["author_id"],
+        referencedTable: "authors",
+        referencedColumns: ["id"],
+      }),
+      expect.objectContaining({
+        name: "author_ref",
+        kind: "unique",
+        columns: ["author_id"],
+        referencedTable: undefined,
+        referencedColumns: undefined,
+      }),
+    ]);
+    expect(queryObjectRows.mock.calls[0]?.[0]).toContain(
+      "AND (kcu.REFERENCED_TABLE_NAME IS NOT NULL) = (tc.CONSTRAINT_TYPE = 'FOREIGN KEY')",
+    );
+    await expect(
+      driver.getConstraintDDL("db", "", "posts", "author_ref", "unique"),
+    ).resolves.toBe(
+      "CREATE UNIQUE INDEX `author_ref` ON `db`.`posts` (`author_id`);",
+    );
+    await expect(
+      driver.getConstraintDDL("db", "", "posts", "author_ref", "foreign_key"),
+    ).resolves.toContain(
+      "FOREIGN KEY (`author_id`) REFERENCES `db`.`authors` (`id`)",
+    );
+  });
+
+  it("only treats key-usage rows with a referenced table as foreign keys", async () => {
+    const queryObjectRows = vi.fn(async () => []);
+    const driver = mysqlDriver(queryObjectRows);
+
+    await driver.getForeignKeys("db", "", "posts");
+    await driver.describeTable("db", "", "posts");
+
+    for (const [sql] of queryObjectRows.mock.calls as unknown as [string][]) {
+      expect(sql).toMatch(
+        /CONSTRAINT_TYPE = 'FOREIGN KEY'\s+AND kcu\.REFERENCED_TABLE_NAME IS NOT NULL/,
+      );
+    }
+  });
 });
 
 describe("fixed-width CHAR persisted edit verification", () => {

@@ -1,6 +1,8 @@
 import oracledb from "oracledb";
+import { types as pgTypes } from "pg";
 import { describe, expect, it, vi } from "vitest";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
+import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 
 describe("formatQueryResult", () => {
@@ -196,6 +198,50 @@ describe("formatQueryResult", () => {
         __col_1: "P1Y2M3DT4H5M6.7S",
       },
     ]);
+  });
+
+  it("formats a zero PostgreSQL interval as P0D without touching plain empty objects", () => {
+    const zero = pgTypes.getTypeParser(1186)("00:00:00");
+    expect(Object.keys(zero)).toEqual([]);
+    const formatted = formatQueryResult(
+      {
+        columns: ["zero", "json_empty"],
+        columnMeta: [{ category: "interval" }, { category: "json" }],
+        rows: [{ __col_0: zero, __col_1: {} }],
+        rowCount: 1,
+        executionTimeMs: 1,
+      },
+      100,
+    );
+    expect(formatted.rows).toEqual([{ __col_0: "P0D", __col_1: "{}" }]);
+
+    const pg = new PostgresDriver({ id: "pg", name: "PG", type: "pg" });
+    expect(
+      pg.formatOutputValue(zero, {
+        name: "i",
+        nativeType: "interval",
+        category: "interval",
+      } as never),
+    ).toBe("P0D");
+    expect(
+      pg.formatOutputValue({}, {
+        name: "j",
+        nativeType: "jsonb",
+        category: "json",
+      } as never),
+    ).toBe("{}");
+    expect(
+      formatQueryResult(
+        {
+          columns: ["empty"],
+          columnMeta: [{ category: "interval" }],
+          rows: [{ __col_0: {} }],
+          rowCount: 1,
+          executionTimeMs: 1,
+        },
+        100,
+      ).rows,
+    ).toEqual([{ __col_0: "{}" }]);
   });
 
   it.each([

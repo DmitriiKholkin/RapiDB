@@ -33,6 +33,7 @@ class FakeClient {
   readGate?: ReturnType<typeof deferred<void>>;
   errorSql?: RegExp;
   serverVersionNum = 120000;
+  relkindRows: Array<{ relkind: string }> = [{ relkind: "r" }];
   columnRows?: Array<{
     column_name: string;
     data_type: string;
@@ -49,7 +50,7 @@ class FakeClient {
     }
     if (sql.includes("current_database()"))
       return { rows: [{ name: "resolved" }] };
-    if (sql.includes("SELECT c.relkind")) return { rows: [{ relkind: "r" }] };
+    if (sql.includes("SELECT c.relkind")) return { rows: this.relkindRows };
     if (sql.includes("FROM pg_attribute a")) {
       await this.readGate?.promise;
       if (this.destroyed) throw new Error("client destroyed");
@@ -79,6 +80,8 @@ class FakePool {
   columnRows?: Array<{
     column_name: string;
     data_type: string;
+    array_base_type?: string | null;
+    array_base_is_array?: boolean;
     is_nullable: boolean;
     column_default?: string | null;
     generated_kind?: string | null;
@@ -203,6 +206,31 @@ describe("B08 owned PostgreSQL catalog session", () => {
     expect(columnQuery).not.toMatch(/\ba\.attgenerated\b/);
   });
 
+  it("rejects DDL for a missing relation instead of returning an empty table", async () => {
+    const { driver } = await connect();
+    const catalog = pool();
+    catalog.client.relkindRows = [];
+
+    await expect(
+      driver.getCreateTableDDL("", "public", "missing"),
+    ).rejects.toThrow('Table "public"."missing" not found');
+    expect(
+      catalog.client.query.mock.calls.some(([sql]) =>
+        sql.includes("FROM pg_attribute a"),
+      ),
+    ).toBe(false);
+  });
+
+  it("still reconstructs DDL for an existing zero-column table", async () => {
+    const { driver } = await connect();
+    const catalog = pool();
+    catalog.client.columnRows = [];
+
+    const ddl = await driver.getCreateTableDDL("", "public", "empty");
+
+    expect(ddl).toContain('CREATE TABLE "public"."empty"');
+  });
+
   it.each([
     {
       serverVersionNum: 110000,
@@ -263,6 +291,74 @@ describe("B08 owned PostgreSQL catalog session", () => {
     expect(editor.query).toHaveBeenCalledOnce();
     expect(sql).toContain("to_jsonb(a)->>'attgenerated'");
     expect(sql).not.toMatch(/\ba\.attgenerated\b/);
+  });
+
+  it("resolves domain array element base types without changing the native type", async () => {
+    const { driver, editor } = await connect();
+    editor.columnRows = [
+      {
+        column_name: "amounts",
+        data_type: "public.amount[]",
+        array_base_type: "numeric(10,2)[]",
+        is_nullable: true,
+      },
+      { column_name: "tags", data_type: "text[]", is_nullable: true },
+    ];
+
+    const columns = await driver.describeColumns("", "public", "items");
+    const sql = editor.query.mock.calls[0]?.[0];
+
+    expect(columns).toEqual([
+      expect.objectContaining({
+        name: "amounts",
+        type: "public.amount[]",
+        nativeType: "public.amount[]",
+        baseType: "numeric(10,2)[]",
+        category: "array",
+      }),
+      expect.objectContaining({ name: "tags", baseType: undefined }),
+    ]);
+    expect(editor.query).toHaveBeenCalledOnce();
+    expect(sql).toContain("WITH RECURSIVE element_chain");
+    expect(sql).toContain("chain_type.typbasetype");
+  });
+
+  it("keeps the column's own type as the comparison type for domains over arrays", async () => {
+    const { driver, editor } = await connect();
+    editor.columnRows = [
+      {
+        column_name: "flags",
+        data_type: "public.flags[]",
+        array_base_type: "boolean[][]",
+        array_base_is_array: true,
+        is_nullable: true,
+      },
+      {
+        column_name: "spans",
+        data_type: "public.rng[]",
+        array_base_type: "int4range[]",
+        array_base_is_array: false,
+        is_nullable: true,
+      },
+    ];
+
+    const columns = await driver.describeColumns("", "public", "items");
+
+    expect(columns).toEqual([
+      expect.objectContaining({
+        name: "flags",
+        nativeType: "public.flags[]",
+        baseType: "public.flags[]",
+      }),
+      expect.objectContaining({
+        name: "spans",
+        nativeType: "public.rng[]",
+        baseType: "int4range[]",
+      }),
+    ]);
+    expect(editor.query.mock.calls[0]?.[0]).toContain(
+      "base_type.typcategory = 'A'",
+    );
   });
 
   it.each([

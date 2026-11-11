@@ -8,6 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type ColumnTypeMeta,
@@ -104,6 +105,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
 });
 
 import { TableView } from "../../src/webview/components/TableView";
+import { TableGrid } from "../../src/webview/components/table/TableGrid";
 import {
   DEBOUNCE,
   INSERT_DEFAULT_SENTINEL,
@@ -616,7 +618,7 @@ async function initializeCommittedTableData(overrides?: {
   };
   totalCount?: number;
 }) {
-  renderTableView(overrides?.renderOverrides);
+  const view = renderTableView(overrides?.renderOverrides);
 
   const columnDefs = overrides?.columnDefs ?? columns;
   const primaryKeyColumns = overrides?.primaryKeyColumns ?? ["id"];
@@ -659,6 +661,7 @@ async function initializeCommittedTableData(overrides?: {
   await waitFor(() => {
     expect(screen.getByRole("table")).toBeTruthy();
   });
+  return view;
 }
 
 function getBodyCell(columnName: string, rowIndex = 0): HTMLTableCellElement {
@@ -681,6 +684,51 @@ function getBodyCell(columnName: string, rowIndex = 0): HTMLTableCellElement {
   }
 
   return targetCell;
+}
+
+function getHeaderCell(columnId: string): HTMLElement {
+  return screen
+    .getByRole("table")
+    .querySelector(
+      `thead tr:first-child th[data-column-id="${columnId}"]`,
+    ) as HTMLElement;
+}
+
+function getHeaderColumnIds(): string[] {
+  return Array.from(
+    screen
+      .getByRole("table")
+      .querySelectorAll("thead tr:first-child th[data-column-id]"),
+  ).map((header) => header.getAttribute("data-column-id") ?? "");
+}
+
+function getDataHeaderOrder(): string[] {
+  return getHeaderColumnIds().filter((id) => id !== "__sel");
+}
+
+function dragHeaderToStart(columnId: string, firstColumnId: string): void {
+  const rect = (left: number) =>
+    ({
+      x: left,
+      y: 0,
+      left,
+      top: 0,
+      right: left + 100,
+      bottom: 28,
+      width: 100,
+      height: 28,
+      toJSON: () => ({}),
+    }) as DOMRect;
+  getHeaderCell(firstColumnId).getBoundingClientRect = () => rect(0);
+  getHeaderCell(columnId).getBoundingClientRect = () => rect(100);
+  fireEvent.mouseDown(getHeaderCell(columnId), {
+    button: 0,
+    clientX: 150,
+    clientY: 14,
+  });
+  fireEvent.mouseMove(document, { clientX: 140, clientY: 14 });
+  fireEvent.mouseMove(document, { clientX: 20, clientY: 14 });
+  fireEvent.mouseUp(document, { clientX: 20, clientY: 14 });
 }
 
 afterEach(() => {
@@ -2845,7 +2893,10 @@ describe("TableView", () => {
       },
       { key: "Y", code: "KeyY", ...modifier, shiftKey: true },
       { key: "y", code: "KeyY", ...modifier, altKey: true },
-      { key: "y", code: "KeyX", ...modifier },
+      { key: "x", code: "KeyY", ...modifier },
+      { key: ";", code: "KeyZ", ...modifier },
+      { key: ":", code: "KeyZ", ...modifier, shiftKey: true },
+      { key: "6", code: "KeyY", ...modifier },
     ];
     for (const init of ignoredEvents) {
       const event = new KeyboardEvent("keydown", {
@@ -2856,6 +2907,7 @@ describe("TableView", () => {
       fireEvent(document.body, event);
       expect(event.defaultPrevented).toBe(false);
       expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+      expect(getBodyCell("name", 1).textContent).toContain("Edited Alice");
     }
     for (const tag of ["input", "textarea", "select"]) {
       const input = document.createElement(tag);
@@ -2884,6 +2936,407 @@ describe("TableView", () => {
     });
     expect(getBodyCell("name", 0).textContent).toBe("Draft name");
     vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["QWERTY", { key: "z", code: "KeyZ" }, { key: "y", code: "KeyY" }],
+    ["QWERTZ", { key: "z", code: "KeyY" }, { key: "y", code: "KeyZ" }],
+    ["AZERTY", { key: "z", code: "KeyW" }, { key: "y", code: "KeyY" }],
+    ["Dvorak", { key: "z", code: "Slash" }, { key: "y", code: "KeyT" }],
+    ["Cyrillic", { key: "я", code: "KeyZ" }, { key: "н", code: "KeyY" }],
+  ] as const)("matches undo and redo shortcuts by layout key on %s", async (_layout, undoKey, redoKey) => {
+    await stageMetadataWork();
+    fireEvent.keyDown(document.body, {
+      ...undoKey,
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name", 0).textContent).toContain("DEFAULT");
+    fireEvent.keyDown(document.body, {
+      ...redoKey,
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name", 0).textContent).toBe("Draft name");
+  });
+
+  it("undoes and redoes draft rows from the keyboard on tables without a primary key", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: noPkColumns,
+      primaryKeyColumns: [],
+      dataRows: noPkRows,
+    });
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    expect(getBodyCell("name").textContent).toContain("DEFAULT");
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+    });
+    expect(getBodyCell("name").textContent).toBe("Alice");
+    fireEvent.keyDown(document.body, {
+      key: "z",
+      code: "KeyZ",
+      ctrlKey: true,
+      metaKey: true,
+      shiftKey: true,
+    });
+    expect(getBodyCell("name").textContent).toContain("DEFAULT");
+  });
+
+  it("keeps column widths and order when a page reveals extra columns", async () => {
+    await initializeCommittedTableData({ totalCount: 50 });
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    const resizedWidth = getHeaderCell("name").style.width;
+    dragHeaderToStart("name", "id");
+    expect(getDataHeaderOrder()).toEqual(["name", "id"]);
+
+    clearPostedMessages();
+    fireEvent.click(screen.getByRole("button", { name: "Next →" }));
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        extraColumns: [{ ...columns[1], name: "extra" }],
+        rows: [{ id: 26, name: "Zed", extra: "found later" }],
+        totalCount: 50,
+      }),
+    );
+    expect(screen.getByText("found later")).toBeTruthy();
+    expect(getDataHeaderOrder()).toEqual(["name", "id", "extra"]);
+    expect(getHeaderCell("name").style.width).toBe(resizedWidth);
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    fireEvent.click(screen.getByRole("button", { name: /Export visible/ }));
+    expect(postedMessagesOfType("exportJSON").at(-1)?.payload).toMatchObject({
+      columnOrder: ["name", "id", "extra"],
+    });
+  });
+
+  async function refreshMetadataWithoutWork(
+    nextColumns: ColumnTypeMeta[],
+    nextRows: readonly Record<string, unknown>[],
+  ) {
+    clearPostedMessages();
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: nextColumns,
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: nextRows,
+        totalCount: nextRows.length,
+      }),
+    );
+  }
+
+  it("follows a server-side column reorder when the user has not reordered columns", async () => {
+    const extra = { ...columns[1], name: "extra" };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, extra],
+      dataRows: [{ id: 1, name: "Alice", extra: "x" }],
+    });
+    expect(getDataHeaderOrder()).toEqual(["id", "name", "extra"]);
+    await refreshMetadataWithoutWork(
+      [extra, columns[0], columns[1]],
+      [{ id: 1, name: "Alice", extra: "x" }],
+    );
+    expect(getDataHeaderOrder()).toEqual(["extra", "id", "name"]);
+    expect(getHeaderColumnIds()[0]).toBe("__sel");
+  });
+
+  it("keeps the user column layout when a metadata refresh without pending work rebuilds the grid", async () => {
+    const note = { ...columns[1], name: "note" };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, note],
+      dataRows: [{ id: 1, name: "Alice", note: "First note" }],
+    });
+    dragHeaderToStart("name", "id");
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize note column" }),
+      -1000,
+    );
+    const nameWidth = getHeaderCell("name").style.width;
+    const noteWidth = getHeaderCell("note").style.width;
+    expect(getDataHeaderOrder()).toEqual(["name", "id", "note"]);
+    expect(noteWidth).toBe("0px");
+    const tableBefore = screen.getByRole("table");
+
+    await refreshMetadataWithoutWork(
+      [columns[0], { ...columns[1], nullable: false }, note],
+      [{ id: 1, name: "Alice", note: "First note" }],
+    );
+    expect(screen.getByRole("table")).not.toBe(tableBefore);
+    expect(getHeaderColumnIds()).toEqual(["__sel", "name", "id", "note"]);
+    expect(getHeaderCell("name").style.width).toBe(nameWidth);
+    expect(getHeaderCell("note").style.width).toBe(noteWidth);
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(postedMessagesOfType("exportJSON").at(-1)?.payload).toMatchObject({
+      columnOrder: ["name", "id"],
+    });
+  });
+
+  it("reconciles a rebuilt user column layout with dropped and added columns", async () => {
+    const note = { ...columns[1], name: "note" };
+    const extra = { ...columns[1], name: "extra" };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, note, { ...columns[1], name: "__sel" }],
+      dataRows: [{ id: 1, name: "Alice", note: "First note", __sel: "x" }],
+    });
+    const selectionWidth = getHeaderCell("__sel_").style.width;
+    dragHeaderToStart("note", "id");
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize id column" }),
+      20,
+    );
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize __sel column" }),
+      300,
+    );
+    const idWidth = getHeaderCell("id").style.width;
+    const nameWidth = getHeaderCell("name").style.width;
+    expect(getHeaderColumnIds()).toEqual([
+      "__sel_",
+      "note",
+      "id",
+      "name",
+      "__sel",
+    ]);
+
+    await refreshMetadataWithoutWork(
+      [columns[0], note, extra],
+      [{ id: 1, note: "First note", extra: "x" }],
+    );
+    expect(getHeaderColumnIds()).toEqual(["__sel", "note", "id", "extra"]);
+    expect(getHeaderCell("__sel").style.width).toBe(selectionWidth);
+    expect(getHeaderCell("id").style.width).toBe(idWidth);
+    expect(getHeaderCell("extra").style.width).not.toBe(nameWidth);
+    expect(
+      screen.queryByRole("button", { name: "Resize name column" }),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(postedMessagesOfType("exportJSON").at(-1)?.payload).toMatchObject({
+      columnOrder: ["note", "id", "extra"],
+    });
+  });
+
+  it("resets the user column layout for a different table", async () => {
+    const { rerender } = await initializeCommittedTableData();
+    const defaultWidth = getHeaderCell("name").style.width;
+    dragHeaderToStart("name", "id");
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    expect(getDataHeaderOrder()).toEqual(["name", "id"]);
+    expect(getHeaderCell("name").style.width).not.toBe(defaultWidth);
+
+    rerender(
+      <TableView
+        connectionId="conn-1"
+        database="main"
+        schema="public"
+        table="orders"
+      />,
+    );
+    expect(getDataHeaderOrder()).toEqual(["id", "name"]);
+    expect(getHeaderCell("name").style.width).toBe(defaultWidth);
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(postedMessagesOfType("exportJSON").at(-1)?.payload).toMatchObject({
+      columnOrder: ["id", "name"],
+    });
+  });
+
+  it("keeps the selection column first and a user order when a real column is named __sel", async () => {
+    await stageMetadataWork();
+    dragHeaderToStart("name", "id");
+    expect(getHeaderColumnIds()).toEqual(["__sel", "name", "id"]);
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [...columns, { ...columns[1], name: "__sel" }],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(screen.queryByText(/Schema conflict/)).toBeNull();
+    expect(getHeaderColumnIds()).toEqual(["__sel_", "name", "id", "__sel"]);
+  });
+
+  it.each([
+    ["widened", 300, 100],
+    ["collapsed", -1000, 1],
+  ] as const)("prunes stale grid widths so the selection column does not inherit a %s dropped __sel column", (_label, deltaX, staleSize) => {
+    const hiddenColumnIdsRef = { current: new Set<string>() };
+    const renderGrid = (gridColumns: ColumnTypeMeta[]) => (
+      <TableGrid
+        canEditRows
+        canSelectAndDeleteRows
+        colSizes={{ id: 100, name: 100, __sel: staleSize }}
+        columns={gridColumns}
+        editCell={null}
+        filterDrafts={{}}
+        hiddenColumnIdsRef={hiddenColumnIdsRef}
+        loading={false}
+        loadingRef={{ current: false }}
+        fetchEpochRef={{ current: 0 }}
+        newRows={[]}
+        onCancelEdit={vi.fn()}
+        onBatchCellEdit={vi.fn()}
+        onCommitCellEdit={vi.fn()}
+        onCommitDraftCellEdit={vi.fn()}
+        onMixedBatchEdit={vi.fn()}
+        onFilterDraftChange={vi.fn()}
+        onSelectionChange={vi.fn()}
+        onSort={vi.fn()}
+        onOpenStructuredCell={vi.fn()}
+        onStartDraftEdit={vi.fn()}
+        onStartEdit={vi.fn()}
+        pendingEdits={new Map()}
+        rows={[{ id: 1, name: "Alice", __sel: "x" }]}
+        scrollRef={createRef<HTMLDivElement>()}
+        selected={new Set<number>()}
+        sort={null}
+      />
+    );
+    const { rerender } = render(
+      renderGrid([...columns, { ...columns[1], name: "__sel" }]),
+    );
+    expect(getHeaderColumnIds()).toEqual(["__sel_", "id", "name", "__sel"]);
+    const selectionWidth = getHeaderCell("__sel_").style.width;
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    const nameWidth = getHeaderCell("name").style.width;
+    expect(nameWidth).toBe("140px");
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize __sel column" }),
+      deltaX,
+    );
+    expect(getHeaderCell("__sel").style.width).not.toBe("100px");
+
+    rerender(renderGrid(columns));
+    expect(getHeaderColumnIds()).toEqual(["__sel", "id", "name"]);
+    expect(getHeaderCell("__sel").style.width).toBe(selectionWidth);
+    expect(getHeaderCell("name").style.width).toBe(nameWidth);
+    expect(hiddenColumnIdsRef.current.size).toBe(0);
+    expect(screen.getByRole("checkbox", { name: "Select row 1" })).toBeTruthy();
+  });
+
+  it.each([
+    "drop",
+    "rename",
+  ] as const)("reconciles order, widths and selection in place after a %s metadata refresh with pending work", async (change) => {
+    const user = userEvent.setup();
+    const note = { ...columns[1], name: "note" };
+    await initializeCommittedTableData({
+      columnDefs: [...columns, note],
+      dataRows: [{ id: 1, name: "Alice", note: "First note" }],
+    });
+    dragResizeHandle(
+      screen.getByRole("button", { name: "Resize name column" }),
+      40,
+    );
+    const resizedWidth = getHeaderCell("name").style.width;
+    await user.dblClick(getBodyCell("note"));
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: "Edited note" },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    const selectedCell = getBodyCell("note");
+    fireEvent.mouseDown(selectedCell, { button: 0 });
+    fireEvent.mouseUp(selectedCell);
+    expect(selectedCell.className).toContain("rdb-tcell-anchor");
+
+    const nextColumns =
+      change === "drop"
+        ? [columns[0], note]
+        : [columns[0], { ...columns[1], name: "label" }, note];
+    await act(async () =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: nextColumns,
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(screen.getByText(/Schema conflict/)).toBeTruthy();
+    expect(getDataHeaderOrder()).toEqual(["id", "name", "note"]);
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Revert All" }));
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    await act(async () =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows: [
+          change === "drop"
+            ? { id: 1, note: "First note" }
+            : { id: 1, label: "Alice", note: "First note" },
+        ],
+        totalCount: 1,
+      }),
+    );
+    expect(getDataHeaderOrder()).toEqual(
+      nextColumns.map((column) => column.name),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Resize name column" }),
+    ).toBeNull();
+    if (change === "rename")
+      expect(getHeaderCell("label").style.width).not.toBe(resizedWidth);
+    expect(
+      screen.getByRole("table").querySelectorAll(".rdb-tcell-anchor"),
+    ).toHaveLength(0);
+    expect(getBodyCell("note").getAttribute("data-col")).toBe(
+      String(nextColumns.length),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
+    expect(postedMessagesOfType("exportJSON").at(-1)?.payload).toMatchObject({
+      columnOrder: nextColumns.map((column) => column.name),
+    });
+  });
+
+  it.each([
+    ["view", { isView: true }],
+    ["read-only connection", { connectionReadOnly: true }],
+  ] as const)("does not intercept undo and redo shortcuts on a %s", async (_label, renderOverrides) => {
+    await initializeCommittedTableData({ renderOverrides });
+    expect(screen.queryByRole("button", { name: "Add Row" })).toBeNull();
+    for (const init of [
+      { key: "z", code: "KeyZ" },
+      { key: "z", code: "KeyZ", shiftKey: true },
+      { key: "y", code: "KeyY" },
+    ]) {
+      const event = new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        ctrlKey: true,
+        metaKey: true,
+        ...init,
+      });
+      fireEvent(document.body, event);
+      expect(event.defaultPrevented).toBe(false);
+    }
   });
 
   it("removes active table resize listeners on unmount without a late width commit", async () => {

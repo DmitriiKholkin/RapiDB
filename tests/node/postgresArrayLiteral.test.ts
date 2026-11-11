@@ -364,6 +364,130 @@ describe("PostgreSQL temporal, json, interval and point arrays keep raw element 
     ).toBe(false);
   });
 
+  it.each([
+    ["numeric(10,2)[]", "[1.5]", 1231, "{1.50}", "[1.6]"],
+    ["double precision[]", "[1.0]", 1022, "{1}", "[1.5]"],
+    ["real[]", "[0.1]", 1021, "{0.1}", "[0.2]"],
+    ["numeric[]", "[1e2]", 1231, "{100}", "[1e3]"],
+    ["integer[]", "{+1}", 1007, "{1}", "{-1}"],
+    [
+      "bigint[]",
+      '["9223372036854775807"]',
+      1016,
+      "{9223372036854775807}",
+      "[9223372036854775806]",
+    ],
+    [
+      "uuid[]",
+      '["A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11"]',
+      2951,
+      "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11}",
+      '["A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12"]',
+    ],
+    ["character(3)[]", '["ab"]', 1014, '{"ab "}', '["ac"]'],
+  ])("verifies %s edits using element-type canonical values", (nativeType, input, oid, stored, different) => {
+    const column = arrayColumn(nativeType);
+    const persistedValue = parser(oid)(stored);
+    expect(driver.checkPersistedEdit(column, input)?.ok).toBe(true);
+    expect(
+      driver.checkPersistedEdit(column, input, { persistedValue })?.ok,
+    ).toBe(true);
+    expect(
+      driver.checkPersistedEdit(column, different, { persistedValue })?.ok,
+    ).toBe(false);
+  });
+
+  it("keeps numeric[] comparisons exact beyond double precision", () => {
+    const column = arrayColumn("numeric[]");
+    const persistedValue = parser(1231)("{12345678901234567890.10}");
+    expect(
+      driver.checkPersistedEdit(column, "[12345678901234567890.1]", {
+        persistedValue,
+      })?.ok,
+    ).toBe(true);
+    expect(
+      driver.checkPersistedEdit(column, "[12345678901234567890.2]", {
+        persistedValue,
+      })?.ok,
+    ).toBe(false);
+    expect(
+      driver.checkPersistedEdit(column, "[1.5,null]", {
+        persistedValue: parser(1231)("{1.50,NULL}"),
+      })?.ok,
+    ).toBe(true);
+    expect(
+      driver.checkPersistedEdit(column, "[1.5,0]", {
+        persistedValue: parser(1231)("{1.50,NULL}"),
+      })?.ok,
+    ).toBe(false);
+  });
+
+  const domainArrayColumn = (nativeType: string, baseType: string) =>
+    ({ ...(arrayColumn(nativeType) as object), baseType }) as never;
+
+  it.each([
+    ["public.amount[]", "numeric(10,2)[]", "[1.5]", "{1.50}", "[1.6]"],
+    ["public.amount[]", "numeric(10,2)[]", [1.5], "{1.50}", [1.6]],
+    ["public.qty[]", "integer[]", "[1]", "{1}", "[2]"],
+    ["public.qty[]", "integer[]", [1], "{1}", [2]],
+    ["public.amount3[]", "numeric(10,2)[]", "[2.5]", "{2.50}", "[2.6]"],
+    [
+      "hidden.hamount[]",
+      "numeric(8,3)[]",
+      "[1.25,null]",
+      "{1.250,NULL}",
+      "[1.25,0]",
+    ],
+    ["public.label[]", "text[]", '["x"]', "{x}", '["y"]'],
+    ["public.moods[]", "public.mood[]", '["sad"]', "{sad}", '["ok"]'],
+  ])("verifies %s domain array edits using the %s base element type", (nativeType, baseType, input, stored, different) => {
+    const column = domainArrayColumn(nativeType, baseType);
+    expect(driver.checkPersistedEdit(column, input)?.ok).toBe(true);
+    expect(
+      driver.checkPersistedEdit(column, input, { persistedValue: stored }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      driver.checkPersistedEdit(column, different, { persistedValue: stored })
+        ?.ok,
+    ).toBe(false);
+  });
+
+  it.each([
+    ['["{t,f}"]', '{"{t,f}"}', '["{t,t}"]'],
+    [["{t,f}"], '{"{t,f}"}', ["{t,t}"]],
+    ['["{t}",null]', '{"{t}",NULL}', '["{f}",null]'],
+  ])("verifies arrays of domains over boolean[] with the generic comparison (%j)", (input, stored, different) => {
+    const column = domainArrayColumn("public.flags[]", "public.flags[]");
+    expect(
+      driver.checkPersistedEdit(column, input, { persistedValue: stored }),
+    ).toEqual({ ok: true, shouldVerify: true });
+    expect(
+      driver.checkPersistedEdit(column, different, { persistedValue: stored })
+        ?.ok,
+    ).toBe(false);
+  });
+
+  it("does not verify arrays of domains over temporal base types", () => {
+    expect(
+      driver.checkPersistedEdit(
+        domainArrayColumn("public.day[]", "date[]"),
+        '["2024-1-1"]',
+        { persistedValue: "{2024-01-01}" },
+      ),
+    ).toEqual({ ok: true, shouldVerify: false });
+  });
+
+  it.each([
+    "public.amount[]",
+    '"audit"."amount"[]',
+  ])("skips verification of %s when its element base type is unresolved", (nativeType) => {
+    expect(
+      driver.checkPersistedEdit(arrayColumn(nativeType), "[1.5]", {
+        persistedValue: "{1.50}",
+      }),
+    ).toEqual({ ok: true, shouldVerify: false });
+  });
+
   it("exports json[] and jsonb[] elements as nested JSON without precision loss", () => {
     for (const [nativeType, oid, expected] of [
       [

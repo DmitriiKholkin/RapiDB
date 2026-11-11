@@ -469,6 +469,58 @@ function skipSqlIdentifier(sql: string, start: number): number {
   const match = /^[A-Za-z_][A-Za-z0-9_]*/.exec(sql.slice(index));
   return match ? index + match[0].length : index;
 }
+function parseSqliteTriggerHeader(
+  sql: string,
+): Pick<import("./types").TriggerMeta, "timing" | "events"> {
+  const unknown = () => ({
+    timing: "unknown" as const,
+    events: ["unknown" as const],
+  });
+  let token = readSqlKeyword(sql, 0);
+  if (token?.keyword !== "CREATE") return unknown();
+  token = readSqlKeyword(sql, token.next);
+  if (token?.keyword === "TEMP" || token?.keyword === "TEMPORARY")
+    token = readSqlKeyword(sql, token.next);
+  if (token?.keyword !== "TRIGGER") return unknown();
+  let index = token.next;
+  const ifToken = readSqlKeyword(sql, index);
+  const notToken = ifToken && readSqlKeyword(sql, ifToken.next);
+  const existsToken = notToken && readSqlKeyword(sql, notToken.next);
+  if (
+    ifToken?.keyword === "IF" &&
+    notToken?.keyword === "NOT" &&
+    existsToken?.keyword === "EXISTS"
+  )
+    index = existsToken.next;
+  const skipName = (start: number) => {
+    const nameStart = skipSqlTrivia(sql, start);
+    if (/["'`[]/.test(sql[nameStart] ?? "")) {
+      return skipQuotedSql(sql, nameStart);
+    }
+    const match = /^[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/.exec(
+      sql.slice(nameStart),
+    );
+    return nameStart + (match?.[0].length ?? 0);
+  };
+  index = skipName(index);
+  const dot = skipSqlTrivia(sql, index);
+  if (sql[dot] === ".") index = skipName(dot + 1);
+  let timing: import("./types").TriggerMeta["timing"] = "before";
+  token = readSqlKeyword(sql, index);
+  if (token?.keyword === "BEFORE" || token?.keyword === "AFTER") {
+    timing = token.keyword === "BEFORE" ? "before" : "after";
+    token = readSqlKeyword(sql, token.next);
+  } else if (token?.keyword === "INSTEAD") {
+    token = readSqlKeyword(sql, token.next);
+    if (token?.keyword !== "OF") return unknown();
+    timing = "instead_of";
+    token = readSqlKeyword(sql, token.next);
+  }
+  const event = token?.keyword.toLowerCase();
+  if (event !== "delete" && event !== "insert" && event !== "update")
+    return unknown();
+  return { timing, events: [event] };
+}
 function sqliteColumnDefinitionName(definition: string): string | null {
   const trimmed = definition.trim();
   if (!trimmed) {
@@ -885,21 +937,28 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     ) as SQLiteDatabaseListRow[];
   }
   private resolveSqliteSchema(database: string, schema: string): string {
-    const candidate = (schema || database || "main").trim() || "main";
-    const available = new Set(
+    const available = new Map(
       this.listAttachedDatabases()
         .map((entry) => entry.name)
         .filter(
           (name): name is string => typeof name === "string" && name.length > 0,
-        ),
+        )
+        .map((name) => [sqliteAsciiLower(name), name]),
     );
-    if (available.has(candidate)) {
-      return candidate;
+    available.set("temp", available.get("temp") ?? "temp");
+    const lookup = (name: string) =>
+      available.get(sqliteAsciiLower(name)) ??
+      available.get(sqliteAsciiLower(name.trim()));
+    if (schema?.trim()) {
+      const resolved = lookup(schema);
+      if (!resolved) {
+        throw new Error(
+          `[RapiDB] SQLite schema "${schema}" is not attached to this connection`,
+        );
+      }
+      return resolved;
     }
-    if (available.has(database)) {
-      return database;
-    }
-    return "main";
+    return (database?.trim() && lookup(database)) || "main";
   }
   private readTableMetadata(
     database: string,
@@ -1017,7 +1076,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     }));
   }
   async listSchemas(database: string): Promise<SchemaInfo[]> {
-    return [{ name: this.resolveSqliteSchema(database, database) }];
+    return [{ name: this.resolveSqliteSchema(database, "") }];
   }
   async listObjects(database: string, schema: string): Promise<TableInfo[]> {
     const sqliteSchema = this.resolveSqliteSchema(database, schema);
@@ -1063,7 +1122,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       ? `${quoteSqliteIdentifier(schema)}.sqlite_master`
       : "sqlite_master";
     const result = await this.query(
-      `SELECT type FROM ${master} WHERE name = ?`,
+      `SELECT type FROM ${master} WHERE type IN ('table','view') AND name = ?`,
       [table],
     );
     if (result.rows[0]?.__col_0 !== "table") {
@@ -1083,15 +1142,14 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     operationContext?: QueryExecutionOptions & { deadline?: number },
   ): Promise<QueryResult> {
     const db = this.requireDb();
-    const checkDeadline = () => {
-      if (
-        operationContext?.deadline !== undefined &&
-        Date.now() >= operationContext.deadline
-      ) {
-        throw new Error("SQLite query deadline exceeded before completion.");
-      }
-    };
-    checkDeadline();
+    const deadlineExceeded = () =>
+      operationContext?.deadline !== undefined &&
+      Date.now() >= operationContext.deadline;
+    if (deadlineExceeded()) {
+      throw new MutationNotExecutedError(
+        "SQLite query deadline exceeded before execution. The query was NOT_EXECUTED (not executed).",
+      );
+    }
     const statements = splitSQLiteScript(sql);
     const transactional =
       statements.length > 0 &&
@@ -1104,7 +1162,9 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     try {
       const result = await this.executeQuery(sql, params, operationContext);
       if (transactional) {
-        checkDeadline();
+        if (deadlineExceeded()) {
+          throw new Error("SQLite query deadline exceeded before completion.");
+        }
         db.exec("RELEASE SAVEPOINT rapidb_query_deadline");
       }
       if (db.inTransaction) {
@@ -1417,43 +1477,16 @@ export class SQLiteCoreDriver extends BaseDBDriver {
   ): Promise<import("./types").TriggerMeta[] | null> {
     const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const rows = this.requireDb().all(
-      `SELECT name, sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name=? ORDER BY name`,
+      `SELECT name, sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name = ? COLLATE NOCASE ORDER BY name`,
       [table],
     ) as { name: string; sql: string | null }[];
-    return rows.map((row) => {
-      const sql = row.sql ?? "";
-      const triggerTypeMatch = sql.match(
-        /\b(BEFORE|AFTER|INSTEAD OF)\b([\s\S]*?)\bON\b/i,
-      );
-      const typeSegment = triggerTypeMatch?.[0] ?? "";
-      const events: import("./types").TriggerMeta["events"] = [];
-      if (/\bINSERT\b/i.test(typeSegment)) {
-        events.push("insert");
-      }
-      if (/\bUPDATE\b/i.test(typeSegment)) {
-        events.push("update");
-      }
-      if (/\bDELETE\b/i.test(typeSegment)) {
-        events.push("delete");
-      }
-      if (events.length === 0) {
-        events.push("unknown");
-      }
-      return {
-        name: row.name,
-        timing: /\bBEFORE\b/i.test(typeSegment)
-          ? "before"
-          : /\bINSTEAD OF\b/i.test(typeSegment)
-            ? "instead_of"
-            : /\bAFTER\b/i.test(typeSegment)
-              ? "after"
-              : "unknown",
-        events,
-        orientation: "row",
-        enabled: true,
-        definition: row.sql ?? undefined,
-      };
-    });
+    return rows.map((row) => ({
+      name: row.name,
+      ...parseSqliteTriggerHeader(row.sql ?? ""),
+      orientation: "row",
+      enabled: true,
+      definition: row.sql ?? undefined,
+    }));
   }
   override async getConstraintDDL(
     database: string,
@@ -1508,7 +1541,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
   ): Promise<string> {
     const sqliteSchema = this.resolveSqliteSchema(database, schema);
     const row = this.requireDb().get(
-      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name = ? AND name = ?`,
+      `SELECT sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='trigger' AND tbl_name = ? COLLATE NOCASE AND name = ?`,
       [table, triggerName],
     ) as { sql: string | null } | null;
     const sql = row?.sql?.trim();

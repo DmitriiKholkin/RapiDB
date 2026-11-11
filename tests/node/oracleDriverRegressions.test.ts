@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import oracledb from "oracledb";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -569,7 +570,115 @@ describe("Oracle catalog metadata", () => {
         source: "catalog",
       },
     ]);
-    expect(connection.close).toHaveBeenCalledTimes(2);
+    expect(connection.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads constraints on a single pooled connection", async () => {
+    const oracle = driver();
+    let leased = 0;
+    const connection = {
+      execute: vi.fn(async (sql: string) =>
+        sql.includes("fk.constraint_type = 'R'")
+          ? {
+              rows: [
+                {
+                  CONSTRAINT_NAME: "FK_PARENT",
+                  COLUMN_NAME: "PARENT_ID",
+                  R_OWNER: "APP",
+                  R_TABLE_NAME: "PARENT",
+                  R_COLUMN_NAME: "ID",
+                },
+              ],
+            }
+          : { rows: [] },
+      ),
+      close: vi.fn(async () => {
+        leased--;
+      }),
+    };
+    vi.spyOn(
+      oracle as unknown as { getConnection(): Promise<unknown> },
+      "getConnection",
+    ).mockImplementation(async () => {
+      if (leased >= 1) throw new Error("pool exhausted");
+      leased++;
+      return connection;
+    });
+    await expect(oracle.getConstraints("", "APP", "T")).resolves.toEqual([
+      {
+        name: "FK_PARENT",
+        kind: "foreign_key",
+        columns: ["PARENT_ID"],
+        referencedSchema: "APP",
+        referencedTable: "PARENT",
+        referencedColumns: ["ID"],
+        source: "catalog",
+      },
+    ]);
+    expect(leased).toBe(0);
+  });
+});
+
+describe("Oracle BFILE values", () => {
+  it("releases fetched BFILE locators and shows a read-only placeholder", async () => {
+    const oracle = driver();
+    const errorHandled: boolean[] = [];
+    const lobs = [0, 1, 2].map(() => {
+      const lob = Object.assign(new EventEmitter(), {
+        destroy: vi.fn(() => {
+          process.nextTick(() => {
+            const handled = lob.listenerCount("error") > 0;
+            errorHandled.push(handled);
+            if (handled) lob.emit("error", new Error("NJS-003: invalid LOB"));
+          });
+        }),
+      });
+      return lob;
+    });
+    const bfileMeta = { name: "F", dbType: oracledb.DB_TYPE_BFILE };
+    const connection = {
+      execute: vi.fn(
+        async (
+          _sql: string,
+          _binds: unknown,
+          options: oracledb.ExecuteOptions,
+        ) => {
+          const handler = options.fetchTypeHandler?.(
+            bfileMeta as oracledb.Metadata<unknown>,
+          );
+          const rows = [null, lobs[0], lobs[1], lobs[2]].map((value) => [
+            handler?.converter ? handler.converter(value) : value,
+          ]);
+          let fetched = false;
+          return {
+            resultSet: {
+              metaData: [bfileMeta],
+              getRows: async () => {
+                if (fetched) return [];
+                fetched = true;
+                return rows;
+              },
+              close: async () => undefined,
+            },
+          };
+        },
+      ),
+      commit: vi.fn(async () => undefined),
+      close: vi.fn(async () => undefined),
+    };
+    vi.spyOn(
+      oracle as unknown as { getConnection(): Promise<unknown> },
+      "getConnection",
+    ).mockResolvedValue(connection);
+    const result = await oracle.query("SELECT f FROM t", undefined, {
+      hardCap: 2,
+    });
+    expect(result.rows).toEqual([{ __col_0: null }, { __col_0: "(BFILE)" }]);
+    expect(result.rowCount).toBe(4);
+    for (const lob of lobs) expect(lob.destroy).toHaveBeenCalledOnce();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(errorHandled).toEqual([true, true, true]);
+    expect(oracle.column("F", "BFILE").isReadOnly).toBe(true);
   });
 });
 

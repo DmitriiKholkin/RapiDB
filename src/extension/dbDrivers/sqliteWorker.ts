@@ -1,3 +1,4 @@
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import { SQLiteCoreDriver } from "./sqliteCore";
 import {
   SQLITE_WORKER_METHODS,
@@ -14,7 +15,9 @@ process.on("message", (request: SQLiteWorkerRequest) => {
       const response: SQLiteWorkerResponse = { id: request.id };
       try {
         if (Date.now() >= request.deadline)
-          throw new Error("SQLite operation deadline exceeded");
+          throw new MutationNotExecutedError(
+            "SQLite operation deadline exceeded before it started. The request was NOT_EXECUTED (not executed).",
+          );
         if (request.method === "connect") {
           if (!request.config || !request.runtimeTargets)
             throw new Error("Invalid SQLite worker startup");

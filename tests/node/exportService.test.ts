@@ -2311,6 +2311,61 @@ describe("exportService", () => {
     );
   });
 
+  it("sanitizes the default export file name into one portable path segment", async () => {
+    const { exportTableDataAsCsv, sanitizeExportFileName } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    expect(sanitizeExportFileName("mydb_../../../.ssh/x")).toBe(
+      "mydb_.._.._.._.ssh_x",
+    );
+    expect(sanitizeExportFileName("..")).toBe("export");
+    expect(sanitizeExportFileName('a\\b:c*d?e"f<g>h|i\u0001j')).toBe(
+      "a_b_c_d_e_f_g_h_i_j",
+    );
+    expect(sanitizeExportFileName(" .hidden. ")).toBe("hidden");
+    expect(sanitizeExportFileName("nul.txt")).toBe("_nul.txt");
+    expect(sanitizeExportFileName("CON.foo")).toBe("_CON.foo");
+    expect(sanitizeExportFileName("Com1")).toBe("_Com1");
+    expect(sanitizeExportFileName("lpt9.csv")).toBe("_lpt9.csv");
+    expect(sanitizeExportFileName("com0")).toBe("com0");
+    expect(sanitizeExportFileName("lpt0.csv")).toBe("lpt0.csv");
+    expect(sanitizeExportFileName("public_users")).toBe("public_users");
+    expect(sanitizeExportFileName("a".repeat(300), ".json")).toBe(
+      "a".repeat(250),
+    );
+    const longUnicode = sanitizeExportFileName("é😀".repeat(100), ".csv");
+    expect(Buffer.byteLength(`${longUnicode}.csv`, "utf8")).toBeLessThanOrEqual(
+      255,
+    );
+    expect(longUnicode).toBe(`${"é😀".repeat(41)}é`);
+    expect(sanitizeExportFileName(`${"a".repeat(250)}. tail`, ".csv")).toBe(
+      "a".repeat(250),
+    );
+    expect(sanitizeExportFileName(`CON${" ".repeat(247)}x`, ".json")).toBe(
+      "_CON",
+    );
+    expect(sanitizeExportFileName(`NUL${" ".repeat(260)}x`, ".json")).toBe(
+      "_NUL",
+    );
+    expect(sanitizeExportFileName(`CON${"\u3000".repeat(83)}x`, ".json")).toBe(
+      "_CON",
+    );
+    expect(sanitizeExportFileName(`CON.${"a".repeat(246)}`, ".json")).toBe(
+      `_CON.${"a".repeat(245)}`,
+    );
+
+    vscodeMock.showSaveDialog.mockResolvedValueOnce(undefined);
+    const loadChunks = vi.fn();
+    await exportTableDataAsCsv({ fileName: "../../etc/passwd", loadChunks });
+
+    const [{ defaultUri }] = vscodeMock.showSaveDialog.mock.calls[0];
+    expect(path.dirname(defaultUri.fsPath)).toBe(
+      path.join(os.homedir(), "Downloads"),
+    );
+    expect(path.basename(defaultUri.fsPath)).toBe("_.._etc_passwd.csv");
+    expect(loadChunks).not.toHaveBeenCalled();
+  });
+
   it("refuses to replace an existing file on Windows", async () => {
     fs.writeFileSync(outputPath, "previous export\n");
     const loadChunks = vi.fn(async function* () {

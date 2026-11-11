@@ -29,9 +29,9 @@ import {
   verifySQLiteIntegrity,
 } from "../../src/extension/utils/sqliteArchive";
 import {
-  SQLITE_ARTIFACT_POLICY_ID,
   SQLITE_ARTIFACTS,
   type SQLiteHeaderPins,
+  sqliteArtifactPolicyId,
   sqliteHeaderPins,
 } from "../../src/extension/utils/sqliteArtifactPins";
 import {
@@ -434,6 +434,18 @@ async function runtimeFixture() {
   return { root, logs };
 }
 
+function currentPolicyId() {
+  return sqliteArtifactPolicyId({
+    betterSqlite3Version: "12.10.0",
+    runtime: process.versions.electron ? "electron" : "node",
+    abi: process.versions.modules,
+    platform: process.platform,
+    arch: process.arch,
+    libc: "",
+    electronVersion: process.versions.electron,
+  });
+}
+
 function fixturePrebuiltPin(kind: "official" | "patched", data: Buffer) {
   const runtime = process.versions.electron ? "electron" : "node";
   const filename = `better-sqlite3-v12.10.0-${runtime}-v${process.versions.modules}-${process.platform}-${process.arch}.tar.gz`;
@@ -494,7 +506,7 @@ describe("SQLite installer security across callers and fallback paths", () => {
         join(
           f.root,
           "storage/sqlite-runtime/better-sqlite3/12.10.0",
-          `node-abi-${process.versions.modules}-${process.platform}-${process.arch}-${SQLITE_ARTIFACT_POLICY_ID}`,
+          `node-abi-${process.versions.modules}-${process.platform}-${process.arch}-${currentPolicyId()}`,
           "runtime.json",
         ),
       ),
@@ -530,13 +542,14 @@ describe("SQLite installer security across callers and fallback paths", () => {
   it.each([
     "",
     "-archive-v1",
-    `-${SQLITE_ARTIFACT_POLICY_ID.replace("pins-v4-", "pins-v2-")}`,
-    `-${SQLITE_ARTIFACT_POLICY_ID.replace("pins-v4-", "pins-v3-")}`,
+    `-${currentPolicyId().replace("pins-v5-", "pins-v2-")}`,
+    `-${currentPolicyId().replace("pins-v5-", "pins-v3-")}`,
+    `-${currentPolicyId().replace("pins-v5-", "pins-v4-")}`,
   ])("does not reuse a cache suffix '%s' from an older integrity/execution policy", async (legacySuffix) => {
     const f = await runtimeFixture();
     const probe = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
     const legacyPackage = (probe.installedPackagePath as string).replace(
-      `-${SQLITE_ARTIFACT_POLICY_ID}`,
+      `-${currentPolicyId()}`,
       legacySuffix,
     );
     mkdirSync(join(legacyPackage, "build/Release"), { recursive: true });
@@ -559,6 +572,14 @@ describe("SQLite installer security across callers and fallback paths", () => {
         "utf8",
       ),
     ).toBe("new");
+    expect(
+      existsSync(
+        join(dirname(dirname(installed as string)), ".rapidb-last-used"),
+      ),
+    ).toBe(true);
+    expect(
+      existsSync(join(dirname(dirname(legacyPackage)), ".rapidb-last-used")),
+    ).toBe(false);
     expect(
       readFileSync(
         join(legacyPackage, "build/Release/better_sqlite3.node"),
@@ -1627,7 +1648,7 @@ describe("SQLite runtime installation lock recovery", () => {
     expect(lockToken(f.lockRoot)).toBe("replacement");
     rmSync(f.lockRoot, { recursive: true, force: true });
     await expect(installation).resolves.toBeTruthy();
-    expect(takeovers).toBe(2);
+    expect(takeovers).toBe(3);
   });
 
   it("leaves a mismatched tombstone in place when it cannot be restored", async () => {

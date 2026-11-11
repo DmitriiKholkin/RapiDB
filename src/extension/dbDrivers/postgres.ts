@@ -26,9 +26,12 @@ import {
   parsePostgresArrayLiteral,
   parsePostgresBooleanArrayElement,
 } from "../utils/postgresArrayParser";
+import { isEmptyPostgresIntervalObject } from "../utils/queryResultFormatting";
 import { scanSqlForCap } from "../utils/sqlStatementScan";
 import {
   BaseDBDriver,
+  canonicalizeApproximateNumericPersistedEditValue,
+  canonicalizeExactNumericText,
   formatDatetimeForDisplay,
   isoToLocalDateStr,
   normalizeSqlDatetimeOffsetSpacing,
@@ -442,8 +445,10 @@ function formatPostgresIntervalLikeValue(value: object): string | null {
     "microseconds",
   ]);
   const keys = Object.keys(record);
+  if (keys.length === 0) {
+    return isEmptyPostgresIntervalObject(value) ? "P0D" : null;
+  }
   if (
-    keys.length === 0 ||
     keys.some((key) => !knownKeys.has(key)) ||
     keys.some((key) => !hasFiniteNumber(record[key]))
   ) {
@@ -683,9 +688,55 @@ function normalizePostgresArrayTextForDisplay(
   return value;
 }
 
-function canonicalizePostgresJsonArrayElements(
+function postgresArrayElementCanonicalizer(
+  nativeType: string,
+): ((token: string) => string) | null {
+  const elementType = postgresArrayElementType(nativeType);
+  if (elementType === undefined) return null;
+  if (elementType === "json") {
+    return (token) => canonicalizeJsonPreservingRawNumbers(token) ?? token;
+  }
+  if (elementType === "jsonb") {
+    return (token) => canonicalizeJsonNumericValues(token) ?? token;
+  }
+  if (["real", "float4", "double precision", "float8"].includes(elementType)) {
+    const significantDigits = ["real", "float4"].includes(elementType) ? 7 : 17;
+    return (token) =>
+      canonicalizePostgresFloatSpecial(token)?.canonical ??
+      canonicalizeApproximateNumericPersistedEditValue(token, significantDigits)
+        ?.canonical ??
+      token;
+  }
+  if (postgresArrayElementKind(nativeType) === "numeric") {
+    return (token) =>
+      canonicalizeExactNumericText(token) ??
+      canonicalizePostgresFloatSpecial(token)?.canonical ??
+      token;
+  }
+  if (elementType === "uuid") {
+    return (token) => {
+      const normalized = normalizePostgresUuidInput(token);
+      return typeof normalized === "string" ? normalized.toLowerCase() : token;
+    };
+  }
+  if (["char", "bpchar", "character"].includes(elementType)) {
+    return (token) => token.replace(/ +$/, "");
+  }
+  return null;
+}
+
+function postgresArrayComparisonType(
+  column: Pick<ColumnTypeMeta, "nativeType" | "baseType">,
+): string | null {
+  if (column.baseType !== undefined) return column.baseType;
+  return postgresArrayElementType(column.nativeType)?.includes(".")
+    ? null
+    : column.nativeType;
+}
+
+function canonicalizePostgresArrayElements(
   value: unknown,
-  jsonb: boolean,
+  canonicalizeElement: (token: string) => string,
 ): unknown {
   if (typeof value !== "string" || !value.trim().startsWith("[")) {
     return value;
@@ -694,10 +745,7 @@ function canonicalizePostgresJsonArrayElements(
     return serializeArrayPreservingRawTokens(
       parsePostgresArrayLiteral(
         jsonArrayLiteralToPgArrayLiteral(value),
-        (token) =>
-          (jsonb
-            ? canonicalizeJsonNumericValues(token)
-            : canonicalizeJsonPreservingRawNumbers(token)) ?? token,
+        canonicalizeElement,
       ),
       false,
     );
@@ -1396,6 +1444,8 @@ export class PostgresDriver extends BaseDBDriver {
     type DescribeTableRow = {
       column_name: string;
       data_type: string;
+      array_base_type: string | null;
+      array_base_is_array?: boolean | number | string | null;
       range_subtype: string | null;
       is_nullable: boolean | number | string;
       column_default: string | null;
@@ -1416,6 +1466,8 @@ export class PostgresDriver extends BaseDBDriver {
                   pg_catalog.format_type(element_type.oid, a.atttypmod))
            ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
          END                                      AS data_type,
+         array_base.base_type                     AS array_base_type,
+         array_base.base_is_array                 AS array_base_is_array,
          CASE
            WHEN range_subtype_type.oid IS NOT NULL
            THEN pg_catalog.format('%I.%I', range_subtype_ns.nspname, range_subtype_type.typname)
@@ -1438,6 +1490,31 @@ export class PostgresDriver extends BaseDBDriver {
        LEFT JOIN pg_catalog.pg_type array_type ON array_type.oid = a.atttypid
        LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = array_type.typelem
        LEFT JOIN pg_catalog.pg_namespace element_ns ON element_ns.oid = element_type.typnamespace
+       LEFT JOIN LATERAL (
+         WITH RECURSIVE element_chain(type_oid, type_mod, depth) AS (
+           SELECT element_type.oid, a.atttypmod, 0
+           WHERE array_type.typcategory = 'A'
+             AND element_ns.oid <> 'pg_catalog'::pg_catalog.regnamespace
+           UNION ALL
+           SELECT chain_type.typbasetype, chain_type.typtypmod, element_chain.depth + 1
+           FROM element_chain
+           JOIN pg_catalog.pg_type chain_type ON chain_type.oid = element_chain.type_oid
+           WHERE chain_type.typtype = 'd' AND element_chain.depth < 32
+         )
+         SELECT CASE
+                  WHEN base_ns.oid <> 'pg_catalog'::pg_catalog.regnamespace
+                    AND pg_catalog.pg_type_is_visible(base_type.oid)
+                  THEN pg_catalog.format('%I.%s[]', base_ns.nspname,
+                         pg_catalog.format_type(base_type.oid, element_chain.type_mod))
+                  ELSE pg_catalog.format_type(base_type.oid, element_chain.type_mod) || '[]'
+                END AS base_type,
+                base_type.typcategory = 'A' AS base_is_array
+         FROM element_chain
+         JOIN pg_catalog.pg_type base_type ON base_type.oid = element_chain.type_oid
+         JOIN pg_catalog.pg_namespace base_ns ON base_ns.oid = base_type.typnamespace
+         WHERE base_type.typtype <> 'd'
+         LIMIT 1
+       ) array_base ON TRUE
        LEFT JOIN pg_catalog.pg_range range_meta
          ON range_meta.rngtypid = a.atttypid
          OR (pg_catalog.to_jsonb(range_meta)->>'rngmultitypid') = a.atttypid::text
@@ -1479,6 +1556,14 @@ export class PostgresDriver extends BaseDBDriver {
       return {
         name: r.column_name as string,
         type: r.data_type as string,
+        // Domain-over-array elements arrive as nested array literals, so they
+        // keep the generic comparison against the column's own type.
+        baseType: isPgTrue(r.array_base_is_array)
+          ? r.data_type
+          : typeof r.array_base_type === "string" &&
+              r.array_base_type.trim() !== ""
+            ? r.array_base_type
+            : undefined,
         rangeSubtype:
           typeof r.range_subtype === "string" && r.range_subtype.trim() !== ""
             ? r.range_subtype
@@ -2221,6 +2306,9 @@ export class PostgresDriver extends BaseDBDriver {
       [schema, table],
     );
     const relkind = kindRes.rows[0]?.relkind;
+    if (relkind === undefined) {
+      throw new Error(`Table "${schema}"."${table}" not found`);
+    }
     if (relkind === "v") {
       const res = await client.query<{
         def: string;
@@ -3122,7 +3210,18 @@ export class PostgresDriver extends BaseDBDriver {
       );
     }
     if (column.category === "array") {
-      const elementKind = postgresArrayElementKind(column.nativeType);
+      const comparisonType = postgresArrayComparisonType(column);
+      if (comparisonType === null) {
+        return {
+          ok: true,
+          shouldVerify: false,
+        };
+      }
+      const arrayColumn =
+        comparisonType === column.nativeType
+          ? column
+          : { ...column, nativeType: comparisonType };
+      const elementKind = postgresArrayElementKind(comparisonType);
       if (elementKind === "temporal" || elementKind === "geometric") {
         return {
           ok: true,
@@ -3152,27 +3251,32 @@ export class PostgresDriver extends BaseDBDriver {
           };
         }
       } else if (typeof expectedValue === "string") {
-        normalizedExpected = this.formatOutputValue(expectedValue, column);
+        normalizedExpected = this.formatOutputValue(expectedValue, arrayColumn);
       }
-      normalizedExpected = this.formatOutputValue(normalizedExpected, column);
+      normalizedExpected = this.formatOutputValue(
+        normalizedExpected,
+        arrayColumn,
+      );
       let persistedValue = options
-        ? this.formatOutputValue(options.persistedValue, column)
+        ? this.formatOutputValue(options.persistedValue, arrayColumn)
         : undefined;
-      if (elementKind === "json" || elementKind === "jsonb") {
-        normalizedExpected = canonicalizePostgresJsonArrayElements(
+      const canonicalizeElement =
+        postgresArrayElementCanonicalizer(comparisonType);
+      if (canonicalizeElement) {
+        normalizedExpected = canonicalizePostgresArrayElements(
           normalizedExpected,
-          elementKind === "jsonb",
+          canonicalizeElement,
         );
-        persistedValue = canonicalizePostgresJsonArrayElements(
+        persistedValue = canonicalizePostgresArrayElements(
           persistedValue,
-          elementKind === "jsonb",
+          canonicalizeElement,
         );
       }
       const normalizedOptions = options
         ? { ...options, persistedValue }
         : options;
       return this.checkJsonArrayPersistedEdit(
-        column,
+        arrayColumn,
         normalizedExpected,
         normalizedOptions,
       );

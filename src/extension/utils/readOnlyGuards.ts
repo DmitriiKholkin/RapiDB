@@ -347,6 +347,8 @@ const SQL_MUTATING_FUNCTIONS = new Set([
   "pg_advisory_xact_lock",
   "pg_try_advisory_lock",
   "pg_try_advisory_xact_lock",
+  "pg_try_advisory_lock_shared",
+  "pg_try_advisory_xact_lock_shared",
   "pg_advisory_unlock",
   "pg_advisory_unlock_all",
   "dblink",

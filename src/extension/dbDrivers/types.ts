@@ -51,6 +51,7 @@ export interface TableInfo {
   type: DbObjectKind;
   routineIdentity?: string;
 }
+export type TableInfoList = TableInfo[] & { truncated?: boolean };
 export interface QueryResult {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
@@ -281,7 +282,7 @@ export interface IDBDriver {
   getCapabilities?(): DriverCapabilities;
   listDatabases(): Promise<DatabaseInfo[]>;
   listSchemas(database: string): Promise<SchemaInfo[]>;
-  listObjects(database: string, schema: string): Promise<TableInfo[]>;
+  listObjects(database: string, schema: string): Promise<TableInfoList>;
   describeTable(
     database: string,
     schema: string,

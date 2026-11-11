@@ -149,9 +149,20 @@ function readIntervalFields(
   };
 }
 
+export function isEmptyPostgresIntervalObject(value: object): boolean {
+  const proto: unknown = Object.getPrototypeOf(value);
+  return (
+    Object.keys(value).length === 0 &&
+    proto !== null &&
+    proto !== Object.prototype &&
+    typeof (proto as { toPostgres?: unknown }).toPostgres === "function" &&
+    typeof (proto as { toISO?: unknown }).toISO === "function"
+  );
+}
+
 function isRecognizedIntervalRecord(record: Record<string, unknown>): boolean {
   const keys = Object.keys(record);
-  if (keys.length === 0) return false;
+  if (keys.length === 0) return isEmptyPostgresIntervalObject(record);
   return keys.every(
     (key) => INTERVAL_KEY_SET.has(key) && isFiniteNumber(record[key]),
   );

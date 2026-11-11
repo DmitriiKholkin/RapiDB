@@ -170,7 +170,7 @@ describe("view DDL generation", () => {
     } as never;
 
     await expect(
-      driver.getCreateTableDDL("test_db", "ignored", "v_employees"),
+      driver.getCreateTableDDL("test_db", "", "v_employees"),
     ).resolves.toBe('CREATE VIEW "v_employees" AS SELECT 1');
   });
 });

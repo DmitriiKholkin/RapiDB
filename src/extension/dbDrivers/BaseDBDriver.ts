@@ -458,6 +458,9 @@ function canonicalizeExactNumeric(
     scaleOverflow: false,
   };
 }
+export function canonicalizeExactNumericText(value: unknown): string | null {
+  return canonicalizeExactNumeric(value, null)?.canonical ?? null;
+}
 function formatDiagnosticValue(value: unknown): string {
   if (value === null) return "NULL";
   if (value === undefined) return "<missing>";
@@ -715,7 +718,7 @@ function roundToShortestSinglePrecision(value: number): number {
   }
   return Number.parseFloat(single.toPrecision(9));
 }
-function canonicalizeApproximateNumericPersistedEditValue(
+export function canonicalizeApproximateNumericPersistedEditValue(
   value: unknown,
   significantDigits: number,
 ): CanonicalPersistedEditValue | null {

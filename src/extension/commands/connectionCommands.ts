@@ -6,7 +6,10 @@ import {
   confirmConnectionRemoval,
 } from "../connectionManagerPrompts";
 import { ConnectionFormPanel } from "../panels/connectionFormPanel";
-import type { RapiDBNode } from "../providers/connectionProvider";
+import {
+  claimConnectFailureReport,
+  type RapiDBNode,
+} from "../providers/connectionProvider";
 import { connectWithProgress } from "../utils/connectOrchestration";
 import { logErrorWithContext } from "../utils/errorHandling";
 import { resolveConnectionId } from "../utils/resolveConnectionId";
@@ -137,26 +140,32 @@ export function registerConnectionCommands(
       return;
     }
 
-    if (
-      connectionManager.isConnected(id) ||
-      connectionManager.isConnecting(id)
-    ) {
+    if (connectionManager.isConnected(id)) {
       refresh();
       return;
     }
 
     const conn = connectionManager.getConnection(id);
+    const joinedPendingAttempt = connectionManager.isConnecting(id);
     try {
-      await connectWithProgress(
+      const connected = await connectWithProgress(
         connectionManager,
         id,
         `RapiDB: Connecting to "${conn?.name ?? id}"…`,
-        false,
+        true,
         undefined,
         "explicit",
       );
       refresh();
+      if (!connected && joinedPendingAttempt) {
+        vscode.window.showInformationMessage(
+          `[RapiDB] The pending connection to "${conn?.name ?? id}" was cancelled before it completed.`,
+        );
+      }
     } catch (err: unknown) {
+      if (!claimConnectFailureReport(err)) {
+        return;
+      }
       const error = logErrorWithContext(
         `Connect command failed for ${conn?.name ?? id}`,
         err,

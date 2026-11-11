@@ -383,6 +383,7 @@ function cloneSchemaSnapshotSchemaEntry(
   return {
     name: schema.name,
     objects: schema.objects.map(cloneSchemaSnapshotObjectEntry),
+    ...(schema.objectsTruncated ? { objectsTruncated: true } : {}),
   };
 }
 
@@ -997,6 +998,14 @@ export class ConnectionManager
     }
   }
 
+  private isConnectionIdInOtherScope(id: string): boolean {
+    try {
+      return this.store.hasConnectionIdOutsideActiveScope?.(id) ?? false;
+    } catch {
+      return true;
+    }
+  }
+
   private isOrphanedSecretCleanupPending(id: string): boolean {
     return this.store.readOrphanedSecretIds?.().includes(id) ?? false;
   }
@@ -1570,6 +1579,12 @@ export class ConnectionManager
       if (!connections.some((connection) => connection.id === id)) {
         return { result: false };
       }
+      const remaining = connections.filter(
+        (connection) => connection.id !== id,
+      );
+      if (this.isConnectionIdInOtherScope(id)) {
+        return { connections: remaining, result: true };
+      }
       const previousSecret = await this.store.getSecret(id);
       try {
         await this.store.deleteSecret(id);
@@ -1587,7 +1602,7 @@ export class ConnectionManager
         throw deleteError;
       }
       return {
-        connections: connections.filter((connection) => connection.id !== id),
+        connections: remaining,
         result: true,
         rollback:
           previousSecret === undefined

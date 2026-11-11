@@ -65,6 +65,7 @@ interface UseTableMutationControllerParams {
   tableDraftKey?: string;
   mongoRowIdentity?: boolean;
   canEditRows: boolean;
+  canInsertRows?: boolean;
   loadingRef: MutableRefObject<boolean>;
   metadataBlockedRef?: MutableRefObject<boolean>;
   committedColumnNamesRef?: MutableRefObject<ReadonlySet<string>>;
@@ -116,6 +117,7 @@ export function useTableMutationController({
   tableDraftKey,
   mongoRowIdentity = false,
   canEditRows,
+  canInsertRows = canEditRows,
   loadingRef,
   metadataBlockedRef,
   committedColumnNamesRef,
@@ -1750,7 +1752,7 @@ export function useTableMutationController({
   ]);
 
   useEffect(() => {
-    if (!canEditRows) return;
+    if (!canEditRows && !canInsertRows) return;
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (
@@ -1767,13 +1769,21 @@ export function useTableMutationController({
       const mod = isMac ? event.metaKey : event.ctrlKey;
       if (!mod || event.altKey) return;
 
-      if (event.code === "KeyZ" && !event.shiftKey) {
+      const key = event.key.toLowerCase();
+      // Non-Latin layouts (e.g. Cyrillic) report a localized key; fall back to the physical key.
+      const letter = /^[a-z]$/.test(key)
+        ? key
+        : /^\P{ASCII}$/u.test(event.key) && event.code.startsWith("Key")
+          ? event.code.slice(3).toLowerCase()
+          : "";
+
+      if (letter === "z" && !event.shiftKey) {
         event.preventDefault();
         undoAction();
-      } else if (event.code === "KeyZ" && event.shiftKey) {
+      } else if (letter === "z" && event.shiftKey) {
         event.preventDefault();
         redoAction();
-      } else if (event.code === "KeyY" && !event.shiftKey) {
+      } else if (letter === "y" && !event.shiftKey) {
         event.preventDefault();
         redoAction();
       }
@@ -1781,7 +1791,7 @@ export function useTableMutationController({
 
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [canEditRows, undoAction, redoAction]);
+  }, [canEditRows, canInsertRows, undoAction, redoAction]);
 
   return {
     getRowCellColumn,
