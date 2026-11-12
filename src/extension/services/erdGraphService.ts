@@ -1217,7 +1217,11 @@ export class ErdGraphService {
     const columnSets: string[][] = [];
 
     for (const index of indexes) {
-      if ((!index.unique && !index.primary) || index.partial) {
+      if (
+        (!index.unique && !index.primary) ||
+        index.partial ||
+        index.expression
+      ) {
         continue;
       }
       if (

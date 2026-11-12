@@ -284,6 +284,56 @@ describe("PNL-7 unrelated schema refresh during mutation preparation", () => {
       },
     });
   });
+
+  it("reports a schema conflict before confirm as a not-executed delete", async () => {
+    const s = await setupPostgres();
+    vi.spyOn(
+      TableDataService.prototype,
+      "prepareDeleteRowsPlan",
+    ).mockResolvedValue(deletePlan());
+    const execute = vi.spyOn(
+      TableDataService.prototype,
+      "executePreparedDeletePlan",
+    );
+    await s.panel.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "del-1", primaryKeysList: [{ id: 1 }] },
+    });
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)?.type).toBe("tableMutationPreview"),
+    );
+    const { previewToken } = s.panel.hostMessages().at(-1)?.payload as {
+      previewToken: string;
+    };
+    s.describeColumns.mockResolvedValue([pgColumns[0], column("renamed")]);
+    s.refreshSchemas();
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)).toMatchObject({
+        type: "tableInit",
+        payload: { intent: "metadataRefresh" },
+      }),
+    );
+    await s.panel.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "del-1", previewToken },
+    });
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)?.type).toBe("deleteResult"),
+    );
+    expect(execute).not.toHaveBeenCalled();
+    expect(s.panel.hostMessages().at(-1)).toEqual({
+      type: "deleteResult",
+      payload: {
+        operationId: "del-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: false,
+        outcomeUnknown: false,
+      },
+    });
+  });
 });
 
 describe("AUD-028 table panel applies per-row Mongo type hints before prevalidation", () => {

@@ -1485,6 +1485,8 @@ describe("TablePanel", () => {
         error: expect.stringContaining(
           "previous mutation preview cannot be applied",
         ),
+        changesPossible: false,
+        outcomeUnknown: false,
       },
     });
   });
@@ -3087,6 +3089,10 @@ describe("TablePanel", () => {
         operationId: "op-1",
         success: false,
         error: expect.stringContaining("Schema metadata changed"),
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: false,
+        outcomeUnknown: false,
       },
     });
   });
@@ -3134,6 +3140,10 @@ describe("TablePanel", () => {
         operationId: "op-1",
         success: false,
         error: expect.stringContaining("Schema metadata changed"),
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: false,
+        outcomeUnknown: false,
       },
     });
     metadata.resolve([{ name: "new_id", isPrimaryKey: true }]);
@@ -3205,6 +3215,8 @@ describe("TablePanel", () => {
         operationId: "op-1",
         success: false,
         error: expect.stringContaining("Schema metadata changed"),
+        changesPossible: false,
+        outcomeUnknown: false,
       },
     });
     await panel.webview.dispatchMessage({
@@ -3272,6 +3284,8 @@ describe("TablePanel", () => {
         operationId: "op-1",
         success: false,
         error: expect.stringContaining("Schema metadata changed"),
+        changesPossible: false,
+        outcomeUnknown: false,
       },
     });
     await panel.webview.dispatchMessage({

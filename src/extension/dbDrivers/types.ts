@@ -62,6 +62,8 @@ export interface QueryResult {
   rowCount: number;
   executionTimeMs: number;
   affectedRows?: number;
+  /** No exact mutation total is available; rowCount is only a rowset count. */
+  affectedRowsUnknown?: boolean;
   truncated?: boolean;
   resultSets?: QueryResultSet[];
   resultSetsTruncated?: boolean;

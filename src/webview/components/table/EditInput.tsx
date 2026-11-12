@@ -42,6 +42,7 @@ export function EditInput({
   readOnly = false,
   onCommit,
   onCancel,
+  onDirtyChange,
 }: {
   initial: string;
   initialMissing?: boolean;
@@ -53,6 +54,7 @@ export function EditInput({
   readOnly?: boolean;
   onCommit: (v: string) => void;
   onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const isInitiallyNull = initial === NULL_SENTINEL;
   const [isNull, setIsNull] = useState(isInitiallyNull);
@@ -227,6 +229,18 @@ export function EditInput({
     };
   }, [contextMenu, closeContextMenu]);
   const normalizedValue = normalizeEditInitialValue(val, category);
+  const dirty =
+    !readOnly &&
+    ((initialMissing && editedRef.current) ||
+      isNull !== isInitiallyNull ||
+      (!isNull &&
+        normalizedValue !== normalizeEditInitialValue(initial, category)));
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  onDirtyChangeRef.current = onDirtyChange;
+  useEffect(() => {
+    onDirtyChangeRef.current?.(dirty);
+  }, [dirty]);
+  useEffect(() => () => onDirtyChangeRef.current?.(false), []);
   const commit = () => {
     finishEditing();
     if (initialMissing && !editedRef.current) {

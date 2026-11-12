@@ -100,8 +100,7 @@ export function preserveTrustedSshFingerprint(
   const pin = ssh.hostFingerprintSha256?.trim();
   if (
     ssh.host?.trim() !== stored.host?.trim() ||
-    (ssh.port ?? 22) !== (stored.port ?? 22) ||
-    ssh.username?.trim() !== stored.username?.trim()
+    (ssh.port ?? 22) !== (stored.port ?? 22)
   ) {
     if (!pin || pin !== stored.hostFingerprintSha256?.trim()) {
       return config;

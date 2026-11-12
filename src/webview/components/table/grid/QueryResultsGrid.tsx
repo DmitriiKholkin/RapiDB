@@ -79,9 +79,18 @@ export function QueryResultsGrid({
     columnName: string;
     value: string;
     isNull: boolean;
+    isMissing: boolean;
+    sourceResult: QueryResult;
   } | null>(null);
+  const [copyBlocked, setCopyBlocked] = useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setCellPreview((preview) =>
+      preview?.sourceResult === result ? preview : null,
+    );
+  }, [result]);
 
   const colCount = colNames.length;
   const missingCellKeys = useMemo(
@@ -124,15 +133,17 @@ export function QueryResultsGrid({
         setActiveCell(null);
         setCellPreview({
           columnName: colNames[columnIndex] ?? columnId,
-          value: displayValue,
+          value: isMissing ? "" : displayValue,
           isNull,
+          isMissing,
+          sourceResult: result,
         });
         return;
       }
 
       setActiveCell({ rowIndex, columnId });
     },
-    [colNames, columnMeta, missingCellKeys],
+    [colNames, columnMeta, missingCellKeys, result],
   );
 
   const getCellValue = useCallback(
@@ -145,7 +156,7 @@ export function QueryResultsGrid({
       if (missingCellKeys.has(`${sortedRow.index}:${columnIndex}`)) {
         return undefined;
       }
-      return sortedRow.original[colId];
+      return sortedRow.original[colId] ?? null;
     },
     [missingCellKeys],
   );
@@ -162,8 +173,11 @@ export function QueryResultsGrid({
   }, []);
 
   const handleCopyText = useCallback((text: string) => {
+    setCopyBlocked(false);
     postMessage("writeClipboard", { text });
   }, []);
+
+  const handleAbsentCopy = useCallback(() => setCopyBlocked(true), []);
 
   const isColumnCollapsed = useCallback(
     (visualColIndex: number) => {
@@ -180,9 +194,16 @@ export function QueryResultsGrid({
     scrollRef,
     getCellFromPoint,
     onCopy: handleCopyText,
+    onAbsentCopy: handleAbsentCopy,
     isColumnCollapsed,
     onCellNavigate,
   });
+
+  useEffect(() => {
+    // The notice describes the selection used by the last copy attempt.
+    void selection.range;
+    setCopyBlocked(false);
+  }, [selection.range]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -211,16 +232,24 @@ export function QueryResultsGrid({
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
     if (text) {
-      postMessage("writeClipboard", { text });
+      handleCopyText(text);
     }
-  }, [selection.copySelection]);
+  }, [selection.copySelection, handleCopyText]);
 
   useEffect(() => {
+    void result;
     void rows;
     void sorting;
+    setCopyBlocked(false);
     selection.clearSelection();
     selection.contextMenuCellRef.current = null;
-  }, [rows, sorting, selection.clearSelection, selection.contextMenuCellRef]);
+  }, [
+    result,
+    rows,
+    sorting,
+    selection.clearSelection,
+    selection.contextMenuCellRef,
+  ]);
 
   const colSizes = useMemo(
     () =>
@@ -528,14 +557,69 @@ export function QueryResultsGrid({
           </tbody>
         </table>
       </div>
+      {copyBlocked && (
+        <div
+          role="alert"
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            padding: "8px 12px",
+            background:
+              "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.15))",
+            borderTop:
+              "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.5))",
+            color: "var(--vscode-errorForeground)",
+            fontSize: 12,
+            zIndex: 10,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+          }}
+        >
+          <Icon
+            name="error"
+            size={14}
+            style={{ flexShrink: 0, marginTop: 2 }}
+          />
+          <div style={{ flex: 1 }}>
+            Copy blocked: the selection contains MISSING cells, which plain-text
+            copy would turn into NULL. Select a range without them.
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss copy error"
+            onClick={() => setCopyBlocked(false)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-errorForeground)",
+              cursor: "pointer",
+              padding: "2px 6px",
+              fontSize: 14,
+              opacity: 0.7,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
       <GridContextMenu containerRef={containerRef} onCopy={handleCopy} />
-      {cellPreview && (
+      {cellPreview?.sourceResult === result && (
         <LargeMonacoDialog
           title={`Cell data: ${cellPreview.columnName}`}
           description={
-            cellPreview.isNull
-              ? `${cellPreview.columnName} is NULL (no value).`
-              : `Text data in ${cellPreview.columnName}.`
+            cellPreview.isMissing
+              ? `${cellPreview.columnName} is MISSING (attribute absent).`
+              : cellPreview.isNull
+                ? `${cellPreview.columnName} is NULL (no value).`
+                : `Text data in ${cellPreview.columnName}.`
+          }
+          unavailableMessage={
+            cellPreview.isMissing
+              ? "This item does not contain the attribute. Copy is unavailable: plain text cannot preserve an absent value."
+              : undefined
           }
           value={cellPreview.value}
           language="plaintext"

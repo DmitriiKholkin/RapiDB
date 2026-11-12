@@ -20,6 +20,24 @@ export type BoundedPgResultSet = {
 export const POSTGRES_MAX_RETAINED_RESULT_SETS = 100;
 export const POSTGRES_MAX_RETAINED_RESULT_COLUMNS = 4096;
 
+const POSTGRES_AFFECTED_ROW_COMMANDS: ReadonlySet<string> = new Set([
+  "INSERT",
+  "UPDATE",
+  "DELETE",
+  "MERGE",
+]);
+
+// Command tags count only the top-level statement (never trigger work), so a
+// script's DML total is the sum of its DML tags; SELECT/SHOW tags are skipped.
+export function addPostgresAffectedRows(
+  total: number | undefined,
+  result: { command?: string | null; rowCount?: number | null },
+): number | undefined {
+  if (!result.command || !POSTGRES_AFFECTED_ROW_COMMANDS.has(result.command))
+    return total;
+  return (total ?? 0) + (result.rowCount ?? 0);
+}
+
 const StreamingQueryBase = Query as unknown as new (
   config: QueryArrayConfig,
   callback: Completion,
@@ -108,6 +126,7 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
   readonly retained: BoundedQueryRows<unknown[]>;
   readonly resultSets: BoundedPgResultSet[] = [];
   resultSetsTruncated = false;
+  affectedRows: number | undefined;
   private readonly resultSetByBuilder = new WeakMap<
     object,
     BoundedPgResultSet
@@ -189,6 +208,10 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
     connection: object,
   ): void {
     super.handleCommandComplete(message, connection);
+    this.affectedRows = addPostgresAffectedRows(
+      this.affectedRows,
+      this._result,
+    );
     if (this.activeResultSet) {
       const decodedCompletely = this._canceledDueToError === false;
       this.activeResultSetCompleted = decodedCompletely;

@@ -76,6 +76,7 @@ export function QueryView({
       )}
 
       <QueryEditorPanels
+        allowFormatting={view.editorState.canFormat}
         editorHeight={view.editorHeight}
         editorLabel={view.editorState.editorLabel}
         editorRef={view.editorRef}

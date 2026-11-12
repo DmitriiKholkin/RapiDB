@@ -5,6 +5,7 @@ import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mssqlCompletionTokenHarness } from "../helpers/mssqlCompletionTokenHarness";
 import {
   MockMssqlRequest,
   mockMssqlSessionPool,
@@ -33,20 +34,31 @@ const columns: ColumnTypeMeta[] = [
 
 function harness(error?: Error, diagnosticRows = true) {
   const request = new MockMssqlRequest();
+  const pool = mockMssqlSessionPool([request]);
+  // Install the real parser factory before the query session hooks it. The
+  // diagnostic rowset count is not evidence of a successful INSERT: supply
+  // a distinct, classified parent count to keep the positive-count/error test.
+  const wire = mssqlCompletionTokenHarness(pool.connections[0], request);
   request.execute.mockImplementation(async () => {
     request.emit("recordset", [{ name: "diagnostic", type: mssql.Int }]);
     if (diagnosticRows) {
       request.emit("row", [1]);
-      request.emit("rowsaffected", 1);
     }
+    await wire.complete(0xc1, diagnosticRows ? 1 : 0);
+    if (diagnosticRows) await wire.complete(0xc3, 1);
     if (error) {
       request.emit("error", error);
       throw error;
     }
-    return { recordsets: [], recordset: [], rowsAffected: [1], output: {} };
+    return {
+      recordsets: [],
+      recordset: [],
+      rowsAffected: diagnosticRows ? [1, 1] : [0],
+      output: {},
+    };
   });
   const driver = new MSSQLDriver(config);
-  Object.assign(driver, { pool: mockMssqlSessionPool([request]) });
+  Object.assign(driver, { pool });
   const manager = {
     getConnection: () => ({ ...config, readOnly: false }),
     getDriver: () => driver,

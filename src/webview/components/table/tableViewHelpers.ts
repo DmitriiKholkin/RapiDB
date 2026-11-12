@@ -3,6 +3,7 @@ import {
   type ColumnTypeMeta as ColumnMeta,
   deriveApplicableFilterDrafts,
   type FilterDraftMap,
+  type FilterExpression,
   type FilterOperator,
   formatColumnDetailDescription,
   formatPrimaryKeyRoleLabel,
@@ -66,6 +67,7 @@ export interface FetchSnapshot {
   page: number;
   pageSize: number;
   sort: TableSortState;
+  filters: FilterExpression[];
 }
 
 export interface PendingRestoreState {

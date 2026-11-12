@@ -215,6 +215,22 @@ describe("edit precondition ignores extension-managed background writes", () => 
     expect(f.connections()[0].ssh?.hostFingerprintSha256).toBeUndefined();
   });
 
+  it("keeps the background-trusted fingerprint when only the SSH username is edited", async () => {
+    const { f, edit, payload } = await openTofu();
+    await edit.panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: { ...payload, ssh: { ...payload.ssh, username: "other" } },
+    });
+    await edit.result;
+    expect(saveResults(edit.panel)).toEqual([]);
+    expect(f.connections()[0].ssh).toMatchObject({
+      host: tofuSsh.host,
+      port: tofuSsh.port,
+      username: "other",
+      hostFingerprintSha256: "SHA256:trusted",
+    });
+  });
+
   it.each([
     ["host change", { host: "moved.local" }],
     ["secret change", { password: "rotated" }],

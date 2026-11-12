@@ -46,7 +46,10 @@ import {
   isMutationNotExecutedError,
   MutationNotExecutedError,
 } from "./mutationExecutionState";
-import { BoundedPostgresQuery } from "./postgresBoundedQuery";
+import {
+  addPostgresAffectedRows,
+  BoundedPostgresQuery,
+} from "./postgresBoundedQuery";
 import {
   isPostgresStatementRejection,
   PostgresStatementRejectedAndRolledBackError,
@@ -1775,13 +1778,22 @@ export class PostgresDriver extends BaseDBDriver {
       const columns = primaryResultSet?.columns ?? fallbackColumns;
       const columnMeta = primaryResultSet?.columnMeta ?? fallbackColumnMeta;
       const rows = primaryResultSet?.rows ?? fallbackFormattedRows;
+      const affectedRows =
+        partialQueryError !== undefined
+          ? undefined
+          : boundedQuery
+            ? boundedQuery.affectedRows
+            : (Array.isArray(res) ? res : [res]).reduce<number | undefined>(
+                addPostgresAffectedRows,
+                undefined,
+              );
       const rowCount =
         resultSets.length > 0
           ? resultSets.reduce(
               (total, resultSet) => total + resultSet.rowCount,
               0,
             )
-          : (result.rowCount ?? fallbackRows.length);
+          : (affectedRows ?? result.rowCount ?? fallbackRows.length);
       const queryResult = {
         columns,
         ...(columnMeta.length > 0 ? { columnMeta } : {}),
@@ -1801,9 +1813,8 @@ export class PostgresDriver extends BaseDBDriver {
         ...(boundedQuery?.resultSetsTruncated
           ? { resultSetsTruncated: true }
           : {}),
-        ...(hardCap !== undefined &&
-        ["INSERT", "UPDATE", "DELETE", "MERGE"].includes(result.command ?? "")
-          ? { affectedRows: result.rowCount ?? 0 }
+        ...(hardCap !== undefined && affectedRows !== undefined
+          ? { affectedRows }
           : {}),
         ...(partialQueryError !== undefined
           ? {
@@ -2280,6 +2291,45 @@ export class PostgresDriver extends BaseDBDriver {
     );
   }
 
+  // CREATE OR REPLACE VIEW replaces the view's reloptions, so they must be
+  // emitted explicitly or security_barrier/security_invoker/check_option are lost.
+  private buildViewDDL(
+    qualifiedName: string,
+    reloptions: string[] | null,
+    viewdef: string,
+  ): string {
+    const withOptions: string[] = [];
+    let checkOption: string | undefined;
+    for (const option of Array.isArray(reloptions) ? reloptions : []) {
+      const eq = option.indexOf("=");
+      if (eq <= 0) {
+        continue;
+      }
+      const name = option.slice(0, eq);
+      const value = option.slice(eq + 1);
+      if (!/^[a-z_][a-z0-9_]*$/.test(name)) {
+        continue;
+      }
+      const normalized = value.toLowerCase();
+      if (
+        name === "check_option" &&
+        (normalized === "local" || normalized === "cascaded")
+      ) {
+        checkOption = normalized.toUpperCase();
+        continue;
+      }
+      withOptions.push(`${name}='${value.replace(/'/g, "''")}'`);
+    }
+    const withClause = withOptions.length
+      ? `\n  WITH (${withOptions.join(", ")})`
+      : "";
+    let body = viewdef;
+    if (checkOption) {
+      body = `${viewdef.trimEnd().replace(/;$/, "")}\n  WITH ${checkOption} CHECK OPTION;`;
+    }
+    return `CREATE OR REPLACE VIEW ${qualifiedName}${withClause} AS\n${body}`;
+  }
+
   private async readCreateTableDDL(
     client: PoolClient,
     schema: string,
@@ -2292,6 +2342,8 @@ export class PostgresDriver extends BaseDBDriver {
       column_default: string | null;
       generated_kind: string | null;
       identity_kind: string | null;
+      collation_schema?: string | null;
+      collation_name?: string | null;
     };
     const kindRes = await client.query<{
       relkind: string;
@@ -2311,20 +2363,24 @@ export class PostgresDriver extends BaseDBDriver {
     }
     if (relkind === "v") {
       const res = await client.query<{
-        def: string;
+        qualified_name: string;
+        reloptions: string[] | null;
+        viewdef: string | null;
       }>(
-        `SELECT 'CREATE OR REPLACE VIEW ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ' AS\n' ||
-                pg_get_viewdef(c.oid, true) AS def
+        `SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS qualified_name,
+                c.reloptions,
+                pg_get_viewdef(c.oid, true) AS viewdef
          FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'
          LIMIT 1`,
         [schema, table],
       );
-      return (
-        res.rows[0]?.def ??
-        `-- View definition not available for "${schema}"."${table}"`
-      );
+      const row = res.rows[0];
+      if (!row || row.viewdef === null) {
+        return `-- View definition not available for "${schema}"."${table}"`;
+      }
+      return this.buildViewDDL(row.qualified_name, row.reloptions, row.viewdef);
     }
     if (relkind === "m") {
       const res = await client.query<{
@@ -2343,6 +2399,9 @@ export class PostgresDriver extends BaseDBDriver {
         `-- Materialized view definition not available for "${schema}"."${table}"`
       );
     }
+    if (relkind === "f") {
+      return `-- ${this.qualifiedTableName("", schema, table).replace(/[\r\n]/g, " ")} is a foreign table.\n-- Reconstructing CREATE FOREIGN TABLE (server, FDW and column options) is not supported.`;
+    }
     try {
       await client.query("BEGIN READ ONLY");
       await client.query("SET LOCAL search_path TO pg_catalog");
@@ -2353,11 +2412,18 @@ export class PostgresDriver extends BaseDBDriver {
          NOT a.attnotnull                         AS is_nullable,
          pg_get_expr(d.adbin, d.adrelid)         AS column_default,
           ${PG_GENERATED_KIND_EXPRESSION}           AS generated_kind,
-         NULLIF(a.attidentity, '')                AS identity_kind
+         NULLIF(a.attidentity, '')                AS identity_kind,
+         coll_ns.nspname                          AS collation_schema,
+         coll.collname                            AS collation_name
        FROM pg_attribute a
        JOIN pg_class     c ON c.oid = a.attrelid
        JOIN pg_namespace n ON n.oid = c.relnamespace
+       JOIN pg_type      t ON t.oid = a.atttypid
        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+       LEFT JOIN pg_collation coll
+         ON coll.oid = a.attcollation
+        AND a.attcollation <> t.typcollation
+       LEFT JOIN pg_namespace coll_ns ON coll_ns.oid = coll.collnamespace
        WHERE n.nspname = $1
          AND c.relname = $2
          AND a.attnum > 0
@@ -2387,16 +2453,20 @@ export class PostgresDriver extends BaseDBDriver {
         const nullable = isPgTrue(r.is_nullable);
         const notNull = !nullable ? " NOT NULL" : "";
         const identityClause = pgIdentityClause(r.identity_kind);
+        const dataType =
+          r.collation_schema && r.collation_name
+            ? `${r.data_type} COLLATE ${this.quoteIdentifier(r.collation_schema)}.${this.quoteIdentifier(r.collation_name)}`
+            : r.data_type;
         if (isComputed && r.column_default) {
           const generatedStorage =
             r.generated_kind === "v" ? "VIRTUAL" : "STORED";
-          return `  ${this.quoteIdentifier(columnName)} ${r.data_type} GENERATED ALWAYS AS (${r.column_default}) ${generatedStorage}${notNull}`;
+          return `  ${this.quoteIdentifier(columnName)} ${dataType} GENERATED ALWAYS AS (${r.column_default}) ${generatedStorage}${notNull}`;
         }
         const defClause =
           !identityClause && r.column_default
             ? ` DEFAULT ${r.column_default}`
             : "";
-        return `  ${this.quoteIdentifier(columnName)} ${r.data_type}${identityClause}${notNull}${defClause}`;
+        return `  ${this.quoteIdentifier(columnName)} ${dataType}${identityClause}${notNull}${defClause}`;
       });
       for (const constraint of constraintRes.rows) {
         cols.push(

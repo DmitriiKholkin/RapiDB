@@ -1,6 +1,11 @@
 import type { EventEmitter } from "node:events";
 import type * as mssql from "mssql";
 import { logger } from "../utils/logger";
+import {
+  bridgeMssqlCompletionMetadata,
+  type MssqlCompletionEvent,
+  type MssqlStatementCompletionMetadata,
+} from "./mssqlCompletionMetadata";
 import { throwIfQueryCancelled } from "./timeout";
 import type { QueryExecutionOptions } from "./types";
 
@@ -187,7 +192,10 @@ export class MssqlQuerySession {
 
   trackStatementCompletions(
     request: mssql.Request,
-    onComplete: () => void,
+    onComplete: (
+      event: MssqlCompletionEvent,
+      metadata?: MssqlStatementCompletionMetadata,
+    ) => void,
   ): () => void {
     type NativeRequest = Pick<EventEmitter, "emit">;
     type RequestProtocol = {
@@ -196,6 +204,7 @@ export class MssqlQuerySession {
     const protocol = request as unknown as RequestProtocol;
     const originalSet = protocol._setCurrentRequest;
     if (typeof originalSet !== "function") return () => {};
+    const metadataBridge = bridgeMssqlCompletionMetadata(this.connection);
     const hadOwnSet = Object.hasOwn(protocol, "_setCurrentRequest");
     const restorers: Array<() => void> = [];
     const seen = new WeakSet<object>();
@@ -211,6 +220,7 @@ export class MssqlQuerySession {
       )
         return result;
       seen.add(nativeRequest);
+      metadataBridge.register(nativeRequest);
       const originalEmit = nativeRequest.emit;
       const hadOwnEmit = Object.hasOwn(nativeRequest, "emit");
       const wrappedEmit = function (
@@ -220,7 +230,7 @@ export class MssqlQuerySession {
       ): boolean {
         const emitted = originalEmit.call(this, event, ...args);
         if (event === "done" || event === "doneInProc" || event === "doneProc")
-          onComplete();
+          onComplete(event, metadataBridge.read(nativeRequest, event, args));
         return emitted;
       };
       nativeRequest.emit = wrappedEmit;
@@ -238,6 +248,7 @@ export class MssqlQuerySession {
         else Reflect.deleteProperty(protocol, "_setCurrentRequest");
       }
       for (const restore of restorers) restore();
+      metadataBridge.dispose();
     };
   }
 

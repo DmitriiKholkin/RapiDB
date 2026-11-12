@@ -6,6 +6,7 @@ import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
 import { TableGrid } from "../table/TableGrid";
 
 interface QueryEditorPanelsProps {
+  allowFormatting: boolean;
   editorHeight: number;
   editorLabel: string;
   editorRef: RefObject<MonacoEditorHandle | null>;
@@ -23,6 +24,7 @@ interface QueryEditorPanelsProps {
 }
 
 export function QueryEditorPanels({
+  allowFormatting,
   editorHeight,
   editorLabel,
   editorRef,
@@ -49,6 +51,7 @@ export function QueryEditorPanels({
           language={language}
           ariaLabel={editorLabel}
           readOnly={status === "running"}
+          allowFormatting={allowFormatting}
           onExecute={onExecute}
           onChange={onEditorChange}
           onSelectionChange={onEditorSelectionChange}

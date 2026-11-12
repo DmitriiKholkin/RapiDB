@@ -557,49 +557,53 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     );
   });
 
-  it("keeps destructive filters when query code replaces VM serialization built-ins", async () => {
+  it("rejects serialization built-in replacement before the earlier delete", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
 
-    await driver.query(`db.users.deleteMany({ active: false });
+    await expect(
+      driver.query(`db.users.deleteMany({ active: false });
       Object.entries = function() { return []; };
       JSON.stringify = function() { return '{}'; };
-      Array["proto"+"type"].toJSON = function() { return []; }`);
+      Array["proto"+"type"].toJSON = function() { return []; }`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
 
-    expect(mockDeleteMany).toHaveBeenCalledWith({ active: false });
+    expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("does not let inherited array setters remove fields from a delete filter", async () => {
+  it("rejects inherited array setters before the earlier delete", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
-    await driver.query(`db.users.deleteMany({ active: false });
-      Object.defineProperty(Array["proto"+"type"], "0", { set: function() {} })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({ active: false });
+    await expect(
+      driver.query(`db.users.deleteMany({ active: false });
+      Object.defineProperty(Array["proto"+"type"], "0", { set: function() {} })`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("uses the native RegExp source even if query code changes its getter", async () => {
+  it("rejects RegExp getter mutation before the earlier delete", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
-    await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
-      Object.defineProperty(RegExp["proto"+"type"], "source", { get: function() { return ".*"; } })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({
-      name: new BSONRegExp("^Alice$"),
-    });
+    await expect(
+      driver.query(`db.users.deleteMany({ name: /^Alice$/ });
+      Object.defineProperty(RegExp["proto"+"type"], "source", { get: function() { return ".*"; } })`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("uses native RegExp flag getters after query code changes ignoreCase", async () => {
+  it("rejects RegExp flag mutation before the earlier delete", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
-    await driver.query(`db.users.deleteMany({ name: /^Alice$/ });
-      Object.defineProperty(nativeRegExp["proto"+"type"], "ignoreCase", { get: function() { return true; } })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({
-      name: new BSONRegExp("^Alice$"),
-    });
+    await expect(
+      driver.query(`db.users.deleteMany({ name: /^Alice$/ });
+      Object.defineProperty(nativeRegExp["proto"+"type"], "ignoreCase", { get: function() { return true; } })`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("preserves RegExp filters after query code replaces Symbol.hasInstance", async () => {
+  it("rejects Symbol.hasInstance replacement before the earlier delete", async () => {
     const { driver, mockDeleteMany } = createMockDriver();
-    await driver.query(`db.users.deleteMany({ name: { $nin: [/^Alice$/] } });
-      Object.defineProperty(nativeRegExp, Symbol.hasInstance, { value: function() { return false; } })`);
-    expect(mockDeleteMany).toHaveBeenCalledWith({
-      name: { $nin: [new BSONRegExp("^Alice$")] },
-    });
+    await expect(
+      driver.query(`db.users.deleteMany({ name: { $nin: [/^Alice$/] } });
+      Object.defineProperty(nativeRegExp, Symbol.hasInstance, { value: function() { return false; } })`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
   it("rejects Proxy-wrapped RegExp filters before deleting documents", async () => {
@@ -620,24 +624,20 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
-  it("checks the parsed operation again at execution on read-only connections", async () => {
-    const { driver, mockDeleteMany } = createMockDriver();
+  it("rejects writes and dynamic method selection on read-only connections", async () => {
+    const { driver, mockDeleteMany, mockFind } = createMockDriver();
     await expect(
       driver.query("db.users.deleteMany({})", undefined, { readOnly: true }),
     ).rejects.toThrow(/Read-only MongoDB/);
 
-    for (let i = 0; i < 20; i++) {
-      try {
-        await driver.query(
-          'db.users[Math.random() < 0.5 ? "find" : "deleteMany"]({})',
-          undefined,
-          { readOnly: true },
-        );
-      } catch (error) {
-        expect(error).toBeInstanceOf(Error);
-        expect((error as Error).message).toMatch(/Read-only MongoDB/);
-      }
-    }
+    await expect(
+      driver.query(
+        'db.users[Math.random() < 0.5 ? "find" : "deleteMany"]({})',
+        undefined,
+        { readOnly: true },
+      ),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(mockFind).not.toHaveBeenCalled();
     expect(mockDeleteMany).not.toHaveBeenCalled();
   });
 
@@ -841,15 +841,17 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(mockFind).not.toHaveBeenCalled();
   });
 
-  it("applies the VM timeout to recursively queued Promise microtasks", async () => {
+  it("rejects functions and Promise programs before evaluating the VM", async () => {
     const { driver, mockFind } = createMockDriver();
     const query = `function loop() { Promise.resolve().then(loop); }
       Promise.resolve().then(loop);
       db.users.find({})`;
 
-    await expect(driver.query(query)).rejects.toThrow(/timed out/i);
+    await expect(driver.query(query)).rejects.toThrow(
+      /Unsupported mongosh JavaScript/,
+    );
     expect(mockFind).not.toHaveBeenCalled();
-  }, 10_000);
+  });
 
   it.each([
     "NaN",

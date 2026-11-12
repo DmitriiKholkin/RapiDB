@@ -220,6 +220,19 @@ function lastWarning(): string {
 }
 
 describe("PNL-2 unsaved table drafts stay bound to their connection session", () => {
+  it("accepts the fresh webview's clean flag during reload initialization and closes on disconnect", async () => {
+    const s = await openDirtyPanel();
+    const ready = s.panel.dispatchMessage({ type: "ready" });
+    await s.panel.dispatchMessage({
+      type: "unsavedChangesState",
+      payload: { hasUnsavedChanges: false },
+    });
+    await ready;
+    s.disconnect();
+    expect(s.onDispose).toHaveBeenCalledOnce();
+    expect(state.showWarningMessage).not.toHaveBeenCalled();
+  });
+
   it("re-attaches drafts after a plain disconnect and reconnect", async () => {
     const s = await openDirtyPanel();
     s.disconnect();

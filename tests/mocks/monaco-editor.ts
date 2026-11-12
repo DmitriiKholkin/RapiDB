@@ -55,6 +55,7 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
     getLineCount: () => 1,
     getLineMaxColumn: () => value.length + 1,
     getLineContent: () => value,
+    getEOL: () => "\n",
     getWordUntilPosition: (position: { column: number }) => ({
       word: "",
       startColumn: position.column,
@@ -78,7 +79,11 @@ function createMockEditor(container: HTMLElement, initialValue: string) {
     updateOptions: () => {},
     getModel: () => model,
     getSelection,
-    getSelections: () => [getSelection()],
+    getSelections(this: {
+      getSelection: () => ReturnType<typeof getSelection>;
+    }) {
+      return [this.getSelection()];
+    },
     getPosition: () => ({ lineNumber: 1, column: value.length + 1 }),
     setPosition: (_position: { lineNumber: number; column: number }) =>
       __setMockSelectionText(""),

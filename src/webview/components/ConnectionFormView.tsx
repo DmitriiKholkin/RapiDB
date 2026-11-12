@@ -773,8 +773,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const sshTargetChanged =
     sshHost.trim() !== (existing?.ssh?.host?.trim() ?? "") ||
     (sshPort.trim() === "" ? 22 : Number(sshPort)) !==
-      (existing?.ssh?.port ?? 22) ||
-    sshUsername.trim() !== (existing?.ssh?.username?.trim() ?? "");
+      (existing?.ssh?.port ?? 22);
   const pinnedSshFingerprint =
     sshHostVerificationMode === "trustOnFirstUse" && sshTargetChanged
       ? ""

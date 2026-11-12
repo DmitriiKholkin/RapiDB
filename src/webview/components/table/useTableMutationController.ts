@@ -25,7 +25,7 @@ import type {
 } from "../../types";
 import { onMessage, postMessage } from "../../utils/messaging";
 import type { PasteValidationError } from "../../utils/pasteUtils";
-import { readWebviewState, updateWebviewState } from "../../utils/vscodeState";
+import { updateWebviewState } from "../../utils/vscodeState";
 import { valueToEditString } from "./EditInput";
 import type {
   StructuredCellDialogState,
@@ -138,6 +138,7 @@ export function useTableMutationController({
     PendingRestoreEntry[]
   >([]);
   const [editCell, setEditCell] = useState<EditTarget | null>(null);
+  const [inlineEditorDirty, setInlineEditorDirty] = useState(false);
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<TableApplyStatus | null>(
     initialDraft?.mutation?.kind === "apply"
@@ -322,18 +323,21 @@ export function useTableMutationController({
     unresolvedPendingEdits,
   ]);
 
+  const structuredCellDialogDirty =
+    structuredCellDialog !== null &&
+    !structuredCellDialog.readOnly &&
+    (structuredCellDialog.draftText !== structuredCellDialog.initialText ||
+      structuredCellDialog.isNull !== structuredCellDialog.initialIsNull);
   const hasUnsavedChanges =
     awaitingDraftRestore ||
     pendingEdits.size > 0 ||
     unresolvedPendingEdits.length > 0 ||
-    newRows.length > 0;
-  const [hostAssumesRestoredDraft] = useState(
-    () =>
-      readWebviewState<Record<string, unknown>>({}).tableDraft !== undefined,
-  );
-  const reportedUnsavedChangesRef = useRef<boolean | null>(
-    hostAssumesRestoredDraft ? null : false,
-  );
+    newRows.length > 0 ||
+    structuredCellDialogDirty ||
+    (editCell !== null && inlineEditorDirty);
+  // The host survives a webview reload. Report the first state even when clean,
+  // so a lost, non-persisted editor draft cannot leave its old dirty flag set.
+  const reportedUnsavedChangesRef = useRef<boolean | null>(null);
   useEffect(() => {
     if (reportedUnsavedChangesRef.current === hasUnsavedChanges) return;
     reportedUnsavedChangesRef.current = hasUnsavedChanges;
@@ -1893,6 +1897,7 @@ export function useTableMutationController({
     cancelStructuredCellDialog,
     confirmStructuredCellDialog,
     setEditCell,
+    setInlineEditorDirty,
     setStructuredCellDialogNull,
     setStructuredCellDialogDefault,
     startInsertRow,

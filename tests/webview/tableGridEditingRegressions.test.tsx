@@ -210,7 +210,7 @@ describe("TableGrid editing regressions", () => {
     }
   });
 
-  it("copies a MISSING attribute as NULL instead of literal or empty text", () => {
+  it("refuses to copy a MISSING attribute instead of writing NULL, literal or empty text", () => {
     const props = buildProps({ rows: [{ b: "b0", c: "c0" }] });
     const view = render(<TableGrid {...props} />);
     const first = view.container.querySelector<HTMLElement>(
@@ -231,9 +231,8 @@ describe("TableGrid editing regressions", () => {
       key: "c",
       ctrlKey: true,
     });
-    const message = getLastPostedMessage();
-    expect(message?.type).toBe("writeClipboard");
-    expect((message?.payload as { text: string }).text).toBe("NULL\tb0");
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(view.getByRole("alert").textContent).toContain("Copy blocked");
   });
 
   it("does not remount the inline editor when parent callbacks change identity", () => {
@@ -602,7 +601,7 @@ describe("Query results copy", () => {
     );
   }
 
-  it("copies a MISSING attribute as NULL instead of literal or empty text", () => {
+  it("refuses to copy a MISSING attribute instead of writing NULL, literal or empty text", () => {
     const result: QueryResult = {
       columns: ["optional", "name"],
       columnMeta: [{ category: "text" }, { category: "text" }],
@@ -611,7 +610,9 @@ describe("Query results copy", () => {
       rowCount: 1,
       executionTimeMs: 1,
     };
-    const { container } = render(<QueryResultsGridHarness result={result} />);
+    const { container, getByRole } = render(
+      <QueryResultsGridHarness result={result} />,
+    );
     const first = container.querySelector<HTMLElement>(
       'td[data-row="0"][data-col="0"]',
     );
@@ -626,8 +627,7 @@ describe("Query results copy", () => {
 
     clearPostedMessages();
     fireEvent.keyDown(second, { key: "c", ctrlKey: true });
-    const message = getLastPostedMessage();
-    expect(message?.type).toBe("writeClipboard");
-    expect((message?.payload as { text: string }).text).toBe("NULL\tx");
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(getByRole("alert").textContent).toContain("Copy blocked");
   });
 });

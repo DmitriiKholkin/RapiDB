@@ -936,7 +936,7 @@ export abstract class BaseDBDriver implements IDBDriver {
     }
 
     for (const index of indexes) {
-      if (index.primary || !index.unique || index.partial) {
+      if (index.primary || !index.unique || index.partial || index.expression) {
         continue;
       }
 

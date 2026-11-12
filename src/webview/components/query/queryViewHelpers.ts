@@ -123,7 +123,7 @@ export function resolveQueryEditorState({
       : false;
   const canFormat =
     monacoLanguage === "json"
-      ? true
+      ? (activeEditorPresentation?.allowFormatting ?? true)
       : monacoLanguage === "sql"
         ? allowSqlFormatting
         : false;

@@ -2,6 +2,7 @@ import mssql from "mssql";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
 import { MssqlQuerySession } from "../../src/extension/dbDrivers/mssqlQuerySession";
+import { mssqlCompletionTokenHarness } from "../helpers/mssqlCompletionTokenHarness";
 import {
   MockMssqlRequest,
   mockMssqlSessionPool,
@@ -121,13 +122,15 @@ describe("MSSQL query session isolation", () => {
     const { driver, requests, pool } = harness();
     const request = requests[0];
     let completedStatements = 0;
+    const tokens = mssqlCompletionTokenHarness(pool.connections[0], request);
     request.execute.mockImplementation(async () => {
       for (let n = 0; n < 1000; n++) {
         request.emit("recordset", [{ name: `v${n}`, type: mssql.Int }]);
         request.emit("row", [n]);
-        request.emit("rowsaffected", 1);
+        await tokens.complete(0xc1, 1);
         completedStatements++;
       }
+      await tokens.complete(0xc5, 1000);
       return {
         recordsets: [],
         recordset: [],
@@ -136,7 +139,7 @@ describe("MSSQL query session isolation", () => {
       };
     });
     const result = await driver.query(
-      "SELECT many results; later operation",
+      "SELECT many results; UPDATE later SET x=1",
       undefined,
       {
         hardCap: 1,
@@ -153,6 +156,7 @@ describe("MSSQL query session isolation", () => {
     expect(result.affectedRows).toBe(1000);
     expect(request.cancel).not.toHaveBeenCalled();
     expect(request.eventNames()).toEqual([]);
+    expect(Object.hasOwn(tokens.native, "emit")).toBe(false);
     expect(pool.release).toHaveBeenCalledOnce();
   });
 
@@ -589,20 +593,32 @@ describe("MSSQL query session isolation", () => {
     expect(requests[2].batch).not.toHaveBeenCalled();
   });
 
-  it("normalizes buffered batch metadata when request events are unavailable", async () => {
-    const { driver, requests } = harness();
+  it.each([
+    { counts: [2, 3], affectedRows: undefined },
+    { counts: [2, 0], affectedRows: undefined },
+    { counts: [0], affectedRows: 0 },
+    { counts: [], affectedRows: 0 },
+  ])("normalizes buffered metadata without inventing a DML total from $counts", async ({
+    counts,
+    affectedRows,
+  }) => {
+    const { driver, requests, pool } = harness();
     const columns = [{ index: 0, name: "", type: undefined }];
     requests[0].execute.mockResolvedValue({
       recordsets: [],
       recordset: Object.assign([[9]], { columns }),
-      rowsAffected: [2, 3],
+      rowsAffected: counts,
       output: {},
     });
     expect(await driver.query("SELECT 9")).toMatchObject({
       columns: [" "],
       rows: [{ __col_0: 9 }],
-      affectedRows: 3,
+      rowCount: 1,
+      affectedRows,
     });
+    expect(requests[0].cancel).not.toHaveBeenCalled();
+    expect(requests[0].eventNames()).toEqual([]);
+    expect(pool.release).toHaveBeenCalledOnce();
   });
 
   it("retains every SQL Server result set from a successful batch", async () => {

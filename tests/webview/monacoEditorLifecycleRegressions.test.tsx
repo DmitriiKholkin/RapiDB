@@ -281,6 +281,8 @@ describe("MonacoEditor lifecycle regressions", () => {
         },
         text: "x",
         forceMoveMarkers: true,
+        identifier: { major: 0, minor: 0 },
+        _isTracked: true,
       },
     ]);
   });

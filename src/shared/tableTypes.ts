@@ -309,6 +309,8 @@ export interface IndexMeta {
   unique: boolean;
   primary: boolean;
   partial?: boolean;
+  /** At least one key is an expression; its `columns` entry is SQL text, not a column name. */
+  expression?: boolean;
   ddlSupport?: IndexDdlSupport;
 }
 

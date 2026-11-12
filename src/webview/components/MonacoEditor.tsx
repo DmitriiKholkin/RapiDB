@@ -12,11 +12,19 @@ import { format as sqlFormatterFormat } from "sql-formatter";
 import type { ClipboardTextPayload } from "../../shared/webviewContracts";
 import type { ClipboardWrittenPayload } from "../../shared/webviewContracts/table";
 import type { SchemaObject } from "../store";
+import { formatJsonPreservingTokens } from "../utils/jsonFormatting";
 import { onMessage, postMessage } from "../utils/messaging";
 import {
   buildSqlCompletionSuggestions,
   type SqlCompletionSuggestionKind,
 } from "../utils/sqlCompletionSuggestions";
+import {
+  buildClipboardData,
+  buildPasteEdits,
+  type EditorClipboardData,
+  rememberClipboardData,
+  toPlainRange,
+} from "./monacoClipboard";
 
 type MonacoHostWindow = Window & {
   __monacoEnvSet?: boolean;
@@ -26,6 +34,18 @@ type MonacoHostGlobal = typeof globalThis & {
   MonacoEnvironment?: {
     getWorker(): Worker;
   };
+};
+
+// Monaco 0.53 preserves these runtime fields, omitted from monaco.d.ts.
+// Tracking prevents operation reduction from dropping per-selection identifiers.
+interface TrackedPasteOperation
+  extends monaco.editor.IIdentifiedSingleEditOperation {
+  identifier: { major: number; minor: number };
+  _isTracked: true;
+}
+
+type IdentifiedInverseEdit = monaco.editor.IValidEditOperation & {
+  identifier?: TrackedPasteOperation["identifier"] | null;
 };
 
 type SqlFormatterOptions = NonNullable<
@@ -212,19 +232,7 @@ export function formatSQLOrError(
 export function formatJSONOrError(
   input: string,
 ): { result: string } | { error: string } {
-  if (!input.trim()) {
-    return { result: input };
-  }
-
-  try {
-    return {
-      result: JSON.stringify(JSON.parse(input) as unknown, null, 2),
-    };
-  } catch (err: unknown) {
-    return {
-      error: err instanceof Error ? err.message : String(err),
-    };
-  }
+  return formatJsonPreservingTokens(input);
 }
 
 function formatEditorValueOrError(options: {
@@ -255,6 +263,7 @@ interface Props {
   onExecute?: (value: string | null) => void;
   height?: string | number;
   readOnly?: boolean;
+  allowFormatting?: boolean;
   ariaLabel?: string;
 }
 
@@ -277,6 +286,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       onExecute,
       height = "100%",
       readOnly = false,
+      allowFormatting = true,
       ariaLabel = "SQL editor",
     },
     ref,
@@ -289,10 +299,11 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
     const onSelectionChangeRef = useRef(onSelectionChange);
     const onExecuteRef = useRef(onExecute);
     const readOnlyRef = useRef(readOnly);
+    const allowFormattingRef = useRef(allowFormatting);
     const ariaLabelRef = useRef(ariaLabel);
     const languageRef = useRef(language);
     const suppressChangeEventRef = useRef(false);
-    const getSelectedTextRef = useRef<() => string>(() => "");
+    const hasSelectionRef = useRef<() => boolean>(() => false);
     const copySelectionRef = useRef<() => void>(() => {});
     const cutSelectionRef = useRef<() => void>(() => {});
     const pasteClipboardRef = useRef<() => void>(() => {});
@@ -338,6 +349,10 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         domReadOnly: readOnly,
       });
     }, [readOnly]);
+
+    useEffect(() => {
+      allowFormattingRef.current = allowFormatting;
+    }, [allowFormatting]);
 
     useEffect(() => {
       ariaLabelRef.current = ariaLabel;
@@ -398,7 +413,11 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       },
       format: (requestedDialect?: string) => {
         const editor = editorRef.current;
-        if (!editor || editor.getOption(monaco.editor.EditorOption.readOnly)) {
+        if (
+          !editor ||
+          !allowFormattingRef.current ||
+          editor.getOption(monaco.editor.EditorOption.readOnly)
+        ) {
           return null;
         }
         const model = editor.getModel();
@@ -548,26 +567,41 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         schemaGetterByModel.set(editorModel, getSchema);
       }
 
-      const getInsertRange = (): monaco.IRange => {
-        const selection = editor.getSelection();
-        if (selection) {
-          return {
-            startLineNumber: selection.startLineNumber,
-            startColumn: selection.startColumn,
-            endLineNumber: selection.endLineNumber,
-            endColumn: selection.endColumn,
-          };
+      const getEditorSelections = (): monaco.Selection[] => {
+        const selections = editor.getSelections();
+        if (selections && selections.length > 0) {
+          return selections;
         }
-        const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
-        return {
-          startLineNumber: pos.lineNumber,
-          startColumn: pos.column,
-          endLineNumber: pos.lineNumber,
-          endColumn: pos.column,
-        };
+        const selection = editor.getSelection();
+        return selection ? [selection] : [];
       };
 
-      const insertText = (text: string, range: monaco.IRange) => {
+      const getInsertRanges = (): monaco.IRange[] => {
+        const selections = getEditorSelections();
+        if (selections.length > 0) {
+          return selections.map(toPlainRange);
+        }
+        const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+        return [
+          {
+            startLineNumber: pos.lineNumber,
+            startColumn: pos.column,
+            endLineNumber: pos.lineNumber,
+            endColumn: pos.column,
+          },
+        ];
+      };
+
+      const getClipboardData = (): EditorClipboardData | null => {
+        const model = editor.getModel();
+        const selections = getEditorSelections();
+        if (!model || selections.length === 0) {
+          return null;
+        }
+        return buildClipboardData(model, selections.map(toPlainRange));
+      };
+
+      const insertText = (text: string, ranges: monaco.IRange[]) => {
         if (readOnlyRef.current) {
           return;
         }
@@ -576,24 +610,41 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           editor.trigger("keyboard", "type", { text });
           return;
         }
-        editor.executeEdits(
-          "paste",
-          [{ range, text, forceMoveMarkers: true }],
-          (inverseEdits) => {
-            const insertedRange = inverseEdits[0]?.range;
-            if (!insertedRange) {
-              return null;
-            }
-            return [
-              new monaco.Selection(
-                insertedRange.endLineNumber,
-                insertedRange.endColumn,
-                insertedRange.endLineNumber,
-                insertedRange.endColumn,
-              ),
-            ];
-          },
+        const edits = buildPasteEdits(text, ranges);
+        const operations = edits.map(
+          ({ range, text: editText }, index): TrackedPasteOperation => ({
+            range,
+            text: editText,
+            forceMoveMarkers: true,
+            identifier: { major: index, minor: 0 },
+            _isTracked: true,
+          }),
         );
+        editor.executeEdits("paste", operations, (inverseEdits) => {
+          // Touching inverses use document order, not input order. Auto-trim
+          // edits may also be added, without an identifier. Match by identity.
+          const insertedRanges = new Map<number, monaco.Range>();
+          for (const edit of inverseEdits as IdentifiedInverseEdit[]) {
+            if (edit.identifier?.minor === 0) {
+              insertedRanges.set(edit.identifier.major, edit.range);
+            }
+          }
+          const selections: monaco.Selection[] = [];
+          for (const [index, edit] of edits.entries()) {
+            const range = insertedRanges.get(index);
+            if (!range) return null;
+            const column = edit.keepColumn ?? range.endColumn;
+            selections.push(
+              new monaco.Selection(
+                range.endLineNumber,
+                column,
+                range.endLineNumber,
+                column,
+              ),
+            );
+          }
+          return selections;
+        });
         editor.pushUndoStop();
         const newPos = editor.getPosition();
         if (newPos) {
@@ -606,7 +657,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         requestId: string;
         model: monaco.editor.ITextModel | null;
         versionId: number | null;
-        range: monaco.IRange;
+        ranges: monaco.IRange[];
       } | null = null;
       const requestClipboard = () => {
         const requestId = crypto.randomUUID();
@@ -615,7 +666,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           requestId,
           model,
           versionId: model?.getVersionId() ?? null,
-          range: getInsertRange(),
+          ranges: getInsertRanges(),
         };
         postMessage("readClipboard", {
           requestId,
@@ -642,7 +693,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           ) {
             return;
           }
-          insertText(payload.text, pending.range);
+          insertText(payload.text, pending.ranges);
           editor.focus();
         },
       );
@@ -650,7 +701,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         requestId: string;
         model: monaco.editor.ITextModel | null;
         versionId: number | null;
-        range: monaco.IRange;
+        ranges: monaco.IRange[];
       } | null = null;
       const unsubClipboardWritten = onMessage<ClipboardWrittenPayload>(
         "clipboardWritten",
@@ -671,13 +722,14 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
           ) {
             return;
           }
-          editor.executeEdits("native-cut", [
-            {
-              range: pending.range,
+          editor.executeEdits(
+            "native-cut",
+            pending.ranges.map((range) => ({
+              range,
               text: "",
               forceMoveMarkers: true,
-            },
-          ]);
+            })),
+          );
           editor.pushUndoStop();
         },
       );
@@ -699,51 +751,43 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
       };
 
       const getExecText = () => getSelectionOrValueFromEditor(editor);
-      const getSelectedText = () => {
-        const model = editor.getModel();
-        const selection = editor.getSelection();
-        if (!model || !selection || selection.isEmpty()) {
-          return "";
-        }
-        return model.getValueInRange(selection);
-      };
-      const writeSelectionThenDelete = (selectedText: string) => {
-        const selection = editor.getSelection();
-        if (!selection || selection.isEmpty()) {
-          return;
-        }
+      const hasSelection = () =>
+        getEditorSelections().some((selection) => !selection.isEmpty());
+      const writeClipboardThenDelete = (data: EditorClipboardData) => {
         const requestId = crypto.randomUUID();
         const model = editor.getModel();
         pendingCutRequest = {
           requestId,
           model,
           versionId: model?.getVersionId() ?? null,
-          range: {
-            startLineNumber: selection.startLineNumber,
-            startColumn: selection.startColumn,
-            endLineNumber: selection.endLineNumber,
-            endColumn: selection.endColumn,
-          },
+          ranges: data.cutRanges,
         };
+        rememberClipboardData(data);
         postMessage("writeClipboard", {
-          text: selectedText,
+          text: data.text,
           requestId,
           recipient: clipboardRecipient,
         });
       };
       const copySelection = () => {
-        const selectedText = getSelectedText();
-        if (!selectedText) {
-          return;
+        const data = getClipboardData();
+        if (!data) {
+          return false;
         }
-        postMessage("writeClipboard", { text: selectedText });
+        rememberClipboardData(data);
+        postMessage("writeClipboard", { text: data.text });
+        return true;
       };
       const cutSelection = () => {
-        const selectedText = getSelectedText();
-        if (!selectedText || readOnlyRef.current) {
-          return;
+        if (readOnlyRef.current) {
+          return false;
         }
-        writeSelectionThenDelete(selectedText);
+        const data = getClipboardData();
+        if (!data) {
+          return false;
+        }
+        writeClipboardThenDelete(data);
+        return true;
       };
       const pasteClipboard = () => {
         if (readOnlyRef.current) {
@@ -752,7 +796,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         requestClipboard();
       };
 
-      getSelectedTextRef.current = getSelectedText;
+      hasSelectionRef.current = hasSelection;
       copySelectionRef.current = copySelection;
       cutSelectionRef.current = cutSelection;
       pasteClipboardRef.current = pasteClipboard;
@@ -761,25 +805,21 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         if (isWidgetClipboardTarget(e.target)) {
           return;
         }
-        const selectedText = getSelectedText();
-        if (!selectedText) {
+        if (!copySelection()) {
           return;
         }
         e.preventDefault();
         e.stopImmediatePropagation();
-        postMessage("writeClipboard", { text: selectedText });
       };
       const nativeCut = (e: ClipboardEvent) => {
         if (isWidgetClipboardTarget(e.target)) {
           return;
         }
-        const selectedText = getSelectedText();
-        if (!selectedText || readOnlyRef.current) {
+        if (!cutSelection()) {
           return;
         }
         e.preventDefault();
         e.stopImmediatePropagation();
-        writeSelectionThenDelete(selectedText);
       };
 
       const actionDisposables = [
@@ -845,7 +885,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
             monaco.KeyMod.Shift | monaco.KeyMod.Alt | monaco.KeyCode.KeyF,
           ],
           run: () => {
-            if (readOnlyRef.current) {
+            if (readOnlyRef.current || !allowFormattingRef.current) {
               return;
             }
             const model = editor.getModel();
@@ -908,7 +948,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         domNode?.removeEventListener("copy", nativeCopy, true);
         domNode?.removeEventListener("cut", nativeCut, true);
         domNode?.removeEventListener("paste", nativePaste, true);
-        getSelectedTextRef.current = () => "";
+        hasSelectionRef.current = () => false;
         copySelectionRef.current = () => {};
         cutSelectionRef.current = () => {};
         pasteClipboardRef.current = () => {};
@@ -945,7 +985,7 @@ export const MonacoEditor = forwardRef<MonacoEditorHandle, Props>(
         setContextMenu({
           x,
           y,
-          hasSelection: getSelectedTextRef.current().length > 0,
+          hasSelection: hasSelectionRef.current(),
           readOnly: readOnlyRef.current,
         });
       };

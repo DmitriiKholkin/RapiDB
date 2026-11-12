@@ -1,5 +1,5 @@
 import type { SortingState } from "@tanstack/react-table";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { QueryResultExportPayload } from "../../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus } from "../../../store";
 import { postMessage } from "../../../utils/messaging";
@@ -37,15 +37,20 @@ export function QueryModeTableGrid({
     ? resultSets.indexOf(selectedResultSet)
     : 0;
   const displayedColumns = selectedResultSet?.columns ?? result?.columns;
-  const displayedResult =
-    selectedResultSet && result
-      ? {
-          ...result,
-          ...selectedResultSet,
-          columnMeta: selectedResultSet.columnMeta ?? [],
-          resultSets: undefined,
-        }
-      : result;
+  // Preserve dataset identity through layout/parent renders, but invalidate
+  // preview snapshots when the source result or the selected set changes.
+  const displayedResult = useMemo(
+    () =>
+      selectedResultSet && result
+        ? {
+            ...result,
+            ...selectedResultSet,
+            columnMeta: selectedResultSet.columnMeta ?? [],
+            resultSets: undefined,
+          }
+        : result,
+    [result, selectedResultSet],
+  );
 
   useEffect(() => {
     if (displayedColumns) {
@@ -121,7 +126,7 @@ export function QueryModeTableGrid({
       <QueryEmptyState
         icon="pass"
         primary="Query executed successfully"
-        secondary={`${result?.rowCount ?? 0} rows affected · ${result?.executionTimeMs ?? 0} ms`}
+        secondary={`${result?.affectedRowsUnknown ? "Affected row count unavailable" : `${result?.rowCount ?? 0} rows affected`} · ${result?.executionTimeMs ?? 0} ms`}
       />
     );
   }
@@ -291,6 +296,7 @@ export function QueryModeTableGrid({
           {truncated
             ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
             : `${rowCount.toLocaleString()} row${rowCount !== 1 ? "s" : ""}`}
+          {result.affectedRowsUnknown && " · Affected row count unavailable"}
           <span style={{ opacity: 0.5, marginLeft: 6 }}>
             {executionTimeMs} ms
           </span>

@@ -10,6 +10,7 @@ import {
   POSTGRES_MAX_RETAINED_RESULT_SETS,
 } from "../../src/extension/dbDrivers/postgresBoundedQuery";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
+import { mssqlCompletionTokenHarness } from "../helpers/mssqlCompletionTokenHarness";
 import { mockMssqlSessionPool } from "../helpers/mssqlQuerySessionHarness";
 
 type WireQuery = BoundedPostgresQuery & {
@@ -714,15 +715,19 @@ describe("driver-owned result budgets", () => {
     }));
     batch = vi.fn((sql: string) => this.query(sql));
   }
-  function mssqlHarness(requests: Request[]) {
+  function mssqlHarness(
+    requests: Request[],
+    setup?: (connection: object) => void,
+  ) {
     const driver = new MSSQLDriver({
       id: "ms-budget",
       name: "MSSQL",
       type: "mssql",
       host: "localhost",
     });
-    (driver as unknown as { pool: unknown }).pool =
-      mockMssqlSessionPool(requests);
+    const pool = mockMssqlSessionPool(requests);
+    setup?.(pool.connections[0]);
+    (driver as unknown as { pool: unknown }).pool = pool;
     return driver;
   }
 
@@ -733,6 +738,10 @@ describe("driver-owned result budgets", () => {
       complete = resolve;
     });
     let drained = 0;
+    let tokens!: ReturnType<typeof mssqlCompletionTokenHarness>;
+    const driver = mssqlHarness([request], (connection) => {
+      tokens = mssqlCompletionTokenHarness(connection, request);
+    });
     request.query.mockImplementation(async () => {
       for (let set = 0; set < 60; set++) {
         request.emit("recordset", [column("same"), column("same", 1)]);
@@ -740,12 +749,12 @@ describe("driver-owned result budgets", () => {
           request.emit("row", [set * 1000 + row, -row]);
           drained++;
         }
-        request.emit("rowsaffected", 1000);
+        await tokens.complete(0xc1, 1000); // SELECT rowset, not DML.
       }
       await finished;
+      await tokens.complete(0xc5, 60000); // Parent UPDATE completion.
       return { rowsAffected: [60000], recordsets: [] };
     });
-    const driver = mssqlHarness([request]);
     let settled = false;
     const pending = driver
       .query("UPDATE items SET x = 1", undefined, {
@@ -756,7 +765,10 @@ describe("driver-owned result budgets", () => {
         settled = true;
         return result;
       });
-    await vi.waitFor(() => expect(request.stream).toBe(true));
+    await vi.waitFor(() => {
+      expect(request.stream).toBe(true);
+      expect(drained).toBe(60000);
+    });
     expect(request.arrayRowMode).toBe(true);
     expect(drained).toBe(60000);
     expect(settled).toBe(false);
@@ -783,6 +795,7 @@ describe("driver-owned result budgets", () => {
       { __col_0: 2, __col_1: -2 },
     ]);
     expect(request.eventNames()).toEqual([]);
+    expect(Object.hasOwn(tokens.native, "emit")).toBe(false);
     expect(request.query).toHaveBeenCalledWith("UPDATE items SET x = 1");
   });
 

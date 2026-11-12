@@ -22,6 +22,7 @@ export interface QueryResult {
   responseMetadata?: Record<string, unknown>[];
   missingCells?: QueryMissingCell[];
   rowCount: number;
+  affectedRowsUnknown?: boolean;
   executionTimeMs: number;
   error?: string;
 

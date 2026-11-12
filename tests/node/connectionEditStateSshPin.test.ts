@@ -36,7 +36,6 @@ describe("preserveTrustedSshFingerprint", () => {
   it.each([
     ["host", { host: "new-bastion.example.com" }],
     ["port", { port: 2222 }],
-    ["username", { username: "other" }],
   ])("drops a resubmitted pin after the SSH %s changes", (_field, change) => {
     const result = preserveTrustedSshFingerprint(
       profile({ hostFingerprintSha256: PIN, ...change }),
@@ -51,6 +50,26 @@ describe("preserveTrustedSshFingerprint", () => {
     const result = preserveTrustedSshFingerprint(
       profile({ hostFingerprintSha256: PIN }),
       expected,
+      stored,
+    );
+
+    expect(result.ssh?.hostFingerprintSha256).toBe(PIN);
+  });
+
+  it("keeps a resubmitted pin when only the SSH username changes", () => {
+    const result = preserveTrustedSshFingerprint(
+      profile({ hostFingerprintSha256: PIN, username: "other" }),
+      expected,
+      stored,
+    );
+
+    expect(result.ssh?.hostFingerprintSha256).toBe(PIN);
+  });
+
+  it("restores a pin added while the editor was open when only the SSH username changes", () => {
+    const result = preserveTrustedSshFingerprint(
+      profile({ username: "other" }),
+      connectionEditState(profile({}), {}),
       stored,
     );
 

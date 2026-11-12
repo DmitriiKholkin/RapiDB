@@ -51,6 +51,7 @@ import {
 } from "./BaseDBDriver";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import { getMetadataSdkOptions } from "./metadataCancellation";
+import { assertMongoshSupportedSyntax } from "./mongoshSyntax";
 import {
   applyFilters,
   applySort,
@@ -564,6 +565,16 @@ const MONGOSH_SANDBOX_SETUP = `
       isMarker: (value) => safeApply(nativeWeakSetHas, markers, [value]),
     };
   })();
+  const { trackProxy, isProxy } = (() => {
+    const proxies = new WeakSet();
+    return {
+      trackProxy: (value) => {
+        safeApply(nativeWeakSetAdd, proxies, [value]);
+        return value;
+      },
+      isProxy: (value) => safeApply(nativeWeakSetHas, proxies, [value]),
+    };
+  })();
   const serializeOperations = (() => {
     const entries = Object.entries;
     const stringify = JSON.stringify;
@@ -609,6 +620,8 @@ const MONGOSH_SANDBOX_SETUP = `
         if (typeof value === 'number' && !isFiniteNumber(value))
           throw new Error('Non-finite numbers are not supported in mongosh queries.');
         if (value === null || typeof value !== 'object') return value;
+        if (isProxy(value))
+          throw new Error('MongoDB operation results and db/collection handles cannot be used as values in mongosh queries; run each operation as a separate statement.');
         if (safeApply(nativeWeakSetHas, active, [value]))
           throw new Error('Cyclic mongosh values are not supported.');
         safeApply(nativeWeakSetAdd, active, [value]);
@@ -662,7 +675,11 @@ const MONGOSH_SANDBOX_SETUP = `
     }
     return name;
   };
-  const createChainProxy = (operation) => new InternalProxy({}, {
+  const rejectProxyAsValue = () => {
+    throw new Error('MongoDB operation results and db/collection handles cannot be used as values in mongosh queries; run each operation as a separate statement.');
+  };
+  const createChainProxy = (operation) => trackProxy(new InternalProxy({}, {
+    ownKeys: rejectProxyAsValue,
     get(_target, method) {
       if (typeof method !== 'string') return undefined;
       return (...args) => {
@@ -670,36 +687,37 @@ const MONGOSH_SANDBOX_SETUP = `
         return createChainProxy(operation);
       };
     },
-  });
-  const createCollProxy = (dbName, collName) => new InternalProxy({}, {
+  }));
+  // Every recorded operation must return an opaque result, including DB helpers.
+  // Returning undefined here would let spreads/assign silently erase a nested
+  // operation and turn a destructive filter into an explicit empty document.
+  // The AST boundary forbids results in data expressions; proxies are defense
+  // in depth, not an attempt to emulate or validate arbitrary JS dataflow.
+  const recordOperation = (dbName, collName, op, args) => {
+    const operation = { dbName, collName, op, args, chainOps: [] };
+    operations.push(operation);
+    return createChainProxy(operation);
+  };
+  const createCollProxy = (dbName, collName) => trackProxy(new InternalProxy({}, {
+    ownKeys: rejectProxyAsValue,
     get(_target, method) {
       if (typeof method !== 'string' || method === 'then') return undefined;
-      return (...args) => {
-        const operation = { dbName, collName, op: method, args, chainOps: [] };
-        operations.push(operation);
-        return createChainProxy(operation);
-      };
+      return (...args) => recordOperation(dbName, collName, method, args);
     },
-  });
-  const createDbProxy = (dbName) => new InternalProxy({}, {
+  }));
+  const createDbProxy = (dbName) => trackProxy(new InternalProxy({}, {
+    ownKeys: rejectProxyAsValue,
     get(_target, prop) {
       if (typeof prop !== 'string') return undefined;
       if (prop === 'getSiblingDB') return (name) => createDbProxy(requireNamespaceName(name));
       if (prop === 'getCollection') return (name) => createCollProxy(dbName, requireNamespaceName(name));
-      if (prop === 'runCommand' || prop === 'adminCommand') return (cmd) => {
-        const operation = { dbName: prop === 'adminCommand' ? 'admin' : dbName, op: 'runCommand', args: [cmd], chainOps: [] };
-        operations.push(operation);
-        return createChainProxy(operation);
-      };
-      if (prop === 'getCollectionNames') return (...args) => {
-        operations.push({ dbName, op: 'getCollectionNames', args, chainOps: [] });
-      };
-      if (prop === 'createCollection' || prop === 'createView') return (...args) => {
-        operations.push({ dbName, op: prop, args, chainOps: [] });
-      };
+      if (prop === 'runCommand' || prop === 'adminCommand') return (cmd) =>
+        recordOperation(prop === 'adminCommand' ? 'admin' : dbName, undefined, 'runCommand', [cmd]);
+      if (prop === 'getCollectionNames' || prop === 'createCollection' || prop === 'createView')
+        return (...args) => recordOperation(dbName, undefined, prop, args);
       return createCollProxy(dbName, prop);
     },
-  });
+  }));
   return createDbProxy();
   })();
   globalThis.Proxy = undefined;
@@ -987,6 +1005,7 @@ function parseMongoshOperations(queryText: string): MongoshOperation[] {
   let operations: MongoshOperation[];
   try {
     ensureMongoshQueryIsSafe(queryText);
+    assertMongoshSupportedSyntax(queryText);
     const context = vm.createContext(Object.create(null), {
       codeGeneration: { strings: false, wasm: false },
       microtaskMode: "afterEvaluate",

@@ -373,10 +373,13 @@ describe("MONGO-6 follow-up: JavaScript string keys", () => {
     "switch (0) { case 0: break; case 1, process: break; } db.c.find({})",
     "{eval: 1}; db.c.find({})",
     "var p; ({process: p} = this); db.c.find({a: p === undefined})",
-  ])("allows harmless key-shaped name %s", async (query) => {
-    const { driver, find } = harness();
-    await driver.query(query);
-    expect(find).toHaveBeenCalledTimes(1);
+  ])("rejects non-operation JS programs even with key-shaped names: %s", async (query) => {
+    const { driver, find, insertOne } = harness();
+    await expect(
+      driver.query(`db.c.insertOne({_id: 'earlier'}); ${query}`),
+    ).rejects.toThrow(/Unsupported mongosh JavaScript/);
+    expect(find).not.toHaveBeenCalled();
+    expect(insertOne).not.toHaveBeenCalled();
   });
 
   it.each([

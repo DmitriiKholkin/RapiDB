@@ -273,6 +273,8 @@ export interface LargeMonacoDialogProps {
   focusEditorOnOpen?: boolean;
   hideCancelAction?: boolean;
   fullWindow?: boolean;
+  /** Show an explanation instead of a copyable editor when no value exists. */
+  unavailableMessage?: string;
 }
 
 export function LargeMonacoDialog({
@@ -293,20 +295,22 @@ export function LargeMonacoDialog({
   focusEditorOnOpen = false,
   hideCancelAction = false,
   fullWindow = false,
+  unavailableMessage,
 }: LargeMonacoDialogProps) {
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const editorRef = useRef<MonacoEditorHandle>(null);
+  const shouldFocusEditor = focusEditorOnOpen && !unavailableMessage;
   const handleDialogKeyDown = useDialogFocusTrap({
     dialogRef,
-    initialFocusRef: focusEditorOnOpen ? undefined : closeButtonRef,
+    initialFocusRef: shouldFocusEditor ? undefined : closeButtonRef,
     onEscape: onCancel,
   });
 
   useEffect(() => {
-    if (!focusEditorOnOpen) {
+    if (!shouldFocusEditor) {
       return;
     }
 
@@ -317,7 +321,7 @@ export function LargeMonacoDialog({
     return () => {
       cancelAnimationFrame(frameId);
     };
-  }, [focusEditorOnOpen]);
+  }, [shouldFocusEditor]);
 
   const dialog = (
     <div
@@ -404,25 +408,31 @@ export function LargeMonacoDialog({
             overflow: fullWindow ? "auto" : undefined,
           }}
         >
-          <div
-            style={{
-              height: fullWindow ? "60vh" : PREVIEW_DIALOG_EDITOR_H,
-              flexShrink: fullWindow ? 0 : undefined,
-              border: "1px solid var(--vscode-panel-border)",
-              borderRadius: 4,
-              overflow: "hidden",
-            }}
-          >
-            <MonacoEditor
-              ref={editorRef}
-              initialValue={value}
-              height="100%"
-              readOnly={readOnly}
-              language={language}
-              ariaLabel={ariaLabel}
-              onChange={onChange}
-            />
-          </div>
+          {unavailableMessage ? (
+            <p style={{ margin: 0, fontSize: 13, lineHeight: 1.5 }}>
+              {unavailableMessage}
+            </p>
+          ) : (
+            <div
+              style={{
+                height: fullWindow ? "60vh" : PREVIEW_DIALOG_EDITOR_H,
+                flexShrink: fullWindow ? 0 : undefined,
+                border: "1px solid var(--vscode-panel-border)",
+                borderRadius: 4,
+                overflow: "hidden",
+              }}
+            >
+              <MonacoEditor
+                ref={editorRef}
+                initialValue={value}
+                height="100%"
+                readOnly={readOnly}
+                language={language}
+                ariaLabel={ariaLabel}
+                onChange={onChange}
+              />
+            </div>
+          )}
 
           {validationMessage && (
             <div

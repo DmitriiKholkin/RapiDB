@@ -11,6 +11,7 @@ import {
   type ColumnTypeMeta as ColumnMeta,
   type FilterDraft,
   type FilterDraftMap,
+  type FilterExpression,
   type MongoValueTypeHint,
   serializeFilterDrafts,
 } from "../../../shared/tableTypes";
@@ -174,6 +175,9 @@ export function useTableDataController({
   const [requestedSort, setRequestedSort] = useState<TableSortState>(
     initialView?.sort ?? null,
   );
+  const [committedFilters, setCommittedFilters] = useState<FilterExpression[]>(
+    [],
+  );
   const [readOnlyTable, setReadOnlyTable] = useState(initialReadOnlyTable);
   const [colSizes, setColSizes] = useState<Record<string, number>>({});
   const [isInitialized, setIsInitialized] = useState(false);
@@ -242,6 +246,19 @@ export function useTableDataController({
         : null;
       return error;
     },
+    [columnsRef],
+  );
+
+  const getRequestedSnapshot = useCallback(
+    (): FetchSnapshot => ({
+      page: requestedPageRef.current,
+      pageSize: requestedPageSizeRef.current,
+      sort: requestedSortRef.current,
+      filters: serializeFilterDrafts(
+        columnsRef.current,
+        debouncedFilterDraftsRef.current,
+      ),
+    }),
     [columnsRef],
   );
 
@@ -456,11 +473,7 @@ export function useTableDataController({
         .reconciliationPending
         ? epoch
         : null;
-      const snapshot: FetchSnapshot = {
-        page: requestedPageRef.current,
-        pageSize: requestedPageSizeRef.current,
-        sort: requestedSortRef.current,
-      };
+      const snapshot = getRequestedSnapshot();
 
       fetchSnapshotsRef.current.clear();
       fetchSnapshotsRef.current.set(epoch, snapshot);
@@ -468,22 +481,18 @@ export function useTableDataController({
       setLoading(true);
       setReadError(null);
 
-      const activeFilters = serializeFilterDrafts(
-        columnsRef.current,
-        debouncedFilterDraftsRef.current,
-      );
-      fetchHadFiltersRef.current = activeFilters.length > 0;
+      fetchHadFiltersRef.current = snapshot.filters.length > 0;
 
       postMessage("fetchPage", {
         fetchId: epoch,
         page: snapshot.page,
         pageSize: snapshot.pageSize,
-        filters: activeFilters,
+        filters: snapshot.filters,
         sort: snapshot.sort,
         ...(options?.refreshMetadata ? { refreshMetadata: true } : {}),
       });
     },
-    [advanceFetchEpoch, columnsRef],
+    [advanceFetchEpoch, getRequestedSnapshot],
   );
 
   fetchPageRef.current = fetchPage;
@@ -738,13 +747,11 @@ export function useTableDataController({
           return copy;
         });
 
-        const snapshot = (fetchId !== undefined
-          ? fetchSnapshotsRef.current.get(fetchId)
-          : fetchSnapshotsRef.current.get(fetchEpochRef.current)) ?? {
-          page: requestedPageRef.current,
-          pageSize: requestedPageSizeRef.current,
-          sort: requestedSortRef.current,
-        };
+        const snapshot =
+          (fetchId !== undefined
+            ? fetchSnapshotsRef.current.get(fetchId)
+            : fetchSnapshotsRef.current.get(fetchEpochRef.current)) ??
+          getRequestedSnapshot();
 
         const knownColumnNames = new Set(
           columnsRef.current.map((column) => column.name),
@@ -799,6 +806,7 @@ export function useTableDataController({
         setPage(snapshot.page);
         setPageSize(snapshot.pageSize);
         setSort(snapshot.sort);
+        setCommittedFilters(snapshot.filters);
         loadingRef.current = false;
         setLoading(false);
         setHasCommittedData(true);
@@ -858,6 +866,12 @@ export function useTableDataController({
         }
         const { busy, hasWork } = metadataStateRef.current();
         if (!hasCommittedDataRef.current || (!busy && !hasWork)) {
+          setCommittedFilters(
+            (
+              fetchSnapshotsRef.current.get(fetchId ?? fetchEpochRef.current) ??
+              getRequestedSnapshot()
+            ).filters,
+          );
           pasteStructureEpochRef.current++;
           setRows([]);
           setTotalCount(0);
@@ -891,6 +905,7 @@ export function useTableDataController({
   }, [
     advanceFetchEpoch,
     columnsRef,
+    getRequestedSnapshot,
     initialView,
     mongoIdTypesRef,
     rowValueTypesRef,
@@ -1042,7 +1057,7 @@ export function useTableDataController({
     fetchEpochRef,
     columns,
     colSizes,
-    debouncedFilterDrafts,
+    committedFilters,
     error,
     executionTimeMs,
     fetchPage,

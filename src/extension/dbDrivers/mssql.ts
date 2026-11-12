@@ -26,6 +26,15 @@ import {
   getMetadataContext,
   withMetadataResource,
 } from "./metadataCancellation";
+import {
+  MssqlAffectedRows,
+  type MssqlCompletionCount,
+} from "./mssqlAffectedRows";
+import {
+  isMssqlDmlCompletion,
+  isMssqlNonDmlCompletion,
+  type MssqlStatementCompletionMetadata,
+} from "./mssqlCompletionMetadata";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import { MssqlQuerySession } from "./mssqlQuerySession";
 import { MutationNotExecutedError } from "./mutationExecutionState";
@@ -2350,6 +2359,8 @@ export class MSSQLDriver extends BaseDBDriver {
         };
         let retainedRows = 0;
         let resultRowCount = 0;
+        let affectedRows = 0;
+        let affectedRowsUnknown = false;
         let resultSetsTruncated = false;
         let stopBatches = false;
         for (const { sql: batch, repeatCount } of batches) {
@@ -2384,6 +2395,8 @@ export class MSSQLDriver extends BaseDBDriver {
               };
             }
             resultSetsTruncated ||= batchResult.resultSetsTruncated === true;
+            affectedRowsUnknown ||= batchResult.affectedRowsUnknown === true;
+            affectedRows += batchResult.affectedRows ?? 0;
             for (const resultSet of batchResult.resultSets ?? []) {
               retainedRows += resultSet.rows.length;
               resultRowCount += resultSet.rowCount;
@@ -2402,7 +2415,14 @@ export class MSSQLDriver extends BaseDBDriver {
                     rowCount: resultRowCount,
                     resultSets,
                   }
-                : batchResult;
+                : {
+                    ...batchResult,
+                    rowCount: affectedRowsUnknown ? 0 : affectedRows,
+                  };
+            lastResult.affectedRows = affectedRowsUnknown
+              ? undefined
+              : affectedRows;
+            if (affectedRowsUnknown) lastResult.affectedRowsUnknown = true;
             if (resultSetsTruncated) lastResult.resultSetsTruncated = true;
             if (batchResult.error) {
               stopBatches = true;
@@ -2464,14 +2484,21 @@ export class MSSQLDriver extends BaseDBDriver {
       let retainedRowCount = 0;
       let receivedRecordset = false;
       let resultSetsTruncated = false;
-      let affectedRows = 0;
       let streamError: Error | undefined;
+      // Rowset classification is independent of procedure-boundary accounting.
+      // DONEPROC does not identify the parent; ambiguous totals stay unknown.
+      let completionTracked = false;
+      let recordsetOpen = false;
+      let pendingCount: Omit<MssqlCompletionCount, "command"> | undefined;
+      const statementAffectedRows = new MssqlAffectedRows();
+      let unclassifiedCountSeen = false;
 
       const onRecordset = (columnsMeta: MssqlArrayColumnMeta[]) => {
         if (activeResultSet) activeResultSet.completed = true;
         activeResultSet = undefined;
         receivedRecordset = true;
         if (!columnsMeta.length) return;
+        recordsetOpen = true;
         if (
           resultBudget.remainingSets === 0 ||
           columnsMeta.length > resultBudget.remainingColumns
@@ -2514,11 +2541,37 @@ export class MSSQLDriver extends BaseDBDriver {
         retainedRowCount++;
       };
       const onAffected = (count: number) => {
-        affectedRows = count;
-        if (activeResultSet) {
+        // Without completion metadata a rowset may be SELECT or OUTPUT DML.
+        unclassifiedCountSeen ||= count > 0;
+        pendingCount = { count, closesRecordset: recordsetOpen };
+        recordsetOpen = false;
+        if (activeResultSet && !activeResultSet.completed) {
           activeResultSet.output.affectedRows = count;
           activeResultSet.completed = true;
         }
+      };
+      const onStatementComplete = (
+        event: "done" | "doneInProc" | "doneProc",
+        metadata?: MssqlStatementCompletionMetadata,
+      ) => {
+        if (activeResultSet) activeResultSet.completed = true;
+        completionTracked = true;
+        const pending = pendingCount;
+        pendingCount = undefined;
+        recordsetOpen = false;
+        // A SELECT assignment has DONE_COUNT but no recordset. Only the
+        // server's CurCmd can distinguish it from DML (including inside RPC).
+        statementAffectedRows.complete(
+          event,
+          pending && {
+            ...pending,
+            command: isMssqlDmlCompletion(metadata)
+              ? "dml"
+              : isMssqlNonDmlCompletion(metadata)
+                ? "nonDml"
+                : "unknown",
+          },
+        );
       };
       const onError = (error: Error) => {
         streamError ??= error;
@@ -2542,18 +2595,26 @@ export class MSSQLDriver extends BaseDBDriver {
       };
       const createResult = (error?: unknown): QueryResult => {
         const firstResultSet = resultSets[0];
+        const scriptAffectedRows = completionTracked
+          ? statementAffectedRows.value
+          : unclassifiedCountSeen
+            ? undefined
+            : 0;
         const rowCount = firstResultSet
           ? resultSets.reduce(
               (total, resultSet) => total + resultSet.rowCount,
               0,
             )
-          : affectedRows;
+          : (scriptAffectedRows ?? 0);
         return {
           columns: firstResultSet?.columns ?? [],
           columnMeta: firstResultSet?.columnMeta ?? [],
           rows: firstResultSet?.rows ?? [],
           rowCount,
-          affectedRows,
+          affectedRows: scriptAffectedRows,
+          ...(scriptAffectedRows === undefined
+            ? { affectedRowsUnknown: true }
+            : {}),
           ...(resultSets.length > 0 ? { resultSets } : {}),
           ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
           ...(error !== undefined
@@ -2570,9 +2631,7 @@ export class MSSQLDriver extends BaseDBDriver {
       trackedReq.on("error", onError);
       const stopTrackingCompletion = session.trackStatementCompletions(
         trackedReq,
-        () => {
-          if (activeResultSet) activeResultSet.completed = true;
-        },
+        onStatementComplete,
       );
       try {
         let response: MssqlArrayResult | undefined;
@@ -2581,7 +2640,10 @@ export class MSSQLDriver extends BaseDBDriver {
           response = (await (params?.length
             ? trackedReq.query(finalSql)
             : trackedReq.batch(finalSql))) as MssqlArrayResult;
-          affectedRows = response.rowsAffected?.at(-1) ?? affectedRows;
+          if (!completionTracked) {
+            unclassifiedCountSeen ||=
+              response.rowsAffected?.some((count) => count > 0) ?? false;
+          }
           if (streamError) executionError = streamError;
         } catch (error) {
           executionError = error;

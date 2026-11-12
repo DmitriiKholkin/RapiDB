@@ -5,6 +5,8 @@ import {
   type MongoValueTypeHint,
 } from "../../shared/tableTypes";
 import {
+  type ApplyResultPayload,
+  type DeleteResultPayload,
   parseTablePanelMessage,
   type TableInitPayload,
   type TableMutationPreviewPayload,
@@ -63,6 +65,43 @@ const EXPORT_CHUNK_SIZE = 500;
 const TABLE_PANEL_RETENTION_MODE = "retain" as const;
 const MUTATION_SESSION_CONFLICT =
   "Connection session changed or is not connected. The previous mutation preview cannot be applied; create a new preview before retrying.";
+const MUTATION_SCHEMA_CONFLICT =
+  "Schema metadata changed. The previous mutation preview cannot be applied; pending work is retained. Review the schema conflict before retrying.";
+
+type NotExecutedOutcome = { changesPossible: false; outcomeUnknown: false };
+
+type NotExecutedMutationResult =
+  | {
+      type: "applyResult" | "insertResult";
+      payload: ApplyResultPayload & NotExecutedOutcome;
+    }
+  | {
+      type: "deleteResult";
+      payload: DeleteResultPayload & NotExecutedOutcome;
+    };
+
+function notExecutedMutationResult(
+  operationId: string,
+  kind: TableMutationPreviewPayload["kind"],
+  error: string,
+): NotExecutedMutationResult {
+  const payload = {
+    operationId,
+    success: false,
+    error,
+    changesPossible: false,
+    outcomeUnknown: false,
+  } as const;
+  return kind === "deleteRows"
+    ? {
+        type: "deleteResult",
+        payload: { ...payload, affectedRows: 0, rowOutcomes: [] },
+      }
+    : {
+        type: kind === "applyChanges" ? "applyResult" : "insertResult",
+        payload,
+      };
+}
 
 type TablePanelObjectKind = "table" | "view" | "materializedView";
 
@@ -766,21 +805,12 @@ export class TablePanel {
     operationId: string,
     kind: TableMutationPreviewPayload["kind"],
   ): Promise<void> {
-    await this.postMessage(
-      kind === "applyChanges"
-        ? "applyResult"
-        : kind === "deleteRows"
-          ? "deleteResult"
-          : "insertResult",
-      {
-        operationId,
-        success: false,
-        error: MUTATION_SESSION_CONFLICT,
-        changesPossible: false,
-        outcomeUnknown: false,
-        ...(kind === "deleteRows" ? { affectedRows: 0, rowOutcomes: [] } : {}),
-      },
+    const { type, payload } = notExecutedMutationResult(
+      operationId,
+      kind,
+      MUTATION_SESSION_CONFLICT,
     );
+    await this.postMessage(type, payload);
   }
 
   private async postPreviewUnavailable(operationId: string): Promise<void> {
@@ -816,19 +846,12 @@ export class TablePanel {
     operationId: string,
     kind: TableMutationPreviewPayload["kind"],
   ): Promise<void> {
-    await this.postMessage(
-      kind === "applyChanges"
-        ? "applyResult"
-        : kind === "deleteRows"
-          ? "deleteResult"
-          : "insertResult",
-      {
-        operationId,
-        success: false,
-        error:
-          "Schema metadata changed. The previous mutation preview cannot be applied; pending work is retained. Review the schema conflict before retrying.",
-      },
+    const { type, payload } = notExecutedMutationResult(
+      operationId,
+      kind,
+      MUTATION_SCHEMA_CONFLICT,
     );
+    await this.postMessage(type, payload);
   }
 
   private isConnectionReadOnly(): boolean {

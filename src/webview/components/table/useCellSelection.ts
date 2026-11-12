@@ -29,6 +29,8 @@ export interface UseCellSelectionOptions {
     y: number,
   ) => { row: number; col: number } | null;
   onCopy?: (text: string) => void;
+  /** When set, copying DEFAULT/missing (undefined) cells is refused. */
+  onAbsentCopy?: () => void;
   onPaste?: () => void;
   isColumnCollapsed?: (colIndex: number) => boolean;
   onCellNavigate?: (row: number, col: number) => void;
@@ -75,7 +77,8 @@ function serializeToTsv(
   range: CellRange,
   getCellValue: (rowIndex: number, colIndex: number) => unknown,
   isColumnCollapsed?: (colIndex: number) => boolean,
-): string {
+  onAbsentCopy?: () => void,
+): string | null {
   const { minRow, maxRow, minCol, maxCol } = normalizeRange(range);
   const rows: (string | null)[][] = [];
 
@@ -84,6 +87,10 @@ function serializeToTsv(
     for (let col = minCol; col <= maxCol; col++) {
       if (isColumnCollapsed?.(col)) continue;
       const value = getCellValue(row, col);
+      if (value === undefined && onAbsentCopy) {
+        onAbsentCopy();
+        return null;
+      }
       if (value === null || value === undefined) {
         cells.push(null);
       } else {
@@ -107,6 +114,7 @@ export function useCellSelection({
   scrollRef,
   getCellFromPoint,
   onCopy,
+  onAbsentCopy,
   onPaste,
   isColumnCollapsed,
   onCellNavigate,
@@ -124,6 +132,7 @@ export function useCellSelection({
   const colCountRef = useRef(colCount);
   const getCellValueRef = useRef(getCellValue);
   const onCopyRef = useRef(onCopy);
+  const onAbsentCopyRef = useRef(onAbsentCopy);
   const onPasteRef = useRef(onPaste);
   const isColumnCollapsedRef = useRef(isColumnCollapsed);
   const onCellNavigateRef = useRef(onCellNavigate);
@@ -136,6 +145,7 @@ export function useCellSelection({
     colCountRef.current = colCount;
     getCellValueRef.current = getCellValue;
     onCopyRef.current = onCopy;
+    onAbsentCopyRef.current = onAbsentCopy;
     onPasteRef.current = onPaste;
     isColumnCollapsedRef.current = isColumnCollapsed;
     onCellNavigateRef.current = onCellNavigate;
@@ -358,6 +368,7 @@ export function useCellSelection({
     const currentColCount = colCountRef.current;
     const currentGetCellValue = getCellValueRef.current;
     const currentOnCopy = onCopyRef.current;
+    const currentOnAbsentCopy = onAbsentCopyRef.current;
     const currentOnPaste = onPasteRef.current;
     const currentIsColumnCollapsed = isColumnCollapsedRef.current;
     const currentOnCellNavigate = onCellNavigateRef.current;
@@ -502,6 +513,7 @@ export function useCellSelection({
             currentRange,
             currentGetCellValue,
             currentIsColumnCollapsed,
+            currentOnAbsentCopy,
           );
           if (text && currentOnCopy) {
             currentOnCopy(text);
@@ -519,6 +531,7 @@ export function useCellSelection({
             currentRange,
             currentGetCellValue,
             currentIsColumnCollapsed,
+            currentOnAbsentCopy,
           );
           if (text && currentOnCopy) {
             currentOnCopy(text);
@@ -579,7 +592,12 @@ export function useCellSelection({
     if (!range) {
       return null;
     }
-    return serializeToTsv(range, getCellValue, isColumnCollapsedRef.current);
+    return serializeToTsv(
+      range,
+      getCellValue,
+      isColumnCollapsedRef.current,
+      onAbsentCopyRef.current,
+    );
   }, [range, getCellValue]);
 
   return {

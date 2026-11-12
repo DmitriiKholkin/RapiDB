@@ -422,10 +422,16 @@ describe("MonacoEditor", () => {
     const computeCursorState = executeEdits.mock.calls[0][2] as (
       inverseEdits: Array<{
         range: { endLineNumber: number; endColumn: number };
+        identifier: { major: number; minor: number };
       }>,
     ) => Selection[] | null;
     expect(
-      computeCursorState([{ range: { endLineNumber: 2, endColumn: 4 } }]),
+      computeCursorState([
+        {
+          range: { endLineNumber: 2, endColumn: 4 },
+          identifier: { major: 0, minor: 0 },
+        },
+      ]),
     ).toEqual([new Selection(2, 4, 2, 4)]);
     expect(setPosition).not.toHaveBeenCalled();
     expect(revealPosition).toHaveBeenCalledWith({ lineNumber: 2, column: 4 });

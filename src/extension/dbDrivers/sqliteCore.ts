@@ -278,18 +278,94 @@ function isSQLiteDmlStatement(sql: string): boolean {
       : leadingKeyword?.keyword;
   return keyword !== undefined && SQLITE_DML_STARTERS.has(keyword);
 }
-function splitSQLiteScript(sql: string): string[] {
+// Statement boundaries follow SQLite's sqlite3_complete() state machine:
+// a CREATE [TEMP] TRIGGER statement only ends at a `;` that directly follows
+// `; END` (whitespace and comments aside), so `;` inside the trigger body,
+// CASE ... END and columns named END/BEGIN do not split it.
+type SQLiteScanState =
+  | "start"
+  | "normal"
+  | "explain"
+  | "create"
+  | "trigger"
+  | "semi"
+  | "end";
+type SQLiteScanToken =
+  | "semi"
+  | "other"
+  | "explain"
+  | "create"
+  | "temp"
+  | "trigger"
+  | "end";
+// Mirrors trans[][] in SQLite's complete.c (whitespace/comments: no change).
+function nextSQLiteScanState(
+  state: SQLiteScanState,
+  token: SQLiteScanToken,
+): SQLiteScanState {
+  if (token === "semi") {
+    return state === "trigger" || state === "semi" ? "semi" : "start";
+  }
+  switch (state) {
+    case "start":
+      return token === "explain" || token === "create" ? token : "normal";
+    case "explain":
+      if (token === "other") return "explain";
+      return token === "create" ? "create" : "normal";
+    case "create":
+      if (token === "temp") return "create";
+      return token === "trigger" ? "trigger" : "normal";
+    case "normal":
+      return "normal";
+    case "semi":
+      return token === "end" ? "end" : "trigger";
+    case "trigger":
+    case "end":
+      return "trigger";
+  }
+}
+const SQLITE_WORD_CHAR_RE = /[A-Za-z0-9_$\u0080-\uffff]/;
+// tokenize.c's CC_SPACE, not JavaScript whitespace (e.g. NBSP is an ID char).
+const SQLITE_SPACE_RE = /[\t\n\f\r ]/;
+// Trim leading BOM trivia for keyword checks, but never a BOM ending an ID.
+const SQLITE_TRIM_TRIVIA_RE = /^[\t\n\f\r \uFEFF]+|[\t\n\f\r ]+$/g;
+function sqliteScanKeywordToken(word: string): SQLiteScanToken {
+  switch (word.toUpperCase()) {
+    case "EXPLAIN":
+      return "explain";
+    case "CREATE":
+      return "create";
+    case "TEMP":
+    case "TEMPORARY":
+      return "temp";
+    case "TRIGGER":
+      return "trigger";
+    case "END":
+      return "end";
+    default:
+      return "other";
+  }
+}
+export function splitSQLiteScript(sql: string): string[] {
   const stmts: string[] = [];
   let buf = "";
   let i = 0;
   const n = sql.length;
+  let state: SQLiteScanState = "start";
+  const advance = (token: SQLiteScanToken) => {
+    state = nextSQLiteScanState(state, token);
+  };
+  const keepsComments = () =>
+    state === "trigger" || state === "semi" || state === "end";
   while (i < n) {
     if (sql[i] === "-" && sql[i + 1] === "-") {
+      const commentStart = i;
       while (i < n && sql[i] !== "\n") i++;
-      buf += " ";
+      buf += keepsComments() ? sql.slice(commentStart, i) : " ";
       continue;
     }
     if (sql[i] === "/" && sql[i + 1] === "*") {
+      const commentStart = i;
       i += 2;
       while (i < n) {
         if (sql[i] === "*" && sql[i + 1] === "/") {
@@ -298,7 +374,7 @@ function splitSQLiteScript(sql: string): string[] {
         }
         i++;
       }
-      buf += " ";
+      buf += keepsComments() ? sql.slice(commentStart, i) : " ";
       continue;
     }
     if (sql[i] === "'" || sql[i] === '"' || sql[i] === "`" || sql[i] === "[") {
@@ -317,18 +393,40 @@ function splitSQLiteScript(sql: string): string[] {
           }
         }
       }
+      advance("other");
       continue;
     }
     if (sql[i] === ";") {
       i++;
-      const stmt = buf.trim();
+      advance("semi");
+      if (state !== "start") {
+        buf += ";";
+        continue;
+      }
+      const stmt = buf.replace(SQLITE_TRIM_TRIVIA_RE, "");
       if (stmt) stmts.push(stmt);
       buf = "";
       continue;
     }
-    buf += sql[i++];
+    // tokenize.c's CC_BOM is TK_SPACE only at the start of a token.
+    // Keep FEFF in the word loop below: IdChar consumes it inside identifiers.
+    if (sql[i] === "\uFEFF") {
+      buf += sql[i++];
+      continue;
+    }
+    if (SQLITE_WORD_CHAR_RE.test(sql[i])) {
+      const wordStart = i;
+      while (i < n && SQLITE_WORD_CHAR_RE.test(sql[i])) i++;
+      const word = sql.slice(wordStart, i);
+      buf += word;
+      advance(sqliteScanKeywordToken(word));
+      continue;
+    }
+    const current = sql[i++];
+    buf += current;
+    if (!SQLITE_SPACE_RE.test(current)) advance("other");
   }
-  const tail = buf.trim();
+  const tail = buf.replace(SQLITE_TRIM_TRIVIA_RE, "");
   if (tail) stmts.push(tail);
   return stmts;
 }
@@ -738,25 +836,6 @@ function sqliteWithMainKeyword(sql: string, start: number): string | undefined {
     break;
   }
   return readSqlKeyword(sql, index)?.keyword;
-}
-function isUnsafeSQLiteScript(sql: string): boolean {
-  let keyword = nextSqlKeyword(sql, 0);
-  while (keyword) {
-    if (keyword.keyword === "CREATE") {
-      let nextKeyword = nextSqlKeyword(sql, keyword.next);
-      if (
-        nextKeyword?.keyword === "TEMP" ||
-        nextKeyword?.keyword === "TEMPORARY"
-      ) {
-        nextKeyword = nextSqlKeyword(sql, nextKeyword.next);
-      }
-      if (nextKeyword?.keyword === "TRIGGER") {
-        return true;
-      }
-    }
-    keyword = nextSqlKeyword(sql, keyword.next);
-  }
-  return false;
 }
 function canSQLiteStatementReturnRows(sql: string): boolean {
   let keyword = nextSqlKeyword(sql, 0);
@@ -1206,15 +1285,6 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     if (params && params.length > 0) {
       return this._executeSingle(sql, params, start, hardCap);
     }
-    if (isUnsafeSQLiteScript(sql)) {
-      this.requireDb().exec(sql);
-      return {
-        columns: [],
-        rows: [],
-        rowCount: 0,
-        executionTimeMs: Date.now() - start,
-      };
-    }
     const stmts = splitSQLiteScript(sql);
     if (stmts.length === 0) {
       return { columns: [], rows: [], rowCount: 0, executionTimeMs: 0 };
@@ -1385,22 +1455,55 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       name: string;
       unique: number;
       origin: string;
+      partial?: number;
     }[];
     const result: import("./types").IndexMeta[] = [];
+    let indexSqlByName: Map<string, string | null> | undefined;
     for (const idx of idxList) {
       const safeName = idx.name.replace(/"/g, '""');
-      const cols = db.all(
-        `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.index_info("${safeName}")`,
-      ) as {
-        seqno: number;
-        cid: number;
-        name: string;
-      }[];
+      const keys = (
+        db.all(
+          `PRAGMA ${quoteSqliteIdentifier(sqliteSchema)}.index_xinfo("${safeName}")`,
+        ) as {
+          seqno: number;
+          cid: number;
+          name: string | null;
+          key: number;
+        }[]
+      ).filter((column) => column.key === 1);
+      const hasExpression = keys.some(
+        (column) => column.cid < 0 || column.name === null,
+      );
+      let expressionTerms: string[] = [];
+      if (hasExpression) {
+        indexSqlByName ??= new Map(
+          (
+            db.all(
+              `SELECT name, sql FROM ${quoteSqliteIdentifier(sqliteSchema)}.sqlite_master WHERE type='index' AND tbl_name = ? COLLATE NOCASE`,
+              [table],
+            ) as { name: string; sql: string | null }[]
+          ).map((row) => [row.name, row.sql]),
+        );
+        const terms = sqliteSplitCreateDefinitions(
+          indexSqlByName.get(idx.name) ?? "",
+        );
+        if (terms.length === keys.length) {
+          // Preserve the complete indexed term. ASC/DESC can be unquoted
+          // column operands (a + desc), not necessarily sort-order suffixes.
+          expressionTerms = terms;
+        }
+      }
       result.push({
         name: idx.name,
-        columns: cols.map((c) => c.name),
+        columns: keys.map((column, position) =>
+          column.cid >= 0 && column.name !== null
+            ? column.name
+            : expressionTerms[position] || "<expression>",
+        ),
         unique: idx.unique === 1,
         primary: idx.origin === "pk",
+        ...(idx.partial === 1 ? { partial: true } : {}),
+        ...(hasExpression ? { expression: true } : {}),
       });
     }
     return result;

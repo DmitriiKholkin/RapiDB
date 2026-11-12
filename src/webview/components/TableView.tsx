@@ -42,6 +42,8 @@ interface ExportChoiceState {
   format: ExportFormat;
   filters: unknown[];
   sort: TableSortState;
+  page: number;
+  pageSize: number;
 }
 
 function resolveTableExportMessageType(format: ExportFormat) {
@@ -359,8 +361,7 @@ export function TableView({
 
       <TableToolbar
         canSelectAndDeleteRows={canSelectAndDeleteRows}
-        columns={data.columns}
-        debouncedFilterDrafts={data.debouncedFilterDrafts}
+        committedFilters={data.committedFilters}
         deleting={mutation.deleting}
         executionTimeMs={data.executionTimeMs}
         mutationBusy={mutationBusy}
@@ -377,7 +378,13 @@ export function TableView({
         onDeleteSelected={mutation.deleteSelected}
         onExport={(format, filters) => {
           if (data.totalCount > data.rows.length) {
-            setExportChoice({ format, filters, sort: data.sort });
+            setExportChoice({
+              format,
+              filters,
+              sort: data.sort,
+              page: data.page,
+              pageSize: data.pageSize,
+            });
             return;
           }
 
@@ -458,6 +465,7 @@ export function TableView({
         fetchEpochRef={data.fetchEpochRef}
         newRows={mutation.newRows}
         onCancelEdit={cancelCellEdit}
+        onEditorDirtyChange={mutation.setInlineEditorDirty}
         onBatchCellEdit={mutation.commitBatchCellEdits}
         onCommitCellEdit={mutation.commitCellEdit}
         onCommitDraftCellEdit={mutation.commitDraftCellEdit}
@@ -539,8 +547,8 @@ export function TableView({
             sort: exportChoice.sort,
             filters: exportChoice.filters,
             limitToPage: {
-              page: data.page,
-              pageSize: data.pageSize,
+              page: exportChoice.page,
+              pageSize: exportChoice.pageSize,
             },
             columnOrder: getExportColumnOrder(),
           });

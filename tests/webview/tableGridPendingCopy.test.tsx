@@ -120,7 +120,7 @@ describe("TableGrid pending clipboard values", () => {
     expect(grid.copy()).toBe('"{""x"":1}"\tRedisBinary(0xff)\tNULL');
   });
 
-  it("copies missing and inherited fields as NULL while retaining pending null, empty and falsy values", () => {
+  it("refuses to copy missing and inherited fields while retaining pending null, empty and falsy values", () => {
     const row = Object.assign(Object.create({ a: "inherited" }), {
       b: "old",
       c: "old",
@@ -146,7 +146,18 @@ describe("TableGrid pending clipboard values", () => {
     );
     expect(grid.cell(0, 0).textContent).toContain("MISSING");
     grid.select([0, 0], [1, 2]);
-    expect(grid.copy()).toBe('NULL\tNULL\tfalse\n0\t""\tNULL');
+    clearPostedMessages();
+    fireEvent.keyDown(grid.props.scrollRef.current as HTMLElement, {
+      key: "c",
+      ctrlKey: true,
+    });
+    expect(getLastPostedMessage()).toBeUndefined();
+    grid.select([0, 1], [1, 1]);
+    expect(grid.copy()).toBe('NULL\n""');
+    grid.select([0, 2]);
+    expect(grid.copy()).toBe("false");
+    grid.select([1, 0]);
+    expect(grid.copy()).toBe("0");
   });
 
   it("uses the current row indexes and pending values after externally sorted rows change", () => {

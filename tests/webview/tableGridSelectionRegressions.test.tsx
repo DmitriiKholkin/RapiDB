@@ -343,7 +343,7 @@ describe("TableGrid clipboard", () => {
     ]);
   });
 
-  it("copies DEFAULT draft cells and missing fields as NULL, distinct from empty text", () => {
+  it("refuses to copy DEFAULT draft cells and missing fields, keeping empty text distinct", () => {
     const onBatchCellEdit = vi.fn();
     const grid = setup({
       rows: [{ a: "a0" }],
@@ -351,8 +351,14 @@ describe("TableGrid clipboard", () => {
       onBatchCellEdit,
     });
     grid.select([-1, 0], [0, 2]);
-    const copied = grid.copy();
-    expect(copied).toBe("NULL\tx\tNULL\na0\tNULL\tNULL");
+    clearPostedMessages();
+    fireEvent.keyDown(grid.props.scrollRef.current as HTMLElement, {
+      key: "c",
+      ctrlKey: true,
+    });
+    expect(getLastPostedMessage()).toBeUndefined();
+    grid.select([-1, 1]);
+    expect(grid.copy()).toBe("x");
 
     grid.select([0, 0]);
     grid.paste('""\t""');

@@ -48,7 +48,6 @@ describe("trust-on-first-use SSH fingerprint pin", () => {
   it.each([
     ["SSH host", "new-bastion.example.com"],
     ["SSH port", "2222"],
-    ["SSH username", "other"],
   ])("drops the pin when the %s changes", async (label, value) => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={pinnedProfile} />);
@@ -61,6 +60,53 @@ describe("trust-on-first-use SSH fingerprint pin", () => {
     expect(
       screen.queryByRole("button", { name: "Reset pinned fingerprint" }),
     ).toBeNull();
+  });
+
+  it("keeps the host:port pin on Save when only the SSH username changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={pinnedProfile} />);
+
+    await user.clear(screen.getByLabelText("SSH username"));
+    await user.type(screen.getByLabelText("SSH username"), "other");
+    await save(user);
+
+    expect(payload().ssh).toMatchObject({
+      username: "other",
+      hostFingerprintSha256: PIN,
+    });
+    expect(
+      screen.getByRole("button", { name: "Reset pinned fingerprint" }),
+    ).toBeTruthy();
+  });
+
+  it("sends the host:port pin to Test Connection when only the SSH username changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={pinnedProfile} />);
+
+    await user.clear(screen.getByLabelText("SSH username"));
+    await user.type(screen.getByLabelText("SSH username"), "other");
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+
+    expect(getLastPostedMessage()?.type).toBe("testConnection");
+    expect(payload().ssh).toMatchObject({
+      username: "other",
+      hostFingerprintSha256: PIN,
+    });
+  });
+
+  it("sends no pin to Test Connection after the SSH host changes", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={pinnedProfile} />);
+
+    await user.clear(screen.getByLabelText("SSH host"));
+    await user.type(
+      screen.getByLabelText("SSH host"),
+      "new-bastion.example.com",
+    );
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+
+    expect(getLastPostedMessage()?.type).toBe("testConnection");
+    expect(payload().ssh?.hostFingerprintSha256).toBeUndefined();
   });
 
   it("resets the pin from the form", async () => {

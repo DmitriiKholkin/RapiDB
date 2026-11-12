@@ -1625,6 +1625,7 @@ export class ConnectionProvider
       index.primary ? "primary" : undefined,
       index.unique ? "unique" : undefined,
       index.partial ? "partial" : undefined,
+      index.expression ? "expression" : undefined,
     ].filter((value): value is string => Boolean(value));
     const descriptionParts = [
       flags.length > 0 ? flags.join(", ") : undefined,

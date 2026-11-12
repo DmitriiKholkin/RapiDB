@@ -40,7 +40,8 @@ describe("PNL-2 table unsaved-changes state reporting", () => {
         selected: new Set<number>(),
       }),
     );
-    expect(unsavedStates()).toEqual([]);
+    expect(unsavedStates()).toEqual([{ hasUnsavedChanges: false }]);
+    clearPostedMessages();
 
     act(() => result.current.commitCellEdit(0, column, "B", "A"));
     expect(unsavedStates()).toEqual([{ hasUnsavedChanges: true }]);

@@ -31,6 +31,7 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
     onChange?: (value: string) => void;
     onSelectionChange?: () => void;
     readOnly?: boolean;
+    allowFormatting?: boolean;
     ariaLabel?: string;
     schema?: Array<unknown>;
     dialect?: string;
@@ -108,6 +109,9 @@ vi.mock("../../src/webview/components/MonacoEditor", async () => {
           {String(props.schema?.length ?? 0)}
         </div>
         <div data-testid="monaco-language">{props.language ?? "sql"}</div>
+        <div data-testid="monaco-allow-formatting">
+          {String(props.allowFormatting ?? true)}
+        </div>
         <div data-testid="monaco-dialect">{props.dialect ?? "none"}</div>
         <textarea
           ref={textareaRef}
@@ -1316,7 +1320,7 @@ describe("QueryView", () => {
       expect(
         (screen.getByRole("button", { name: "Format" }) as HTMLButtonElement)
           .disabled,
-      ).toBe(false);
+      ).toBe(true);
     });
   });
 
@@ -1880,10 +1884,9 @@ describe("QueryView", () => {
     expect(formatMock).not.toHaveBeenCalled();
   });
 
-  it("uses DynamoDB native mode in JSON editor language and formats valid JSON", async () => {
+  it("uses DynamoDB native mode in JSON editor language and honours allowFormatting false", async () => {
     const user = userEvent.setup();
     const initialValue = '{"TableName":"Users"}';
-    const formattedValue = JSON.stringify({ TableName: "Users" }, null, 2);
 
     render(
       <QueryView
@@ -1915,16 +1918,13 @@ describe("QueryView", () => {
 
     expect(screen.getByLabelText("Query editor")).toBeTruthy();
     expect(screen.getByTestId("monaco-language").textContent).toBe("json");
+    expect(screen.getByTestId("monaco-allow-formatting").textContent).toBe(
+      "false",
+    );
 
     const formatButton = screen.getByRole("button", { name: "Format" });
-    expect((formatButton as HTMLButtonElement).disabled).toBe(false);
-
-    await user.click(formatButton);
-
-    expect(formatMock).toHaveBeenCalledWith(undefined);
-    expect(
-      (screen.getByLabelText("Query editor") as HTMLTextAreaElement).value,
-    ).toBe(formattedValue);
+    expect((formatButton as HTMLButtonElement).disabled).toBe(true);
+    expect(formatMock).not.toHaveBeenCalled();
 
     clearPostedMessages();
     await user.click(screen.getByRole("button", { name: "Run" }));
@@ -1932,14 +1932,55 @@ describe("QueryView", () => {
     expect(getLastPostedMessage()).toEqual({
       type: "executeQuery",
       payload: {
-        queryText: formattedValue,
+        queryText: initialValue,
         connectionId: "conn-1",
         operationId: "query:1",
       },
     });
   });
 
-  it("shows JSON parse failures when formatting invalid DynamoDB native queries", async () => {
+  it("formats JSON editors when the presentation does not disable formatting", async () => {
+    const user = userEvent.setup();
+    const initialValue = '{"TableName":"Users"}';
+    const formattedValue = JSON.stringify({ TableName: "Users" }, null, 2);
+
+    render(
+      <QueryView
+        connectionId="conn-1"
+        initialQueryText={initialValue}
+        editorPresentation={{
+          queryMode: "text",
+          editorLanguage: "json",
+          formatOnOpen: false,
+        }}
+      />,
+    );
+
+    dispatchIncomingMessage("connections", [
+      {
+        id: "conn-1",
+        name: "Json",
+        type: "dynamodb",
+        editorPresentation: {
+          queryMode: "text",
+          editorLanguage: "json",
+          formatOnOpen: false,
+        },
+      },
+    ]);
+
+    expect(screen.getByTestId("monaco-allow-formatting").textContent).toBe(
+      "true",
+    );
+    await user.click(screen.getByRole("button", { name: "Format" }));
+
+    expect(formatMock).toHaveBeenCalledWith(undefined);
+    expect(
+      (screen.getByLabelText("Query editor") as HTMLTextAreaElement).value,
+    ).toBe(formattedValue);
+  });
+
+  it("shows JSON parse failures when formatting invalid JSON queries", async () => {
     const user = userEvent.setup();
 
     render(
@@ -1950,7 +1991,6 @@ describe("QueryView", () => {
           queryMode: "text",
           editorLanguage: "json",
           formatOnOpen: false,
-          allowFormatting: false,
         }}
       />,
     );
@@ -1958,13 +1998,12 @@ describe("QueryView", () => {
     dispatchIncomingMessage("connections", [
       {
         id: "conn-1",
-        name: "Dynamo",
+        name: "Json",
         type: "dynamodb",
         editorPresentation: {
           queryMode: "text",
           editorLanguage: "json",
           formatOnOpen: false,
-          allowFormatting: false,
         },
       },
     ]);

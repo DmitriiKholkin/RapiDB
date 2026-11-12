@@ -1,7 +1,10 @@
 import mssql from "mssql";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MSSQLDriver } from "../../src/extension/dbDrivers/mssql";
-import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
+import type {
+  ColumnMeta,
+  ColumnTypeMeta,
+} from "../../src/extension/dbDrivers/types";
 import {
   executeAtomicSqlApplyPlan,
   prepareApplyChangesPlan,
@@ -51,6 +54,7 @@ function harness(
     table?: string;
     objectType?: "U" | "V";
     metadata?: ColumnTypeMeta[];
+    rawMetadata?: ColumnMeta[];
     permission?: number | null;
     guardError?: boolean;
     blockedTable?: string;
@@ -70,6 +74,8 @@ function harness(
   };
   const driver = new MSSQLDriver(config);
   const metadata = options.metadata ?? columns;
+  if (options.rawMetadata)
+    vi.spyOn(driver, "describeTable").mockResolvedValue(options.rawMetadata);
   const stored = new Map<unknown, unknown>([
     [1, "1.25"],
     [50, "5"],
@@ -201,7 +207,7 @@ function harness(
           expect(sql).toContain(" INTO @__rapidb_identity");
           expect(sql).toContain("SET @__rapidb_affected_rows = @@ROWCOUNT");
           const id = sql.includes("([id], [amount])") ? params[0] : 101;
-          const amount = sql.includes("VALUES (@p1, NULL)")
+          const amount = /VALUES \((?:@p1, )?NULL\)/.test(sql)
             ? null
             : params.at(-1);
           if (
@@ -236,7 +242,7 @@ function harness(
           reads.push(params);
           const id = params[0];
           const names = [
-            ...sql.split(" FROM ")[0].matchAll(/\[(id|amount)\] AS/g),
+            ...sql.split(" FROM ")[0].matchAll(/\[(id|amount|flag)\] AS/g),
           ].map((match) => match[1]);
           const values = names.map((name) =>
             name === "id" ? id : stored.get(id),
@@ -259,7 +265,10 @@ function harness(
     getConnection: () => config,
   } as never;
   const service = new TableMutationService(manager, {
-    getColumns: async () => metadata,
+    getColumns: async () =>
+      options.rawMetadata
+        ? driver.describeColumns(database, schema, table)
+        : metadata,
   });
   const prepare = (values: Record<string, unknown>, target = table) =>
     service.prepareInsertRow("f03", database, schema, target, values);
@@ -295,6 +304,108 @@ function harness(
 }
 
 afterEach(() => vi.restoreAllMocks());
+
+// Use raw describeTable metadata: hand-built ColumnTypeMeta can accidentally
+// omit MSSQL's bit semantics and exercise a route that real tables never use.
+const bitColumns: ColumnMeta[] = [
+  {
+    name: "id",
+    type: "int",
+    nullable: false,
+    isPrimaryKey: true,
+    isForeignKey: false,
+    identityGeneration: "always",
+    isReadOnly: true,
+  },
+  {
+    name: "flag",
+    type: "bit",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+  },
+];
+
+describe("MSSQL bit-only INSERT with enriched table metadata", () => {
+  it.each([
+    true,
+    false,
+    null,
+  ])("verifies %s through a guarded transaction with generated identity", async (flag) => {
+    const h = harness({ rawMetadata: bitColumns });
+    const transaction = vi.spyOn(h.driver, "runTransaction");
+    const plan = await h.prepare({ flag });
+    expect(plan.verification?.values).toEqual([
+      {
+        column: expect.objectContaining({
+          name: "flag",
+          category: "integer",
+          valueSemantics: "bit",
+        }),
+        expectedValue: flag,
+      },
+    ]);
+    expect(plan.operation.sql).toContain("OUTPUT INSERTED.[id]");
+    expect(plan.operation.sql).toContain("INTO @__rapidb_identity");
+    expect(plan.operation.captureIdentity).toBeDefined();
+    expect(plan.operation.expectedAffectedRows).toBe(1);
+    await h.service.executePreparedInsertPlan(plan);
+    expect(transaction).toHaveBeenCalledOnce();
+    expect(h.events).toEqual(["BEGIN", "GUARD", "INSERT", "VERIFY", "COMMIT"]);
+    expect(h.stored.get(101)).toBe(flag);
+    expect(h.reads).toEqual([[101]]);
+    expect(h.outsideQuery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    true,
+    false,
+    null,
+  ])("rejects an INSTEAD OF INSERT trigger before writing %s", async (flag) => {
+    const h = harness({
+      rawMetadata: bitColumns,
+      trigger: { instead: true, disabled: false, event: "INSERT" },
+    });
+    const plan = await h.prepare({ flag });
+    expect(plan.verification).toBeDefined();
+    await expect(h.service.executePreparedInsertPlan(plan)).rejects.toThrow(
+      /INSTEAD OF INSERT/,
+    );
+    expect(h.events).toEqual(["BEGIN", "GUARD", "ROLLBACK"]);
+    expect(h.stored.has(101)).toBe(false);
+    expect(h.outsideQuery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    true,
+    false,
+    null,
+  ])("refuses %s without a reliable primary key before any write", async (flag) => {
+    const h = harness({ rawMetadata: bitColumns.slice(1) });
+    await expect(h.prepare({ flag })).rejects.toThrow(/reliable primary key/);
+    expect(h.events).toEqual([]);
+    expect(h.outsideQuery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    true,
+    false,
+    null,
+  ])("rolls back a persisted %s mismatch instead of reporting success", async (flag) => {
+    const h = harness({ rawMetadata: bitColumns, mismatch: true });
+    const plan = await h.prepare({ flag });
+    await expect(h.service.executePreparedInsertPlan(plan)).rejects.toThrow();
+    expect(h.events).toEqual([
+      "BEGIN",
+      "GUARD",
+      "INSERT",
+      "VERIFY",
+      "ROLLBACK",
+    ]);
+    expect(h.stored.has(101)).toBe(false);
+    expect(h.outsideQuery).not.toHaveBeenCalled();
+  });
+});
 
 describe("F03: MSSQL INSTEAD OF INSERT fabricated OUTPUT", () => {
   it.each([

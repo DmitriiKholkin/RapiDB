@@ -1,8 +1,4 @@
-import {
-  type ColumnTypeMeta as ColumnMeta,
-  type FilterDraftMap,
-  serializeFilterDrafts,
-} from "../../../shared/tableTypes";
+import type { FilterExpression } from "../../../shared/tableTypes";
 import { Icon } from "../Icon";
 import { type ExportFormat, TableExportActions } from "./TableExportActions";
 import {
@@ -13,8 +9,7 @@ import {
 
 interface TableToolbarProps {
   canSelectAndDeleteRows: boolean;
-  columns: readonly ColumnMeta[];
-  debouncedFilterDrafts: FilterDraftMap;
+  committedFilters: FilterExpression[];
   deleting: boolean;
   executionTimeMs?: number;
   mutationBusy: boolean;
@@ -31,8 +26,7 @@ interface TableToolbarProps {
 
 export function TableToolbar({
   canSelectAndDeleteRows,
-  columns,
-  debouncedFilterDrafts,
+  committedFilters,
   deleting,
   executionTimeMs,
   mutationBusy,
@@ -46,8 +40,6 @@ export function TableToolbar({
   onExport,
   onRefresh,
 }: TableToolbarProps) {
-  const activeFilters = serializeFilterDrafts(columns, debouncedFilterDrafts);
-
   return (
     <div
       style={{
@@ -105,7 +97,7 @@ export function TableToolbar({
       </button>
       <TableExportActions
         disabled={mutationBusy}
-        onExport={(format) => onExport(format, activeFilters)}
+        onExport={(format) => onExport(format, committedFilters)}
       />
       <div style={{ flex: 1 }} />
       <span style={{ fontSize: 11, opacity: 0.5 }}>

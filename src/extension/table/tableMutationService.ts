@@ -538,7 +538,10 @@ export class TableMutationService {
       { database: plan.database },
     );
     if (result.error) throw new Error(result.error);
-    const affectedRows = result.affectedRows ?? result.rowCount;
+    // An unavailable mutation total is not a confirmed zero-row write.
+    const affectedRows = result.affectedRowsUnknown
+      ? undefined
+      : (result.affectedRows ?? result.rowCount);
     if (affectedRows !== undefined && affectedRows === 0) {
       throw new Error(
         "Insert failed: the database reported 0 rows affected. The row may have been rejected by a trigger or constraint.",

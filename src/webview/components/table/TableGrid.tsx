@@ -340,6 +340,7 @@ interface TableGridProps {
   fetchEpochRef: React.MutableRefObject<number>;
   newRows: InsertDraftRow[];
   onCancelEdit: () => void;
+  onEditorDirtyChange?: (dirty: boolean) => void;
   onBatchCellEdit: (
     edits: Array<{
       rowIdx: number;
@@ -432,6 +433,7 @@ function TableDataGrid({
   fetchEpochRef,
   newRows,
   onCancelEdit,
+  onEditorDirtyChange,
   onBatchCellEdit,
   onCommitCellEdit,
   onCommitDraftCellEdit,
@@ -546,6 +548,7 @@ function TableDataGrid({
 
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
+  const [copyBlocked, setCopyBlocked] = useState(false);
   const newRowsRef = useRef(newRows);
   const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
 
@@ -606,8 +609,11 @@ function TableDataGrid({
   }, []);
 
   const handleCopyText = useCallback((text: string) => {
+    setCopyBlocked(false);
     postMessage("writeClipboard", { text });
   }, []);
+
+  const handleAbsentCopy = useCallback(() => setCopyBlocked(true), []);
 
   const clipboardRecipientRef = useRef(`table-grid:${crypto.randomUUID()}`);
   const clipboardRequestRef = useRef<string | null>(null);
@@ -639,6 +645,7 @@ function TableDataGrid({
     clipboardRequestRef.current = null;
     pendingPasteRangeRef.current = null;
     pendingPasteContextRef.current = null;
+    setCopyBlocked(false);
   }, [
     pasteLayout,
     columns,
@@ -712,6 +719,7 @@ function TableDataGrid({
     scrollRef,
     getCellFromPoint,
     onCopy: handleCopyText,
+    onAbsentCopy: handleAbsentCopy,
     onPaste: handlePaste,
     isColumnCollapsed,
     onCellNavigate,
@@ -719,6 +727,7 @@ function TableDataGrid({
 
   useLayoutEffect(() => {
     selectionRangeRef.current = selection.range;
+    setCopyBlocked(false);
   }, [selection.range]);
 
   pasteContextRef.current = selection.contextMenuCellRef;
@@ -895,9 +904,9 @@ function TableDataGrid({
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
     if (text) {
-      postMessage("writeClipboard", { text });
+      handleCopyText(text);
     }
-  }, [selection.copySelection]);
+  }, [selection.copySelection, handleCopyText]);
 
   useEffect(() => {
     const handleClipboardText = ({
@@ -1392,6 +1401,7 @@ function TableDataGrid({
                     onCommitCellEdit(rowIdx, column, value, originalValue)
                   }
                   onCancel={onCancelEdit}
+                  onDirtyChange={onEditorDirtyChange}
                 />
               );
             }
@@ -1426,6 +1436,7 @@ function TableDataGrid({
       editCell,
       onCancelEdit,
       onCommitCellEdit,
+      onEditorDirtyChange,
       onSelectionChange,
       pendingEdits,
       selected,
@@ -1766,6 +1777,7 @@ function TableDataGrid({
                     onOpenCell={openCell}
                     onCommit={onCommitDraftCellEdit}
                     onCancelEdit={onCancelEdit}
+                    onEditorDirtyChange={onEditorDirtyChange}
                     selection={selection}
                   />,
                 ];
@@ -1819,6 +1831,55 @@ function TableDataGrid({
         >
           <Icon name="inbox" size={28} style={{ opacity: 0.4 }} />
           <div style={{ fontSize: 13, marginTop: 8 }}>No rows found</div>
+        </div>
+      )}
+
+      {copyBlocked && (
+        <div
+          role="alert"
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            padding: "8px 12px",
+            background:
+              "var(--vscode-inputValidation-errorBackground, rgba(200,50,50,0.15))",
+            borderTop:
+              "1px solid var(--vscode-inputValidation-errorBorder, rgba(200,50,50,0.5))",
+            color: "var(--vscode-errorForeground)",
+            fontSize: 12,
+            zIndex: 11,
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 8,
+          }}
+        >
+          <Icon
+            name="error"
+            size={14}
+            style={{ flexShrink: 0, marginTop: 2 }}
+          />
+          <div style={{ flex: 1 }}>
+            Copy blocked: the selection contains DEFAULT or MISSING cells, which
+            plain-text copy would turn into NULL. Select a range without them.
+          </div>
+          <button
+            type="button"
+            aria-label="Dismiss copy error"
+            onClick={() => setCopyBlocked(false)}
+            style={{
+              background: "transparent",
+              border: "none",
+              color: "var(--vscode-errorForeground)",
+              cursor: "pointer",
+              padding: "2px 6px",
+              fontSize: 14,
+              opacity: 0.7,
+            }}
+          >
+            ×
+          </button>
         </div>
       )}
 
@@ -2076,6 +2137,7 @@ function DraftTableRow({
   onOpenCell,
   onCommit,
   onCancelEdit,
+  onEditorDirtyChange,
   selection,
 }: {
   columns: readonly ColumnMeta[];
@@ -2087,6 +2149,7 @@ function DraftTableRow({
   onOpenCell: (rowIndex: number, columnId: string) => void;
   onCommit: (rowIdx: number, column: ColumnMeta, value: string) => void;
   onCancelEdit: () => void;
+  onEditorDirtyChange?: (dirty: boolean) => void;
   selection?: {
     handleCellMouseDown: (
       rowIndex: number,
@@ -2245,6 +2308,7 @@ function DraftTableRow({
                     }
                     onCommit={(value) => onCommit(rowIndex, columnDef, value)}
                     onCancel={onCancelEdit}
+                    onDirtyChange={onEditorDirtyChange}
                   />
                 ) : !isCollapsed && isDefault ? (
                   <span style={{ fontStyle: "italic", opacity: 0.65 }}>

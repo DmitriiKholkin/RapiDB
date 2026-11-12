@@ -4107,6 +4107,27 @@ describe("TableView", () => {
     ).toBe(false);
   });
 
+  it("does not reconcile a delete rejected by a schema conflict before confirm", async () => {
+    const { operationId } = await stageDeleteMetadataReconciliation();
+    await act(async () =>
+      dispatchRawIncomingMessage("deleteResult", {
+        operationId,
+        success: false,
+        error:
+          "Schema metadata changed. The previous mutation preview cannot be applied; pending work is retained. Review the schema conflict before retrying.",
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: false,
+        outcomeUnknown: false,
+      }),
+    );
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(0);
+    expect(screen.getByText(/Schema metadata changed/)).toBeTruthy();
+    expect(screen.queryByText(/refresh again and verify/)).toBeNull();
+    expect(getBodyCell("name").textContent).toContain("Draft name");
+    expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
+  });
+
   async function stageDirtyDeleteWork(dataRows = rows) {
     const user = userEvent.setup();
     await initializeCommittedTableData({ dataRows });
@@ -5429,7 +5450,10 @@ describe("TableView", () => {
   it("requests pages, debounces filter application, and renders filter errors", async () => {
     renderTableView();
 
-    expect(getPostedMessages()).toEqual([{ type: "ready" }]);
+    expect(getPostedMessages()).toEqual([
+      { type: "ready" },
+      { type: "unsavedChangesState", payload: { hasUnsavedChanges: false } },
+    ]);
 
     dispatchIncomingMessage("tableInit", {
       columns,

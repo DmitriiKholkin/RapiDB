@@ -74,7 +74,13 @@ describe("view DDL generation", () => {
       if (sql.includes("pg_get_viewdef")) {
         expect(params).toEqual(["public", "v_employees"]);
         return {
-          rows: [{ def: 'CREATE VIEW "public"."v_employees" AS SELECT 1' }],
+          rows: [
+            {
+              qualified_name: "public.v_employees",
+              reloptions: null,
+              viewdef: " SELECT 1;",
+            },
+          ],
         };
       }
       if (sql.includes("pg_class c")) {
@@ -98,7 +104,7 @@ describe("view DDL generation", () => {
 
     await expect(
       driver.getCreateTableDDL("test_db", "public", "v_employees"),
-    ).resolves.toBe('CREATE VIEW "public"."v_employees" AS SELECT 1');
+    ).resolves.toBe("CREATE OR REPLACE VIEW public.v_employees AS\n SELECT 1;");
   });
 
   it("Oracle asks DBMS_METADATA for VIEW DDL when the object type is a view", async () => {
