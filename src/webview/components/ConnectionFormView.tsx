@@ -99,6 +99,8 @@ const TLS_MODE_COLORS: Record<ConnectionTlsMode, string> = {
 interface TypeDraft {
   port: string;
   portTouched: boolean;
+  password: string;
+  clearPassword: boolean;
   tlsMode: ConnectionTlsMode;
   tlsCaFilePath: string;
   tlsCertFilePath: string;
@@ -712,8 +714,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const isElasticsearch = type === "elasticsearch";
   const isDynamo = type === "dynamodb";
   const hasStoredSecret = existingHasStoredSecret && existing?.type === type;
-  const legacyPgDefaultPort =
-    type === "pg" && existing?.type === "pg" && existing.port === undefined;
   const hasAnyAwsCredentialInput =
     awsAccessKeyId.trim().length > 0 ||
     awsSecretAccessKey.trim().length > 0 ||
@@ -783,7 +783,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       ? pinnedSshFingerprint.length > 0
         ? `The first accepted SSH fingerprint is pinned automatically. Current pinned fingerprint: ${pinnedSshFingerprint}`
         : "The first successful SSH handshake when you connect will pin the discovered SHA256 fingerprint automatically, even if the database login then fails, and enforce it on future connections. Test Connection does not save a pin."
-      : "Required. Use the OpenSSH SHA256 fingerprint format, for example SHA256:AbCdEf...";
+      : "Required. Paste the SHA256 fingerprint reported by OpenSSH.";
   const readOnlyHint =
     (type === "oracle"
       ? "Blocks table edits and query editor execution for Oracle. Table data and schema browsing remain available. Autonomous transactions can commit writes despite SET TRANSACTION READ ONLY and caller rollback. To run queries, use database-enforced read-only permissions, including restrictions on executable routines, with a regular connection."
@@ -888,6 +888,8 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     typeDraftsRef.current[type] = {
       port,
       portTouched,
+      password,
+      clearPassword,
       tlsMode,
       tlsCaFilePath,
       tlsCertFilePath,
@@ -904,6 +906,8 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         ? initialPort
         : String(DEFAULT_PORT_BY_CONNECTION_TYPE[nextType] || ""),
       portTouched: false,
+      password: "",
+      clearPassword: false,
       tlsMode: original ? initialTlsMode : "disabled",
       tlsCaFilePath: original?.tls?.caFilePath ?? "",
       tlsCertFilePath: original?.tls?.certFilePath ?? "",
@@ -917,6 +921,8 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     setType(nextType);
     setPort(draft.port);
     setPortTouched(draft.portTouched);
+    setPassword(draft.password);
+    setClearPassword(draft.clearPassword);
     setTestState("idle");
     setTlsMode(draft.tlsMode);
     setTlsCaFilePath(draft.tlsCaFilePath);
@@ -1054,10 +1060,11 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   ? undefined
                   : host.trim(),
               port: usesDatabasePort
-                ? existing?.type === type &&
-                  existing.port === undefined &&
-                  isConnectionPortRelevant(existing) &&
-                  (!portTouched || (legacyPgDefaultPort && port.trim() === ""))
+                ? (type === "pg" && port.trim() === "") ||
+                  (existing?.type === type &&
+                    existing.port === undefined &&
+                    isConnectionPortRelevant(existing) &&
+                    !portTouched)
                   ? undefined
                   : port.trim() === ""
                     ? DEFAULT_PORT_BY_CONNECTION_TYPE[type]
@@ -1171,7 +1178,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     host,
     port,
     portTouched,
-    legacyPgDefaultPort,
     database,
     awsProfile,
     awsRegion,
@@ -1734,7 +1740,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                           aria-label="Port"
                           value={port}
                           placeholder={
-                            legacyPgDefaultPort
+                            type === "pg"
                               ? "Default"
                               : String(DEFAULT_PORT_BY_CONNECTION_TYPE[type])
                           }
@@ -1756,7 +1762,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                       </div>
                     )}
                   </div>
-                  {legacyPgDefaultPort && (
+                  {type === "pg" && (
                     <div
                       style={{
                         fontSize: 11,
@@ -2590,7 +2596,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     onChange={(e) =>
                       setSshHostFingerprintSha256(e.target.value)
                     }
-                    placeholder="SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/"
+                    placeholder="SHA256:7lN2WRjpaHWna/5VrB0IlGDQRNZz4EA2TB76MLsK+X8"
                     style={{
                       fontFamily: "var(--vscode-editor-font-family, monospace)",
                     }}

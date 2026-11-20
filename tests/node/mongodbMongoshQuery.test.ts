@@ -149,7 +149,10 @@ describe("MongoDBDriver — mongosh query()", () => {
     const { driver, mockClient, mockCommand } = createMockDriver();
     await driver.query('db.getSiblingDB("app").adminCommand({ ping: 1 })');
     expect(mockClient.db).toHaveBeenCalledWith("admin");
-    expect(mockCommand).toHaveBeenCalledWith({ ping: 1 });
+    expect(mockCommand).toHaveBeenCalledWith(
+      { ping: 1 },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
+    );
   });
 
   it("supports collection.drop() with the selected database and literal collection name", async () => {
@@ -158,7 +161,10 @@ describe("MongoDBDriver — mongosh query()", () => {
       'db.getSiblingDB("app").getCollection("audit.logs").drop()',
     );
     expect(mockClient.db).toHaveBeenCalledWith("app");
-    expect(mockCommand).toHaveBeenCalledWith({ drop: "audit.logs" });
+    expect(mockCommand).toHaveBeenCalledWith(
+      { drop: "audit.logs" },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
+    );
   });
 
   it.each([
@@ -178,8 +184,10 @@ describe("MongoDBDriver — mongosh query()", () => {
     expect(mockFind).toHaveBeenCalledWith(
       {},
       {
+        useBigInt64: false,
         promoteValues: false,
         bsonRegExp: true,
+        raw: true,
       },
     );
     expect(result.columns).toContain("name");
@@ -255,7 +263,7 @@ describe("MongoDBDriver — mongosh query()", () => {
     await driver.query('db.users.find({ name: "Alice" }).limit(5)');
     expect(findReturn).toHaveBeenCalledWith(
       { name: "Alice" },
-      { promoteValues: false, bsonRegExp: true },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
     );
   });
 
@@ -271,8 +279,10 @@ describe("MongoDBDriver — mongosh query()", () => {
       { active: true },
       {
         projection: { name: 1, _id: 0 },
+        useBigInt64: false,
         promoteValues: false,
         bsonRegExp: true,
+        raw: true,
       },
     );
     expect(mockSort).toHaveBeenCalledWith({ score: -1 });
@@ -292,7 +302,7 @@ describe("MongoDBDriver — mongosh query()", () => {
 
     expect(mockFind).toHaveBeenCalledWith(
       {},
-      { promoteValues: false, bsonRegExp: true },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
     );
     expect(result.rowCount).toBe(1);
   });
@@ -553,7 +563,7 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
     expect(mockInsertOne).toHaveBeenCalledWith({ n: 9007199254740993n });
     expect(mockFind).toHaveBeenCalledWith(
       { n: 9007199254740993n },
-      { promoteValues: false, bsonRegExp: true },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
     );
   });
 
@@ -682,7 +692,10 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
   it("executes db.runCommand", async () => {
     const { driver, mockCommand } = createMockDriver();
     const result = await driver.query("db.runCommand({ ping: 1 })");
-    expect(mockCommand).toHaveBeenCalledWith({ ping: 1 });
+    expect(mockCommand).toHaveBeenCalledWith(
+      { ping: 1 },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
+    );
     expect(result.rowCount).toBe(1);
   });
 
@@ -804,8 +817,10 @@ db.getSiblingDB("rapidb_mongo_db").bson_types.updateMany(
         _id: new ObjectId("507f1f77bcf86cd799439011"),
       },
       {
+        useBigInt64: false,
         promoteValues: false,
         bsonRegExp: true,
+        raw: true,
       },
     );
   });
@@ -994,8 +1009,10 @@ describe("MongoDBDriver — readTablePage()", () => {
         },
       },
       {
+        useBigInt64: false,
         promoteValues: false,
         bsonRegExp: true,
+        raw: true,
       },
     );
     const readCursor = mockFind.mock.results.at(-1)?.value as {
@@ -1099,7 +1116,7 @@ describe("MongoDB table mutations", () => {
       affectedRows: 1,
       updateRowOutcomes: [
         { rowIndex: 0, status: "applied" },
-        { rowIndex: 1, status: "not_applied" },
+        { rowIndex: 1, status: "not_applied", conflict: true },
       ],
     });
   });

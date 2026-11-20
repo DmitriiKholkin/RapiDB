@@ -112,6 +112,8 @@ describe("explorer constraint detail nodes with shared names", () => {
       })),
       getDriverEntityManifest: vi.fn(() => undefined),
       getDriver: vi.fn(() => driver),
+      getConnectedDriverSessionKey: vi.fn(() => "source-session"),
+      initializeConnectionCredentialRevision: vi.fn(() => undefined),
       getQueryEditorPresentation: vi.fn(() => undefined),
       isConnected: vi.fn(() => true),
       isConnecting: vi.fn(() => false),

@@ -70,6 +70,8 @@ const GROUPED_NUMBER_RE =
   /^[+-]?(?:\d{1,3}(?:,\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 const APOSTROPHE_GROUPED_RE =
   /^[+-]?(?:\d{1,3}(?:'\d{3})+)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+const SPACE_GROUPED_RE =
+  /^[+-]?\d{1,3}([ \u00a0\u202f])\d{3}(?:\1\d{3})*(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
 
 export function normalizeNumericToken(
   rawValue: string,
@@ -86,7 +88,13 @@ export function normalizeNumericToken(
   }
 
   value = stripCurrencyAffixes(value);
-  value = value.replace(/\s+/g, "");
+  // A leading sign can precede the currency affix, e.g. "-$ 1 234".
+  value = value.replace(/^([+-])\s*\p{Sc}[\p{Sc}\s]*/u, "$1");
+  if (/\s/.test(value)) {
+    // Only remove spaces that separate thousands groups in the integer part.
+    if (!SPACE_GROUPED_RE.test(value)) return null;
+    value = value.replace(/[ \u00a0\u202f]/g, "");
+  }
   value = stripAllCurrencySymbols(value);
 
   if (value.includes("'")) {

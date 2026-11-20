@@ -562,13 +562,12 @@ describe("formatNormalizedPasteValue", () => {
     expect(result).toBe("");
   });
 
-  it("returns NULL_SENTINEL for a blank value normalized to NULL", () => {
-    expect(formatNormalizedPasteValue("", null)).toBe("\x00__NULL__\x00");
+  it("returns null for a blank value normalized to NULL", () => {
+    expect(formatNormalizedPasteValue("", null)).toBeNull();
   });
 
-  it("returns NULL_SENTINEL for NULL keyword input", () => {
-    const sentinel = formatNormalizedPasteValue("NULL", null);
-    expect(sentinel).toBe("\x00__NULL__\x00");
+  it("returns null for NULL keyword input", () => {
+    expect(formatNormalizedPasteValue("NULL", null)).toBeNull();
   });
 
   it("returns the normalized string when present", () => {

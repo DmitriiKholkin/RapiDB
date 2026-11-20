@@ -87,7 +87,7 @@ interface ResolveQueryEditorStateParams {
   activeConnection: ConnectionEntry | undefined;
   editorLanguage?: QueryEditorLanguage;
   editorPresentation?: QueryEditorPresentation;
-  formatOnOpen: boolean;
+  formatOnOpen?: boolean;
   initialConnectionId: string;
   resolvedConnectionId: string;
 }
@@ -107,10 +107,14 @@ export function resolveQueryEditorState({
     editorPresentation,
   );
 
+  // The opening panel may override its original connection's driver default
+  // (e.g. keep bookmarked text verbatim). Do not carry it to another target.
   const shouldFormatOnOpen =
+    (resolvedConnectionId === initialConnectionId
+      ? (editorPresentation?.formatOnOpen ?? formatOnOpen)
+      : undefined) ??
     activeEditorPresentation?.formatOnOpen ??
-    editorPresentation?.formatOnOpen ??
-    formatOnOpen;
+    false;
   const monacoLanguage =
     activeEditorPresentation?.editorLanguage ?? editorLanguage ?? "sql";
   const sqlDialect =

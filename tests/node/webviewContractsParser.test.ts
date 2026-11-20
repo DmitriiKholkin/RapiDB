@@ -7,6 +7,7 @@ import {
   parseTablePanelMessage,
   parseWebviewInitialState,
 } from "../../src/shared/webviewContracts";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 describe("connection port contract", () => {
   const base = {
@@ -429,6 +430,23 @@ describe("parseQueryPanelMessage", () => {
     expect(parsed).toBeNull();
   });
 
+  it("requires both connection and operation IDs to cancel a query", () => {
+    const type = "cancelQuery";
+    const payload = { connectionId: "conn-1", operationId: "query-1" };
+    expect(parseQueryPanelMessage({ type, payload })).toEqual({
+      type,
+      payload,
+    });
+    for (const incomplete of [
+      { operationId: payload.operationId },
+      { connectionId: payload.connectionId },
+      { ...payload, connectionId: 1 },
+      { ...payload, operationId: "" },
+    ]) {
+      expect(parseQueryPanelMessage({ type, payload: incomplete })).toBeNull();
+    }
+  });
+
   it.each([
     "",
     " \t\n",
@@ -551,8 +569,7 @@ describe("parseConnectionFormPanelMessage", () => {
           privateKey:
             "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
           passphrase: "key-passphrase",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
@@ -573,8 +590,7 @@ describe("parseConnectionFormPanelMessage", () => {
           privateKey:
             "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
           passphrase: "key-passphrase",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,

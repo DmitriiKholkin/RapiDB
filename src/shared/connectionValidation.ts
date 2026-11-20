@@ -11,6 +11,8 @@ import {
   hasAmbiguousUriCredentials,
 } from "./connectionUriSecurity";
 import {
+  assertMongoUriOptionNameEncoding,
+  decodeMongoUriDatabasePath,
   getMongoConnectionUri,
   normalizeMongoConnectionConfig,
   resolveMongoConnectionMode,
@@ -234,7 +236,9 @@ function isSshFingerprintSha256(value: string | undefined): boolean {
     return false;
   }
 
-  return /^SHA256:[A-Za-z0-9+/]+={0,2}$/.test(value.trim());
+  // A 32-byte digest uses 43 base64 characters and one optional "=".
+  // The last character's two unused bits must be zero.
+  return /^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=?$/.test(value.trim());
 }
 
 function resolveSshHostVerificationMode(
@@ -663,6 +667,7 @@ export function validateConnectionConfig(
     ...buildConnectionPortValidationIssues(config),
     ...buildMongoConnectionValidationIssues(config),
     ...buildRedisConnectionValidationIssues(config),
+    ...buildElasticsearchCloudIdValidationIssues(config),
     ...buildDynamoValidationIssues(config, {
       hasStoredAwsKeyPair: options.hasStoredAwsKeyPair,
     }),
@@ -691,6 +696,50 @@ export function validateConnectionConfig(
     missingAnyOf,
     issues,
   };
+}
+
+function buildElasticsearchCloudIdValidationIssues(
+  config: Partial<ConnectionConfig>,
+): ConnectionValidationIssue[] {
+  // The SDK uses a truthy Cloud ID instead of any supplied endpoint.
+  const cloudId = config.cloudId;
+  if (config.type !== "elasticsearch" || !cloudId) return [];
+  const invalid = (message: string) => [
+    createValidationIssue("invalid", ["cloudId"], message),
+  ];
+  if (typeof cloudId !== "string") {
+    return invalid("Elasticsearch Cloud ID must be a string.");
+  }
+  const parts = cloudId.split(":");
+  const encoded = parts[1];
+  if (parts.length !== 2 || !encoded) {
+    return invalid('Elasticsearch Cloud ID must use the format "name:base64".');
+  }
+
+  // Match Buffer's permissive handling of ASCII input: both alphabets, ignored
+  // separators, and optional padding. Leave non-ASCII input to the SDK decoder.
+  if (/[\u0080-\uffff]/.test(encoded)) return [];
+  const base64 = encoded
+    .split("=", 1)[0]
+    .replace(/[^A-Za-z0-9+/_-]/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+  const binary = atob(base64.length % 4 === 1 ? base64.slice(0, -1) : base64);
+  const decoded = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+    Uint8Array.from(binary, (byte) => byte.charCodeAt(0)),
+  );
+  const [host, elasticId] = decoded.split("$", 2);
+  if (!host || !elasticId) {
+    return invalid(
+      "Elasticsearch Cloud ID must encode a cloud host and an Elasticsearch deployment ID.",
+    );
+  }
+  try {
+    new URL(`https://${elasticId}.${host}`);
+  } catch {
+    return invalid("Elasticsearch Cloud ID does not resolve to a valid URL.");
+  }
+  return [];
 }
 
 function buildHttpEndpointValidationIssues(
@@ -765,6 +814,24 @@ export function buildMongoConnectionValidationIssues(
           ? "Enter a valid MongoDB SRV URI with one hostname and no port."
           : "Enter a valid MongoDB URI starting with mongodb:// or mongodb+srv://.",
       );
+    }
+    if (parsedUri) {
+      try {
+        decodeMongoUriDatabasePath(parsedUri.pathname);
+        assertMongoUriOptionNameEncoding(uri);
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        invalid("connectionUri", error.message);
+      }
+      // The driver rejects empty or repeated URI options before considering
+      // credentials or a legacy explicit authSource override.
+      const authSources = parsedUri.searchParams.getAll("authSource");
+      if (authSources.length > 1 || authSources.includes("")) {
+        invalid(
+          "connectionUri",
+          "MongoDB URI authSource must have one non-empty value when present.",
+        );
+      }
     }
     if (parsedUri?.hosts.some((host) => !isValidMongoUriHostEntry(host))) {
       invalid(
@@ -908,6 +975,27 @@ export function buildDynamoValidationIssues(
   const hasSecretAccessKey = hasValue(config.awsSecretAccessKey);
   const hasSessionToken = hasValue(config.awsSessionToken);
   const issues: ConnectionValidationIssue[] = [];
+  const region = config.awsRegion;
+  if (typeof region === "string" && region.trim()) {
+    // Smithy checks the resolved region's hostname label even with a custom
+    // endpoint. Preserve its legacy FIPS forms and wildcard exception.
+    const resolvedRegion =
+      region.startsWith("fips-") || region.endsWith("-fips")
+        ? region.replace(/fips-(dkr-|prod-)?|-fips/, "")
+        : region;
+    if (
+      resolvedRegion !== "*" &&
+      !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(resolvedRegion)
+    ) {
+      issues.push(
+        createValidationIssue(
+          "invalid",
+          ["awsRegion"],
+          "AWS region must be a valid hostname label (1–63 letters, digits, or hyphens, with no leading or trailing hyphen).",
+        ),
+      );
+    }
+  }
   if (hasAccessKeyId !== hasSecretAccessKey) {
     issues.push(
       createValidationIssue(

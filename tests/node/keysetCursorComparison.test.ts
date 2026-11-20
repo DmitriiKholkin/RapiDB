@@ -83,8 +83,8 @@ describe("exact driver cursor predicates", () => {
     )(`Oracle ${nativeType} %s binds precise UTC text without Date coercion`, (operator, sqlOperator) => {
       const driver = new OracleDriver(TEST_CONNECTION_SEEDS.oracle.connection);
       for (const raw of [
-        "2024-01-15 11:00:00.123456789",
-        "2024-07-15 10:00:00.123456789",
+        "-0001-01-15 11:00:00.123456789",
+        " 2024-07-15 10:00:00.123456789",
       ]) {
         const predicate = driver.buildCursorComparison(
           column(nativeType, "datetime", 't"s'),
@@ -93,7 +93,9 @@ describe("exact driver cursor predicates", () => {
           7,
         );
         expect(predicate).toEqual({
-          sql: `SYS_EXTRACT_UTC(CAST("t""s" AS TIMESTAMP(9) WITH TIME ZONE)) ${sqlOperator} TO_TIMESTAMP(:7, 'YYYY-MM-DD HH24:MI:SS.FF')`,
+          sql: nativeType.includes("LOCAL")
+            ? `"t""s" ${sqlOperator} CAST(FROM_TZ(TO_TIMESTAMP(:7, 'SYYYY-MM-DD HH24:MI:SS.FF9', 'NLS_DATE_LANGUAGE=American NLS_CALENDAR=Gregorian'), '+00:00') AS TIMESTAMP(9) WITH LOCAL TIME ZONE)`
+            : `SYS_EXTRACT_UTC(CAST("t""s" AS TIMESTAMP(9) WITH TIME ZONE)) ${sqlOperator} TO_TIMESTAMP(:7, 'SYYYY-MM-DD HH24:MI:SS.FF9', 'NLS_DATE_LANGUAGE=American NLS_CALENDAR=Gregorian')`,
           params: [raw],
         });
       }
@@ -104,28 +106,36 @@ describe("exact driver cursor predicates", () => {
     operators,
   )("Oracle plain timestamp %s retains wall-clock nanoseconds", (operator, sqlOperator) => {
     const driver = new OracleDriver(TEST_CONNECTION_SEEDS.oracle.connection);
-    const raw = "2024-07-15 12:00:00.123456789";
+    const raw = " 2024-07-15 12:00:00.123456789";
     expect(
       driver.buildCursorComparison(column("TIMESTAMP(9)"), operator, raw, 4),
     ).toEqual({
-      sql: `"ts" ${sqlOperator} TO_TIMESTAMP(:4, 'YYYY-MM-DD HH24:MI:SS.FF')`,
+      sql: `"ts" ${sqlOperator} TO_TIMESTAMP(:4, 'SYYYY-MM-DD HH24:MI:SS.FF9', 'NLS_DATE_LANGUAGE=American NLS_CALENDAR=Gregorian')`,
       params: [raw],
     });
   });
 
-  it("Oracle DATE accepts raw date-only output without session NLS coercion", () => {
+  it("Oracle DATE cursor requires an era instead of defaulting to AD", () => {
     const driver = new OracleDriver(TEST_CONNECTION_SEEDS.oracle.connection);
     expect(
       driver.buildCursorComparison(
         column("DATE", "date"),
         "gt",
-        "2024-01-15",
+        "-0001-01-15 00:00:00",
         2,
       ),
     ).toEqual({
-      sql: `"ts" > TO_DATE(:2, 'YYYY-MM-DD HH24:MI:SS')`,
-      params: ["2024-01-15 00:00:00"],
+      sql: `"ts" > TO_DATE(:2, 'SYYYY-MM-DD HH24:MI:SS', 'NLS_DATE_LANGUAGE=American NLS_CALENDAR=Gregorian')`,
+      params: ["-0001-01-15 00:00:00"],
     });
+    expect(() =>
+      driver.buildCursorComparison(
+        column("DATE", "date"),
+        "gt",
+        "0001-01-15 00:00:00",
+        2,
+      ),
+    ).toThrow(/Missing exact Oracle temporal export cursor/);
   });
 
   it.each(
@@ -180,7 +190,7 @@ describe("TableReadService cursor integration", () => {
     const raw =
       engine === "mssql"
         ? new Date(2024, 0, 15, 12, 0, 0, 3)
-        : "2024-07-15 10:00:00.123456789";
+        : " 2024-07-15 10:00:00.123456789";
     const meta = [
       column(engine === "mssql" ? "datetime" : "TIMESTAMP(9) WITH TIME ZONE"),
       {
@@ -193,10 +203,21 @@ describe("TableReadService cursor integration", () => {
     vi.spyOn(driver, "formatOutputValue").mockImplementation((value, col) =>
       col.name === "ts" ? "lossy display" : value,
     );
+    const displayColumns = ["ts", "id", "bucket"];
+    const queryColumns =
+      engine === "oracle"
+        ? [...displayColumns, "__rapidb_cursor_0"]
+        : displayColumns;
     const query = vi
       .spyOn(driver, "query")
-      .mockResolvedValueOnce(result(["ts", "id", "bucket"], [[raw, 2, 1]]))
-      .mockResolvedValueOnce(result(["ts", "id", "bucket"], []));
+      .mockResolvedValueOnce(
+        result(queryColumns, [
+          engine === "oracle"
+            ? ["2024-07-15 10:00:00.123456789 +00:00", 2, 1, raw]
+            : [raw, 2, 1],
+        ]),
+      )
+      .mockResolvedValueOnce(result(queryColumns, []));
     const hook = vi.spyOn(driver, "buildCursorComparison");
     const filter = vi.spyOn(driver, "buildFilterCondition");
     const service = new TableReadService({

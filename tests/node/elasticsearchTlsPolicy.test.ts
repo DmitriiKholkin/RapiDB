@@ -65,7 +65,7 @@ describe("Elasticsearch TLS endpoint policy", () => {
       validateConnectionConfig({
         ...config,
         tls,
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
         connectionUri: "http://unused:9200",
       }).valid,
     ).toBe(true);

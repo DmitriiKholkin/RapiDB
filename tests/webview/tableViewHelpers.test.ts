@@ -9,7 +9,11 @@ import {
   INSERT_DEFAULT_SENTINEL,
   parsePersistedTableDraft,
   parsePersistedTableViewState,
+  registerPostgresArrayRowIdentity,
+  registerSQLiteRowIdentity,
   restorePendingEditsSafely,
+  rowMutationBlockReason,
+  rowMutationPrimaryKeys,
   serializeTableDraft,
 } from "../../src/webview/components/table/tableViewHelpers";
 import type {
@@ -34,6 +38,80 @@ function row(col: string, value: unknown): InsertDraftRow {
 function rows(...cols: Array<[string, unknown]>): InsertDraftRow[] {
   return cols.map(([c, v]) => row(c, v));
 }
+
+it("restores a draft only to the same SQLite storage-class identity", () => {
+  const text = { id: "0xab", name: "unchanged" };
+  const blob = { id: "0xab", name: "unchanged" };
+  const textKey = { id: { $rapidbSqliteKey: "t:30786162" } };
+  const blobKey = { id: { $rapidbSqliteKey: "b:AB" } };
+  registerSQLiteRowIdentity(text, textKey);
+  registerSQLiteRowIdentity(blob, blobKey);
+  const pending = pendingEditsFrom([[0, { name: "draft" }]]);
+  const restore = buildPendingRestoreState(pending, [text, blob], ["id"]);
+  const draft = parsePersistedTableDraft(
+    JSON.parse(JSON.stringify(serializeTableDraft("table", restore, []))),
+    "table",
+  );
+  const reloadedText = { ...text };
+  registerSQLiteRowIdentity(reloadedText, textKey);
+  const reloadedBlob = { ...blob };
+  registerSQLiteRowIdentity(reloadedBlob, blobKey);
+  expect(
+    restorePendingEditsSafely(
+      draft?.restoreState ?? null,
+      [reloadedBlob, reloadedText],
+      ["id"],
+    ),
+  ).toEqual({
+    pendingEdits: pendingEditsFrom([[1, { name: "draft" }]]),
+    unresolved: [],
+  });
+  const oldDraft = buildPendingRestoreState(pending, [{ ...text }], ["id"]);
+  expect(
+    restorePendingEditsSafely(oldDraft, [reloadedText], ["id"]),
+  ).toMatchObject({ pendingEdits: new Map(), unresolved: oldDraft.entries });
+});
+
+it("restores a PostgreSQL array-key draft only to the original bounds", () => {
+  const display = { scope: 2, id: "[4,5]", name: "unchanged" };
+  const lower = { ...display };
+  const ordinary = { ...display };
+  const lowerKey = { id: { $rapidbPgArrayKey: "[0:1]={4,5}" } };
+  registerPostgresArrayRowIdentity(lower, lowerKey);
+  registerPostgresArrayRowIdentity(ordinary, {
+    id: { $rapidbPgArrayKey: "{4,5}" },
+  });
+  const keys = ["scope", "id"];
+  expect(rowMutationPrimaryKeys(lower, keys, undefined, false)).toEqual({
+    scope: 2,
+    ...lowerKey,
+  });
+  const pending = pendingEditsFrom([[0, { name: "draft" }]]);
+  const restore = buildPendingRestoreState(pending, [lower, ordinary], keys);
+  const draft = parsePersistedTableDraft(
+    JSON.parse(JSON.stringify(serializeTableDraft("table", restore, []))),
+    "table",
+  );
+  expect(
+    restorePendingEditsSafely(
+      draft?.restoreState ?? null,
+      [ordinary, lower],
+      keys,
+    ),
+  ).toEqual({
+    pendingEdits: pendingEditsFrom([[1, { name: "draft" }]]),
+    unresolved: [],
+  });
+  const oldDraft = buildPendingRestoreState(pending, [display], keys);
+  expect(restorePendingEditsSafely(oldDraft, [ordinary], keys)).toEqual({
+    pendingEdits: new Map(),
+    unresolved: oldDraft.entries,
+  });
+  registerPostgresArrayRowIdentity(display, { id: null });
+  expect(rowMutationBlockReason(display, keys)).toMatch(
+    /cannot be targeted safely/,
+  );
+});
 
 describe("table filter draft validation", () => {
   const columns = [
@@ -621,13 +699,32 @@ describe("snapshot round-trip", () => {
 });
 
 describe("buildInsertValues", () => {
+  it("migrates only the old insert NULL marker and preserves new literal text on restore", () => {
+    const markerDraft = { field: { value: NULL_SENTINEL } };
+    const nullDraft = { field: { value: null } };
+    const serialized = serializeTableDraft("table", { entries: [] }, [
+      markerDraft,
+      nullDraft,
+    ]);
+    expect(parsePersistedTableDraft(serialized, "table")?.newRows).toEqual([
+      markerDraft,
+      nullDraft,
+    ]);
+    for (const draftVersion of [undefined, 2]) {
+      expect(
+        parsePersistedTableDraft({ ...serialized, draftVersion }, "table")
+          ?.newRows,
+      ).toEqual([nullDraft, nullDraft]);
+    }
+  });
+
   it("serializes explicit NULL without changing draft state or other values", () => {
     const serialize = buildInsertValues;
     const structured = { nested: [NULL_SENTINEL, false, 0] };
     const draft: InsertDraftRow = {
       omitted: { value: INSERT_DEFAULT_SENTINEL },
-      explicitNull: { value: NULL_SENTINEL },
-      actualNull: { value: null },
+      formerNullMarker: { value: NULL_SENTINEL },
+      explicitNull: { value: null },
       empty: { value: "" },
       literal: { value: "NULL" },
       ttl: { value: "-1" },
@@ -636,8 +733,8 @@ describe("buildInsertValues", () => {
       number: { value: 0 },
     };
     expect(serialize(draft)).toEqual({
+      formerNullMarker: NULL_SENTINEL,
       explicitNull: null,
-      actualNull: null,
       empty: "",
       literal: "NULL",
       ttl: "-1",
@@ -645,7 +742,7 @@ describe("buildInsertValues", () => {
       bool: false,
       number: 0,
     });
-    expect(draft.explicitNull.value).toBe(NULL_SENTINEL);
+    expect(draft.formerNullMarker.value).toBe(NULL_SENTINEL);
     expect(serialize(draft).structured).toBe(structured);
     expect(serialize({ omitted: draft.omitted })).toEqual({});
   });

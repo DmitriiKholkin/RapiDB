@@ -23,6 +23,7 @@ import { TableView } from "../../src/webview/components/TableView";
 import {
   DEBOUNCE,
   type PersistedTableViewState,
+  serializeTableDraft,
 } from "../../src/webview/components/table/tableViewHelpers";
 import {
   clearPostedMessages,
@@ -53,6 +54,8 @@ const idColumn: ColumnTypeMeta = {
   isPrimaryKey: true,
   filterOperators: ["eq", "gt", "between"],
 };
+const rejectedSortMessage =
+  "Sorting DynamoDB data with the current request requires materializing up to 5000 rows. Narrow the filters or sort by the key-compatible order instead.";
 
 function persistView(view: Omit<PersistedTableViewState, "tableKey">) {
   return persistState({
@@ -139,6 +142,16 @@ function commit(fetchId: number) {
     });
   });
   expect(screen.getByRole("table")).toBeTruthy();
+}
+
+function rejectSort(fetchId: number) {
+  act(() =>
+    dispatchIncomingMessage("tableError", {
+      fetchId,
+      error: rejectedSortMessage,
+      isFilterError: false,
+    }),
+  );
 }
 
 function mountThirdPage(
@@ -258,7 +271,7 @@ describe("TableView persisted state recovery", () => {
     "sort-asc",
     "sort-desc",
     "sort-clear",
-  ])("restores requested %s intent before its read response", (action) => {
+  ])("restores view state after %s, persisting sort changes only on success", (action) => {
     vi.useFakeTimers();
     const initialSort: PersistedTableViewState["sort"] | undefined =
       action === "sort-desc" || action === "sort-clear"
@@ -300,13 +313,26 @@ describe("TableView persisted state recovery", () => {
       pageSize: expectedSize,
       sort: expectedSort,
     };
-    expect(persisted().tableView).toEqual(expected);
+    expect(persisted().tableView).toEqual({ ...expected, sort: view.sort });
     expect(lastFetch()).toMatchObject({
       page: expectedPage,
       pageSize: expectedSize,
       sort: expectedSort,
     });
     expect(screen.getByText("Page 3 of 4")).toBeTruthy();
+    if (action.startsWith("sort-")) {
+      const pending = lastFetch();
+      act(() =>
+        dispatchIncomingMessage("tableData", {
+          rows: [{ id: 91, name: "UNCORRELATED SORT RESPONSE" }],
+          totalCount: 1,
+        }),
+      );
+      expect(screen.queryByText("UNCORRELATED SORT RESPONSE")).toBeNull();
+      expect(persisted().tableView).toMatchObject({ sort: view.sort });
+      commit(pending.fetchId);
+    }
+    expect(persisted().tableView).toEqual(expected);
     first.unmount();
     clearPostedMessages();
     renderTable();
@@ -321,6 +347,169 @@ describe("TableView persisted state recovery", () => {
     act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
     expect(fetches()).toEqual([restored]);
     expect(persisted().tableView).toEqual(expected);
+  });
+
+  it.each([
+    null,
+    { column: "id", direction: "desc" } as const,
+  ])("restores the last accepted sort %j instead of a rejected non-key sort", (sort) => {
+    const { first, persisted, view } = mountThirdPage(sort);
+    fireEvent.click(screen.getByRole("columnheader", { name: "name" }));
+    const rejected = lastFetch();
+    expect(rejected.sort).toEqual({ column: "name", direction: "asc" });
+    rejectSort(rejected.fetchId);
+    expect(screen.getByText(rejectedSortMessage)).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "Alice" })).toBeTruthy();
+    expect(persisted().tableView).toEqual({ tableKey, ...view, page: 1 });
+
+    act(() =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: rejected.fetchId,
+        rows: [{ id: 91, name: "LATE FAILED SORT" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.queryByText("LATE FAILED SORT")).toBeNull();
+    expect(persisted().tableView).toMatchObject({ sort });
+
+    first.unmount();
+    clearPostedMessages();
+    renderTable();
+    const restored = initialize([idColumn, nameColumn]);
+    expect(restored).toMatchObject({
+      page: 1,
+      pageSize: view.pageSize,
+      sort,
+      filters: [{ column: "name", ...view.filters.name }],
+    });
+    rejectSort(rejected.fetchId);
+    expect(screen.queryByText(rejectedSortMessage)).toBeNull();
+    commit(restored.fetchId);
+    expect(fetches()).toEqual([restored]);
+  });
+
+  it.each([
+    null,
+    { column: "id", direction: "desc" } as const,
+  ])("retries a first read with saved sort %j after a transient error", (sort) => {
+    const { first, persisted, view } = mountThirdPage(sort);
+    first.unmount();
+    renderTable();
+    const failed = initialize([idColumn, nameColumn]);
+    act(() =>
+      dispatchIncomingMessage("tableError", {
+        fetchId: failed.fetchId,
+        error: "Temporary read failure",
+      }),
+    );
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Temporary read failure",
+    );
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(
+      Boolean(screen.queryByRole("button", { name: "Clear Sort and Retry" })),
+    ).toBe(sort !== null);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(fetches()).toHaveLength(2);
+    const retry = lastFetch();
+    expect(retry).toEqual({ ...failed, fetchId: retry.fetchId });
+    expect(retry.fetchId).toBeGreaterThan(failed.fetchId);
+    expect(screen.queryByRole("alert")).toBeNull();
+    commit(retry.fetchId);
+    expect(persisted().tableView).toEqual({ tableKey, ...view });
+  });
+
+  it("clears a legacy rejected sort from the initial error without losing restored work or retrying a write", () => {
+    const view = {
+      tableKey,
+      page: 3,
+      pageSize: 100,
+      sort: { column: "name", direction: "asc" },
+      filters: { name: { operator: "like", value: "Alice" } },
+    };
+    const draft = serializeTableDraft(
+      tableKey,
+      {
+        entries: [
+          {
+            originalSignature: JSON.stringify([["id", 1]]),
+            changes: new Map([["name", "Edited Alice"]]),
+            originalValues: new Map([["name", "Alice"]]),
+            originalMissingFields: new Set(),
+            baselinePresenceVersion: 1,
+          },
+        ],
+      },
+      [{ name: { value: "Unverified insert draft" } }],
+      { kind: "apply", unknown: true },
+    );
+    const persisted = persistState({
+      unrelated: "retained",
+      tableView: view,
+      tableDraft: draft,
+    });
+    const first = renderTable();
+    const failed = initialize([idColumn, nameColumn]);
+    expect(failed).toMatchObject({ page: 3, sort: view.sort });
+    rejectSort(failed.fetchId);
+    expect(screen.getByRole("alert").textContent).toContain(
+      rejectedSortMessage,
+    );
+    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(fetches()).toEqual([failed]);
+    expect(persisted().tableDraft).toEqual(draft);
+
+    const beforeRetry = getPostedMessages().length;
+    fireEvent.click(
+      screen.getByRole("button", { name: "Clear Sort and Retry" }),
+    );
+    expect(fetches()).toHaveLength(2);
+    const reset = lastFetch();
+    expect(reset).toMatchObject({
+      page: 1,
+      pageSize: 100,
+      sort: null,
+      filters: [{ column: "name", ...view.filters.name }],
+    });
+    expect(persisted()).toMatchObject({
+      tableReadEpoch: reset.fetchId,
+      tableView: { ...view, page: 1, sort: null },
+      tableDraft: draft,
+      unrelated: "retained",
+    });
+    expect(
+      getPostedMessages()
+        .slice(beforeRetry)
+        .map(({ type }) => type),
+    ).toEqual(["fetchPage"]);
+
+    first.unmount();
+    clearPostedMessages();
+    renderTable();
+    const restored = initialize([idColumn, nameColumn]);
+    expect(restored).toEqual({ ...reset, fetchId: restored.fetchId });
+    expect(restored.fetchId).toBeGreaterThan(reset.fetchId);
+    rejectSort(failed.fetchId);
+    act(() =>
+      dispatchIncomingMessage("tableData", {
+        fetchId: reset.fetchId,
+        rows: [{ id: 91, name: "LATE RESET READ" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.queryByRole("table")).toBeNull();
+    commit(restored.fetchId);
+    expect(screen.getByText("Edited Alice")).toBeTruthy();
+    expect(screen.getByText("Unverified insert draft")).toBeTruthy();
+    expect(isButtonDisabled("Apply Changes")).toBe(true);
+    expect(persisted()).toMatchObject({ tableDraft: draft });
+    expect(
+      getPostedMessages().filter(
+        ({ type }) => type !== "ready" && type !== "unsavedChangesState",
+      ),
+    ).toEqual([{ type: "fetchPage", payload: restored }]);
   });
 
   it("applies the latest filter on the first Enter before the debounce expires", () => {
@@ -381,6 +570,91 @@ describe("TableView persisted state recovery", () => {
       page: 1,
       filters: [{ column: "name", operator: "like", value: "Bob" }],
     });
+  });
+
+  it.each([
+    ["without filters", false],
+    ["with an unchanged filter", true],
+  ] as const)("keeps page 2 after changed metadata refresh %s", (_label, filtered) => {
+    vi.useFakeTimers();
+    const draft = { operator: "like", value: "Alice" } as const;
+    const view = {
+      page: 2,
+      pageSize: 100,
+      sort: null,
+      filters: filtered ? { name: draft } : {},
+    };
+    const persisted = persistView(view);
+    renderTable();
+    commit(initialize([idColumn, nameColumn]).fetchId);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    clearPostedMessages();
+
+    act(() =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [idColumn, nameColumn, { ...nameColumn, name: "old_name" }],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(fetches()).toHaveLength(1);
+    const refresh = lastFetch();
+    expect(refresh).toMatchObject({
+      page: 2,
+      filters: filtered ? [{ column: "name", ...draft }] : [],
+    });
+    commit(refresh.fetchId);
+
+    act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
+    expect(fetches()).toEqual([refresh]);
+    expect(screen.getByText("Page 2 of 4")).toBeTruthy();
+    expect(persisted().tableView).toEqual({ tableKey, ...view });
+  });
+
+  it.each([
+    "debouncing",
+    "ready",
+  ])("applies a %s filter edit after changed metadata refresh", (timing) => {
+    vi.useFakeTimers();
+    const { persisted } = mountThirdPage();
+    fireEvent.change(screen.getByLabelText("name filter value"), {
+      target: { value: "Bob" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    if (timing === "ready") {
+      act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
+      expect(fetches()).toHaveLength(1);
+    }
+    clearPostedMessages();
+
+    act(() =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "metadataRefresh",
+        columns: [idColumn, nameColumn, { ...nameColumn, name: "old_name" }],
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(fetches()).toHaveLength(1);
+    const refresh = lastFetch();
+    expect(refresh).toMatchObject({
+      page: 3,
+      filters: [{ column: "name", operator: "like", value: "Alice" }],
+    });
+    commit(refresh.fetchId);
+    expect(persisted().tableView).toMatchObject({
+      page: 1,
+      filters: { name: { operator: "like", value: "Bob" } },
+    });
+
+    act(() => vi.advanceTimersByTime(DEBOUNCE + 1));
+    expect(fetches()).toHaveLength(2);
+    const filtered = lastFetch();
+    expect(filtered).toMatchObject({
+      page: 1,
+      filters: [{ column: "name", operator: "like", value: "Bob" }],
+    });
+    commit(filtered.fetchId);
+    expect(screen.getByText("Page 1 of 4")).toBeTruthy();
   });
 
   it.each([
@@ -704,6 +978,7 @@ describe("TableView persisted state recovery", () => {
     expect(
       screen.getByText(/Table read identity is invalid or exhausted/),
     ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     act(() => {
       dispatchIncomingMessage("tableData", {
         fetchId: 2,
@@ -739,6 +1014,7 @@ describe("TableView persisted state recovery", () => {
     });
     expect(fetches()).toHaveLength(0);
     expect(screen.getByText("State storage unavailable")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     act(() => {
       dispatchIncomingMessage("tableData", {
         rows: [{ id: 1, name: "UNCORRELATED DATA" }],

@@ -18,6 +18,14 @@ Loopback prevents direct access from other machines; it does **not** authenticat
 - Use database TLS with server identity verification where supported, especially when the database is on a different host from the SSH server; SSH encryption ends at the SSH server.
 - Run the extension host in a trusted environment. If untrusted local users or processes must be isolated, use OS-enforced network isolation (for example, a separate VM), not loopback alone. RapiDB does not provide protection against a malicious process running as the same OS user. Disconnect unused connections to close their forwards.
 
+## Deleting rows in the SQL Table Viewer
+
+Delete checks the stored row version or original values from the loaded page in the DELETE itself, even when mutation preview is disabled. If a selected row no longer matches, the delete batch is rolled back; refresh and review the rows before retrying.
+
+- PostgreSQL uses the table and physical row version; a table rewrite can also invalidate a preview. SQL Server uses a non-nullable `rowversion` where available and also checks legacy LOB columns that can change without advancing it.
+- SQLite, MySQL, Oracle, and SQL Server tables without a usable `rowversion` compare digests of stored values. This detects changed values, including changes that display formatting can hide. For Oracle LOBs, the Viewer also locks the key before running the guarded DELETE so it compares current contents after a concurrent LOB writer finishes. Value comparisons cannot distinguish an identical reinsertion or a change that was reverted before the DELETE. These digests are not unique row identifiers.
+- If a trustworthy snapshot is unavailable, the Viewer refuses to delete that row instead of falling back to its key. Examples include non-NULL MySQL JSON (its text representation can lose native nested types), Oracle `LONG`/`LONG RAW` and unsupported non-NULL complex types, Oracle character LOBs longer than 500 units or BLOBs longer than 2,000 bytes, and relations that cannot expose the required evidence. This does not disable updates.
+
 ## Redis browsing
 
 Redis keys are grouped by the prefix before `:`. **All keys** and **Unprefixed keys** are separate views; prefixed groups are shown as patterns such as `default:*` and `users:*`. Edits and deletes still address the exact stored key.
@@ -28,13 +36,15 @@ Redis table reads and exports deduplicate `SCAN` replies and use exact-key tie-b
 
 ## Query text privacy and cleanup
 
-- **Storage:** History and bookmarks persist SQL/query text (only outer whitespace is trimmed), connection IDs, and timestamps in VS Code's extension `globalState`, shared across workspaces rather than stored in workspace files. This is not credential `SecretStorage`: literals, comments, and any secrets in query text are not redacted. History recording is requested before the driver executes, so failed or cancelled queries can remain; history is not a log of successful executions.
+- **Storage:** History and bookmarks persist SQL/query text (only outer whitespace is trimmed), connection IDs, pinned PostgreSQL database names where applicable, and timestamps in VS Code's extension `globalState`, shared across workspaces rather than stored in workspace files. This is not credential `SecretStorage`: literals, comments, and any secrets in query text are not redacted. History recording is requested before the driver executes, so failed or cancelled queries can remain; history is not a log of successful executions.
 - **History:** Set `"rapidb.queryHistoryLimit": 0` in VS Code user settings to stop new history entries (default: 100, shared across connections). Lowering the limit while the extension is active trims excess entries, including clearing history when changed to 0. To explicitly clear existing history, use **Clear History** (trash icon) in the **Query History** view header and confirm **Clear**. There is no individual history-entry deletion command.
 - **Bookmarks:** The history limit does not disable or clear bookmarks. Avoid **Bookmark** if you do not want to save query text. Right-click an entry in **Bookmarks** → **Delete Bookmark** to remove one, or use **Clear Bookmarks** (trash icon) in that view's header and confirm **Clear** to remove all. Clearing history does not clear bookmarks. These cleanup commands are not shown in the Command Palette.
 
 These controls only manage history/bookmark entries, not copies elsewhere. Editor drafts, including unexecuted text, can persist separately in VS Code webview state even with history disabled; clearing history/bookmarks does not clear those drafts. Cleanup does not guarantee secure erasure from storage or backups.
 
 ## Query execution
+
+PostgreSQL definition tabs opened from the Explorer are pinned to the selected database on that connection. The title and toolbar show the target; restoring a tab or reopening its history or bookmarks keeps the same target. If the pinned target is unavailable, execution fails instead of falling back. Open a new query to use a different connection. Regular query tabs still use the profile's default database. Older tabs and saved entries without a recorded database cannot be retroactively pinned; verify their target before running them.
 
 For PostgreSQL, MySQL, SQL Server, and SQLite, finish explicit transactions with `COMMIT` or `ROLLBACK` in the same executed script (or `RELEASE` for an outermost SQLite `SAVEPOINT`). Unfinished transactions are not kept for a later Execute. SQL Server keeps one session across the script's `GO` batches and cleans it before another query can borrow it; cancelling or timing out a query is not proof that earlier commits were undone. After a failed or cancelled write, verify the data before retrying: earlier changes may already have committed.
 
@@ -49,6 +59,12 @@ DynamoDB native JSON uses the official AWS `AttributeValue` format: `B` and `BS`
 Elasticsearch REST scripts validate supported endpoints and body shapes before sending the first request. DELETE requests and non-search GET requests reject JSON bodies instead of silently discarding them: `DELETE /index` deletes the entire index, not documents matching a body filter. Scripts are not transactions; server-side errors can still follow successful mutations.
 
 Elasticsearch REST paths must start with `/` and address the current connection. Absolute URLs, fragments, backslashes, invalid Unicode, and literal or percent-encoded `.` / `..` path segments are rejected before any request in the script. Encode document ID delimiters such as `/`, `#`, and `?` as `%2F`, `%23`, and `%3F`; URL normalization must never turn a document operation into an index operation.
+
+Table Viewer pages share one Elasticsearch point-in-time snapshot, so page order stays consistent and external changes are not shown until a new snapshot. Refresh, changing filters, sort or page size, and verifying a Viewer write start a new snapshot. If the snapshot expires (45 seconds idle or five minutes total) or is evicted, refresh to continue; the Viewer will not silently mix pages from different snapshots. Exports use their own snapshot.
+
+Table Viewer edits and deletes require index metadata access (`view_index_metadata` or equivalent) for the viewed target and the concrete index being changed. Rows can still be browsed without that privilege, but cannot be edited or deleted without a verified generation. Refresh after rebuilding an index with the same name.
+
+The Viewer checks the index UUID before and after opening the read snapshot, then again immediately before each write. Elasticsearch still checks the document’s sequence number and primary term. The UUID checks are separate requests, not atomic: inconsistent cluster state during snapshot creation, or a rebuild after the final metadata check but before the server resolves the write target, can defeat them. Do not rebuild an index while editing it. REST previews copied into the Query Editor or another client are raw requests and do not include the Viewer’s UUID check.
 
 ### MongoDB
 
@@ -84,11 +100,19 @@ Redis structured table edits (hash, list, set, sorted set) reject JSON numeric l
 
 Truncated results show a warning. `rapidb.queryRowLimit` controls the number of displayed rows, subject to a hard ceiling of 10,000 rows; increasing the setting above 10,000 does not lift that ceiling. This display limit does not limit rows affected by a mutation or cancel query execution. Query-result exports include only the displayed rows; use JSON when preserving value types matters.
 
+Query and table CSV exports use UTF-8 without a byte order mark (BOM) by default. Enable `rapidb.export.csvUtf8Bom` if Excel on Windows misreads non-ASCII text when opening a CSV directly. Leave it off for CSV readers that treat the BOM as part of the first column name.
+
 Table exports keep a stable column schema across chunks. SQL NULL is written as `(NULL)` in both table and query-result CSV exports; empty strings stay empty. Missing fields are written as `MISSING`. Marker-like strings are not escaped. When a column contains both a marker and the same literal value, CSV export fails, even across chunks. CSV cannot distinguish an isolated marker from an identical literal: use JSON when retaining types or missing values matters. Spreadsheet formula-like strings are protected by an apostrophe prefix. A later unexpected column fails the export rather than silently dropping data. JSON applies the same unexpected-column check. Failed exports leave an existing destination file intact.
 
-Exports are staged in the destination directory. New files are published with an exclusive hard link; support is probed before reading export data, and filesystems that do not support it reject the export. A later filesystem or permission change can still make publication fail. On POSIX, replacement of an existing file uses a single rename, subject to the filesystem's rename guarantees. On Windows, replacing an existing file is not supported: choose a new name. No portable compare-and-swap is available for an existing POSIX destination, so avoid changing that path concurrently. These operations do not guarantee durability after power loss.
+Exports are staged in the destination directory. For a new file, RapiDB probes hard-link support before loading table rows. If the probe succeeds, RapiDB tries to publish the completed staging file with a hard link. If the probe or final link fails with an error treated as lack of hard-link support (such as `ENOTSUP` or `EPERM`), RapiDB copies the completed staging file instead. Other probe failures stop the export before table rows are loaded; other final link failures do not fall back to copying.
 
-MongoDB table exports use canonical Extended JSON for BSON values. Literal documents containing reserved EJSON type keys (for example `$oid`) fail explicitly because EJSON cannot preserve their types unambiguously; use a BSON backup for these documents.
+Neither method overwrites a file that appears at the new destination. A successful hard link makes the complete file visible at once; an exclusive copy is not atomic, so readers may see partial content while it runs. A later filesystem or permission change can still make publication fail.
+
+On POSIX, confirmed replacement of an existing file uses a single rename, subject to the filesystem's rename guarantees. On Windows, replacing an existing file is not supported: choose a new name. No portable compare-and-swap is available for an existing POSIX destination, so avoid changing that path concurrently. None of these methods guarantees durability after power loss.
+
+MongoDB table and query JSON exports use canonical Extended JSON for BSON values. For example, a BSON Long uses `{"$numberLong":"9007199254740993"}`, so JSON readers do not round it to a JavaScript number. Deprecated BSON DBPointer values in table rows, query documents, and command replies use `$dbPointer`; ordinary DBRefs keep `$ref` and `$id`. JSON export stops if the driver cannot distinguish an exported DBRef from a DBPointer, or if a literal document contains reserved Extended JSON keys such as `$oid`. Use a BSON backup if you need to preserve such data. CSV is unchanged: query CSV uses display values, and MongoDB table CSV still renders DBPointer as DBRef.
+
+When editing a MongoDB DBRef in Table Viewer, use `"$id":{"$oid":"507f1f77bcf86cd799439011"}` for an ObjectId or `"$id":{"$string":"507f1f77bcf86cd799439011"}` for a string with the same spelling. The `$string` marker is only for the table editor; it does not appear in exports. Older DBRef drafts with an ambiguous ID are not applied automatically. Refresh and re-enter the edit with the intended type.
 
 ## Table editing
 
@@ -97,6 +121,8 @@ Persisted edits are prevalidated against available column metadata before any wr
 SQL table updates must affect exactly one row per edited row; an unexpected count aborts the transaction. This also protects against a cached primary key becoming non-unique after an external schema change. Table updates require rollback support, including temporal-only updates on MySQL; nontransactional engines such as MyISAM are blocked. Oracle catalog lookups preserve the exact identifier spelling, so quoted mixed-case objects do not borrow metadata from uppercase namesakes.
 
 SQL table deletes also require rollback support, even when the selected rows fit into one DELETE statement. Storage-engine support is checked again after preview confirmation and before execution, so a stale selection or changed engine cannot bypass this safeguard.
+
+SQLite Table Viewers for attached databases are bound to the attachment they originally read. You can still run `ATTACH` and `DETACH` in the Query Editor. If you detach a viewer's alias, even if you reattach the same file or reuse an in-memory alias, close and reopen the viewer to work with the new attachment. Refresh does not switch targets or transfer pending edits or previews. Drafts for attached databases and SQLite's `temp` schema are not restored across extension restarts because the original attachment cannot be verified.
 
 Temporal-value verification is driver-specific: SQL Server and Oracle verify explicitly edited dates/times, while PostgreSQL, MySQL, and SQLite retain their existing temporal verification exceptions. Exact temporal persistence is not guaranteed by this safeguard for those three drivers.
 

@@ -263,6 +263,50 @@ describe.skipIf(!endpoint)(
     it.each([
       "delete",
       "update",
+    ])("rejects a stale %s after a same-name rebuild with matching sequence, term, and source", async (operation) => {
+      const { index, routing, driver, primaryKeys } = await fixture();
+      const before = await client.get({ index, id: "same-id", routing });
+      await client.indices.delete({ index });
+      await client.indices.create({
+        index,
+        settings: { number_of_shards: 3, number_of_replicas: 0 },
+      });
+      await client.index({
+        index,
+        id: "same-id",
+        routing,
+        document: { tenant: "selected" },
+        refresh: true,
+      });
+      const after = await client.get({ index, id: "same-id", routing });
+      expect([after._seq_no, after._primary_term, after._source]).toEqual([
+        before._seq_no,
+        before._primary_term,
+        before._source,
+      ]);
+      const base = { database: "default", schema: "indices", table: index };
+      await expect(
+        operation === "delete"
+          ? driver.deleteRows({ ...base, primaryKeyValuesList: [primaryKeys] })
+          : driver.updateRows({
+              ...base,
+              updates: [
+                {
+                  primaryKeys,
+                  changes: { _source: '{"tenant":"edited"}' },
+                  originalValues: { _source: '{"tenant":"selected"}' },
+                },
+              ],
+            }),
+      ).rejects.toThrow(/index generation changed/);
+      expect(
+        (await client.get({ index, id: "same-id", routing }))._source,
+      ).toEqual({ tenant: "selected" });
+    }, 30000);
+
+    it.each([
+      "delete",
+      "update",
     ])("rejects a stale %s identity after a concurrent replacement", async (operation) => {
       const { index, routing, driver, primaryKeys } = await fixture();
       await client.index({

@@ -58,6 +58,9 @@ export interface ConnectionManagerStore {
   getSecret(id: string): Promise<string | undefined>;
   storeSecret(id: string, value: string): Promise<void>;
   deleteSecret(id: string): Promise<void>;
+  onDidChangeSecret?(
+    listener: (id: string) => void,
+  ): vscode.Disposable | undefined;
   getConnectionIdsByScope?(): ConnectionIdsByScope;
   hasConnectionIdInAnyScope?(id: string): boolean;
   hasConnectionIdOutsideActiveScope?(id: string): boolean;
@@ -106,6 +109,11 @@ export interface ConnectionStoreMutation<TResult> {
   connections?: ConnectionConfig[];
   result: TResult;
   rollback?: () => Promise<void>;
+  // A credential-only Save commits in SecretStorage, not in settings. Run
+  // this only after checking the settings snapshot, under the mutation queue.
+  commitSecretOnly?: () => Promise<void>;
+  // Run under the same queue, but outside the settings rollback path.
+  afterSettingsWrite?: () => Promise<void>;
 }
 
 interface ConnectionsConfigurationSnapshot {
@@ -527,38 +535,37 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       try {
         this.assertSnapshotCurrent(snapshot);
         if (!mutation.connections) {
+          await mutation.commitSecretOnly?.();
           return mutation.result;
         }
         writeStarted = true;
         await vscode.workspace
           .getConfiguration("rapidb")
           .update("connections", mutation.connections, snapshot.target);
-        this.normalizedCache = undefined;
       } catch (writeError) {
         const postFailureSnapshot = this.readConnectionsSnapshot();
-        if (
+        const settingsApplied =
           writeStarted &&
           mutation.connections &&
           postFailureSnapshot.target === snapshot.target &&
           computeConnectionsRevision(mutation.connections) ===
-            postFailureSnapshot.revision
-        ) {
-          this.normalizedCache = undefined;
-          return mutation.result;
-        }
-        if (!mutation.rollback) {
+            postFailureSnapshot.revision;
+        if (!settingsApplied) {
+          if (mutation.rollback) {
+            try {
+              await mutation.rollback();
+            } catch (rollbackError) {
+              throw new AggregateError(
+                [writeError, rollbackError],
+                "Connection settings write and rollback both failed.",
+              );
+            }
+          }
           throw writeError;
         }
-        try {
-          await mutation.rollback();
-        } catch (rollbackError) {
-          throw new AggregateError(
-            [writeError, rollbackError],
-            "Connection settings write and rollback both failed.",
-          );
-        }
-        throw writeError;
       }
+      this.normalizedCache = undefined;
+      await mutation.afterSettingsWrite?.();
       return mutation.result;
     });
   }
@@ -593,6 +600,12 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
 
   async deleteSecret(id: string): Promise<void> {
     await this.context.secrets.delete(id);
+  }
+
+  onDidChangeSecret(
+    listener: (id: string) => void,
+  ): vscode.Disposable | undefined {
+    return this.context.secrets.onDidChange?.(({ key }) => listener(key));
   }
 
   getConnectionIdsByScope(): ConnectionIdsByScope {

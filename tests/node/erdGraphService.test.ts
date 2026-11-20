@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { SchemaSnapshot } from "../../src/extension/connectionManager";
+import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
+import type {
+  IDBDriver,
+  TableInfoList,
+} from "../../src/extension/dbDrivers/types";
+import { loadSchemaScope } from "../../src/extension/schema/schemaLoaders";
 import { ErdGraphService } from "../../src/extension/services/erdGraphService";
 
 function createEventSource<T>() {
@@ -22,7 +28,271 @@ function createEventSource<T>() {
   };
 }
 
+function redisDiscovery(names: string[], truncated?: boolean): TableInfoList {
+  const objects: TableInfoList = names.map((name) => ({
+    schema: "",
+    type: "table",
+    name,
+  }));
+  if (truncated !== undefined) objects.truncated = truncated;
+  return objects;
+}
+
+function redisMetadataDriver() {
+  return {
+    getCapabilities: () => ({ schemaNamespaces: "none" }),
+    listSchemas: vi.fn(async () => []),
+    listObjects: vi.fn(async () =>
+      redisDiscovery([REDIS_ALL_KEYS_TABLE, "users"], true),
+    ),
+    describeTable: vi.fn(async () => []),
+    describeColumns: vi.fn(async () => []),
+    getForeignKeys: vi.fn(async () => []),
+    getIndexes: vi.fn(async () => []),
+  };
+}
+
+function redisConnectionManager(
+  driver = redisMetadataDriver(),
+  loadSnapshot: () => Promise<SchemaSnapshot> = async () => ({ databases: [] }),
+) {
+  return {
+    getConnection: () => ({ type: "redis" }),
+    getDriver: () => driver,
+    getSchemaSnapshotAsync: vi.fn(loadSnapshot),
+    onDidDisconnect: createEventSource<string>().event,
+    onDidRefreshSchemas: createEventSource<string>().event,
+  };
+}
+
 describe("ErdGraphService", () => {
+  it.each([
+    false,
+    undefined,
+  ])("retries capped direct Redis discovery and caches complete results (truncated flag: %s)", async (flag) => {
+    const driver = redisMetadataDriver();
+    const service = new ErdGraphService(
+      redisConnectionManager(driver) as never,
+    );
+    const request = { connectionId: "redis-1", database: "db0" };
+    try {
+      const first = await service.getGraph(request);
+      expect(first).toMatchObject({
+        fromCache: false,
+        partial: true,
+        graph: {
+          metadataIncomplete: true,
+          discoveryTruncated: "redis-prefixes",
+        },
+      });
+      expect(
+        first.graph.nodes.map((node) => [node.schema, node.table]),
+      ).toEqual([
+        ["db0", REDIS_ALL_KEYS_TABLE],
+        ["db0", "users"],
+      ]);
+      expect(await service.getGraph(request)).toEqual(first);
+      expect(driver.listObjects).toHaveBeenCalledTimes(2);
+      expect(driver.listObjects).toHaveBeenLastCalledWith("db0", "db0");
+
+      driver.listObjects.mockResolvedValueOnce(
+        redisDiscovery([REDIS_ALL_KEYS_TABLE, "orders", "users"], flag),
+      );
+      const complete = await service.getGraph(request);
+      expect(complete).toMatchObject({ fromCache: false, partial: false });
+      expect(complete.graph).not.toHaveProperty("metadataIncomplete");
+      expect(complete.graph).not.toHaveProperty("discoveryTruncated");
+      expect(complete.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "orders",
+        "users",
+      ]);
+      expect(await service.getGraph(request)).toEqual({
+        ...complete,
+        fromCache: true,
+      });
+      expect(driver.listObjects).toHaveBeenCalledTimes(3);
+
+      expect(await service.getGraph(request, true)).toEqual(first);
+      expect(await service.getGraph(request)).toEqual(first);
+      expect(driver.listObjects).toHaveBeenCalledTimes(5);
+    } finally {
+      service.dispose();
+    }
+  });
+
+  it("warns for capped Redis snapshots only in scope and caches a complete reload", async () => {
+    const driver = redisMetadataDriver();
+    let snapshot: SchemaSnapshot | undefined;
+    const getSnapshot = async () => {
+      snapshot ??= {
+        databases: [
+          {
+            name: "db0",
+            schemas: [
+              await loadSchemaScope(
+                driver as unknown as IDBDriver,
+                "db0",
+                "db0",
+              ),
+            ],
+          },
+          {
+            name: "db1",
+            schemas: [
+              {
+                name: "db1",
+                objects: [{ name: "sessions", type: "table", columns: [] }],
+              },
+            ],
+          },
+        ],
+      };
+      return snapshot;
+    };
+    const manager = {
+      ...redisConnectionManager(driver, getSnapshot),
+      getSchemaSnapshot: () => snapshot,
+      getSchemaSnapshotState: () => ({ status: "loaded" }),
+      onDidChangeSchemaState: createEventSource<string>().event,
+      warmSchemaScope: vi.fn(),
+      refreshSchemaCache: vi.fn(() => {
+        snapshot = undefined;
+      }),
+    };
+    const service = new ErdGraphService(manager as never);
+    const request = { connectionId: "redis-1", database: "db0" };
+    try {
+      const first = await service.getGraph(request);
+      expect(first).toMatchObject({
+        fromCache: false,
+        partial: true,
+        graph: {
+          metadataIncomplete: true,
+          discoveryTruncated: "redis-prefixes",
+        },
+      });
+      expect(first.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "users",
+      ]);
+      expect(await service.getGraph(request)).toEqual(first);
+      expect(driver.listObjects).toHaveBeenCalledTimes(1);
+
+      const otherRequest = { ...request, database: "db1" };
+      const other = await service.getGraph(otherRequest);
+      expect(other.partial).toBe(false);
+      expect(other.graph).not.toHaveProperty("discoveryTruncated");
+      expect(other.graph.nodes.map((node) => node.table)).toEqual(["sessions"]);
+      expect(await service.getGraph(otherRequest)).toEqual({
+        ...other,
+        fromCache: true,
+      });
+      expect(await service.getGraph({ connectionId: "redis-1" })).toMatchObject(
+        { partial: true },
+      );
+
+      driver.listObjects.mockResolvedValueOnce(
+        redisDiscovery([REDIS_ALL_KEYS_TABLE, "orders", "users"], false),
+      );
+      const complete = await service.getGraph(request, true);
+      expect(manager.refreshSchemaCache).toHaveBeenCalledWith({
+        connectionId: "redis-1",
+        reason: "manual",
+      });
+      expect(complete).toMatchObject({ fromCache: false, partial: false });
+      expect(complete.graph).not.toHaveProperty("metadataIncomplete");
+      expect(complete.graph).not.toHaveProperty("discoveryTruncated");
+      expect(complete.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "orders",
+        "users",
+      ]);
+      expect(await service.getGraph(request)).toEqual({
+        ...complete,
+        fromCache: true,
+      });
+      expect(driver.listObjects).toHaveBeenCalledTimes(2);
+    } finally {
+      service.dispose();
+    }
+  });
+
+  it("keeps known Redis prefixes until fallback discovery completes", async () => {
+    const snapshot: SchemaSnapshot = {
+      databases: [
+        {
+          name: "db0",
+          schemas: [
+            {
+              name: "db0",
+              objectsTruncated: true,
+              objects: [REDIS_ALL_KEYS_TABLE, "orders"].map((name) => ({
+                name,
+                type: "table",
+                columns: [],
+              })),
+            },
+          ],
+        },
+      ],
+    };
+    const driver = redisMetadataDriver();
+    const manager = {
+      ...redisConnectionManager(driver, async () => snapshot),
+      getSchemaSnapshot: () => snapshot,
+      getSchemaSnapshotState: (_id: string, scope: { kind: string }) => ({
+        status: scope.kind === "schema" ? "error" : "loaded",
+      }),
+      onDidChangeSchemaState: createEventSource<string>().event,
+      warmSchemaScope: vi.fn(),
+    };
+    const service = new ErdGraphService(manager as never);
+    const request = { connectionId: "redis-1", database: "db0" };
+    try {
+      driver.listObjects.mockRejectedValueOnce(new Error("Discovery failed"));
+      const unavailable = await service.getGraph(request);
+      expect(unavailable).toMatchObject({
+        fromCache: false,
+        partial: true,
+        graph: { discoveryTruncated: "redis-prefixes" },
+      });
+      expect(unavailable.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "orders",
+      ]);
+
+      const partial = await service.getGraph(request);
+      expect(partial).toMatchObject({
+        fromCache: false,
+        partial: true,
+        graph: { discoveryTruncated: "redis-prefixes" },
+      });
+      expect(partial.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "orders",
+        "users",
+      ]);
+
+      driver.listObjects.mockResolvedValueOnce(
+        redisDiscovery([REDIS_ALL_KEYS_TABLE, "users"]),
+      );
+      const complete = await service.getGraph(request);
+      expect(complete).toMatchObject({ fromCache: false, partial: false });
+      expect(complete.graph).not.toHaveProperty("discoveryTruncated");
+      expect(complete.graph.nodes.map((node) => node.table)).toEqual([
+        REDIS_ALL_KEYS_TABLE,
+        "users",
+      ]);
+      expect(await service.getGraph(request)).toEqual({
+        ...complete,
+        fromCache: true,
+      });
+    } finally {
+      service.dispose();
+    }
+  });
+
   it("keeps exact database/schema scopes, metadata requests and cache entries distinct", async () => {
     const names = ["sales", " sales ", "   "];
     const driver = {

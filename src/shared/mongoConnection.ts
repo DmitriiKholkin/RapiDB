@@ -18,6 +18,51 @@ export function getMongoConnectionUri(
   return undefined;
 }
 
+export function parseMongoUriPathAndQuery(uri: string): URL {
+  // A placeholder host lets URL normalize the path without parsing the seed list.
+  const match = /^mongodb(?:\+srv)?:\/\/[^/?#]*(.*)$/.exec(uri);
+  if (!match) throw new Error("Invalid MongoDB connection URI.");
+  return new URL(`mongodb://placeholder${match[1]}`);
+}
+
+function decodeMongoUriComponent(value: string, component: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new Error(
+      `MongoDB URI ${component} has invalid percent-encoding. Use %25 for a literal percent sign.`,
+    );
+  }
+}
+
+export function decodeMongoUriDatabasePath(pathname: string): string {
+  return decodeMongoUriComponent(pathname.replace(/^\//, ""), "database path");
+}
+
+function splitMongoUriQuery(uri: string) {
+  const hashIndex = uri.indexOf("#");
+  const fragment = hashIndex < 0 ? "" : uri.slice(hashIndex);
+  const beforeFragment = hashIndex < 0 ? uri : uri.slice(0, hashIndex);
+  const queryIndex = beforeFragment.indexOf("?");
+  return {
+    base: queryIndex < 0 ? beforeFragment : beforeFragment.slice(0, queryIndex),
+    query: queryIndex < 0 ? undefined : beforeFragment.slice(queryIndex + 1),
+    fragment,
+  };
+}
+
+function decodeMongoUriOptionName(option: string): string {
+  return decodeMongoUriComponent(option.split("=", 1)[0], "option name");
+}
+
+export function assertMongoUriOptionNameEncoding(uri: string): void {
+  // URLSearchParams would silently accept malformed escapes in option names.
+  const { query } = splitMongoUriQuery(uri);
+  for (const option of query?.split("&") ?? []) {
+    decodeMongoUriOptionName(option);
+  }
+}
+
 function usesLegacyMongoFields(config: Partial<ConnectionConfig>): boolean {
   return (
     !config.mongoConnectionMode &&
@@ -53,6 +98,11 @@ export function getMongoFormUri(
     value,
   );
   if (!match) return value;
+  try {
+    assertMongoUriOptionNameEncoding(value);
+  } catch {
+    return value; // Leave invalid escapes visible to the editor's validation.
+  }
   const params = new URLSearchParams(match[3]);
   let changed = false;
   for (const key of [
@@ -173,13 +223,12 @@ export function stripMongoUriTlsOptions(
   uri: string,
   keepCertificateOptions = false,
 ): string {
-  const queryIndex = uri.indexOf("?");
-  if (queryIndex < 0) return uri;
-  const options = uri
-    .slice(queryIndex + 1)
+  const { base, query, fragment } = splitMongoUriQuery(uri);
+  if (query === undefined) return uri;
+  const options = query
     .split("&")
     .filter((part) => {
-      const key = decodeURIComponent(part.split("=", 1)[0]);
+      const key = decodeMongoUriOptionName(part);
       if (keepCertificateOptions) {
         return !/^(?:tls|ssl|tlsInsecure|tlsAllowInvalidCertificates|tlsAllowInvalidHostnames)$/i.test(
           key,
@@ -188,5 +237,5 @@ export function stripMongoUriTlsOptions(
       return !/^(?:tls|ssl)/i.test(key);
     })
     .join("&");
-  return `${uri.slice(0, queryIndex)}${options ? `?${options}` : ""}`;
+  return `${base}${options ? `?${options}` : ""}${fragment}`;
 }

@@ -1,4 +1,5 @@
 import type { ConnectionType } from "../connectionTypes";
+import { isPostgresQueryDatabase } from "../postgresQueryDatabase";
 import type { QueryColumnMeta } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -38,11 +39,36 @@ export interface QueryEditorPresentation {
   allowFormatting?: boolean;
 }
 
+export interface QueryTargetBinding {
+  connectionId: string;
+  sessionKey: string | null;
+}
+
+function readQuerySessionKey(value: unknown): string | undefined {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
+    ? value
+    : undefined;
+}
+
+export function parseQueryTargetBinding(
+  value: unknown,
+): QueryTargetBinding | undefined {
+  if (!isRecord(value)) return undefined;
+  const connectionId = readRequiredString(value, "connectionId");
+  const sessionKey =
+    value.sessionKey === null ? null : readQuerySessionKey(value.sessionKey);
+  return connectionId && sessionKey !== undefined
+    ? { connectionId, sessionKey }
+    : undefined;
+}
+
 export interface QueryInitialState extends PanelRetentionState {
   view: "query";
   panelId?: string;
   connectionId: string;
   connectionType?: ConnectionType | "";
+  postgresDatabase?: string;
+  targetBinding?: QueryTargetBinding;
   queryText?: string;
   initialSql?: string;
   formatOnOpen?: boolean;
@@ -128,7 +154,12 @@ export function parseQueryInitialState(
 ): QueryInitialState | null {
   const connectionId = readRequiredString(input, "connectionId");
   const connectionType = readConnectionType(input.connectionType);
-  if (!connectionId || connectionType === undefined) {
+  if (
+    !connectionId ||
+    connectionType === undefined ||
+    (input.postgresDatabase !== undefined &&
+      !isPostgresQueryDatabase(input.postgresDatabase))
+  ) {
     return null;
   }
 
@@ -171,6 +202,17 @@ export function parseQueryInitialState(
     panelId: readOptionalString(input, "panelId"),
     connectionId,
     connectionType,
+    ...(input.targetBinding !== undefined
+      ? {
+          targetBinding: parseQueryTargetBinding(input.targetBinding) ?? {
+            connectionId,
+            sessionKey: null,
+          },
+        }
+      : {}),
+    ...(isPostgresQueryDatabase(input.postgresDatabase)
+      ? { postgresDatabase: input.postgresDatabase }
+      : {}),
     queryText,
     initialSql: queryText,
     formatOnOpen,
@@ -192,6 +234,18 @@ export interface QuerySchemaPayload<TSchemaObject> {
   error?: string;
 }
 
+export interface QueryResultCounts {
+  rowCount: number;
+  /** This driver always uses rowCount for returned rows, even without a rowset. */
+  rowCountKind?: "returned";
+  /** Confirmed count, including zero. On partial results this excludes failed requests. */
+  affectedRows?: number;
+  /** Batch APIs confirm processed writes, not whether every delete found an item. */
+  affectedRowsKind?: "processed-writes";
+  /** No exact affected count is available for the reported result. */
+  affectedRowsUnknown?: boolean;
+}
+
 export interface QueryResultSet {
   id: string;
   columns: string[];
@@ -208,6 +262,7 @@ export interface QueryBookmarkPayload {
   queryText: string;
   sql?: string;
   connectionId?: string;
+  targetSessionKey?: string;
   requestId?: string;
 }
 
@@ -245,18 +300,27 @@ function isQueryColumnId(value: unknown): value is string {
   );
 }
 
+export interface QueryOperationIdentity {
+  connectionId: string;
+  operationId: string;
+}
+
 export type QueryPanelMessage =
-  | WebviewMessageEnvelope<"activeConnectionChanged", { connectionId: string }>
+  | WebviewMessageEnvelope<
+      "activeConnectionChanged",
+      { connectionId: string; targetSessionKey?: string }
+    >
   | WebviewMessageEnvelope<
       "executeQuery",
       {
         queryText: string;
         sql?: string;
         connectionId?: string;
+        targetSessionKey?: string;
         operationId?: string;
       }
     >
-  | WebviewMessageEnvelope<"cancelQuery", { operationId: string }>
+  | WebviewMessageEnvelope<"cancelQuery", QueryOperationIdentity>
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
   | WebviewMessageEnvelope<"exportResultsCSV", QueryResultExportPayload>
@@ -279,8 +343,17 @@ export function parseQueryPanelMessage(
         return null;
       }
       const connectionId = readRequiredString(envelope.payload, "connectionId");
+      const targetSessionKey = readQuerySessionKey(
+        envelope.payload.targetSessionKey,
+      );
       return connectionId
-        ? { type: envelope.type, payload: { connectionId } }
+        ? {
+            type: envelope.type,
+            payload: {
+              connectionId,
+              ...(targetSessionKey !== undefined ? { targetSessionKey } : {}),
+            },
+          }
         : null;
     }
 
@@ -290,6 +363,9 @@ export function parseQueryPanelMessage(
         return null;
       }
       const requestId = readOptionalString(envelope.payload, "requestId");
+      const targetSessionKey = readQuerySessionKey(
+        envelope.payload.targetSessionKey,
+      );
       if (envelope.payload.requestId !== undefined && !requestId?.trim()) {
         return null;
       }
@@ -297,6 +373,7 @@ export function parseQueryPanelMessage(
         type: envelope.type,
         payload: {
           ...payload,
+          ...(targetSessionKey !== undefined ? { targetSessionKey } : {}),
           ...(requestId !== undefined ? { requestId } : {}),
         },
       };
@@ -304,29 +381,26 @@ export function parseQueryPanelMessage(
 
     case "executeQuery": {
       const payload = parseEnvelopeQueryPayload(envelope);
-      return payload
-        ? {
-            type: envelope.type,
-            payload: {
-              ...payload,
-              ...(envelope.type === "executeQuery" && isRecord(envelope.payload)
-                ? {
-                    operationId: readOptionalString(
-                      envelope.payload,
-                      "operationId",
-                    ),
-                  }
-                : {}),
-            },
-          }
-        : null;
+      if (!payload || !isRecord(envelope.payload)) return null;
+      const targetSessionKey = readQuerySessionKey(
+        envelope.payload.targetSessionKey,
+      );
+      return {
+        type: envelope.type,
+        payload: {
+          ...payload,
+          operationId: readOptionalString(envelope.payload, "operationId"),
+          ...(targetSessionKey !== undefined ? { targetSessionKey } : {}),
+        },
+      };
     }
 
     case "cancelQuery": {
       if (!isRecord(envelope.payload)) return null;
+      const connectionId = readRequiredString(envelope.payload, "connectionId");
       const operationId = readRequiredString(envelope.payload, "operationId");
-      return operationId
-        ? { type: envelope.type, payload: { operationId } }
+      return connectionId && operationId
+        ? { type: envelope.type, payload: { connectionId, operationId } }
         : null;
     }
 

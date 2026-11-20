@@ -8,7 +8,14 @@ import {
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchIndexSettings,
+  elasticsearchKeys,
+} from "../support/elasticsearchIdentity";
+import {
+  deferred,
+  elasticsearchResponseError,
+} from "../support/elasticsearchPitMock";
 
 const request: DriverTablePageRequest = {
   database: "default",
@@ -39,6 +46,7 @@ const hits = [
     sort: [1],
   },
 ];
+const rebuiltUuid = "w2MS3cbPTM6-pYMgj5ds-A";
 
 function fixture() {
   const driver = new ElasticsearchDriver({
@@ -53,9 +61,9 @@ function fixture() {
     openPointInTime: vi.fn().mockResolvedValue({ id: "pit" }),
     closePointInTime: vi.fn().mockResolvedValue({ succeeded: true }),
     indices: {
-      getSettings: vi.fn().mockResolvedValue({
-        "records-1": { settings: { index: { max_result_window: "100" } } },
-      }),
+      getSettings: vi
+        .fn()
+        .mockResolvedValue(elasticsearchIndexSettings("records-1")),
       get: vi.fn().mockResolvedValue({}),
     },
     delete: vi.fn().mockResolvedValue({ result: "deleted" }),
@@ -77,7 +85,161 @@ function primaryKeys(
   );
 }
 
+const failedDelete = {
+  deleteResult: { affectedRows: 0, rowOutcomes: [{ status: "failed" }] },
+};
+const failedUpdate = {
+  result: { affectedRows: 0, updateRowOutcomes: [{ status: "not_applied" }] },
+};
+
 describe("Elasticsearch read-to-mutation identity", () => {
+  it.each([
+    "delete",
+    "partial",
+    "replace",
+    "conditional",
+  ] as const)("blocks stale %s after a same-name rebuild with identical document metadata and values", async (operation) => {
+    const { driver, client } = fixture();
+    const stale = primaryKeys(await driver.readTablePage(request));
+    client.indices.getSettings.mockResolvedValue(
+      elasticsearchIndexSettings("records-1", rebuiltUuid),
+    );
+    const fresh = primaryKeys(await driver.readTablePage(request));
+    expect(fresh._identity).not.toEqual(stale._identity);
+    const mutate = (primaryKeys: Record<string, unknown>) =>
+      operation === "delete"
+        ? driver.deleteRows({ ...request, primaryKeyValuesList: [primaryKeys] })
+        : driver.updateRows({
+            ...request,
+            updates: [
+              {
+                primaryKeys,
+                changes:
+                  operation === "partial"
+                    ? { tenant: "edited" }
+                    : { _source: '{"tenant":"edited"}' },
+                ...(operation === "conditional"
+                  ? { originalValues: { _source: '{"tenant":"selected"}' } }
+                  : {}),
+              },
+            ],
+          });
+    await expect(mutate(stale)).rejects.toMatchObject({
+      message: expect.stringContaining("generation changed"),
+      ...(operation === "delete" ? failedDelete : failedUpdate),
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+    expect(client.update).not.toHaveBeenCalled();
+    expect(client.index).not.toHaveBeenCalled();
+    await expect(mutate(fresh)).resolves.toMatchObject({ affectedRows: 1 });
+    expect(client.indices.getSettings).toHaveBeenLastCalledWith(
+      { index: "records-1", name: "index.uuid", local: false },
+      undefined,
+    );
+  });
+
+  it.each([
+    "missing",
+    "invalid",
+    "changed",
+    "denied",
+    "different target",
+  ])("keeps reads available without write identities when PIT generation is %s", async (mode) => {
+    const { driver, client } = fixture();
+    if (mode === "missing")
+      client.indices.getSettings.mockResolvedValueOnce({});
+    else if (mode === "invalid")
+      client.indices.getSettings.mockResolvedValueOnce(
+        elasticsearchIndexSettings("records-1", "_na_"),
+      );
+    else {
+      client.indices.getSettings.mockResolvedValueOnce(
+        elasticsearchIndexSettings("records-1"),
+      );
+      if (mode === "denied")
+        client.indices.getSettings.mockRejectedValueOnce(
+          elasticsearchResponseError(403, "metadata denied"),
+        );
+      else
+        client.indices.getSettings.mockResolvedValueOnce(
+          elasticsearchIndexSettings(
+            mode === "changed" ? "records-1" : "records-2",
+            rebuiltUuid,
+          ),
+        );
+    }
+    const page = await driver.readTablePage(request);
+    expect(page.rows[1]).toMatchObject({ _id: "same-id", _identity: null });
+    await expect(
+      driver.deleteRows({
+        ...request,
+        primaryKeyValuesList: [primaryKeys(page)],
+      }),
+    ).rejects.toThrow(/index generation/);
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "ambiguous",
+    "denied",
+    "missing index",
+  ])("fails closed when mutation metadata is %s", async (mode) => {
+    const { driver, client } = fixture();
+    const keys = primaryKeys(await driver.readTablePage(request));
+    if (mode === "ambiguous")
+      client.indices.getSettings.mockResolvedValue({
+        ...elasticsearchIndexSettings("records-1"),
+        ...elasticsearchIndexSettings("records-2"),
+      });
+    else
+      client.indices.getSettings.mockRejectedValue(
+        elasticsearchResponseError(mode === "denied" ? 403 : 404, mode),
+      );
+    await expect(
+      driver.deleteRows({ ...request, primaryKeyValuesList: [keys] }),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("generation"),
+      ...failedDelete,
+    });
+    expect(client.delete).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "delete",
+    "update",
+  ] as const)("does not dispatch a %s if cancelled during the UUID check", async (operation) => {
+    const { driver, client } = fixture();
+    const keys = primaryKeys(await driver.readTablePage(request));
+    const checked = deferred<ReturnType<typeof elasticsearchIndexSettings>>();
+    client.indices.getSettings.mockReturnValueOnce(checked.promise);
+    const abort = new AbortController();
+    const context = { signal: abort.signal, deadline: Infinity };
+    const mutation =
+      operation === "delete"
+        ? driver.deleteRows(
+            { ...request, primaryKeyValuesList: [keys] },
+            context,
+          )
+        : driver.updateRows(
+            {
+              ...request,
+              updates: [{ primaryKeys: keys, changes: { tenant: "edited" } }],
+            },
+            context,
+          );
+    expect(client.indices.getSettings).toHaveBeenLastCalledWith(
+      { index: "records-1", name: "index.uuid", local: false },
+      { signal: abort.signal },
+    );
+    abort.abort();
+    checked.resolve(elasticsearchIndexSettings("records-1"));
+    await expect(mutation).rejects.toMatchObject(
+      operation === "delete" ? failedDelete : failedUpdate,
+    );
+    expect(client.delete).not.toHaveBeenCalled();
+    expect(client.update).not.toHaveBeenCalled();
+  });
+
   it("uses the same numeric-aware script in execution and preview after JSON number normalization", async () => {
     const { driver, client } = fixture();
     const page = await driver.readTablePage(request);

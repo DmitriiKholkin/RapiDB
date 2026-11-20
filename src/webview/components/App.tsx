@@ -28,8 +28,10 @@ export function App(): ReactElement {
             panelId={state.panelId ?? "query"}
             connectionId={state.connectionId ?? ""}
             connectionType={state.connectionType ?? ""}
+            postgresDatabase={state.postgresDatabase}
+            targetBinding={state.targetBinding}
             initialQueryText={state.queryText ?? state.initialSql ?? ""}
-            formatOnOpen={state.formatOnOpen ?? false}
+            formatOnOpen={state.formatOnOpen}
             isBookmarked={state.isBookmarked ?? false}
             editorLanguage={state.editorLanguage}
             editorPresentation={state.editorPresentation}

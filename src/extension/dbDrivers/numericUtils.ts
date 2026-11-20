@@ -1,5 +1,3 @@
-import { NULL_SENTINEL } from "../../shared/tableTypes";
-
 export interface CanonicalExactNumericValue {
   canonical: string;
   integerDigits: number;
@@ -29,7 +27,7 @@ export function numberToDecimalString(value: number): string {
 }
 
 export function parseDecimalString(value: unknown): string | null {
-  if (value === null || value === undefined || value === NULL_SENTINEL) {
+  if (value === null || value === undefined) {
     return null;
   }
   if (typeof value === "bigint") {

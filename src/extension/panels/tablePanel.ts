@@ -1,9 +1,8 @@
 import * as vscode from "vscode";
 import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
-import {
-  coerceFilterExpressions,
-  type MongoValueTypeHint,
-} from "../../shared/tableTypes";
+import type { SqlDeleteObservation } from "../../shared/sqlDeleteObservation";
+import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
+import { coerceFilterExpressions } from "../../shared/tableTypes";
 import {
   type ApplyResultPayload,
   type DeleteResultPayload,
@@ -21,9 +20,16 @@ import {
   redisKeyspaceDisplayName,
   redisKeyspaceFileName,
 } from "../dbDrivers/redisKeyspace";
+import { isSqlDeleteBackend } from "../dbDrivers/sqlDeleteSnapshot";
+import {
+  SQLITE_ATTACHMENT_CHANGED,
+  type SQLiteAttachmentTarget,
+  sqliteAttachmentSchema,
+} from "../dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
   DriverTableExportChunk,
+  DriverTableExportFormat,
   FilterExpression,
 } from "../dbDrivers/types";
 import {
@@ -32,6 +38,7 @@ import {
   PersistedEditValidationError,
   validatePersistedEditRecord,
 } from "../table/persistedEditValidation";
+import type { TablePage } from "../table/tableDataContracts";
 import { getAtomicApplyRefusal } from "../table/tableMutationExecution";
 import {
   prepareApplyChangesPlan,
@@ -39,6 +46,7 @@ import {
   TableDataService,
 } from "../tableDataService";
 import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
+import { redactDiagnosticText } from "../utils/diagnosticRedaction";
 import {
   logErrorWithContext,
   normalizeUnknownError,
@@ -67,6 +75,51 @@ const MUTATION_SESSION_CONFLICT =
   "Connection session changed or is not connected. The previous mutation preview cannot be applied; create a new preview before retrying.";
 const MUTATION_SCHEMA_CONFLICT =
   "Schema metadata changed. The previous mutation preview cannot be applied; pending work is retained. Review the schema conflict before retrying.";
+
+function assertSQLitePanelIdentities(keys: Record<string, unknown>[]): void {
+  if (keys.some((row) => !Object.values(row).every(isSQLitePrimaryKeyValue))) {
+    throw new Error(
+      "SQLite row identity is missing or invalid. Refresh the table and retry.",
+    );
+  }
+}
+
+function redactMutationDiagnostics(
+  payload: ApplyResultPayload | DeleteResultPayload,
+  secretContext: unknown,
+) {
+  let changed = false;
+  const redact = (text: string): string => {
+    const safe = redactDiagnosticText(text, secretContext);
+    changed ||= safe !== text;
+    return safe;
+  };
+  const redactOutcome = <T extends { message?: string }>(outcome: T): T => {
+    if (outcome.message === undefined) return outcome;
+    const message = redact(outcome.message);
+    return message === outcome.message ? outcome : { ...outcome, message };
+  };
+  // Do not redact the full payload: row identities, columns, and status
+  // fields are used for reconciliation and are not diagnostic text.
+  const safe = {
+    ...payload,
+    ...(payload.error !== undefined && {
+      error: redact(payload.error),
+    }),
+    ...("warning" in payload &&
+      payload.warning !== undefined && {
+        warning: redact(payload.warning),
+      }),
+    ...(payload.rowOutcomes && {
+      rowOutcomes: payload.rowOutcomes.map(redactOutcome),
+    }),
+    ...("insertRowOutcomes" in payload &&
+      payload.insertRowOutcomes && {
+        insertRowOutcomes: payload.insertRowOutcomes.map(redactOutcome),
+      }),
+  };
+  return changed ? safe : payload;
+}
 
 type NotExecutedOutcome = { changesPossible: false; outcomeUnknown: false };
 
@@ -214,6 +267,11 @@ export class TablePanel {
   private readonly previewController: TableMutationPreviewController;
   private disposed = false;
   private hasUnsavedChanges: boolean;
+  private webviewHasDeleteRecovery = false;
+  private readonly deleteOperations = new Map<
+    string,
+    "executing" | "replying" | "recovery"
+  >();
   private messageEpoch = 0;
   private webviewReady = false;
   private initialized = false;
@@ -222,18 +280,12 @@ export class TablePanel {
   private connectionGeneration = 0;
   private metadataInvalidated = false;
   private pageReadAbortController = new AbortController();
-  private readonly inFlightPageRequests = new Map<
-    string,
-    Promise<{
-      columns: ColumnTypeMeta[];
-      rows: Record<string, unknown>[];
-      mongoIdTypes?: Array<"objectId" | "string" | null>;
-      mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
-      rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
-      totalCount: number;
-      executionTimeMs?: number;
-    }>
-  >();
+  private browsingSnapshot?: { key: string; controller: AbortController };
+  private readonly inFlightPageRequests = new Map<string, Promise<TablePage>>();
+  // Export may encounter a selected sparse attribute only in a later chunk.
+  // Keep its display descriptor separate from the schema used for mutations.
+  private readonly dynamoExportColumns = new Map<string, ColumnTypeMeta>();
+  private sqliteAttachmentTarget?: SQLiteAttachmentTarget;
 
   private schemaSnapshot: TableSchemaSnapshot = {
     generation: 0,
@@ -293,7 +345,9 @@ export class TablePanel {
       connectionManager,
       tableDataService: this.svc,
       notifyWarning: (message) => {
-        void vscode.window.showWarningMessage(`[RapiDB] ${message}`);
+        void vscode.window.showWarningMessage(
+          `[RapiDB] ${redactDiagnosticText(message, this.diagnosticContext())}`,
+        );
       },
     });
 
@@ -306,8 +360,10 @@ export class TablePanel {
       connectionManager.onDidInvalidateConnectionMetadata?.((id) => {
         if (this.disposed || id !== connectionId) return;
         ++this.connectionGeneration;
+        this.dynamoExportColumns.clear();
         this.previewController.clear();
         this.pageReadAbortController.abort();
+        this.resetBrowsingSnapshot();
         this.pageReadAbortController = new AbortController();
         this.inFlightPageRequests.clear();
         if (!this.initializationAttempt?.waitingForConnect) {
@@ -345,12 +401,14 @@ export class TablePanel {
       this.disposed = true;
       this.messageEpoch++;
       this.pageReadAbortController.abort();
+      this.resetBrowsingSnapshot();
       connectSubscription?.dispose();
       metadataInvalidationSubscription?.dispose();
       schemaRefreshSubscription?.dispose();
       sessionSubscription?.dispose();
       this.previewController.clear();
       this.previewSchemas.clear();
+      this.deleteOperations.clear();
       TablePanel.instances.delete(this);
       if (TablePanel.panels.get(this.key) === this) {
         TablePanel.panels.delete(this.key);
@@ -372,11 +430,18 @@ export class TablePanel {
         const normalized = logErrorWithContext(
           "TablePanel unhandled error",
           error,
+          this.diagnosticContext(),
         );
         vscode.window.showErrorMessage(
           `[RapiDB] Unexpected error: ${normalized.message}`,
         );
       },
+    );
+  }
+
+  private diagnosticContext(): unknown {
+    return this.connectionManager.getConnectionDiagnosticContext?.(
+      this.connectionId,
     );
   }
 
@@ -406,23 +471,40 @@ export class TablePanel {
           panel.dispose();
           return;
         }
+        const initializing =
+          connectionManager.initializeConnectionCredentialRevision?.(
+            saved.connectionId,
+          );
+        const credentialsVerified = !initializing || (await initializing);
         const currentSessionKey = currentConnectionSessionKey(
           connectionManager,
           saved.connectionId,
         );
         const hasDraft =
           (state as { tableDraft?: unknown }).tableDraft !== undefined;
+        const restoredAttachmentDraft =
+          hasDraft &&
+          connectionManager.getConnection(saved.connectionId)?.type ===
+            "sqlite" &&
+          sqliteAttachmentSchema(saved.database, saved.schema) !== undefined;
         if (
           currentSessionKey === undefined ||
+          restoredAttachmentDraft ||
           (hasDraft &&
-            saved.connectionSessionKey !== undefined &&
-            saved.connectionSessionKey !== currentSessionKey)
+            (!credentialsVerified ||
+              (saved.connectionSessionKey === undefined
+                ? connectionManager.getConnectionSessionNonce?.(
+                    saved.connectionId,
+                  ) !== undefined
+                : saved.connectionSessionKey !== currentSessionKey)))
         ) {
           if (hasDraft) {
             void vscode.window.showWarningMessage(
               currentSessionKey === undefined
                 ? `[RapiDB] A restored table panel for "${saved.table}" was closed because its connection no longer exists. Its unsaved changes were discarded.`
-                : `[RapiDB] A restored table panel for "${saved.table}" was closed because its connection settings changed since its unsaved changes were made. The changes were discarded so they cannot be applied to a different database.`,
+                : restoredAttachmentDraft
+                  ? `[RapiDB] A restored SQLite table panel for "${saved.table}" was closed because attachment identity cannot be verified across restarts. Its unsaved changes were discarded.`
+                  : `[RapiDB] A restored table panel for "${saved.table}" was closed because its connection settings changed since its unsaved changes were made. The changes were discarded so they cannot be applied to a different database.`,
             );
           }
           panel.dispose();
@@ -521,13 +603,25 @@ export class TablePanel {
   }
 
   private keepOpenAfterDisconnect(): boolean {
-    if (this.disposed || !this.hasUnsavedChanges) return false;
+    const hasDeleteRecovery = this.hasDeleteRecovery();
+    if (this.disposed || (!this.hasUnsavedChanges && !hasDeleteRecovery))
+      return false;
     const sessionChange = this.sessionChangeWarning();
     void vscode.window.showWarningMessage(
       sessionChange ??
-        `[RapiDB] "${this.panel.title}" has unsaved changes and was kept open. Reconnect to apply them, or use Revert All to discard them.`,
+        (hasDeleteRecovery
+          ? this.sqliteAttachmentTarget
+            ? `[RapiDB] "${this.panel.title}" was kept open with an unresolved delete. Reconnecting cannot restore this SQLite attachment or transfer the delete recovery.`
+            : `[RapiDB] "${this.panel.title}" was kept open with a delete in progress or awaiting verification. Reconnect and verify the data before retrying.`
+          : this.sqliteAttachmentTarget
+            ? `[RapiDB] "${this.panel.title}" was kept open with unsaved changes. Reconnecting cannot restore this SQLite attachment or transfer the changes.`
+            : `[RapiDB] "${this.panel.title}" has unsaved changes and was kept open. Reconnect to apply them, or use Revert All to discard them.`),
     );
     return sessionChange === null;
+  }
+
+  private hasDeleteRecovery(): boolean {
+    return this.webviewHasDeleteRecovery || this.deleteOperations.size > 0;
   }
 
   private currentSessionGeneration(): number {
@@ -550,16 +644,21 @@ export class TablePanel {
     ) {
       return null;
     }
-    return key === undefined
-      ? `[RapiDB] "${this.panel.title}" was closed because its connection was removed. Its unsaved changes were discarded.`
-      : `[RapiDB] "${this.panel.title}" was closed because its connection settings changed. Its unsaved changes were discarded so they cannot be applied to a different database.`;
+    const warning =
+      key === undefined
+        ? `[RapiDB] "${this.panel.title}" was closed because its connection was removed. Its unsaved changes were discarded.`
+        : `[RapiDB] "${this.panel.title}" was closed because its connection settings changed. Its unsaved changes were discarded so they cannot be applied to a different database.`;
+    return this.hasDeleteRecovery()
+      ? `${warning} A previous delete may have affected the original target; verify it there before retrying.`
+      : warning;
   }
 
   private closeIfSessionChanged(): boolean {
     if (this.disposed) return true;
     const warning = this.sessionChangeWarning();
     if (warning === null) return false;
-    if (!this.hasUnsavedChanges && !this.initialized) {
+    const hasRetainedWork = this.hasUnsavedChanges || this.hasDeleteRecovery();
+    if (!hasRetainedWork && !this.initialized) {
       const key = currentConnectionSessionKey(
         this.connectionManager,
         this.connectionId,
@@ -570,7 +669,7 @@ export class TablePanel {
         return false;
       }
     }
-    if (this.hasUnsavedChanges) void vscode.window.showWarningMessage(warning);
+    if (hasRetainedWork) void vscode.window.showWarningMessage(warning);
     this.panel.dispose();
     return true;
   }
@@ -595,6 +694,7 @@ export class TablePanel {
         logErrorWithContext(
           "TablePanel webview message delivery failed",
           deliveryError,
+          this.diagnosticContext(),
         );
       }
       return false;
@@ -690,6 +790,7 @@ export class TablePanel {
     logErrorWithContext(
       "TablePanel mutation fallback delivery failed",
       error ?? new Error(warning),
+      this.diagnosticContext(),
     );
     void vscode.window.showWarningMessage(`[RapiDB] ${warning}`);
   }
@@ -888,6 +989,31 @@ export class TablePanel {
     });
   }
 
+  private resetBrowsingSnapshot(): void {
+    if (!this.browsingSnapshot) return;
+    this.browsingSnapshot.controller.abort();
+    this.browsingSnapshot = undefined;
+    this.inFlightPageRequests.clear();
+  }
+
+  private getBrowsingSnapshot(
+    pageSize: number,
+    filters: FilterExpression[],
+    sort: SortConfig | null,
+  ): AbortSignal | undefined {
+    if (
+      this.connectionManager.getConnection(this.connectionId)?.type !==
+      "elasticsearch"
+    )
+      return undefined;
+    const key = this.buildPageRequestKey(0, pageSize, filters, sort);
+    if (this.browsingSnapshot?.key !== key) {
+      this.resetBrowsingSnapshot();
+      this.browsingSnapshot = { key, controller: new AbortController() };
+    }
+    return this.browsingSnapshot.controller.signal;
+  }
+
   static disposeAll(): void {
     disposePanelInstances([...TablePanel.instances], (panel) => {
       panel.panel.dispose();
@@ -984,8 +1110,19 @@ export class TablePanel {
         }
         break;
       case "unsavedChangesState":
-        if (parsed.payload)
+        if (parsed.payload) {
           this.hasUnsavedChanges = parsed.payload.hasUnsavedChanges;
+          this.webviewHasDeleteRecovery =
+            parsed.payload.hasDeleteRecovery === true;
+        }
+        break;
+      case "deleteRecoveryResolved":
+        if (
+          parsed.payload &&
+          this.deleteOperations.get(parsed.payload.operationId) === "recovery"
+        ) {
+          this.deleteOperations.delete(parsed.payload.operationId);
+        }
         break;
     }
   }
@@ -1050,10 +1187,10 @@ export class TablePanel {
   }
 
   private refreshMetadata(): void {
+    this.resetBrowsingSnapshot();
     this.svc.clearForConnection(this.connectionId);
     const generation = ++this.schemaRefreshGeneration;
-    this.schemaRefreshPromise = this.svc
-      .getColumns(this.connectionId, this.database, this.schema, this.table)
+    this.schemaRefreshPromise = this.loadTableColumns()
       .then((columns) => {
         if (!this.disposed && generation === this.schemaRefreshGeneration) {
           this.schemaRefreshError = null;
@@ -1072,9 +1209,45 @@ export class TablePanel {
           return;
         this.schemaRefreshError = normalizeUnknownError(error).message;
         void this.postMessage("tableError", {
-          error: `Schema metadata refresh failed: ${this.schemaRefreshError}`,
+          error: `Schema metadata refresh failed: ${redactDiagnosticText(this.schemaRefreshError, this.diagnosticContext())}`,
         });
       });
+  }
+
+  private getSQLiteAttachmentSchema(): string | undefined {
+    return this.connectionManager.getConnection(this.connectionId)?.type ===
+      "sqlite"
+      ? sqliteAttachmentSchema(this.database, this.schema)
+      : undefined;
+  }
+
+  private async loadTableColumns(): Promise<ColumnTypeMeta[]> {
+    const schema = this.getSQLiteAttachmentSchema();
+    if (schema && !this.sqliteAttachmentTarget) {
+      const target = await this.connectionManager
+        .getDriver(this.connectionId)
+        ?.getSQLiteAttachmentTarget?.(schema);
+      if (!target) throw new Error(SQLITE_ATTACHMENT_CHANGED);
+      // Pin the viewer, not just the latest metadata: old rows, queued edits,
+      // undo history and previews may still refer to this attachment.
+      this.sqliteAttachmentTarget ??= target;
+      this.svc.bindSQLiteAttachmentTarget(this.sqliteAttachmentTarget);
+    }
+    return this.svc.getColumns(
+      this.connectionId,
+      this.database,
+      this.schema,
+      this.table,
+    );
+  }
+
+  private getSQLiteAttachmentScope() {
+    if (this.getSQLiteAttachmentSchema() && !this.sqliteAttachmentTarget) {
+      throw new Error(SQLITE_ATTACHMENT_CHANGED);
+    }
+    return this.sqliteAttachmentTarget
+      ? { sqliteAttachmentTarget: this.sqliteAttachmentTarget }
+      : {};
   }
 
   private async initializeTable(attempt: {
@@ -1086,6 +1259,18 @@ export class TablePanel {
       this.initializationAttempt === attempt;
     let generation: number | undefined;
     try {
+      const initializing =
+        this.connectionManager.initializeConnectionCredentialRevision?.(
+          this.connectionId,
+        );
+      if (initializing) {
+        if (!(await initializing)) {
+          throw new Error(
+            "Could not verify the connection's saved credentials. Unlock Secret Storage and retry.",
+          );
+        }
+        if (!isCurrent() || this.closeIfSessionChanged()) return;
+      }
       const reconnectBlock =
         this.connectionManager.getAutomaticReconnectBlockReason?.(
           this.connectionId,
@@ -1108,12 +1293,7 @@ export class TablePanel {
       }
       if (!isCurrent()) return;
       generation = this.schemaRefreshGeneration;
-      const cols = await this.svc.getColumns(
-        this.connectionId,
-        this.database,
-        this.schema,
-        this.table,
-      );
+      const cols = await this.loadTableColumns();
       if (!isCurrent() || generation !== this.schemaRefreshGeneration) {
         return;
       }
@@ -1132,7 +1312,7 @@ export class TablePanel {
       ) {
         return;
       }
-      const error = normalizeUnknownError(err);
+      const error = normalizeUnknownError(err, this.diagnosticContext());
       await this.postMessage("tableError", { error: error.message });
     }
   }
@@ -1161,6 +1341,9 @@ export class TablePanel {
       isView: this.isView,
       connectionReadOnly: this.isConnectionReadOnly(),
       connectionSessionKey: this.sessionKey ?? undefined,
+      ...(this.canObserveSqlDelete()
+        ? { requiresSqlDeleteObservation: true }
+        : {}),
     };
     void this.postMessage("tableInit", payload);
   }
@@ -1183,11 +1366,27 @@ export class TablePanel {
     );
     const filters = coerceFilterExpressions(raw.filters);
     const sort = raw.sort ?? null;
+    const normalizedFilters = filters as FilterExpression[];
+    let browsingSnapshot: AbortSignal | undefined;
     try {
       if (raw.refreshMetadata) this.refreshMetadata();
+      if (raw.conflictRefresh || raw.refreshData) this.resetBrowsingSnapshot();
+      browsingSnapshot = this.getBrowsingSnapshot(
+        pageSize,
+        normalizedFilters,
+        sort,
+      );
       await this.awaitSchemaRefresh();
       if (!isCurrentSession()) return;
-      const normalizedFilters = filters as FilterExpression[];
+      browsingSnapshot?.throwIfAborted();
+      this.getSQLiteAttachmentScope();
+      // A reloaded webview can request verification before a late delete has
+      // settled. Do not let that read lift its retry fence.
+      if ([...this.deleteOperations.values()].includes("executing")) {
+        throw new Error(
+          "A delete is still in progress. Refresh again after it finishes.",
+        );
+      }
       const normalizedSort: SortConfig | null = sort;
       const requestKey = this.buildPageRequestKey(
         page,
@@ -1195,10 +1394,26 @@ export class TablePanel {
         normalizedFilters,
         normalizedSort,
       );
-      let inFlightRequest = raw.refreshMetadata
+      // Conflict review must observe a new read, never a pre-conflict read
+      // already in flight for the same page. The panel's target stays pinned.
+      const freshRead =
+        raw.refreshMetadata || raw.conflictRefresh || raw.refreshData;
+      let inFlightRequest = freshRead
         ? undefined
         : this.inFlightPageRequests.get(requestKey);
       if (!inFlightRequest) {
+        const observeSqlDelete = this.canObserveSqlDelete();
+        const readOptions: [
+          observeSqlDelete?: boolean,
+          conflictRefresh?: boolean,
+          browsingSnapshot?: AbortSignal,
+        ] = browsingSnapshot
+          ? [observeSqlDelete, raw.conflictRefresh, browsingSnapshot]
+          : raw.conflictRefresh
+            ? [observeSqlDelete, true]
+            : observeSqlDelete
+              ? [true]
+              : [];
         const pageRequest = this.svc
           .getPage(
             this.connectionId,
@@ -1211,13 +1426,14 @@ export class TablePanel {
             normalizedSort,
             false,
             this.pageReadAbortController.signal,
+            ...readOptions,
           )
           .finally(() => {
             if (this.inFlightPageRequests.get(requestKey) === pageRequest) {
               this.inFlightPageRequests.delete(requestKey);
             }
           });
-        if (!raw.refreshMetadata) {
+        if (!freshRead) {
           this.inFlightPageRequests.set(requestKey, pageRequest);
         }
         inFlightRequest = pageRequest;
@@ -1225,38 +1441,94 @@ export class TablePanel {
 
       const result = await inFlightRequest;
       if (!isCurrentSession()) return;
+      browsingSnapshot?.throwIfAborted();
       const snapshotColumnNames = new Set(
         this.schemaSnapshot.columns.map((column) => column.name),
       );
-      const extraColumns =
-        this.connectionManager.getConnection(this.connectionId)?.type ===
-        "mongodb"
-          ? result.columns.filter(
-              (column) => !snapshotColumnNames.has(column.name),
-            )
-          : [];
+      const connectionType = this.connectionManager.getConnection(
+        this.connectionId,
+      )?.type;
+      const pageScopedExtraColumns = connectionType === "dynamodb";
+      let extraColumns: ColumnTypeMeta[] = [];
+      if (pageScopedExtraColumns) {
+        // A client-side sort or filter may materialize more than this page.
+        const pageAttributeNames = new Set(
+          result.rows.flatMap((row) => Object.keys(row)),
+        );
+        extraColumns = result.columns
+          .filter(
+            ({ name }) =>
+              pageAttributeNames.has(name) && !snapshotColumnNames.has(name),
+          )
+          .map(
+            ({ name, type, nativeType, category, valueSemantics }) =>
+              ({
+                name,
+                type,
+                nativeType,
+                category,
+                valueSemantics,
+                nullable: true,
+                isReadOnly: true,
+                isPrimaryKey: false,
+                isForeignKey: false,
+                filterable: false,
+                filterOperators: [],
+              }) satisfies ColumnTypeMeta,
+          );
+        for (const column of extraColumns) {
+          this.dynamoExportColumns.set(column.name, column);
+        }
+      } else if (connectionType === "mongodb") {
+        extraColumns = result.columns.filter(
+          (column) => !snapshotColumnNames.has(column.name),
+        );
+      }
       this.postMessage("tableData", {
         fetchId,
         ...(extraColumns.length > 0 ? { extraColumns } : {}),
+        ...(pageScopedExtraColumns ? { pageScopedExtraColumns } : {}),
         rows: result.rows,
         mongoIdTypes: result.mongoIdTypes,
         mongoValueTypes: result.mongoValueTypes,
         rowValueTypes: result.rowValueTypes ?? result.mongoValueTypes,
+        ...(result.sqliteRowIdentities
+          ? { sqliteRowIdentities: result.sqliteRowIdentities }
+          : {}),
+        ...(result.postgresArrayRowIdentities
+          ? { postgresArrayRowIdentities: result.postgresArrayRowIdentities }
+          : {}),
+        ...(result.mysqlTimestampRowIdentities
+          ? { mysqlTimestampRowIdentities: result.mysqlTimestampRowIdentities }
+          : {}),
+        ...(result.mssqlSqlVariantRowIdentities
+          ? {
+              mssqlSqlVariantRowIdentities: result.mssqlSqlVariantRowIdentities,
+            }
+          : {}),
+        ...(result.oracleTemporalRowIdentities
+          ? { oracleTemporalRowIdentities: result.oracleTemporalRowIdentities }
+          : {}),
+        ...(result.sqlDeleteObservations
+          ? { sqlDeleteObservations: result.sqlDeleteObservations }
+          : {}),
         totalCount: result.totalCount,
         executionTimeMs: result.executionTimeMs,
       });
     } catch (err: unknown) {
       if (!isCurrentSession()) return;
-      const error = normalizeUnknownError(err);
-      const errMsg = error.message;
       const isFilterError =
         filters.length > 0 &&
         Boolean(
           this.connectionManager
             .getDriverCapabilities(this.connectionId)
-            ?.isTableFilterError?.(errMsg),
+            ?.isTableFilterError?.(normalizeUnknownError(err).message),
         );
-      this.postMessage("tableError", { fetchId, error: errMsg, isFilterError });
+      this.postMessage("tableError", {
+        fetchId,
+        error: normalizeUnknownError(err, this.diagnosticContext()).message,
+        isFilterError,
+      });
     }
   }
 
@@ -1267,6 +1539,7 @@ export class TablePanel {
   }): Promise<void> {
     const { operationId, updates, insertValues } = payload;
     const connectionGeneration = this.connectionGeneration;
+    const secretContext = this.diagnosticContext();
     try {
       this.assertMutationSession(connectionGeneration);
       const snapshot = await this.awaitSchemaRefresh();
@@ -1276,6 +1549,15 @@ export class TablePanel {
         return;
       }
       const driver = this.connectionManager.getDriver(this.connectionId);
+      if (
+        this.connectionManager.getConnection(this.connectionId)?.type ===
+        "sqlite"
+      ) {
+        assertSQLitePanelIdentities(
+          (updates ?? []).map((row) => row.primaryKeys),
+        );
+      }
+      const attachmentScope = this.getSQLiteAttachmentScope();
       if (driver?.checkPersistedEdit) {
         const columnMap = new Map(
           snapshot.columns.map((column) => [column.name, column]),
@@ -1292,7 +1574,10 @@ export class TablePanel {
         );
         if ([...updateFailures, ...insertFailures].some(Boolean)) {
           await this.postMessage("applyResult", {
-            ...buildPrevalidationFailedResult(updateFailures, insertFailures),
+            ...redactMutationDiagnostics(
+              buildPrevalidationFailedResult(updateFailures, insertFailures),
+              secretContext,
+            ),
             operationId,
           });
           return;
@@ -1309,7 +1594,7 @@ export class TablePanel {
       );
       if (!prepared.executable && !prepared.result.success) {
         await this.postMessage("applyResult", {
-          ...prepared.result,
+          ...redactMutationDiagnostics(prepared.result, secretContext),
           operationId,
         });
         return;
@@ -1398,7 +1683,7 @@ export class TablePanel {
           this.postMessage("applyResult", {
             operationId,
             success: false,
-            error: risk,
+            error: redactDiagnosticText(risk, secretContext),
           });
           return;
         }
@@ -1407,23 +1692,26 @@ export class TablePanel {
       if (!prepared.executable && insertCount === 0) {
         if (prepared.result.warning) {
           void vscode.window.showWarningMessage(
-            `[RapiDB] ${prepared.result.warning}`,
+            `[RapiDB] ${redactDiagnosticText(prepared.result.warning, secretContext)}`,
           );
         }
-        this.postMessage("applyResult", { ...prepared.result, operationId });
+        this.postMessage("applyResult", {
+          ...redactMutationDiagnostics(prepared.result, secretContext),
+          operationId,
+        });
         return;
       }
 
       await this.presentOrExecuteMutationPreview(
         this.previewController.createApplyChangesPreview(operationId, {
-          apply: applyPlan,
+          apply: applyPlan ? { ...applyPlan, ...attachmentScope } : null,
           applyResultWhenEmpty: prepared.executable ? null : prepared.result,
-          inserts: insertPlans,
+          inserts: insertPlans.map((plan) => ({ ...plan, ...attachmentScope })),
         }),
         preparedSnapshot,
       );
     } catch (err: unknown) {
-      const error = normalizeUnknownError(err);
+      const error = normalizeUnknownError(err, secretContext);
       this.postMessage("applyResult", {
         operationId,
         success: false,
@@ -1449,6 +1737,7 @@ export class TablePanel {
   }): Promise<void> {
     const { operationId, values = {} } = payload;
     const connectionGeneration = this.connectionGeneration;
+    const secretContext = this.diagnosticContext();
     try {
       this.assertMutationSession(connectionGeneration);
       const snapshot = await this.awaitSchemaRefresh();
@@ -1457,6 +1746,7 @@ export class TablePanel {
         await this.postSchemaConflict(operationId, "insertRow");
         return;
       }
+      const attachmentScope = this.getSQLiteAttachmentScope();
       const plan = await this.svc.prepareInsertRow(
         this.connectionId,
         this.database,
@@ -1465,11 +1755,14 @@ export class TablePanel {
         values,
       );
       await this.presentOrExecuteMutationPreview(
-        this.previewController.createInsertPreview(operationId, plan),
+        this.previewController.createInsertPreview(operationId, {
+          ...plan,
+          ...attachmentScope,
+        }),
         snapshot,
       );
     } catch (err: unknown) {
-      const error = normalizeUnknownError(err);
+      const error = normalizeUnknownError(err, secretContext);
       this.postMessage("insertResult", {
         operationId,
         success: false,
@@ -1484,13 +1777,28 @@ export class TablePanel {
     }
   }
 
+  private requiresSqlDeleteObservation(): boolean {
+    return isSqlDeleteBackend(
+      this.connectionManager.getConnection(this.connectionId)?.type,
+    );
+  }
+
+  private canObserveSqlDelete(): boolean {
+    return (
+      this.requiresSqlDeleteObservation() &&
+      !this.isView &&
+      !this.isConnectionReadOnly()
+    );
+  }
+
   private async _handleDeleteRows(payload: {
     operationId: string;
     primaryKeysList?: Array<Record<string, unknown>>;
+    sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
   }): Promise<void> {
     const { operationId, primaryKeysList = [] } = payload;
     const connectionGeneration = this.connectionGeneration;
-    let executionPossible = false;
+    const secretContext = this.diagnosticContext();
     try {
       this.assertMutationSession(connectionGeneration);
       const snapshot = await this.awaitSchemaRefresh();
@@ -1499,12 +1807,22 @@ export class TablePanel {
         await this.postSchemaConflict(operationId, "deleteRows");
         return;
       }
+      if (
+        this.connectionManager.getConnection(this.connectionId)?.type ===
+        "sqlite"
+      ) {
+        assertSQLitePanelIdentities(primaryKeysList);
+      }
+      const attachmentScope = this.getSQLiteAttachmentScope();
       const plan = await this.svc.prepareDeleteRowsPlan(
         this.connectionId,
         this.database,
         this.schema,
         this.table,
         primaryKeysList,
+        ...(this.requiresSqlDeleteObservation()
+          ? [payload.sqlDeleteObservations ?? []]
+          : []),
       );
 
       this.assertMutationSession(connectionGeneration);
@@ -1523,28 +1841,24 @@ export class TablePanel {
         return;
       }
 
-      executionPossible = true;
       await this.presentOrExecuteMutationPreview(
-        this.previewController.createDeleteRowsPreview(operationId, plan),
+        this.previewController.createDeleteRowsPreview(operationId, {
+          ...plan,
+          ...attachmentScope,
+        }),
         preparedSnapshot,
       );
     } catch (err: unknown) {
-      const error = normalizeUnknownError(err);
+      const error = normalizeUnknownError(err, secretContext);
       this.postMessage("deleteResult", {
         operationId,
-        ...(executionPossible
-          ? buildDeleteResult(
-              primaryKeysList,
-              { affectedRows: 0 },
-              error.message,
-            )
-          : unattemptedDeleteResult(primaryKeysList, error.message)),
+        ...unattemptedDeleteResult(primaryKeysList, error.message),
       });
     }
   }
 
   private async _handleExport(
-    format: "csv" | "json",
+    format: DriverTableExportFormat,
     payload: ExportPayload | undefined,
   ): Promise<void> {
     const connectionGeneration = this.connectionGeneration;
@@ -1560,6 +1874,13 @@ export class TablePanel {
     const connectionType = this.connectionManager.getConnection(
       this.connectionId,
     )?.type;
+    const observedColumns =
+      connectionType === "dynamodb"
+        ? columnOrder?.flatMap((name) => {
+            const column = this.dynamoExportColumns.get(name);
+            return column ? [column] : [];
+          })
+        : undefined;
     const pageMayLackSnapshot =
       connectionType === "mysql" ||
       connectionType === "mssql" ||
@@ -1567,6 +1888,7 @@ export class TablePanel {
       connectionType === "redis" ||
       connectionType === "dynamodb";
     const exportDriver = this.connectionManager.getDriver(this.connectionId);
+    const secretContext = this.diagnosticContext();
     const usesElasticsearchPit =
       connectionType === "elasticsearch" &&
       (normalizedLimitToPage
@@ -1596,6 +1918,7 @@ export class TablePanel {
       : displayTable;
     const filterExpressions = coerceFilterExpressions(filters);
     const loadChunks = (signal: AbortSignal) => {
+      this.getSQLiteAttachmentScope();
       const assertSession = () => {
         signal.throwIfAborted();
         if (!this.isCurrentMutationSession(connectionGeneration)) {
@@ -1615,6 +1938,7 @@ export class TablePanel {
                 signal,
                 columnOrder,
                 assertSession,
+                format,
               )
             : this.svc.exportAll(
                 this.connectionId,
@@ -1626,9 +1950,11 @@ export class TablePanel {
                 filterExpressions,
                 signal,
                 columnOrder,
+                format,
               ),
           columnOrder,
           assertSession,
+          observedColumns,
         ),
         assertSession,
       );
@@ -1639,6 +1965,7 @@ export class TablePanel {
         fileName,
         loadChunks,
         context: this.context,
+        secretContext,
       });
       return;
     }
@@ -1647,6 +1974,7 @@ export class TablePanel {
       fileName,
       loadChunks,
       context: this.context,
+      secretContext,
     });
   }
 
@@ -1667,6 +1995,7 @@ export class TablePanel {
     chunks: AsyncIterable<ChunkedExportData>,
     columnOrder: string[] | undefined,
     assertSession: () => void,
+    observedColumns: readonly ColumnTypeMeta[] = [],
   ): AsyncIterable<ChunkedExportData> {
     if (!columnOrder) {
       yield* chunks;
@@ -1688,12 +2017,20 @@ export class TablePanel {
         `Export schema metadata unavailable: ${this.schemaRefreshError}`,
       );
     }
+    const schemaColumns = this.schemaSnapshot.columns;
     const knownColumns = new Map<string, ChunkedExportData["columns"][number]>(
-      this.schemaSnapshot.columns.map((column) => [column.name, column]),
+      schemaColumns.map((column) => [column.name, column]),
+    );
+    const sparseColumns = new Map(
+      observedColumns
+        .filter((column) => !knownColumns.has(column.name))
+        .map((column) => [column.name, column]),
     );
 
     for await (const chunk of chunks) {
-      for (const column of chunk.columns) knownColumns.set(column.name, column);
+      for (const column of chunk.columns) {
+        knownColumns.set(column.name, column);
+      }
       const sourceColumnIndexByName = new Map(
         chunk.columns.map((column, index) => [column.name, index]),
       );
@@ -1703,7 +2040,9 @@ export class TablePanel {
         ),
       );
       const reorderedColumns = columnOrder.map((name) => {
-        const column = knownColumns.get(name);
+        // DynamoDB exports native AttributeValue envelopes even when a sparse
+        // field is absent or has a different inferred type in another chunk.
+        const column = sparseColumns.get(name) ?? knownColumns.get(name);
         if (!column) {
           throw new Error(
             `Unknown export column "${name}". Refresh table metadata and retry.`,
@@ -1748,6 +2087,7 @@ export class TablePanel {
     signal: AbortSignal,
     selectedColumns?: readonly string[],
     assertSession?: () => void,
+    format?: DriverTableExportFormat,
   ): AsyncGenerator<DriverTableExportChunk> {
     assertSession?.();
     signal.throwIfAborted();
@@ -1766,7 +2106,8 @@ export class TablePanel {
     )) {
       assertSession?.();
       signal.throwIfAborted();
-      yield driver?.formatTableExportChunk?.(chunk, selectedColumns) ?? chunk;
+      yield driver?.formatTableExportChunk?.(chunk, selectedColumns, format) ??
+        chunk;
     }
   }
 
@@ -1808,7 +2149,16 @@ export class TablePanel {
     } catch {
       this.previewSchemas.delete(payload.previewToken);
       this.previewController.cancel(payload.previewToken, payload.operationId);
-      await this.postSchemaConflict(payload.operationId, schema.kind);
+      if (this.schemaRefreshError === SQLITE_ATTACHMENT_CHANGED) {
+        const { type, payload: result } = notExecutedMutationResult(
+          payload.operationId,
+          schema.kind,
+          SQLITE_ATTACHMENT_CHANGED,
+        );
+        await this.postMessage(type, result);
+      } else {
+        await this.postSchemaConflict(payload.operationId, schema.kind);
+      }
       return;
     }
     if (!this.isCurrentMutationSession(schema.snapshot.connectionGeneration)) {
@@ -1827,24 +2177,71 @@ export class TablePanel {
       return;
     }
     this.previewSchemas.delete(payload.previewToken);
+    const { operationId } = payload;
+    const secretContext = this.diagnosticContext();
     let result:
       | Awaited<ReturnType<TableMutationPreviewController["confirm"]>>
       | undefined;
     try {
       result = await this.previewController.confirm(
         payload.previewToken,
-        payload.operationId,
+        operationId,
+        () => this.deleteOperations.set(operationId, "executing"),
       );
+    } catch (error: unknown) {
+      if (this.deleteOperations.get(operationId) !== "executing") throw error;
+      result = {
+        type: "deleteResult",
+        payload: {
+          operationId,
+          success: false,
+          affectedRows: 0,
+          rowOutcomes: [],
+          changesPossible: true,
+          outcomeUnknown: true,
+          error: normalizeUnknownError(error, secretContext).message,
+        },
+      };
     } finally {
-      const operation = this.previewOperations.get(payload.operationId);
+      const operation = this.previewOperations.get(operationId);
       if (operation && result !== null) operation.executed = true;
     }
     if (!result) {
-      await this.postPreviewUnavailable(payload.operationId);
+      await this.postPreviewUnavailable(operationId);
       return;
     }
 
-    await this.postMessage(result.type, result.payload);
+    // Post-mutation reads (including verification of an uncertain write) must
+    // not read from a PIT opened before the write.
+    if (
+      result.payload.success ||
+      result.payload.changesPossible ||
+      result.payload.outcomeUnknown ||
+      (result.type === "applyResult" && result.payload.insertApplied)
+    ) {
+      this.resetBrowsingSnapshot();
+    }
+    if (result.type === "deleteResult" && !this.disposed) {
+      // A verification request must not join a page read started before the
+      // delete settled.
+      this.inFlightPageRequests.clear();
+      this.deleteOperations.set(
+        operationId,
+        result.payload.changesPossible || result.payload.outcomeUnknown
+          ? "recovery"
+          : "replying",
+      );
+    }
+    try {
+      await this.postMessage(
+        result.type,
+        redactMutationDiagnostics(result.payload, secretContext),
+      );
+    } finally {
+      if (this.deleteOperations.get(operationId) === "replying") {
+        this.deleteOperations.delete(operationId);
+      }
+    }
   }
 
   private _handleCancelMutationPreview(payload: {

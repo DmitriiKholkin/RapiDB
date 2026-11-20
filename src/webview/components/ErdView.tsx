@@ -14,8 +14,8 @@ import {
   type NodeProps,
   Position,
   ReactFlow,
-  type ReactFlowInstance,
   useReactFlow,
+  type Viewport,
 } from "@xyflow/react";
 import React, {
   useCallback,
@@ -26,8 +26,10 @@ import React, {
 } from "react";
 import "../xyflow.css";
 import { formatPrimaryKeyBadgeLabel } from "../../shared/tableTypes";
-import type { ErdGraph } from "../../shared/webviewContracts";
+import { type ErdGraph, isRecord } from "../../shared/webviewContracts";
+import { formatErdDiscoveryNotice } from "../../shared/webviewContracts/erd";
 import { onMessage, postMessage } from "../utils/messaging";
+import { isArrayOf, isString } from "../utils/replyShape";
 import { readWebviewState, updateWebviewState } from "../utils/vscodeState";
 import { GridLoadingOverlay } from "./GridOverlay";
 
@@ -37,22 +39,83 @@ interface ErdGraphMessage {
   loadedAt: string;
 }
 
+const INVALID_ERD_REPLY =
+  "The host returned an invalid ERD reply. Reload to try again.";
+
+function isErdGraphMessage(
+  payload: Record<string, unknown>,
+): payload is Record<string, unknown> & ErdGraphMessage {
+  const { graph } = payload;
+  return (
+    typeof payload.fromCache === "boolean" &&
+    typeof payload.loadedAt === "string" &&
+    isRecord(graph) &&
+    isRecord(graph.scope) &&
+    isArrayOf(graph.nodes, isRecord) &&
+    graph.nodes.every(
+      (node) =>
+        typeof node.id === "string" &&
+        typeof node.database === "string" &&
+        typeof node.schema === "string" &&
+        typeof node.table === "string" &&
+        isRecord(node.position) &&
+        Number.isFinite(node.position.x) &&
+        Number.isFinite(node.position.y) &&
+        isArrayOf(node.columns, isRecord) &&
+        node.columns.every(
+          (column) =>
+            typeof column.name === "string" && typeof column.type === "string",
+        ),
+    ) &&
+    isArrayOf(graph.edges, isRecord) &&
+    graph.edges.every(
+      (edge) =>
+        typeof edge.id === "string" &&
+        typeof edge.fromTableId === "string" &&
+        typeof edge.toTableId === "string" &&
+        typeof edge.fromColumn === "string" &&
+        typeof edge.toColumn === "string",
+    ) &&
+    (graph.omittedTables === undefined ||
+      isArrayOf(graph.omittedTables, isRecord)) &&
+    (graph.discoveryTruncated === undefined ||
+      graph.discoveryTruncated === "redis-prefixes" ||
+      graph.discoveryTruncated === "objects") &&
+    (graph.externalReferences === undefined ||
+      (isArrayOf(graph.externalReferences, isRecord) &&
+        graph.externalReferences.every(
+          (reference) =>
+            isArrayOf(reference.fromColumns, isString) &&
+            isArrayOf(reference.columns, isString),
+        )))
+  );
+}
+
 interface Props {
   connectionId: string;
   database?: string;
   schema?: string;
 }
 
+type NodePosition = ErdGraph["nodes"][number]["position"];
+type NodePositions = Record<string, NodePosition>;
+
+interface LayoutOverrides {
+  pinnedPositions: NodePositions;
+  legacyPositions: NodePositions;
+}
+
 interface ErdViewState {
   search?: string;
   hideUnmatched?: boolean;
   hideIsolated?: boolean;
-  viewport?: {
-    x: number;
-    y: number;
-    zoom: number;
-  };
-  nodePositions?: Record<string, { x: number; y: number }>;
+  viewport?: Viewport;
+}
+
+interface ErdWebviewState extends ErdViewState {
+  initialState?: Props & { view: string };
+  nodePositions?: NodePositions;
+  erdView?: ErdViewState & LayoutOverrides & { scopeKey: string };
 }
 
 interface TableNodeData extends Record<string, unknown> {
@@ -75,19 +138,64 @@ type ErdFlowEdge = Edge<{
 const CARD_WIDTH = 320;
 const HEADER_HEIGHT = 60;
 const COLUMN_ROW_HEIGHT = 20;
+const PIN_CLEARANCE = 16;
 const LOD_ZOOM_THRESHOLD_FULL = 0.3;
 const reactFlowProOptions = { hideAttribution: true };
 const reactFlowFitViewOptions = { padding: 0.2 };
 
 type LODLevel = "full" | "placeholder";
 
-const persistedState = (): ErdViewState => {
-  return readWebviewState<ErdViewState>({});
-};
+function erdScopeKey({ connectionId, database, schema }: Props): string {
+  return JSON.stringify([
+    connectionId.trim(),
+    database || null,
+    schema || null,
+  ]);
+}
 
-const persistState = (state: ErdViewState): void => {
-  updateWebviewState((current) => ({ ...current, ...state }));
-};
+function persistedState(scopeKey: string): ErdViewState & LayoutOverrides {
+  const state = readWebviewState<ErdWebviewState>({});
+  const empty = { pinnedPositions: {}, legacyPositions: {} };
+  if (state.erdView) {
+    return state.erdView.scopeKey === scopeKey
+      ? {
+          ...state.erdView,
+          pinnedPositions: state.erdView.pinnedPositions ?? {},
+          legacyPositions: state.erdView.legacyPositions ?? {},
+        }
+      : empty;
+  }
+  if (
+    state.initialState &&
+    (state.initialState.view !== "erd" ||
+      typeof state.initialState.connectionId !== "string" ||
+      erdScopeKey(state.initialState) !== scopeKey)
+  ) {
+    return empty;
+  }
+
+  // Older panel snapshots stored automatic and user positions together.
+  // Keep them as separate compatibility anchors: even a point matching Dagre
+  // could be intentional, and a different point might be from an older graph.
+  const { search, hideUnmatched, hideIsolated, viewport, nodePositions } =
+    state;
+  return {
+    search,
+    hideUnmatched,
+    hideIsolated,
+    viewport,
+    pinnedPositions: {},
+    legacyPositions: nodePositions ?? {},
+  };
+}
+
+function isNodePosition(position: unknown): position is NodePosition {
+  return (
+    isRecord(position) &&
+    Number.isFinite(position.x) &&
+    Number.isFinite(position.y)
+  );
+}
 
 function matchesSearch(
   node: ErdGraph["nodes"][number],
@@ -167,6 +275,9 @@ function buildGraphNotices(graph: ErdGraph | null): string[] {
   }
 
   const notices: string[] = [];
+  if (graph.discoveryTruncated) {
+    notices.push(formatErdDiscoveryNotice(graph.discoveryTruncated));
+  }
   const omittedTables = graph.omittedTables ?? [];
   if (omittedTables.length > 0) {
     notices.push(
@@ -207,33 +318,85 @@ function buildGraphNotices(graph: ErdGraph | null): string[] {
   return notices;
 }
 
-function mergeNodePositions(
-  graph: ErdGraph,
-  savedPositions: NonNullable<ErdViewState["nodePositions"]>,
-  visibleNodes: ErdFlowNode[],
-  layoutPositions?: Map<string, { x: number; y: number }>,
-): NonNullable<ErdViewState["nodePositions"]> {
-  const visiblePositions = new Map(
-    visibleNodes.map((node) => [node.id, node.position]),
-  );
+function retainPositions(
+  nodes: ErdGraph["nodes"],
+  saved: NodePositions,
+): NodePositions {
   return Object.fromEntries(
-    graph.nodes.map((node) => [
-      node.id,
-      visiblePositions.get(node.id) ??
-        savedPositions[node.id] ??
-        layoutPositions?.get(node.id) ??
-        node.position,
-    ]),
+    nodes.flatMap(({ id }) => {
+      const position = saved[id];
+      return isNodePosition(position) ? [[id, position]] : [];
+    }),
   );
+}
+
+interface NodeRect extends NodePosition {
+  height: number;
+}
+
+function hasHorizontalConflict(a: number, b: number): boolean {
+  return Math.abs(a - b) < CARD_WIDTH + PIN_CLEARANCE;
+}
+
+function reflowAroundAnchors(
+  positions: Map<string, NodePosition>,
+  heights: Map<string, number>,
+  anchors: NodePositions,
+): void {
+  const anchoredRects = Object.entries(anchors).map(([id, position]) => ({
+    ...position,
+    height: heights.get(id) ?? 220,
+  }));
+  if (anchoredRects.length === 0) return;
+
+  const occupied: NodeRect[] = [...anchoredRects];
+  const displaced: Array<[string, NodeRect]> = [];
+  for (const [id, preferred] of positions) {
+    if (Object.hasOwn(anchors, id)) {
+      positions.set(id, anchors[id]);
+      continue;
+    }
+    const rect = { ...preferred, height: heights.get(id) ?? 220 };
+    const blocked = anchoredRects.some(
+      (anchor) =>
+        hasHorizontalConflict(rect.x, anchor.x) &&
+        rect.y + rect.height + PIN_CLEARANCE > anchor.y &&
+        anchor.y + anchor.height + PIN_CLEARANCE > rect.y,
+    );
+    if (blocked) {
+      displaced.push([id, rect]);
+    } else {
+      occupied.push(rect);
+    }
+  }
+  if (displaced.length === 0) return;
+
+  // Leave unaffected Dagre slots alone. For a blocked slot, scan down its
+  // column to the first free position, reserving that slot before the next one.
+  occupied.sort((a, b) => a.y - b.y);
+  for (const [id, { x, y: preferredY, height }] of displaced) {
+    let y = preferredY;
+    for (const rect of occupied) {
+      if (y + height + PIN_CLEARANCE <= rect.y) break;
+      if (hasHorizontalConflict(x, rect.x)) {
+        y = Math.max(y, rect.y + rect.height + PIN_CLEARANCE);
+      }
+    }
+    const insertion = occupied.findIndex((rect) => rect.y > y);
+    occupied.splice(insertion === -1 ? occupied.length : insertion, 0, {
+      x,
+      y,
+      height,
+    });
+    positions.set(id, { x, y });
+  }
 }
 
 function layoutGraph(
   nodes: ErdGraph["nodes"],
   edges: ErdGraph["edges"],
-): {
-  positions: Map<string, { x: number; y: number }>;
-  heights: Map<string, number>;
-} {
+  anchors: NodePositions,
+): Map<string, NodePosition> {
   const heights = new Map<string, number>();
   for (const node of nodes) {
     const height = computeNodeHeight(node);
@@ -398,10 +561,8 @@ function layoutGraph(
     rowHeight = Math.max(rowHeight, component.height);
   }
 
-  return {
-    positions,
-    heights,
-  };
+  reflowAroundAnchors(positions, heights, anchors);
+  return positions;
 }
 
 const TableNode = React.memo(function TableNode({
@@ -965,16 +1126,23 @@ const ErdControls = React.memo(function ErdControls(): React.JSX.Element {
 
 ErdControls.displayName = "ErdControls";
 
-export function ErdView({
-  connectionId: _connectionId,
-}: Props): React.JSX.Element {
-  const initialState = useMemo(() => persistedState(), []);
-  const [graph, setGraph] = useState<ErdGraph | null>(null);
+export function ErdView(props: Props): React.JSX.Element {
+  const scopeKey = erdScopeKey(props);
+  return <ScopedErdView key={scopeKey} scopeKey={scopeKey} />;
+}
+
+function ScopedErdView({ scopeKey }: { scopeKey: string }): React.JSX.Element {
+  const [initialState] = useState(() => persistedState(scopeKey));
+  const [diagram, setDiagram] = useState<{
+    graph: ErdGraph;
+    positions: Map<string, NodePosition>;
+  } | null>(null);
+  const graph = diagram?.graph ?? null;
+  const layoutPositions = diagram?.positions;
+  const hasCommittedGraph = diagram !== null;
   const [loading, setLoading] = useState(true);
-  const [hasCommittedGraph, setHasCommittedGraph] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fromCache, setFromCache] = useState(false);
-  const [loadedAt, setLoadedAt] = useState<string | null>(null);
   const [search, setSearch] = useState(initialState.search ?? "");
   const [hideUnmatched, setHideUnmatched] = useState(
     initialState.hideUnmatched ?? false,
@@ -982,88 +1150,116 @@ export function ErdView({
   const [hideIsolated, setHideIsolated] = useState(
     initialState.hideIsolated ?? false,
   );
-  const [manualPositions, setManualPositions] = useState<
-    Record<string, { x: number; y: number }>
-  >(initialState.nodePositions ?? {});
-  const [reactFlowApi, setReactFlowApi] = useState<ReactFlowInstance<
-    ErdFlowNode,
-    ErdFlowEdge
-  > | null>(null);
   const [flowNodes, setFlowNodes] = useState<ErdFlowNode[]>([]);
   const [lodLevel, setLodLevel] = useState<LODLevel>(() =>
     getLODLevel(initialState.viewport?.zoom ?? 1),
   );
 
-  const hasRestoredViewportRef = useRef(false);
-  const graphRef = useRef<ErdGraph | null>(null);
+  const latestLoadIdRef = useRef(0);
+  const activeLoadIdRef = useRef<number | null>(null);
   const viewportRef = useRef(initialState.viewport);
-  const reactFlowApiRef = useRef<ReactFlowInstance<
-    ErdFlowNode,
-    ErdFlowEdge
-  > | null>(null);
   const flowNodesRef = useRef<ErdFlowNode[]>([]);
-  const manualPositionsRef = useRef(manualPositions);
-  const searchRef = useRef(search);
-  const hideUnmatchedRef = useRef(hideUnmatched);
-  const hideIsolatedRef = useRef(hideIsolated);
+  const overridesRef = useRef<LayoutOverrides>({
+    pinnedPositions: initialState.pinnedPositions,
+    legacyPositions: initialState.legacyPositions,
+  });
+  const filterStateRef = useRef({ search, hideUnmatched, hideIsolated });
   const lodLevelRef = useRef(lodLevel);
 
   const normalizedSearch = search.trim().toLowerCase();
   const shouldHideUnmatched = hideUnmatched && Boolean(normalizedSearch);
 
-  const updateManualPositions = useCallback(
-    (positions: NonNullable<ErdViewState["nodePositions"]>) => {
-      manualPositionsRef.current = positions;
-      setManualPositions(positions);
-    },
-    [],
-  );
+  const saveViewState = useCallback(() => {
+    updateWebviewState((current) => {
+      const next: Record<string, unknown> = {
+        ...current,
+        erdView: {
+          scopeKey,
+          ...filterStateRef.current,
+          ...overridesRef.current,
+          viewport: viewportRef.current,
+        },
+      };
+      delete next.nodePositions;
+      return next;
+    });
+  }, [scopeKey]);
 
   useEffect(() => {
-    searchRef.current = search;
-  }, [search]);
-
-  useEffect(() => {
-    hideUnmatchedRef.current = hideUnmatched;
-  }, [hideUnmatched]);
-
-  useEffect(() => {
-    hideIsolatedRef.current = hideIsolated;
-  }, [hideIsolated]);
+    filterStateRef.current = { search, hideUnmatched, hideIsolated };
+    saveViewState();
+  }, [hideIsolated, hideUnmatched, saveViewState, search]);
 
   useEffect(() => {
     lodLevelRef.current = lodLevel;
   }, [lodLevel]);
 
   useEffect(() => {
-    const unGraph = onMessage<ErdGraphMessage>("erdGraph", (payload) => {
-      const fullLayout = layoutGraph(payload.graph.nodes, payload.graph.edges);
-      const positions = mergeNodePositions(
-        payload.graph,
-        manualPositionsRef.current,
-        flowNodesRef.current,
-        fullLayout.positions,
-      );
-      graphRef.current = payload.graph;
-      const nodeIds = new Set(payload.graph.nodes.map((node) => node.id));
-      flowNodesRef.current = flowNodesRef.current.filter((node) =>
-        nodeIds.has(node.id),
-      );
-      updateManualPositions(positions);
-      setGraph(payload.graph);
-      setFromCache(payload.fromCache);
-      setLoadedAt(payload.loadedAt);
+    const isCurrentReply = (
+      payload: unknown,
+    ): payload is Record<string, unknown> =>
+      isRecord(payload) &&
+      activeLoadIdRef.current !== null &&
+      payload.loadId === activeLoadIdRef.current;
+    const finishError = (message: string) => {
+      activeLoadIdRef.current = null;
+      setError(message);
       setLoading(false);
-      setHasCommittedGraph(true);
+    };
+
+    const unGraph = onMessage<unknown>("erdGraph", (payload) => {
+      if (!isCurrentReply(payload)) return;
+      if (!isErdGraphMessage(payload)) {
+        finishError(INVALID_ERD_REPLY);
+        return;
+      }
+      const { graph: nextGraph } = payload;
+      const { pinnedPositions, legacyPositions } = overridesRef.current;
+      const nextOverrides = {
+        pinnedPositions: retainPositions(nextGraph.nodes, pinnedPositions),
+        legacyPositions: retainPositions(nextGraph.nodes, legacyPositions),
+      };
+      let positions: Map<string, NodePosition>;
+      try {
+        positions = layoutGraph(nextGraph.nodes, nextGraph.edges, {
+          ...nextOverrides.legacyPositions,
+          ...nextOverrides.pinnedPositions,
+        });
+      } catch {
+        finishError(INVALID_ERD_REPLY);
+        return;
+      }
+      activeLoadIdRef.current = null;
+      flowNodesRef.current = flowNodesRef.current.filter((node) =>
+        positions.has(node.id),
+      );
+      overridesRef.current = nextOverrides;
+      saveViewState();
+      setDiagram({ graph: nextGraph, positions });
+      setFromCache(payload.fromCache);
+      setLoading(false);
       setError(null);
     });
 
-    const unError = onMessage<{ error: string }>("erdError", (payload) => {
-      setError(payload.error);
-      setLoading(false);
+    const unError = onMessage<unknown>("erdError", (payload) => {
+      if (!isCurrentReply(payload)) return;
+      finishError(
+        typeof payload.error === "string" && payload.error.trim()
+          ? payload.error
+          : INVALID_ERD_REPLY,
+      );
     });
 
-    const unLoading = onMessage<{ forceReload?: boolean }>("erdLoading", () => {
+    const unLoading = onMessage<unknown>("erdLoading", (payload) => {
+      if (
+        !isRecord(payload) ||
+        typeof payload.loadId !== "number" ||
+        !Number.isSafeInteger(payload.loadId) ||
+        payload.loadId <= latestLoadIdRef.current
+      )
+        return;
+      latestLoadIdRef.current = payload.loadId;
+      activeLoadIdRef.current = payload.loadId;
       setError(null);
       setLoading(true);
     });
@@ -1075,18 +1271,7 @@ export function ErdView({
       unError();
       unLoading();
     };
-  }, [updateManualPositions]);
-
-  useEffect(() => {
-    const nextState: ErdViewState = {
-      search,
-      hideUnmatched,
-      hideIsolated,
-      viewport: viewportRef.current,
-      nodePositions: manualPositions,
-    };
-    persistState(nextState);
-  }, [hideIsolated, hideUnmatched, manualPositions, search]);
+  }, [saveViewState]);
 
   const connectedNodeIds = useMemo(() => {
     if (!graph) {
@@ -1179,12 +1364,10 @@ export function ErdView({
     return visibleGraph.nodes.map((node) => {
       const isDimmed =
         Boolean(normalizedSearch) && !focusedNodeIds.has(node.id);
-      const manualPosition = manualPositions[node.id];
-
       return {
         id: node.id,
         type: "tableNode",
-        position: manualPosition ?? node.position,
+        position: layoutPositions?.get(node.id) ?? node.position,
         data: {
           node,
           isDimmed,
@@ -1195,7 +1378,7 @@ export function ErdView({
     });
   }, [
     focusedNodeIds,
-    manualPositions,
+    layoutPositions,
     normalizedSearch,
     openData,
     lodLevel,
@@ -1203,12 +1386,19 @@ export function ErdView({
   ]);
 
   useEffect(() => {
-    const livePositions = new Map(
-      flowNodesRef.current.map((node) => [node.id, node.position]),
+    const draggingIds = new Set(
+      flowNodesRef.current
+        .filter((node) => node.dragging)
+        .map((node) => node.id),
     );
+    const { pinnedPositions } = overridesRef.current;
     const nodes = preparedFlowNodes.map((node) => ({
       ...node,
-      position: livePositions.get(node.id) ?? node.position,
+      dragging: draggingIds.has(node.id),
+      // A user move may have landed between the graph reply and this effect.
+      position: Object.hasOwn(pinnedPositions, node.id)
+        ? pinnedPositions[node.id]
+        : node.position,
     }));
     flowNodesRef.current = nodes;
     setFlowNodes(nodes);
@@ -1247,90 +1437,78 @@ export function ErdView({
     });
   }, [focusedNodeIds, normalizedSearch, visibleGraph.edges]);
 
-  useEffect(() => {
-    if (!loadedAt || !reactFlowApi || loading || flowNodes.length === 0) {
-      return;
-    }
-
-    if (!hasRestoredViewportRef.current && viewportRef.current) {
-      reactFlowApi.setViewport(viewportRef.current, { duration: 0 });
-      hasRestoredViewportRef.current = true;
-      return;
-    }
-
-    reactFlowApi.fitView({ padding: 0.2, duration: 220 });
-    hasRestoredViewportRef.current = true;
-  }, [flowNodes.length, loadedAt, loading, reactFlowApi]);
-
   const handleReload = useCallback(() => {
     postMessage("reload");
   }, []);
 
   const handleNodesChange = useCallback(
     (changes: NodeChange<ErdFlowNode>[]) => {
-      const nodes = applyNodeChanges(changes, flowNodesRef.current);
+      const previous = flowNodesRef.current;
+      const nodes = applyNodeChanges(changes, previous);
       flowNodesRef.current = nodes;
       setFlowNodes(nodes);
-    },
-    [],
-  );
 
-  const handleInit = useCallback(
-    (instance: ReactFlowInstance<ErdFlowNode, ErdFlowEdge>) => {
-      reactFlowApiRef.current = instance;
-      setReactFlowApi(instance);
+      // In this read-only, flat flow, position changes come from user movement.
+      // Measurement/selection changes and viewport changes must not pin cards.
+      const moved = new Map<string, NodePosition>();
+      let finishedMove = false;
+      const { pinnedPositions, legacyPositions } = overridesRef.current;
+      for (const change of changes) {
+        if (change.type !== "position") continue;
+        const oldPosition = previous.find(
+          (node) => node.id === change.id,
+        )?.position;
+        const position = change.position;
+        if (!oldPosition || !isNodePosition(position)) continue;
+        const didMove =
+          position.x !== oldPosition.x || position.y !== oldPosition.y;
+        if (didMove) {
+          moved.set(change.id, { ...position });
+        }
+        if (
+          change.dragging !== true &&
+          (didMove || Object.hasOwn(pinnedPositions, change.id))
+        ) {
+          finishedMove = true;
+        }
+      }
+      if (moved.size > 0) {
+        const nextLegacy = { ...legacyPositions };
+        for (const id of moved.keys()) delete nextLegacy[id];
+        overridesRef.current = {
+          pinnedPositions: { ...pinnedPositions, ...Object.fromEntries(moved) },
+          legacyPositions: nextLegacy,
+        };
+      }
+      if (finishedMove) saveViewState();
     },
-    [],
+    [saveViewState],
   );
 
   const handleNodeDragStop = useCallback(
     (_event: React.MouseEvent | MouseEvent, node: ErdFlowNode) => {
-      if (!graphRef.current?.nodes.some((item) => item.id === node.id)) {
-        return;
-      }
-      flowNodesRef.current = flowNodesRef.current.map((item) =>
-        item.id === node.id ? { ...item, position: node.position } : item,
-      );
-      updateManualPositions({
-        ...manualPositionsRef.current,
-        [node.id]: {
-          x: node.position.x,
-          y: node.position.y,
+      handleNodesChange([
+        {
+          type: "position",
+          id: node.id,
+          position: node.position,
+          dragging: false,
         },
-      });
+      ]);
     },
-    [updateManualPositions],
+    [handleNodesChange],
   );
 
-  const handleMoveEnd = useCallback(() => {
-    const instance = reactFlowApiRef.current;
-    const currentGraph = graphRef.current;
-    if (!instance || !currentGraph) {
-      return;
-    }
-
-    const viewport = instance.getViewport();
-    viewportRef.current = viewport;
-    const nodePositions = mergeNodePositions(
-      currentGraph,
-      manualPositionsRef.current,
-      flowNodesRef.current,
-    );
-    updateManualPositions(nodePositions);
-    persistState({
-      search: searchRef.current,
-      hideUnmatched: hideUnmatchedRef.current,
-      hideIsolated: hideIsolatedRef.current,
-      nodePositions,
-      viewport,
-    });
-  }, [updateManualPositions]);
+  const handleMoveEnd = useCallback(
+    (_event: MouseEvent | TouchEvent | null, viewport: Viewport) => {
+      viewportRef.current = viewport;
+      saveViewState();
+    },
+    [saveViewState],
+  );
 
   const handleMove = useCallback(
-    (
-      _event: MouseEvent | TouchEvent | null,
-      viewport: { x: number; y: number; zoom: number },
-    ) => {
+    (_event: MouseEvent | TouchEvent | null, viewport: Viewport) => {
       const nextLodLevel = getLODLevel(viewport.zoom);
       if (nextLodLevel !== lodLevelRef.current) {
         lodLevelRef.current = nextLodLevel;
@@ -1583,11 +1761,13 @@ export function ErdView({
               zoomOnPinch
               elementsSelectable={false}
               onNodesChange={handleNodesChange}
-              onInit={handleInit}
               onNodeDragStop={handleNodeDragStop}
               onMove={handleMove}
               onMoveEnd={handleMoveEnd}
-              fitView
+              defaultViewport={viewportRef.current}
+              // Only fit a fresh canvas. A reload or filter change should not
+              // move the user's camera while the scene is laid out again.
+              fitView={!viewportRef.current}
               fitViewOptions={reactFlowFitViewOptions}
               minZoom={0.1}
               maxZoom={2}

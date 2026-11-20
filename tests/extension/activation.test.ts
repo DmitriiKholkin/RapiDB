@@ -132,6 +132,8 @@ describe("extension activation", () => {
       clearBookmarks: vi.fn(),
       clearHistory: vi.fn(),
       getDriver: vi.fn(),
+      getConnectedDriverSessionKey: vi.fn(() => "source-session"),
+      initializeConnectionCredentialRevision: vi.fn(() => undefined),
     };
 
     function ConnectionManagerMock() {
@@ -550,12 +552,20 @@ describe("extension activation", () => {
     const openHistoryCommand = vscodeState.registerCommand.mock.calls.find(
       ([command]) => command === "rapidb.openHistoryEntry",
     )?.[1] as
-      | ((entry: { connectionId?: string; sql?: string }) => void)
+      | ((entry: {
+          connectionId?: string;
+          sql?: string;
+          postgresDatabase?: string;
+        }) => void)
       | undefined;
     const openBookmarkCommand = vscodeState.registerCommand.mock.calls.find(
       ([command]) => command === "rapidb.openBookmarkEntry",
     )?.[1] as
-      | ((entry: { connectionId?: string; sql?: string }) => void)
+      | ((entry: {
+          connectionId?: string;
+          sql?: string;
+          postgresDatabase?: string;
+        }) => void)
       | undefined;
 
     if (!openHistoryCommand || !openBookmarkCommand) {
@@ -565,14 +575,24 @@ describe("extension activation", () => {
     openHistoryCommand({ connectionId: "conn-1", sql: "select 1" });
     openHistoryCommand({ connectionId: "", sql: "select ignored" });
     openBookmarkCommand({ connectionId: "conn-1", sql: "select 2" });
+    const scoped = {
+      connectionId: "conn-1",
+      sql: "select current_database()",
+      postgresDatabase: '  Case:"δοκιμή"  ',
+    };
+    openHistoryCommand(scoped);
+    openBookmarkCommand(scoped);
+    openHistoryCommand({ ...scoped, postgresDatabase: "" });
 
-    expect(queryPanelCreateOrShow).toHaveBeenCalledTimes(2);
+    expect(queryPanelCreateOrShow).toHaveBeenCalledTimes(4);
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       1,
       context,
       connectionManagerInstance,
       "conn-1",
       "select 1",
+      undefined,
+      undefined,
       undefined,
       undefined,
       undefined,
@@ -586,6 +606,35 @@ describe("extension activation", () => {
       true,
       false,
       true,
+      undefined,
+      undefined,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      3,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      scoped.sql,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      scoped.postgresDatabase,
+    );
+    expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
+      4,
+      context,
+      connectionManagerInstance,
+      "conn-1",
+      scoped.sql,
+      true,
+      false,
+      true,
+      undefined,
+      scoped.postgresDatabase,
+    );
+    expect(vscodeState.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("PostgreSQL database is invalid"),
     );
   });
 
@@ -963,6 +1012,10 @@ describe("extension activation", () => {
       'CREATE MATERIALIZED VIEW "public"."daily_users" AS SELECT 1;',
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       2,
@@ -970,6 +1023,12 @@ describe("extension activation", () => {
       connectionManagerInstance,
       "conn-1",
       'CREATE FUNCTION "public"."users_total" AS SELECT 1;',
+      false,
+      undefined,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       3,
@@ -977,6 +1036,12 @@ describe("extension activation", () => {
       connectionManagerInstance,
       "conn-1",
       'CREATE PROCEDURE "public"."refresh_users" AS SELECT 1;',
+      false,
+      undefined,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       4,
@@ -986,6 +1051,10 @@ describe("extension activation", () => {
       'CREATE SEQUENCE "public"."users_id_seq" START WITH 1;',
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       5,
@@ -995,6 +1064,10 @@ describe("extension activation", () => {
       'CREATE TYPE "public"."user_status" AS ENUM (\'active\');',
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
   });
 
@@ -1123,6 +1196,10 @@ describe("extension activation", () => {
       "ALTER TABLE users ADD CONSTRAINT pk_users PRIMARY KEY (id);",
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       2,
@@ -1132,6 +1209,10 @@ describe("extension activation", () => {
       "CREATE INDEX users_uid_idx ON users (uid);",
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       3,
@@ -1141,6 +1222,10 @@ describe("extension activation", () => {
       "CREATE TRIGGER users_audit AFTER INSERT ON users BEGIN SELECT 1; END;",
       true,
       true,
+      false,
+      undefined,
+      "app_db",
+      { connectionId: "conn-1", sessionKey: "source-session" },
     );
   });
 
@@ -1235,6 +1320,8 @@ describe("extension activation", () => {
       false,
       false,
       "javascript",
+      undefined,
+      { connectionId: "conn-mongo", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       2,
@@ -1246,6 +1333,8 @@ describe("extension activation", () => {
       false,
       false,
       "javascript",
+      undefined,
+      { connectionId: "conn-mongo", sessionKey: "source-session" },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       3,
@@ -1257,6 +1346,8 @@ describe("extension activation", () => {
       false,
       false,
       "plaintext",
+      undefined,
+      { connectionId: "conn-es", sessionKey: "source-session" },
     );
   });
 

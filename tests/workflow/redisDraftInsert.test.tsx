@@ -1,7 +1,10 @@
 import "./harness";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { createClient, RESP_TYPES } from "redis";
 import { describe, expect, it, vi } from "vitest";
+import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import {
   executePreparedApplyPlan,
@@ -166,14 +169,33 @@ async function withTable(
     context: WorkflowContext,
     session: BridgeSession,
   ) => Promise<void>,
+  withInsertDraft = true,
+  seedValues: Array<string | string[]> = [structured ? ["seed"] : "seed"],
 ) {
   vi.spyOn(logger, "error").mockReturnValue(new Error("logged"));
   const server = new InsertRespServer();
-  server.rows.set("drafts:seed", {
-    value: structured ? ["seed"] : "seed",
-    ttl: -1,
+  seedValues.forEach((value, index) => {
+    const key = index === 0 ? "drafts:seed" : `drafts:seed-${index}`;
+    server.rows.set(key, { value, ttl: -1 });
   });
-  const port = await server.listen();
+  try {
+    await withRedisGrid(
+      await server.listen(),
+      withInsertDraft,
+      (context, session) => run(server, context, session),
+    );
+  } finally {
+    await server.close();
+  }
+}
+
+async function withRedisGrid(
+  port: number,
+  withInsertDraft: boolean,
+  run: (context: WorkflowContext, session: BridgeSession) => Promise<void>,
+  table = "drafts",
+  seedKey: string | null = `${table}:seed`,
+) {
   const scenario = redisScenario();
   scenario.buildConnection = () => ({
     id: "redis-null-draft",
@@ -182,7 +204,7 @@ async function withTable(
     host: "127.0.0.1",
     port,
   });
-  scenario.tableFixture.table = "drafts";
+  scenario.tableFixture.table = table;
   const { bootstrapWorkflowContext } = await import("./workflowContext");
   delete window.__vscode;
   TablePanel.disposeAll();
@@ -197,24 +219,29 @@ async function withTable(
     await context.connect();
     context.store.setSkipTableMutationPreview(false);
     session = (await context.openTableViewer()).session;
-    await waitFor(() =>
-      expect(getBodyCell("key").textContent).toBe("drafts:seed"),
-    );
+    if (seedKey === null) {
+      await screen.findByText("No rows found");
+    } else {
+      await waitFor(() => expect(getBodyCell("key").textContent).toBe(seedKey));
+    }
     await waitFor(() =>
       expect(
         (screen.getByRole("button", { name: "Add Row" }) as HTMLButtonElement)
           .disabled,
       ).toBe(false),
     );
-    await session.user.click(screen.getByRole("button", { name: "Add Row" }));
-    await waitFor(() => expect(getBodyCell("key").textContent).toBe("DEFAULT"));
-    await editCell(session, "key", "drafts:new");
-    await run(server, context, session);
+    if (withInsertDraft) {
+      await session.user.click(screen.getByRole("button", { name: "Add Row" }));
+      await waitFor(() =>
+        expect(getBodyCell("key").textContent).toBe("DEFAULT"),
+      );
+      await editCell(session, "key", "drafts:new");
+    }
+    await run(context, session);
   } finally {
     session?.unmount();
     TablePanel.disposeAll();
     await context.dispose();
-    await server.close();
   }
 }
 
@@ -235,6 +262,41 @@ async function editCell(
   fireEvent.change(editor, { target: { value } });
   if (inline) fireEvent.keyDown(editor, { key: "Enter" });
   else await session.user.click(screen.getByRole("button", { name: "Apply" }));
+}
+
+async function pasteValues(session: BridgeSession, text: string) {
+  const clipboard = vi
+    .spyOn(workflowState, "readClipboard")
+    .mockResolvedValue(text);
+  try {
+    fireEvent.mouseDown(getBodyCell("value"), { button: 0 });
+    fireEvent.mouseUp(document);
+    fireEvent.paste(document.activeElement as HTMLElement);
+    await waitFor(() =>
+      expect(
+        session.hostMessages().find(({ type }) => type === "clipboardText"),
+      ).toMatchObject({ payload: { text } }),
+    );
+  } finally {
+    clipboard.mockRestore();
+  }
+}
+
+async function applyValueUpdate(session: BridgeSession) {
+  await session.user.click(
+    screen.getByRole("button", { name: "Apply Changes" }),
+  );
+  await session.user.click(
+    within(await screen.findByRole("dialog")).getByRole("button", {
+      name: "Apply Changes",
+    }),
+  );
+  await waitFor(() =>
+    expect(
+      session.hostMessages().find(({ type }) => type === "applyResult")
+        ?.payload,
+    ).toMatchObject({ success: true }),
+  );
 }
 
 async function apply(session: BridgeSession, expectedValues: object) {
@@ -281,6 +343,91 @@ async function apply(session: BridgeSession, expectedValues: object) {
     .filter((message) => message.type === "applyResult")
     .at(-1)?.payload as ApplyResultPayload;
 }
+
+describe("Redis first-key Table Viewer workflow", () => {
+  const key = "first:key";
+  const value = "first value";
+  const ttl = 120;
+
+  async function insertFirstKey(port: number) {
+    vi.spyOn(logger, "error").mockReturnValue(new Error("logged"));
+    await withRedisGrid(
+      port,
+      false,
+      async (context, session) => {
+        const driver = context.connectionManager.getDriver("redis-null-draft");
+        expect(await driver?.listObjects("db0", "")).toEqual([
+          { name: REDIS_ALL_KEYS_TABLE, schema: "", type: "table" },
+        ]);
+        await session.user.click(
+          screen.getByRole("button", { name: "Add Row" }),
+        );
+        await waitFor(() =>
+          expect(getBodyCell("key").textContent).toBe("DEFAULT"),
+        );
+        fireEvent.doubleClick(getBodyCell("type"));
+        expect(screen.queryByLabelText("Cell value")).toBeNull();
+        expect(screen.queryByLabelText("Cell data")).toBeNull();
+        await editCell(session, "key", key);
+        await editCell(session, "value", value);
+        await editCell(session, "ttl", String(ttl));
+        expect(
+          await apply(session, { key, value, ttl: String(ttl) }),
+        ).toMatchObject({
+          success: true,
+          insertApplied: true,
+        });
+        expect(
+          session
+            .hostMessages()
+            .find(({ type }) => type === "tableMutationPreview")?.payload,
+        ).toMatchObject({ sql: `SET "${key}" "${value}" "EX" "${ttl}" "NX"` });
+        await waitFor(() => {
+          expect(document.querySelector('td[data-row="-1"]')).toBeNull();
+          expect(getBodyCell("key").textContent).toBe(key);
+          expect(getBodyCell("value").textContent).toBe(value);
+          expect(getBodyCell("type").textContent).toBe("string");
+        });
+      },
+      REDIS_ALL_KEYS_TABLE,
+      null,
+    );
+  }
+
+  it("adds, previews, applies and reloads the first key in All keys over RESP", async () => {
+    const server = new InsertRespServer();
+    try {
+      await insertFirstKey(await server.listen());
+      expect(server.commands.filter(([command]) => command === "SET")).toEqual([
+        ["SET", key, value, "EX", String(ttl), "NX"],
+      ]);
+      expect(server.rows.get(key)).toEqual({ value, ttl });
+    } finally {
+      await server.close();
+    }
+  });
+
+  const livePort = process.env.RAPIDB_REDIS_EMPTY_GRID_AUDIT_PORT;
+  it.skipIf(!livePort)(
+    "adds the first key on a disposable Redis server",
+    async () => {
+      const port = Number(livePort);
+      const client = createClient({
+        socket: { host: "127.0.0.1", port, reconnectStrategy: false },
+      });
+      await client.connect();
+      try {
+        expect(await client.dbSize()).toBe(0);
+        await insertFirstKey(port);
+        expect(await client.dbSize()).toBe(1);
+        expect(await client.get(key)).toBe(value);
+        expect(await client.ttl(key)).toBeGreaterThan(0);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+});
 
 describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () => {
   it.each([
@@ -343,8 +490,9 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
     });
   });
 
-  it("serializes structured-dialog NULL and retains it after a host error for retry", async () => {
+  it("serializes cell-dialog NULL and retains it after a host error for retry", async () => {
     await withTable(true, async (server, _context, session) => {
+      await editCell(session, "value", "new string draft");
       fireEvent.doubleClick(getBodyCell("value"));
       expect(screen.getByLabelText("Cell data")).toBeTruthy();
       await session.user.click(screen.getByRole("button", { name: "NULL" }));
@@ -390,7 +538,7 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
         "db0",
         "",
         "drafts",
-        { key: "drafts:direct", value: NULL_SENTINEL, ttl: NULL_SENTINEL },
+        { key: "drafts:direct", value: null, ttl: null },
       );
       expect(plan.values).toEqual({
         key: "drafts:direct",
@@ -448,7 +596,7 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
         [
           {
             primaryKeys: { key },
-            changes: { [change]: NULL_SENTINEL },
+            changes: { [change]: null },
             originalValues: { value: original?.value },
           },
         ],
@@ -507,4 +655,200 @@ describe("B07 Redis draft NULL UI → host → real node-redis RESP wire", () =>
       }
     });
   });
+});
+
+describe("Redis value storage types in grid editing", () => {
+  it.each([
+    { input: "1,234", stored: "1,234", mixed: false },
+    { input: " +0007 ", stored: " +0007 ", mixed: false },
+    { input: "\n", stored: "", mixed: false },
+    { input: '"NULL"', stored: "NULL", mixed: false },
+    { input: "1,234", stored: "1,234", mixed: true },
+  ])("applies pasted $input as a literal Redis string (mixed=$mixed)", async ({
+    input,
+    stored,
+    mixed,
+  }) => {
+    await withTable(
+      false,
+      async (server, _context, session) => {
+        await pasteValues(session, input);
+        expect(getBodyCell("value").textContent).toBe(stored);
+        await applyValueUpdate(session);
+        expect(server.rows.get("drafts:seed")?.value).toBe(stored);
+        if (mixed)
+          expect(server.rows.get("drafts:seed-1")?.value).toEqual(["member"]);
+        expect(
+          server.commands
+            .filter(([command]) => command === "EVAL")
+            .map((args) => args[9]),
+        ).toEqual([JSON.stringify(stored)]);
+      },
+      false,
+      mixed ? ["2", ["member"]] : ["2"],
+    );
+  });
+
+  it("pastes a new Redis string without using the sampled decimal category", async () => {
+    await withTable(
+      false,
+      async (server, _context, session) => {
+        const value = " +01.20e+3 ";
+        await pasteValues(session, value);
+        expect(getBodyCell("value").textContent).toBe(value);
+        expect(
+          await apply(session, { key: "drafts:new", value }),
+        ).toMatchObject({ success: true, insertApplied: true });
+        expect(server.rows.get("drafts:new")?.value).toBe(value);
+      },
+      true,
+      ["1.25"],
+    );
+  });
+
+  it("edits JSON-looking Redis strings as text and keeps collections structured in a mixed sample", async () => {
+    await withTable(
+      false,
+      async (server, _context, session) => {
+        fireEvent.doubleClick(getBodyCell("value", 1));
+        expect(screen.getByText(/Structured array data in value/)).toBeTruthy();
+        expect(
+          (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+        ).toBe('[\n  "member"\n]');
+        await session.user.click(
+          screen.getByRole("button", { name: "Cancel" }),
+        );
+
+        const value = "  [not JSON]  ";
+        await editCell(session, "value", value);
+        expect(getBodyCell("value").textContent).toBe(value);
+        await applyValueUpdate(session);
+        expect(server.rows.get("drafts:seed")?.value).toBe(value);
+        expect(server.rows.get("drafts:seed-1")?.value).toEqual(["member"]);
+      },
+      false,
+      ['  ["looks structured"]  ', ["member"]],
+    );
+  });
+
+  const livePort = process.env.RAPIDB_REDIS_VALUE_PASTE_AUDIT_PORT;
+  it.skipIf(!livePort)(
+    "preserves exact Redis bytes after a real grid Paste and Apply",
+    async () => {
+      const port = Number(livePort);
+      const client = createClient({
+        socket: {
+          host: "127.0.0.1",
+          port,
+          reconnectStrategy: false,
+        },
+      });
+      await client.connect();
+      const table = `rapidb-value-paste-${randomUUID()}`;
+      const key = `${table}:seed`;
+      try {
+        await client.set(key, "2", { EX: 120 });
+        await withRedisGrid(
+          port,
+          false,
+          async (_context, session) => {
+            const text = " 1,234 ";
+            await pasteValues(session, text);
+            await applyValueUpdate(session);
+            const reader = client.withTypeMapping({
+              [RESP_TYPES.BLOB_STRING]: Buffer,
+            });
+            expect(await reader.get(key)).toEqual(Buffer.from(text));
+          },
+          table,
+        );
+      } finally {
+        await client.del(key).finally(() => client.close());
+      }
+    },
+  );
+});
+
+it.each([
+  "changed",
+  "deleted",
+] as const)("refreshes the Redis table after a confirmed conflict without writing again (%s)", async (conflict) => {
+  await withTable(
+    false,
+    async (server, _context, session) => {
+      await editCell(session, "value", "my draft");
+      await session.user.click(
+        screen.getByRole("button", { name: "Apply Changes" }),
+      );
+      const dialog = await screen.findByRole("dialog");
+      if (conflict === "changed") {
+        server.rows.set("drafts:seed", { value: "external edit", ttl: -1 });
+      } else {
+        server.rows.delete("drafts:seed");
+        server.rows.set("drafts:replacement", {
+          value: "different key",
+          ttl: -1,
+        });
+      }
+      await session.user.click(
+        within(dialog).getByRole("button", { name: "Apply Changes" }),
+      );
+      await waitFor(() =>
+        expect(
+          session.hostMessages().find(({ type }) => type === "applyResult")
+            ?.payload,
+        ).toMatchObject({
+          success: false,
+          changesPossible: false,
+          outcomeUnknown: false,
+          conflictRows: [0],
+          error: expect.stringContaining(
+            conflict === "changed"
+              ? "Redis value changed"
+              : "changed after they were loaded",
+          ),
+        }),
+      );
+
+      await session.user.click(
+        screen.getByRole("button", { name: /^Refresh/ }),
+      );
+      const current =
+        conflict === "changed" ? "external edit" : "different key";
+      await waitFor(() =>
+        expect(getBodyCell("value").textContent).toBe(current),
+      );
+      expect(screen.getByText("Review conflicting drafts")).toBeTruthy();
+      expect(screen.getByText('"my draft"')).toBeTruthy();
+      expect(
+        server.commands.filter(([command]) => command === "EVAL"),
+      ).toHaveLength(1);
+      expect(server.rows.get("drafts:seed")?.value).toBe(
+        conflict === "changed" ? current : undefined,
+      );
+      if (conflict === "changed") {
+        await session.user.click(
+          screen.getByRole("button", { name: "Discard Unmatched" }),
+        );
+        await editCell(session, "value", "reviewed draft");
+        await session.user.click(
+          screen.getByRole("button", { name: "Apply Changes" }),
+        );
+        await session.user.click(
+          within(await screen.findByRole("dialog")).getByRole("button", {
+            name: "Apply Changes",
+          }),
+        );
+        await waitFor(() =>
+          expect(server.rows.get("drafts:seed")?.value).toBe("reviewed draft"),
+        );
+        const [, retry] = server.commands.filter(
+          ([command]) => command === "EVAL",
+        );
+        expect(retry[3]).toBe("drafts:seed");
+        expect(retry[7]).toBe("external edit");
+      }
+    },
+    false,
+  );
 });

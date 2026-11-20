@@ -2,6 +2,7 @@ import { isIP } from "node:net";
 import type { ClientConfig, PoolClient } from "pg";
 import { Connection, DatabaseError, Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import { isPostgresArrayPrimaryKeyValue } from "../../shared/postgresArrayRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -10,6 +11,7 @@ import {
   type ResolvedConnectionTlsSettings,
   resolveConnectionTlsSettings,
 } from "../services/connectionTls";
+import { resolvePostgresPort } from "../services/postgresPort";
 import { SqlTlsSocket } from "../services/sqlTlsSocket";
 import { serializeArrayPreservingRawTokens } from "../utils/arraySerialization";
 import { normalizeUnknownError } from "../utils/errorHandling";
@@ -77,6 +79,7 @@ import type {
   FilterOperator,
   ForeignKeyMeta,
   IndexMeta,
+  MutationSqlExpression,
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
@@ -92,7 +95,6 @@ import {
   assertTransactionAffectedRows,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
-  NULL_SENTINEL,
 } from "./types";
 
 const POSTGRES_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -264,8 +266,8 @@ function wasPostgresBatchRolledBack(
 
 type PostgresTransportOptions = Pick<
   ClientConfig,
-  "host" | "port" | "stream" | "ssl"
->;
+  "host" | "stream" | "ssl"
+> & { port: number };
 
 type PostgresCancelConnection = Connection & {
   connect(port: number | string, host?: string): void;
@@ -308,7 +310,7 @@ function sendPostgresCancelRequest(
         cancelConnection.stream.end();
       });
       const host = transport.host || "localhost";
-      const port = transport.port ?? 5432;
+      const port = transport.port;
       if (host.startsWith("/")) {
         cancelConnection.connect(`${host}/.s.PGSQL.${port}`);
       } else {
@@ -824,7 +826,7 @@ export class PostgresDriver extends BaseDBDriver {
   private connectionAbortController?: AbortController;
   private publishedConnectionAttempt: Promise<void> | null = null;
   private readonly config: ConnectionConfig;
-  private tlsSettings: ResolvedConnectionTlsSettings | undefined;
+  private transport?: PostgresTransportOptions;
   private _connected = false;
   private connectedDatabaseName = "";
   private timeoutRecoveryInFlight: Promise<void> | null = null;
@@ -888,11 +890,13 @@ export class PostgresDriver extends BaseDBDriver {
       },
     });
   }
-  private connectionTransport(): PostgresTransportOptions {
-    const tlsSettings = this.tlsSettings;
+  private connectionTransport(
+    tlsSettings: ResolvedConnectionTlsSettings | undefined,
+  ): PostgresTransportOptions {
     const forwardedTransport = getSshTcpForwardTransport(this.config);
     const endpointHost = forwardedTransport?.localHost ?? this.config.host;
-    const endpointPort = forwardedTransport?.localPort ?? this.config.port;
+    const endpointPort =
+      forwardedTransport?.localPort ?? resolvePostgresPort(this.config.port);
     const tlsIdentity = tlsSettings?.servername?.replace(/^\[|\]$/g, "");
     return {
       host: tlsIdentity ?? endpointHost,
@@ -901,7 +905,7 @@ export class PostgresDriver extends BaseDBDriver {
         ? () =>
             new SqlTlsSocket(
               endpointHost || "localhost",
-              endpointPort ?? 5432,
+              endpointPort,
               tlsIdentity,
             )
         : undefined,
@@ -928,9 +932,12 @@ export class PostgresDriver extends BaseDBDriver {
     max = 5,
     applicationName?: string,
   ): Pool {
+    if (!this.transport) {
+      throw new Error("[RapiDB] PostgreSQL connection transport is not set");
+    }
     const dbOperationTimeoutMs = this.getDbOperationTimeoutMs();
     return new Pool({
-      ...this.connectionTransport(),
+      ...this.transport,
       database,
       user: this.config.username,
       password: this.config.password,
@@ -1068,7 +1075,7 @@ export class PostgresDriver extends BaseDBDriver {
     this.assertConnectionEpoch(epoch);
     const tlsSettings = await resolveConnectionTlsSettings(this.config, signal);
     this.assertConnectionEpoch(epoch);
-    this.tlsSettings = tlsSettings;
+    this.transport = this.connectionTransport(tlsSettings);
     const pool = this.createPool(this.config.database ?? "");
     this.pendingPools.add(pool);
     pool.on("error", (err) => {
@@ -1123,7 +1130,7 @@ export class PostgresDriver extends BaseDBDriver {
     this.publishedConnectionAttempt = null;
     this._connected = false;
     this.connectedDatabaseName = "";
-    this.tlsSettings = undefined;
+    this.transport = undefined;
     for (const operation of this.activeQueryOperations) {
       operation.cancelled = true;
       operation.wakePoolWait?.();
@@ -1149,15 +1156,7 @@ export class PostgresDriver extends BaseDBDriver {
   }
 
   private cancelTransport(): PostgresTransportOptions | undefined {
-    if (!this.pool) return undefined;
-    try {
-      return this.connectionTransport();
-    } catch (error) {
-      logger.warn(
-        `PostgreSQL backend cancel could not start: ${normalizeUnknownError(error).message}`,
-      );
-      return undefined;
-    }
+    return this.pool ? this.transport : undefined;
   }
 
   private discardAfterCancel(
@@ -1447,6 +1446,7 @@ export class PostgresDriver extends BaseDBDriver {
     type DescribeTableRow = {
       column_name: string;
       data_type: string;
+      is_array_type: boolean | null;
       array_base_type: string | null;
       array_base_is_array?: boolean | number | string | null;
       range_subtype: string | null;
@@ -1469,6 +1469,7 @@ export class PostgresDriver extends BaseDBDriver {
                   pg_catalog.format_type(element_type.oid, a.atttypmod))
            ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
          END                                      AS data_type,
+         array_type.typcategory = 'A'             AS is_array_type,
          array_base.base_type                     AS array_base_type,
          array_base.base_is_array                 AS array_base_is_array,
          CASE
@@ -1582,6 +1583,9 @@ export class PostgresDriver extends BaseDBDriver {
             ? undefined
             : mappedGeneratedKind === "stored",
         isPrimaryKey: isPgTrue(r.is_pk),
+        ...(isPgTrue(r.is_pk) && isPgTrue(r.is_array_type)
+          ? { postgresArrayPrimaryKey: true }
+          : {}),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
       };
@@ -3018,6 +3022,40 @@ export class PostgresDriver extends BaseDBDriver {
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, paramIndex)}`;
   }
+  buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string | null {
+    return column.postgresArrayPrimaryKey
+      ? `${this.quoteIdentifier(column.name)}::pg_catalog.text`
+      : null;
+  }
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (!column.postgresArrayPrimaryKey) {
+      return this.coerceInputValue(value, column);
+    }
+    if (!isPostgresArrayPrimaryKeyValue(value)) {
+      throw new Error(
+        `PostgreSQL array primary key "${column.name}" is missing its exact row identity. Refresh the table and retry.`,
+      );
+    }
+    // The parameter is inferred (or cast) to the column's native type. Do not
+    // parse this literal into a JS array: that would reset its lower bounds.
+    return value.$rapidbPgArrayKey;
+  }
+  buildPrimaryKeyComparison(
+    column: ColumnTypeMeta,
+    value: unknown,
+    paramIndex: number,
+  ): MutationSqlExpression | null {
+    const stored = this.buildTablePrimaryKeyExpr(column);
+    if (!stored) return null;
+    const name = this.quoteIdentifier(column.name);
+    const literal = `$${paramIndex}::pg_catalog.text`;
+    // Keep native indexed equality, but reject a changed interpretation of
+    // the literal (e.g. a different array_nulls setting on this connection).
+    return {
+      sql: `(${name} = (${literal})::${column.nativeType} AND ${stored} COLLATE pg_catalog."C" = ${literal})`,
+      params: [value],
+    };
+  }
   override buildOriginalValueComparison(
     column: ColumnTypeMeta,
     paramIndex: number,
@@ -3085,7 +3123,7 @@ export class PostgresDriver extends BaseDBDriver {
     return `CAST(${arrayLiteral} AS ${nativeType})`;
   }
   private formatPostgresArrayLiteralValue(value: unknown): string {
-    if (value === null || value === undefined || value === NULL_SENTINEL) {
+    if (value === null || value === undefined) {
       return "NULL";
     }
     if (Array.isArray(value)) {
@@ -3094,7 +3132,7 @@ export class PostgresDriver extends BaseDBDriver {
     return this.formatPreviewSqlLiteral(value);
   }
   protected override formatPreviewSqlLiteral(value: unknown): string {
-    if (value === null || value === undefined || value === NULL_SENTINEL) {
+    if (value === null || value === undefined) {
       return "NULL";
     }
     if (Array.isArray(value)) {
@@ -3119,7 +3157,6 @@ export class PostgresDriver extends BaseDBDriver {
   }
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
-    if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
     if (this.hasBooleanSemantics(column)) {
       const normalized = this.parseBooleanInput(value);

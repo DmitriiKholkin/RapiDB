@@ -20,11 +20,10 @@ import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { verifyTransaction } from "../../src/extension/dbDrivers/transactionVerification";
-import {
-  type ColumnMeta,
-  type ColumnTypeMeta,
-  type FilterExpression,
-  NULL_SENTINEL,
+import type {
+  ColumnMeta,
+  ColumnTypeMeta,
+  FilterExpression,
 } from "../../src/extension/dbDrivers/types";
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
@@ -611,10 +610,8 @@ describe("manual review: Oracle exact objects and temporal writes", () => {
       "JSON_OBJECT",
     );
   });
-  it.each([
-    null,
-    NULL_SENTINEL,
-  ])("supports object SQL NULL and verifies atomic null (%s)", (value) => {
+  it("supports object SQL NULL and verifies atomic null", () => {
+    const value = null;
     expect(
       oracle.checkPersistedEdit(objectColumn, value, { persistedValue: null })
         ?.ok,
@@ -1197,12 +1194,12 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
       {
         ID: 1,
         TS: "2026-10-16 01:00:00.123456789 +02:00",
-        utc: "2026-10-15 23:00:00.123456789",
+        utc: " 2026-10-15 23:00:00.123456789",
       },
       {
         ID: 2,
         TS: "2026-10-16 00:30:00.123456790 +00:00",
-        utc: "2026-10-16 00:30:00.12345679",
+        utc: " 2026-10-16 00:30:00.123456790",
       },
     ];
     const query = vi.fn(async (sql: string, params: unknown[] = []) => {
@@ -1222,8 +1219,12 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
         })
         .slice(0, 1);
       return {
-        columns: ["ID", "TS"],
-        rows: ordered.map((row) => ({ __col_0: row.ID, __col_1: row.TS })),
+        columns: ["ID", "TS", "__rapidb_cursor_0"],
+        rows: ordered.map((row) => ({
+          __col_0: row.ID,
+          __col_1: row.TS,
+          __col_2: row.utc,
+        })),
         rowCount: ordered.length,
         executionTimeMs: 0,
       };
@@ -1269,8 +1270,8 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
     const exact = zoned ? "2026-10-15 22:34:56.123456789" : input;
     for (const operator of ["eq", "gt", "lt"] as const) {
       expect(
-        oracle.buildCursorComparison(col, operator, input, 1).params,
-      ).toEqual([exact]);
+        oracle.buildCursorComparison(col, operator, ` ${exact}`, 1).params,
+      ).toEqual([` ${exact}`]);
     }
     for (const operator of [
       "eq",
@@ -1293,15 +1294,6 @@ describe("manual review: Oracle exact temporal filters and export cursors", () =
     expect(oracle.buildFilterCondition(col, "like", input, 1)?.params).toEqual([
       `%${input}%`,
     ]);
-    if (zoned)
-      expect(
-        oracle.buildCursorComparison(
-          col,
-          "gt",
-          "2026-10-15 22:34:56.123456789Z",
-          1,
-        ).params,
-      ).toEqual([exact]);
   });
 });
 

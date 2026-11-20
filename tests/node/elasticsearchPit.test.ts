@@ -52,7 +52,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
       expect(transport.mock.calls[0]).toEqual([
         expect.objectContaining({
           method: "GET",
-          path: "/records/_settings/index.max_result_window",
+          path: "/records/_settings/index.max_result_window%2Cindex.uuid",
           querystring: { include_defaults: true },
         }),
         { signal: expect.any(AbortSignal), requestTimeout: expect.any(Number) },
@@ -140,7 +140,7 @@ describe("Elasticsearch PIT paging and full export (B11)", () => {
     expect(client.indices.getSettings).toHaveBeenCalledWith(
       {
         index: "records",
-        name: "index.max_result_window",
+        name: ["index.max_result_window", "index.uuid"],
         include_defaults: true,
       },
       { signal: expect.any(AbortSignal), requestTimeout: expect.any(Number) },

@@ -696,6 +696,7 @@ describe("RedisDriver — oversized values", () => {
     vi.doMock("vscode", () => ({
       Uri: { file: (fsPath: string) => ({ fsPath }) },
       ProgressLocation: { Notification: 15 },
+      workspace: { getConfiguration: () => ({ get: () => false }) },
       window,
     }));
     try {

@@ -4,6 +4,48 @@ import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 
 describe("TableReadService query errors", () => {
+  it("redacts row-identity and count diagnostics while retaining the fallback read", async () => {
+    const password = "synthetic-fallback-password-11";
+    const query = vi
+      .fn()
+      .mockRejectedValueOnce(new Error(`Count denied for ${password}`))
+      .mockResolvedValueOnce({ rows: [], columns: [] });
+    const driver = {
+      describeColumns: vi.fn().mockResolvedValue([]),
+      getTableRowIdentityOrderExpressions: vi
+        .fn()
+        .mockRejectedValue(new Error(`Identity denied for ${password}`)),
+      qualifiedTableName: vi.fn(() => "events"),
+      buildOrderByDefault: vi.fn(() => ""),
+      buildPagination: vi.fn(() => ({ sql: "LIMIT 26", params: [] })),
+      query,
+    };
+    const service = new TableReadService({
+      getConnection: () => ({ id: "conn-1" }),
+      getDriver: () => driver,
+      getConnectionDiagnosticContext: () => ({ password }),
+    } as never);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(
+        service.getPage("conn-1", "db", "public", "events", 1, 25, []),
+      ).resolves.toMatchObject({ rows: [], totalCount: 0 });
+      expect(query).toHaveBeenCalledTimes(2);
+      expect(log.mock.calls).toEqual([
+        [
+          expect.stringContaining("Row identity lookup failed"),
+          "Identity denied for [REDACTED]",
+        ],
+        [
+          expect.stringContaining("COUNT query failed"),
+          "Count denied for [REDACTED]",
+        ],
+      ]);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("throws driver errors returned in QueryResult instead of showing an empty page", async () => {
     const dateColumn: ColumnTypeMeta = {
       name: "event_date",

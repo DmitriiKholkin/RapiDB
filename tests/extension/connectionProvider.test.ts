@@ -23,6 +23,10 @@ vi.mock("vscode", () => {
         listener(value);
       }
     }
+
+    dispose(): void {
+      this.listeners.clear();
+    }
   }
 
   return {
@@ -731,6 +735,51 @@ describe("ConnectionProvider", () => {
     ).toEqual(["table"]);
     snapshot.databases[0].schemas[0].objects = [];
     expect(await provider.getChildren(tables)).toEqual([]);
+  });
+
+  it("disposes tree listeners, pending refreshes, and manager subscriptions", async () => {
+    const { ConnectionProvider } = await import(
+      "../../src/extension/providers/connectionProvider"
+    );
+    const connect = createEventSource<string>();
+    const disconnect = createEventSource<string>();
+    const connections = createEventSource<void>();
+    const schemaState = createEventSource<string>();
+    const refreshSchemas = createEventSource<void>();
+    const provider = new ConnectionProvider({
+      onDidConnect: connect.event,
+      onDidDisconnect: disconnect.event,
+      onDidChangeConnections: connections.event,
+      onDidChangeSchemaState: schemaState.event,
+      onDidRefreshSchemas: refreshSchemas.event,
+    } as never);
+    const treeChangeSpy = vi.fn();
+    provider.onDidChangeTreeData(treeChangeSpy);
+
+    vi.useFakeTimers();
+    try {
+      connections.fire(undefined);
+      vi.runAllTimers();
+      expect(treeChangeSpy).toHaveBeenCalledExactlyOnceWith(undefined);
+
+      connections.fire(undefined);
+      expect(vi.getTimerCount()).toBe(1);
+      provider.disposable.dispose();
+      provider.disposable.dispose();
+      expect(vi.getTimerCount()).toBe(0);
+
+      connect.fire("conn-1");
+      disconnect.fire("conn-1");
+      connections.fire(undefined);
+      schemaState.fire("conn-1");
+      refreshSchemas.fire(undefined);
+      expect(vi.getTimerCount()).toBe(0);
+
+      provider.refresh();
+      expect(treeChangeSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refreshes only the affected connection subtree when schema state changes", async () => {

@@ -1210,7 +1210,10 @@ describe("schema object definitions", () => {
       { schema: "rapidb", name: "users", type: "table" },
       { schema: "rapidb", name: "active_users", type: "view" },
     ]);
-    expect(listCollections).toHaveBeenCalledWith({}, { nameOnly: false });
+    expect(listCollections).toHaveBeenCalledWith(
+      {},
+      { nameOnly: true, authorizedCollections: true },
+    );
   });
 
   it("renders MongoDB collection, view, and index DDL in mongosh syntax", async () => {
@@ -1274,6 +1277,10 @@ describe("schema object definitions", () => {
       driver.getCreateTableDDL("rapidb", "ignored", "active_users"),
     ).resolves.toBe(
       'db.getSiblingDB("rapidb").createView(\n  "active_users",\n  "users",\n  [{ "$match": { "active": true } }]\n);',
+    );
+    expect(listCollections).toHaveBeenCalledWith(
+      { name: "active_users" },
+      { nameOnly: false },
     );
     await expect(
       driver.getIndexDDL("rapidb", "ignored", "users", "users_by_email"),

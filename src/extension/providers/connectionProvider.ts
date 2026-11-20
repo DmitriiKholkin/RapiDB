@@ -477,6 +477,7 @@ export class ConnectionProvider
         scheduleRefresh(connectionId),
       ),
       connectionManager.onDidRefreshSchemas(() => scheduleRefresh()),
+      this._onDidChangeTreeData,
     );
   }
 

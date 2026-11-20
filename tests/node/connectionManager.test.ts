@@ -34,6 +34,10 @@ import {
   MONGO_QUERY_ERROR_URIS,
   mongoCredentialError,
 } from "../support/mongoCredentialError";
+import {
+  OTHER_SSH_HOST_FINGERPRINT_SHA256,
+  SSH_HOST_FINGERPRINT_SHA256,
+} from "../support/sshFingerprints";
 
 interface DriverBehavior {
   constructorError?: Error;
@@ -104,7 +108,7 @@ function createSshPgConfig(id: string): ConnectionConfig {
       authMethod: "password",
       hostVerificationMode: "manual",
       password: "ssh-secret",
-      hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
     },
   };
 }
@@ -832,7 +836,7 @@ describe("ConnectionManager", () => {
     };
     const store = new NotifyingConnectionManagerStore();
     store.setConnections([config]);
-    const fingerprint = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/";
+    const fingerprint = SSH_HOST_FINGERPRINT_SHA256;
     if (editTarget) {
       store.beforeNotify = () => {
         const current = store.getConnections()[0];
@@ -875,7 +879,7 @@ describe("ConnectionManager", () => {
         ...store.getConnections()[0],
         ssh: {
           ...store.getConnections()[0].ssh,
-          hostFingerprintSha256: "SHA256:Changed",
+          hostFingerprintSha256: OTHER_SSH_HOST_FINGERPRINT_SHA256,
         },
       },
     ]);
@@ -1117,7 +1121,7 @@ describe("ConnectionManager", () => {
         id: "conn-elasticsearch",
         name: "Elasticsearch",
         type: "elasticsearch",
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
       },
       {
         id: "conn-dynamodb",
@@ -1444,7 +1448,7 @@ describe("ConnectionManager", () => {
     );
 
     const connectPromise = manager.connectTo("conn-1");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(driverInstances[0]?.connectCalls).toBe(1));
 
     await manager.disconnectFrom("conn-1");
     connectDeferred.resolve();
@@ -1478,8 +1482,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose: vi.fn(async () => undefined),
     }));
     const manager = new ConnectionManager(
@@ -1811,7 +1814,7 @@ describe("ConnectionManager", () => {
     );
 
     const staleAttempt = manager.connectTo("conn-1");
-    await Promise.resolve();
+    await vi.waitFor(() => expect(driverInstances[0]?.connectCalls).toBe(1));
 
     await manager.disconnectFrom("conn-1");
 
@@ -3039,8 +3042,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose: vi.fn(async () => undefined),
     }));
     const manager = new ConnectionManager(
@@ -3353,8 +3355,7 @@ describe("ConnectionManager", () => {
           remoteHost: "db.internal",
           remotePort: 5432,
         },
-        verifiedFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         dispose: vi.fn(async () => undefined),
       }));
       const manager = new ConnectionManager(
@@ -3528,8 +3529,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose: vi.fn(async () => undefined),
     }));
     const manager = new ConnectionManager(
@@ -3927,8 +3927,7 @@ describe("ConnectionManager", () => {
           hostVerificationMode: "manual",
           privateKey: "hand-private-key",
           passphrase: "hand-passphrase",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
       },
     ];
@@ -4162,8 +4161,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose: vi.fn(async () => undefined),
     }));
 
@@ -4188,7 +4186,7 @@ describe("ConnectionManager", () => {
         privateKey:
           "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
         passphrase: "key-passphrase",
-        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
       useSecretStorage: true,
     });
@@ -4203,7 +4201,7 @@ describe("ConnectionManager", () => {
         port: 22,
         username: "tunnel",
         authMethod: "privateKey",
-        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
       useSecretStorage: true,
     });
@@ -4265,8 +4263,7 @@ describe("ConnectionManager", () => {
         remoteHost: hostname,
         remotePort: 27018,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
     const manager = new ConnectionManager(
@@ -4341,8 +4338,7 @@ describe("ConnectionManager", () => {
         remoteHost,
         remotePort: Number(remotePort),
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
     const manager = new ConnectionManager(
@@ -4356,6 +4352,9 @@ describe("ConnectionManager", () => {
         type,
         endpoint,
         awsRegion: "us-east-1",
+        ...(type === "dynamodb"
+          ? { awsAccessKeyId: "test-access", awsSecretAccessKey: "test-secret" }
+          : {}),
         tls: {
           mode:
             type === "elasticsearch" && endpoint.startsWith("https:")
@@ -4374,8 +4373,20 @@ describe("ConnectionManager", () => {
         { signal: expect.any(AbortSignal) },
       );
       expect(driverInstances[0]?.config).toMatchObject({
-        endpoint: `${endpoint.startsWith("https:") ? "https" : "http"}://127.0.0.1:15432/`,
-        runtimeOverrides: { tlsServername: remoteHost },
+        ...(type === "dynamodb"
+          ? {
+              endpoint,
+              runtimeOverrides: {
+                dynamoDBSshEndpoint: {
+                  request: { remoteHost, remotePort },
+                },
+                transport: { localHost: "127.0.0.1", localPort: 15432 },
+              },
+            }
+          : {
+              endpoint: `${endpoint.startsWith("https:") ? "https" : "http"}://127.0.0.1:15432/`,
+              runtimeOverrides: { tlsServername: remoteHost },
+            }),
       });
       expect(dispose).toHaveBeenCalledOnce();
     } finally {
@@ -4399,6 +4410,9 @@ describe("ConnectionManager", () => {
       type,
       [source]: endpoint,
       awsRegion: "us-east-1",
+      ...(type === "dynamodb"
+        ? { awsAccessKeyId: "test-access", awsSecretAccessKey: "test-secret" }
+        : {}),
       tls: {
         mode: type === "elasticsearch" ? "requireVerifyFull" : "disabled",
       },
@@ -4412,8 +4426,7 @@ describe("ConnectionManager", () => {
         remoteHost: "2001:db8::12",
         remotePort: 8443,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
     const manager = new ConnectionManager(
@@ -4431,9 +4444,20 @@ describe("ConnectionManager", () => {
         { signal: expect.any(AbortSignal) },
       );
       expect(driverInstances[0]?.config).toMatchObject({
-        [source]: "https://127.0.0.1:15432/service?keep=true",
         tls: config.tls,
-        runtimeOverrides: { tlsServername: "2001:db8::12" },
+        ...(type === "dynamodb"
+          ? {
+              [source]: endpoint,
+              runtimeOverrides: {
+                dynamoDBSshEndpoint: {
+                  request: { remoteHost: "2001:db8::12", remotePort: 8443 },
+                },
+              },
+            }
+          : {
+              [source]: "https://127.0.0.1:15432/service?keep=true",
+              runtimeOverrides: { tlsServername: "2001:db8::12" },
+            }),
       });
       expect(config[source]).toBe(endpoint);
       expect(store.getConnections()).toEqual(persisted);
@@ -4458,40 +4482,25 @@ describe("ConnectionManager", () => {
         value: string | undefined,
         defaultPort: number,
       ): unknown;
-      resolveDynamoRemoteTarget(config: ConnectionConfig): unknown;
       resolveElasticsearchRemoteTarget(config: ConnectionConfig): unknown;
     };
     try {
-      for (const type of ["elasticsearch", "dynamodb"] as const) {
-        const config: ConnectionConfig = {
+      expect(
+        resolver.resolveSshRuntimeRequest({
           id: "facade-ipv6",
           name: "IPv6",
-          type,
+          type: "elasticsearch",
           endpoint: "https://[2001:db8::12]/service?keep=true",
-        };
-        expect(resolver.resolveSshRuntimeRequest(config)).toEqual({
-          kind: "tcpForward",
-          remoteHost: "2001:db8::12",
-          remotePort: 443,
-        });
-        expect(config.endpoint).toBe(
-          "https://[2001:db8::12]/service?keep=true",
-        );
-      }
+        }),
+      ).toEqual({
+        kind: "tcpForward",
+        remoteHost: "2001:db8::12",
+        remotePort: 443,
+      });
       expect(resolver.resolveUrlRemoteTarget(undefined, 9200)).toBeUndefined();
       expect(resolver.resolveUrlRemoteTarget("tcp://[::1]", 9200)).toEqual({
         host: "::1",
         port: 9200,
-      });
-      expect(
-        resolver.resolveDynamoRemoteTarget({
-          id: "d",
-          name: "D",
-          type: "dynamodb",
-        }),
-      ).toEqual({
-        host: "dynamodb.us-east-1.amazonaws.com",
-        port: 443,
       });
       expect(
         resolver.resolveElasticsearchRemoteTarget({
@@ -4527,8 +4536,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
 
@@ -4647,7 +4655,7 @@ describe("ConnectionManager", () => {
           remoteHost: "db.internal",
           remotePort: 5432,
         },
-        verifiedFingerprintSha256: "SHA256:learned-fingerprint",
+        verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         dispose,
       };
     });
@@ -4690,8 +4698,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
 
@@ -4731,15 +4738,14 @@ describe("ConnectionManager", () => {
         id: "conn-es-ssh",
         name: "Elastic SSH",
         type: "elasticsearch",
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
         ssh: {
           host: "bastion.example.com",
           port: 22,
           username: "tunnel",
           authMethod: "password",
           password: "ssh-secret",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
       },
     ]);
@@ -4756,8 +4762,7 @@ describe("ConnectionManager", () => {
         httpAgent,
         httpsAgent,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
 
@@ -4776,7 +4781,7 @@ describe("ConnectionManager", () => {
         port: 22,
         username: "tunnel",
         hostVerificationMode: "manual",
-        fingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        fingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         readyTimeoutMs: 15_000,
         auth: {
           kind: "password",
@@ -4790,7 +4795,7 @@ describe("ConnectionManager", () => {
     );
     expect(driverInstances[0]?.config).toMatchObject({
       id: "conn-es-ssh",
-      cloudId: "deployment:ZXM=",
+      cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
       runtimeOverrides: {
         transport: {
           kind: "httpAgent",
@@ -4832,8 +4837,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=",
+      verifiedFingerprintSha256: `${SSH_HOST_FINGERPRINT_SHA256}=`,
       dispose: vi.fn(async () => undefined),
     }));
 
@@ -4871,7 +4875,7 @@ describe("ConnectionManager", () => {
         .getConnections()
         .find((connection) => connection.id === "conn-ssh-tofu")?.ssh
         ?.hostFingerprintSha256,
-    ).toBe("SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=");
+    ).toBe(`${SSH_HOST_FINGERPRINT_SHA256}=`);
   });
 
   describe("SSH TOFU pin lifecycle", () => {
@@ -4884,8 +4888,7 @@ describe("ConnectionManager", () => {
       };
       const store = new FakeConnectionManagerStore();
       store.setConnections([config]);
-      const fingerprint =
-        "SHA256:LearnedTrustOnFirstUseFingerprint1234567890+/=";
+      const fingerprint = `${SSH_HOST_FINGERPRINT_SHA256}=`;
       const dispose = vi.fn(async () => undefined);
       const runtime = () => ({
         transport: {
@@ -4922,7 +4925,7 @@ describe("ConnectionManager", () => {
               ...current,
               ssh: {
                 ...current.ssh,
-                hostFingerprintSha256: "SHA256:DifferentHostKey=",
+                hostFingerprintSha256: `${OTHER_SSH_HOST_FINGERPRINT_SHA256}=`,
               },
             },
           ]);
@@ -5096,8 +5099,7 @@ describe("ConnectionManager", () => {
         const current = store.getConnections()[0];
         const ssh = { ...current.ssh };
         if (change === "pin")
-          ssh.hostFingerprintSha256 =
-            "SHA256:OtherPinnedFingerprint1234567890+/=";
+          ssh.hostFingerprintSha256 = `${OTHER_SSH_HOST_FINGERPRINT_SHA256}=`;
         if (change === "host") ssh.host = "other-bastion.internal";
         if (change === "port") ssh.port = 2222;
         if (change === "username") ssh.username = "other-user";
@@ -5177,7 +5179,7 @@ describe("ConnectionManager", () => {
         ...(await createSshRuntime()),
         verifiedFingerprintSha256: sameKey
           ? fingerprint
-          : "SHA256:OtherPinnedFingerprint1234567890+/=",
+          : `${OTHER_SSH_HOST_FINGERPRINT_SHA256}=`,
         dispose: secondDispose,
       }));
       const second = new ConnectionManager(
@@ -5282,7 +5284,12 @@ describe("ConnectionManager", () => {
       config.type = type;
       if (type === "oracle") config.serviceName = "app";
       if (type === "redis") config.database = "0";
-      if (type === "dynamodb") config.awsRegion = "us-east-1";
+      if (type === "dynamodb") {
+        config.awsRegion = "us-east-1";
+        config.awsAccessKeyId = "test-access";
+        config.awsSecretAccessKey = "test-secret";
+        config.endpoint = "https://db.internal";
+      }
       if (type === "elasticsearch") config.endpoint = "http://db.internal:9200";
       store.setConnections([config]);
       const manager = new ConnectionManager(
@@ -5322,7 +5329,7 @@ describe("ConnectionManager", () => {
       );
       const { config, store, fingerprint } = setup();
       config.type = "elasticsearch";
-      config.cloudId = "deployment:ZXM=";
+      config.cloudId = "deployment:ZXhhbXBsZS50ZXN0JGVz";
       store.setConnections([config]);
       const httpAgent = new http.Agent();
       const httpsAgent = new https.Agent();
@@ -5412,8 +5419,7 @@ describe("ConnectionManager", () => {
         remoteHost: "db.internal",
         remotePort: 5432,
       },
-      verifiedFingerprintSha256:
-        "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       dispose,
     }));
 

@@ -125,7 +125,9 @@ describe("ErdView with real ReactFlow", () => {
     };
     const { container } = render(<ErdView connectionId="conn-1" />);
     await act(async () => {
+      dispatchIncomingMessage("erdLoading", { loadId: 1 });
       dispatchIncomingMessage("erdGraph", {
+        loadId: 1,
         graph,
         fromCache: false,
         loadedAt: "now",
@@ -243,7 +245,9 @@ describe("ErdView with real ReactFlow", () => {
     };
     const { container } = render(<ErdView connectionId="conn-1" />);
     await act(async () => {
+      dispatchIncomingMessage("erdLoading", { loadId: 1 });
       dispatchIncomingMessage("erdGraph", {
+        loadId: 1,
         graph,
         fromCache: false,
         loadedAt: "now",

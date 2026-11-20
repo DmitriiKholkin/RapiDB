@@ -1,5 +1,5 @@
 import type { Disposable } from "vscode";
-import type { IndexMeta } from "../../shared/tableTypes";
+import type { ColumnTypeMeta, IndexMeta } from "../../shared/tableTypes";
 import type {
   ErdGraph,
   ErdRelationshipEdge,
@@ -38,7 +38,9 @@ interface GraphSourceObject {
 
 interface GraphSourceDetail {
   object: GraphSourceObject;
-  columns: Array<{ name: string; nullable: boolean }>;
+  columns: Array<
+    Pick<ColumnTypeMeta, "name" | "nullable" | "sqliteRowidAlias">
+  >;
   foreignKeys: ForeignKeyMeta[];
   indexes: IndexMeta[];
 }
@@ -319,26 +321,27 @@ export class ErdGraphService {
     unloadedSchemas: string[],
     signal?: AbortSignal,
   ): Promise<{ graph: ErdGraph; partial: boolean }> {
-    let objects = this.collectObjects(snapshot, request);
+    const { objects: snapshotObjects, truncatedSchemas } = this.collectObjects(
+      snapshot,
+      request,
+    );
+    let objects = snapshotObjects;
     let partial = false;
-    if (objects.length === 0 && request.database) {
+    let driverDiscoveryTruncated = false;
+    if (
+      request.database &&
+      (objects.length === 0 || unloadedSchemas.length > 0)
+    ) {
       const discovered = await this.discoverObjectsFromDriver(
         driver,
-        request,
-        undefined,
+        request.database,
+        request.schema,
+        objects.length === 0 ? undefined : unloadedSchemas,
         signal,
       );
-      objects = discovered.objects;
-      partial = !discovered.complete;
-    } else if (unloadedSchemas.length > 0) {
-      const discovered = await this.discoverObjectsFromDriver(
-        driver,
-        request,
-        unloadedSchemas,
-        signal,
-      );
+      // Only an exhaustive listing can establish that a known table is gone.
       const retained = objects.filter(
-        (object) => !discovered.listedSchemas.has(object.schema),
+        (object) => !discovered.fullyListedSchemas.has(object.schema),
       );
       const seenIds = new Set(
         retained.map((object) =>
@@ -354,21 +357,30 @@ export class ErdGraphService {
             ),
         ),
       ].sort(compareGraphSourceObjects);
-      partial = !discovered.complete;
+      partial = discovered.failed;
+      for (const schema of discovered.fullyListedSchemas) {
+        truncatedSchemas.delete(schema);
+      }
+      driverDiscoveryTruncated = discovered.truncated;
     }
 
+    const discoveryTruncated =
+      driverDiscoveryTruncated || truncatedSchemas.size > 0;
+    partial ||= discoveryTruncated;
+    const connectionType = this.connectionManager.getConnection?.(
+      request.connectionId,
+    )?.type;
+    const catalog: Pick<ErdGraph, "scope" | "discoveryTruncated"> = {
+      scope: { database: request.database, schema: request.schema },
+      ...(discoveryTruncated
+        ? {
+            discoveryTruncated:
+              connectionType === "redis" ? "redis-prefixes" : "objects",
+          }
+        : {}),
+    };
     if (objects.length === 0) {
-      return {
-        graph: {
-          nodes: [],
-          edges: [],
-          scope: {
-            database: request.database,
-            schema: request.schema,
-          },
-        },
-        partial,
-      };
+      return { graph: { ...catalog, nodes: [], edges: [] }, partial };
     }
 
     signal?.throwIfAborted();
@@ -390,7 +402,11 @@ export class ErdGraphService {
 
           return {
             object,
-            columns,
+            // A SQLite rowid alias may accept NULL as an INSERT input, but
+            // the ERD describes values that can actually be stored.
+            columns: columns.map((column) =>
+              column.sqliteRowidAlias ? { ...column, nullable: false } : column,
+            ),
             foreignKeys,
             indexes,
           };
@@ -449,9 +465,6 @@ export class ErdGraphService {
       },
     }));
 
-    const connectionType = this.connectionManager.getConnection?.(
-      request.connectionId,
-    )?.type;
     const { edges, externalReferences } = this.collectEdges(
       details,
       omittedTables,
@@ -462,12 +475,9 @@ export class ErdGraphService {
 
     return {
       graph: {
+        ...catalog,
         nodes,
         edges,
-        scope: {
-          database: request.database,
-          schema: request.schema,
-        },
         ...(omittedTables.length > 0 ? { omittedTables } : {}),
         ...(externalReferences.length > 0 ? { externalReferences } : {}),
       },
@@ -476,10 +486,14 @@ export class ErdGraphService {
   }
 
   private collectObjects(
-    snapshot: Awaited<ReturnType<ConnectionManager["getSchemaSnapshotAsync"]>>,
+    snapshot: SchemaSnapshotResult,
     request: ErdGraphRequest,
-  ): GraphSourceObject[] {
+  ): {
+    objects: GraphSourceObject[];
+    truncatedSchemas: Set<string>;
+  } {
     const objects: GraphSourceObject[] = [];
+    const truncatedSchemas = new Set<string>();
 
     for (const databaseEntry of snapshot.databases) {
       if (request.database && databaseEntry.name !== request.database) {
@@ -489,6 +503,9 @@ export class ErdGraphService {
       for (const schemaEntry of databaseEntry.schemas) {
         if (request.schema && schemaEntry.name !== request.schema) {
           continue;
+        }
+        if (schemaEntry.objectsTruncated === true) {
+          truncatedSchemas.add(schemaEntry.name);
         }
 
         for (const objectEntry of schemaEntry.objects) {
@@ -507,50 +524,46 @@ export class ErdGraphService {
 
     objects.sort(compareGraphSourceObjects);
 
-    return objects;
+    return { objects, truncatedSchemas };
   }
 
   private async discoverObjectsFromDriver(
     driver: IDBDriver,
-    request: ErdGraphRequest,
+    database: string,
+    schema: string | undefined,
     schemaNamesOverride?: string[],
     signal?: AbortSignal,
   ): Promise<{
     objects: GraphSourceObject[];
-    complete: boolean;
-    listedSchemas: Set<string>;
+    failed: boolean;
+    truncated: boolean;
+    fullyListedSchemas: Set<string>;
   }> {
-    const listedSchemas = new Set<string>();
+    const fullyListedSchemas = new Set<string>();
     signal?.throwIfAborted();
     if (this.lifecycleAbortController.signal.aborted) {
-      return { objects: [], complete: false, listedSchemas };
-    }
-    const database = request.database;
-    if (!database) {
-      return { objects: [], complete: true, listedSchemas };
+      return {
+        objects: [],
+        failed: true,
+        truncated: false,
+        fullyListedSchemas,
+      };
     }
 
-    let complete = true;
+    let failed = false;
+    let truncated = false;
     const schemaNames =
       schemaNamesOverride ??
-      (request.schema
-        ? [request.schema]
-        : [
-            ...new Set(
-              (
-                await driver.listSchemas(database).catch(() => {
-                  complete = false;
-                  return [];
-                })
-              )
-                .map((schema) => schema.name)
-                .filter((name): name is string => Boolean(name)),
-            ),
-          ]);
+      (schema
+        ? [schema]
+        : await this.listDriverSchemaNames(driver, database).catch(() => {
+            failed = true;
+            return [];
+          }));
 
     signal?.throwIfAborted();
     if (schemaNames.length === 0) {
-      return { objects: [], complete, listedSchemas };
+      return { objects: [], failed, truncated, fullyListedSchemas };
     }
 
     const discoveredBySchema = await pMapWithLimit(
@@ -559,11 +572,15 @@ export class ErdGraphService {
       async (schemaName) => {
         const objects = await driver.listObjects(database, schemaName).then(
           (listed) => {
-            listedSchemas.add(schemaName);
+            if (listed.truncated === true) {
+              truncated = true;
+            } else {
+              fullyListedSchemas.add(schemaName);
+            }
             return listed;
           },
           () => {
-            complete = false;
+            failed = true;
             return [];
           },
         );
@@ -582,8 +599,9 @@ export class ErdGraphService {
 
     return {
       objects: discoveredBySchema.flat().sort(compareGraphSourceObjects),
-      complete,
-      listedSchemas,
+      failed,
+      truncated,
+      fullyListedSchemas,
     };
   }
 
@@ -836,11 +854,24 @@ export class ErdGraphService {
     return [
       ...new Set([
         ...schemaNamesFromSnapshot,
-        ...(await driver.listSchemas(request.database))
-          .map((schema) => schema.name)
-          .filter((name): name is string => Boolean(name)),
+        ...(await this.listDriverSchemaNames(driver, request.database)),
       ]),
     ];
+  }
+
+  private async listDriverSchemaNames(
+    driver: IDBDriver,
+    database: string,
+  ): Promise<string[]> {
+    const schemas = await driver.listSchemas(database);
+    // Match the Explorer snapshot's synthetic schema for schema-less drivers.
+    if (
+      schemas.length === 0 &&
+      driver.getCapabilities?.().schemaNamespaces === "none"
+    ) {
+      return [database];
+    }
+    return [...new Set(schemas.map((schema) => schema.name).filter(Boolean))];
   }
 
   private async ensureSchemaScopeLoaded(
@@ -1073,6 +1104,10 @@ export class ErdGraphService {
         detail.columns.map((column) => [column.name, column.nullable]),
       );
       const uniqueColumnSets = this.collectUniqueColumnSets(detail.indexes);
+      for (const column of detail.columns) {
+        // A SQLite rowid alias enforces uniqueness without a separate index.
+        if (column.sqliteRowidAlias) uniqueColumnSets.push([column.name]);
+      }
       const columnsByConstraint = new Map<string, Set<string>>();
       for (const foreignKey of detail.foreignKeys) {
         const constraintKey = this.foreignKeyConstraintKey(

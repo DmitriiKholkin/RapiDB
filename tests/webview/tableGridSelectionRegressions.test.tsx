@@ -318,8 +318,46 @@ describe("TableGrid clipboard", () => {
       ),
     ).toEqual([
       ["b", "NULL"],
-      ["c", NULL_SENTINEL],
+      ["c", null],
     ]);
+  });
+
+  it("copies the former NULL marker without NUL bytes and round-trips it in both row kinds", () => {
+    const onBatchCellEdit = vi.fn();
+    const onMixedBatchEdit = vi.fn();
+    const escapedSpelling = "\\x00__NULL__\\x00";
+    const grid = setup({
+      columns: columns.map((column, index) =>
+        index === 0 ? { ...column, nullable: false } : column,
+      ),
+      rows: [{ a: NULL_SENTINEL, b: escapedSpelling, c: null }, ...rows],
+      newRows: [{}],
+      onBatchCellEdit,
+      onMixedBatchEdit,
+    });
+    grid.select([0, 0], [0, 2]);
+    const copied = grid.copy() ?? "";
+    expect(copied).toBe(`${escapedSpelling}\t"${escapedSpelling}"\tNULL`);
+
+    grid.select([1, 0]);
+    grid.paste(copied);
+    grid.select([-1, 0]);
+    grid.paste(copied);
+
+    for (const commit of [onBatchCellEdit, onMixedBatchEdit]) {
+      expect(
+        commit.mock.calls[0][0].map(
+          (edit: { newVal: string | null }) => edit.newVal,
+        ),
+      ).toEqual([NULL_SENTINEL, escapedSpelling, null]);
+    }
+
+    grid.select([1, 0]);
+    grid.paste("NULL");
+    expect(grid.getByRole("alert").textContent).toContain(
+      "does not allow NULL",
+    );
+    expect(onBatchCellEdit).toHaveBeenCalledTimes(1);
   });
 
   it("keeps quoted literal NULL text when pasting into draft rows", () => {
@@ -339,7 +377,7 @@ describe("TableGrid clipboard", () => {
       ),
     ).toEqual([
       ["a", "NULL"],
-      ["b", NULL_SENTINEL],
+      ["b", null],
     ]);
   });
 

@@ -1,12 +1,16 @@
+import { readFile } from "node:fs/promises";
 import net from "node:net";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { REDIS_ALL_KEYS_TABLE } from "../../src/extension/dbDrivers/redisKeyspace";
 import type { DriverTablePageRequest } from "../../src/extension/dbDrivers/types";
 import { DriverUpdateRowsError } from "../../src/extension/dbDrivers/updateRowOutcomes";
 import { logger } from "../../src/extension/utils/logger";
+import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 import { redisBinarySnapshotDisplay } from "../../src/shared/redisValueSnapshot";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
+import { createProjectTempDir } from "../runtime/tempDirectories";
 import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 function bulk(value: Buffer | string): Buffer {
@@ -192,21 +196,100 @@ async function rowsByKey() {
 }
 
 describe("Redis query reply fidelity", () => {
-  it("shows nested EXEC errors instead of empty objects", async () => {
-    server.replies.set("MULTI", "+OK\r\n");
+  it.each([
+    false,
+    true,
+  ])("warns on EXEC errors (trailing PING: %s)", async (trailingPing) => {
     server.replies.set("SET", "+QUEUED\r\n");
     server.replies.set("INCR", "+QUEUED\r\n");
+    server.replies.set("GET", "+QUEUED\r\n");
+    server.replies.set("PING", "+PONG\r\n");
     server.replies.set(
       "EXEC",
-      "*2\r\n+OK\r\n-ERR value is not an integer or out of range\r\n",
+      array([
+        Buffer.from("+OK\r\n"),
+        Buffer.from("-ERR value is not an integer or out of range\r\n"),
+        bulk(binaryMember),
+      ]),
     );
-    const result = await driver.query("MULTI; SET a 1; INCR text; EXEC");
+    const result = await driver.query(
+      `MULTI; SET a 1; INCR text; GET bytes; EXEC${trailingPing ? "; PING" : ""}`,
+      undefined,
+      { requestToken: 1 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.warnings).toEqual([
+      "EXEC at statement 5 returned errors for one or more commands queued after MULTI at statement 1. Redis does not roll back successful sibling commands.",
+    ]);
     expect(JSON.parse(String(result.rows[0].__col_0))).toEqual([
       "OK",
       "QUEUED",
       "QUEUED",
-      ["OK", "(error) ERR value is not an integer or out of range"],
+      "QUEUED",
+      [
+        "OK",
+        "(error) ERR value is not an integer or out of range",
+        "RedisBinary(0xff00)",
+      ],
+      ...(trailingPing ? ["PONG"] : []),
     ]);
+    expect(server.commands).not.toContainEqual(["DISCARD"]);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("warns on WATCH-aborted EXEC (trailing PING: %s)", async (trailingPing) => {
+    server.replies.set("SET", "+QUEUED\r\n");
+    server.replies.set("EXEC", "_\r\n");
+    server.replies.set("PING", "+PONG\r\n");
+    const result = await driver.query(
+      `WATCH a; MULTI; SET a 1; EXEC${trailingPing ? "; PING" : ""}`,
+      undefined,
+      { requestToken: 1 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.warnings).toEqual([
+      "The commands queued after MULTI at statement 2 were not applied because EXEC at statement 4 returned nil (a WATCHed key changed).",
+    ]);
+    expect(JSON.parse(String(result.rows[0].__col_0))).toEqual([
+      "OK",
+      "OK",
+      "QUEUED",
+      null,
+      ...(trailingPing ? ["PONG"] : []),
+    ]);
+    expect(server.commands).not.toContainEqual(["DISCARD"]);
+  });
+
+  it("does not warn for successful EXEC replies, ordinary nil or intentional DISCARD", async () => {
+    server.replies.set("GET missing", "_\r\n");
+    server.replies.set("GET bytes", "+QUEUED\r\n");
+    server.replies.set("GET other", "+QUEUED\r\n");
+    server.replies.set(
+      "EXEC",
+      array([Buffer.from("_\r\n"), bulk("(error) plain text")]),
+    );
+    const result = await driver.query(
+      "GET missing; MULTI; GET bytes; GET other; EXEC; MULTI; GET other; DISCARD",
+      undefined,
+      { requestToken: 1 },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.warnings).toBeUndefined();
+    expect(JSON.parse(String(result.rows[0].__col_0))).toEqual([
+      null,
+      "OK",
+      "QUEUED",
+      "QUEUED",
+      [null, "(error) plain text"],
+      "OK",
+      "QUEUED",
+      "OK",
+    ]);
+    expect(
+      server.commands.filter(([command]) => command === "DISCARD"),
+    ).toEqual([["DISCARD"]]);
   });
 
   it("keeps integer replies above 2^53 exact", async () => {
@@ -216,23 +299,88 @@ describe("Redis query reply fidelity", () => {
   });
 
   it("keeps safe integer replies numeric and integer-like strings textual", async () => {
-    server.replies.set("DBSIZE", ":42\r\n");
+    server.replies.set("DBSIZE", ":7\r\n");
     server.replies.set("TTL", ":-1\r\n");
-    server.replies.set("GET", bulk("123"));
-    server.replies.set("PING", "+123\r\n");
+    server.replies.set("GET padded", bulk("007"));
+    server.replies.set("GET plain", bulk("7"));
+    server.replies.set("PING", "+0000\r\n");
     server.replies.set("INCRBY", ":9007199254740993\r\n");
     const single = await driver.query("DBSIZE");
-    expect(single.rows[0].__col_0).toBe(42);
+    expect(single.rows[0].__col_0).toBe(7);
+    expect((await driver.query("GET padded")).rows[0].__col_0).toBe("007");
     const multiple = await driver.query(
-      "DBSIZE; TTL a; GET a; PING; INCRBY big 1",
+      "DBSIZE; TTL a; GET padded; GET plain; PING; INCRBY big 1",
     );
     expect(JSON.parse(String(multiple.rows[0].__col_0))).toEqual([
-      42,
+      7,
       -1,
-      "123",
-      "123",
+      "007",
+      "7",
+      "0000",
       "9007199254740993",
     ]);
+  });
+
+  it("keeps nested RESP reply types in query display and exports", async () => {
+    server.replies.set(
+      "EVAL",
+      array([
+        bulk("007"),
+        Buffer.from("+0000\r\n"),
+        Buffer.from(":7\r\n"),
+        Buffer.from(":-9223372036854775808\r\n"),
+        Buffer.from("(9007199254740993\r\n"),
+        Buffer.concat([
+          Buffer.from("%1\r\n"),
+          bulk("nested"),
+          array([bulk("-00"), Buffer.from("+7\r\n"), Buffer.from(":0\r\n")]),
+        ]),
+      ]),
+    );
+    const result = formatQueryResult(await driver.query("EVAL script 0"), 10);
+    const expected = [
+      "007",
+      "0000",
+      7,
+      "-9223372036854775808",
+      "9007199254740993",
+      { nested: ["-00", "7", 0] },
+    ];
+    expect(result.rows[0].__col_0).toBe(JSON.stringify(expected));
+
+    const directory = await createProjectTempDir("redis-export");
+    const csvPath = join(directory, "query.csv");
+    const jsonPath = join(directory, "query.json");
+    vi.doMock("vscode", () => ({
+      Uri: { file: (fsPath: string) => ({ fsPath }) },
+      ProgressLocation: { Notification: 15 },
+      workspace: { getConfiguration: () => ({ get: () => false }) },
+      window: {
+        showSaveDialog: vi
+          .fn()
+          .mockResolvedValueOnce({ fsPath: csvPath })
+          .mockResolvedValueOnce({ fsPath: jsonPath }),
+        withProgress: vi.fn(async (_options, task) =>
+          task({}, { onCancellationRequested: () => ({ dispose: vi.fn() }) }),
+        ),
+        showInformationMessage: vi.fn(),
+        showErrorMessage: vi.fn(),
+      },
+    }));
+    try {
+      const { exportQueryResultsAsCsv, exportQueryResultsAsJson } =
+        await import("../../src/extension/utils/exportService");
+      await exportQueryResultsAsCsv(result);
+      await exportQueryResultsAsJson(result);
+      expect(await readFile(csvPath, "utf8")).toBe(
+        `result\n"${JSON.stringify(expected).replaceAll('"', '""')}"\n`,
+      );
+      expect(JSON.parse(await readFile(jsonPath, "utf8"))).toEqual([
+        { result: expected },
+      ]);
+    } finally {
+      vi.doUnmock("vscode");
+    }
   });
 
   it("keeps a __proto__ hash field in query results", async () => {

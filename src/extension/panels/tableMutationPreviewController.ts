@@ -150,6 +150,7 @@ export class TableMutationPreviewController {
   async confirm(
     previewToken: string,
     operationId?: string,
+    onDeleteStart?: () => void,
   ): Promise<MutationPreviewExecutionResult | null> {
     const preview = this.pendingMutationPreviews.get(previewToken);
     if (!preview || (operationId && preview.operationId !== operationId)) {
@@ -246,9 +247,17 @@ export class TableMutationPreviewController {
             rowOutcomes: [],
           });
 
-      const payload: ApplyResultPayload = insertApplied
-        ? { ...result, operationId: preview.operationId, insertApplied: true }
-        : { ...result, operationId: preview.operationId };
+      const { conflictRows, ...rest } = result;
+      const payload: ApplyResultPayload = {
+        ...rest,
+        operationId: preview.operationId,
+        ...(insertApplied
+          ? {
+              insertApplied: true,
+              ...(conflictRows && { changesPossible: true }),
+            }
+          : conflictRows && { conflictRows }),
+      };
 
       if (payload.warning) {
         this.notifyWarning(payload.warning);
@@ -261,6 +270,7 @@ export class TableMutationPreviewController {
     }
 
     if (preview.kind === "deleteRows") {
+      onDeleteStart?.();
       try {
         await this.tableDataService.executePreparedDeletePlan(preview.plan);
         const identities =

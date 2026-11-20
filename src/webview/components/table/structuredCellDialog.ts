@@ -43,7 +43,12 @@ function resolveStructuredCellKind(
     return "array";
   }
 
-  if (column.category === "json" || normalizedNativeType.includes("json")) {
+  if (
+    column.category === "json" ||
+    normalizedNativeType.includes("json") ||
+    normalizedNativeType === "dbref" ||
+    normalizedNativeType === "bsondbref"
+  ) {
     return "json";
   }
 
@@ -80,7 +85,7 @@ export function serializeStructuredCellDialogDraft(
 
 export function getStructuredCellDraftValidationError(
   draftText: string,
-  column: Pick<ColumnMeta, "category" | "nativeType">,
+  column: Pick<ColumnMeta, "category" | "nativeType" | "redisValue">,
   isNull = false,
 ): string | null {
   if (isNull) {
@@ -94,11 +99,13 @@ export function getStructuredCellDraftValidationError(
 
   const normalizedNativeType = column.nativeType.trim().toLowerCase();
   const requiresObjectRoot = normalizedNativeType === "map";
-  const nativeError = getDynamoDbNativeCellValidationError(
-    draftText,
-    normalizedNativeType,
-  );
-  if (nativeError !== undefined) return nativeError;
+  if (!column.redisValue) {
+    const nativeError = getDynamoDbNativeCellValidationError(
+      draftText,
+      normalizedNativeType,
+    );
+    if (nativeError !== undefined) return nativeError;
+  }
   const supportsPostgresLiteral =
     structuredKind === "array" && normalizedNativeType.endsWith("[]");
   const trimmed = draftText.trim();
@@ -128,13 +135,20 @@ export function getStructuredCellDraftValidationError(
   ) {
     return "Enter a JSON object before applying this DynamoDB Map value.";
   }
+  if (
+    column.redisValue &&
+    structuredKind === "array" &&
+    !Array.isArray(parsed)
+  ) {
+    return "Enter a JSON array before applying this Redis collection value.";
+  }
 
   return null;
 }
 
 export function getStructuredCellDialogValue(
   value: unknown,
-  column: Pick<ColumnMeta, "category" | "nativeType">,
+  column: Pick<ColumnMeta, "category" | "nativeType" | "redisValue">,
 ): StructuredCellDialogValue | null {
   const binaryDisplay = redisBinarySnapshotDisplay(value, column.nativeType);
   if (binaryDisplay !== undefined)
@@ -146,8 +160,8 @@ export function getStructuredCellDialogValue(
   const structuredKind = resolveStructuredCellKind(column);
   if (!structuredKind) {
     if (
-      value === null ||
       value === undefined ||
+      (value === null && !column.redisValue) ||
       (column.category !== "text" && column.category !== "lob")
     ) {
       return null;

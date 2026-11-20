@@ -21,7 +21,9 @@ import {
   INSERT_DEFAULT_SENTINEL,
   parsePersistedTableDraft,
   parsePersistedTableViewState,
+  type TableFetchOptions,
   type TableSortState,
+  tableButtonStyle,
 } from "./table/tableViewHelpers";
 import { useTableDataController } from "./table/useTableDataController";
 import { useTableMutationController } from "./table/useTableMutationController";
@@ -44,6 +46,7 @@ interface ExportChoiceState {
   sort: TableSortState;
   page: number;
   pageSize: number;
+  columnOrder: string[];
 }
 
 function resolveTableExportMessageType(format: ExportFormat) {
@@ -65,9 +68,12 @@ export function TableView({
   const tableDraftKey = JSON.stringify([connectionId, database, schema, table]);
   const [restoredState] = useState(() => {
     const persisted = readWebviewState<Record<string, unknown>>({});
+    const draft = parsePersistedTableDraft(persisted.tableDraft, tableDraftKey);
     return {
-      draft: parsePersistedTableDraft(persisted.tableDraft, tableDraftKey),
-      view: parsePersistedTableViewState(persisted.tableView, tableDraftKey),
+      draft,
+      view:
+        draft?.mutation?.conflictView ??
+        parsePersistedTableViewState(persisted.tableView, tableDraftKey),
     };
   });
   const effectiveReadOnly = isView || connectionReadOnly;
@@ -79,9 +85,9 @@ export function TableView({
   );
   const pkColsRef = useRef<string[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const fetchPageRef = useRef<
-    (options?: { refreshMetadata?: boolean }) => void
-  >(() => undefined);
+  const fetchPageRef = useRef<(options?: TableFetchOptions) => void>(
+    () => undefined,
+  );
   const preserveScrollPositionRef = useRef<() => void>(() => undefined);
   const mutationBridgeRef = useRef<{
     handleRowsCommitted: (
@@ -91,6 +97,7 @@ export function TableView({
       mongoIdTypes: readonly ("objectId" | "string" | null)[],
       previousRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
       nextRowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
+      conflictRefresh?: boolean,
     ) => void;
     resetForTableInit: () => void;
     handleReadFailed: () => void;
@@ -99,6 +106,8 @@ export function TableView({
       busy: boolean;
       hasWork: boolean;
       reconciliationPending?: boolean;
+      applyConflict?: boolean;
+      applying?: boolean;
     };
   }>({
     handleRowsCommitted: () => undefined,
@@ -116,13 +125,6 @@ export function TableView({
   const hiddenColumnIdsRef = useRef<Set<string>>(new Set());
   const gridLayoutRef = useRef<TableGridLayout | null>(null);
   const pasteStructureEpochRef = useRef(0);
-  const getExportColumnOrder = () =>
-    columnOrderRef.current.filter(
-      (id) =>
-        columnsRef.current.some((column) => column.name === id) &&
-        !hiddenColumnIdsRef.current.has(id),
-    );
-
   const data = useTableDataController({
     pasteStructureEpochRef,
     initialPageSize,
@@ -149,6 +151,7 @@ export function TableView({
       nextTypes,
       previousRowTypes,
       nextRowTypes,
+      conflictRefresh,
     ) =>
       mutationBridgeRef.current.handleRowsCommitted(
         rows,
@@ -157,8 +160,15 @@ export function TableView({
         nextTypes,
         previousRowTypes,
         nextRowTypes,
+        conflictRefresh,
       ),
   });
+  const getExportColumnOrder = () => {
+    const columnNames = new Set(data.columns.map((column) => column.name));
+    return columnOrderRef.current.filter(
+      (id) => columnNames.has(id) && !hiddenColumnIdsRef.current.has(id),
+    );
+  };
 
   const hasPrimaryKey = data.pkCols.length > 0;
   const canEditRows = !data.readOnlyTable && hasPrimaryKey;
@@ -176,6 +186,7 @@ export function TableView({
     committedColumnNamesRef: data.committedColumnNamesRef,
     columnsRef,
     fetchPageRef,
+    getCommittedView: data.getCommittedView,
     pkColsRef,
     preserveScrollPositionRef,
     rowsRef,
@@ -194,24 +205,34 @@ export function TableView({
   const { setEditCell } = mutation;
   const cancelCellEdit = useCallback(() => setEditCell(null), [setEditCell]);
 
+  // Remember an explicit sort reset while its replacement read is pending,
+  // so a reload won't reissue the old sort.
+  const canPersistTableView =
+    data.hasCommittedData || (data.initialSortCleared && data.loading);
+  const reviewingConflict =
+    mutation.applyConflictRefreshRequired ||
+    mutation.unresolvedPendingEdits.some((entry) => entry.applyConflict);
+  const { getCommittedView } = data;
   useEffect(() => {
-    if (!data.hasCommittedData) return;
+    if (!canPersistTableView) return;
     updateWebviewState((state) => ({
       ...state,
-      tableView: {
+      tableView: (reviewingConflict && getCommittedView(tableDraftKey)) || {
         tableKey: tableDraftKey,
         page: data.intendedPage,
         pageSize: data.requestedPageSize,
-        sort: data.requestedSort,
+        sort: data.sort,
         filters: data.filterDrafts,
       },
     }));
   }, [
+    canPersistTableView,
     data.filterDrafts,
-    data.hasCommittedData,
     data.intendedPage,
     data.requestedPageSize,
-    data.requestedSort,
+    data.sort,
+    getCommittedView,
+    reviewingConflict,
     tableDraftKey,
   ]);
 
@@ -307,7 +328,29 @@ export function TableView({
           color: "var(--vscode-errorForeground)",
         }}
       >
-        <strong>Error:</strong> {data.error}
+        <div role="alert">
+          <strong>Error:</strong> {data.error}
+        </div>
+        {data.canRetryInitialRead && (
+          <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+            <button
+              type="button"
+              style={tableButtonStyle("primary")}
+              onClick={() => data.retryInitialRead()}
+            >
+              Retry
+            </button>
+            {data.requestedSort && (
+              <button
+                type="button"
+                style={tableButtonStyle()}
+                onClick={() => data.retryInitialRead(true)}
+              >
+                Clear Sort and Retry
+              </button>
+            )}
+          </div>
+        )}
       </div>
     );
   }
@@ -384,6 +427,7 @@ export function TableView({
               sort: data.sort,
               page: data.page,
               pageSize: data.pageSize,
+              columnOrder: getExportColumnOrder(),
             });
             return;
           }
@@ -396,7 +440,8 @@ export function TableView({
         }}
         onRefresh={() => {
           if (!mutation.retryReconciliation()) {
-            if (unresolvedPendingCount > 0) data.fetchPage();
+            if (unresolvedPendingCount > 0)
+              data.fetchPage({ refreshData: true });
             else
               guardRowNavigation(() =>
                 data.fetchPage({ refreshMetadata: true }),
@@ -422,14 +467,26 @@ export function TableView({
         unsavedRowCount={unsavedRowCount}
         unresolvedPendingCount={unresolvedPendingCount}
         unresolvedPendingColumns={unresolvedPendingColumns}
+        conflictDrafts={mutation.unresolvedPendingEdits.filter(
+          (entry) => entry.applyConflict,
+        )}
         unmatchablePendingCount={unmatchablePendingCount}
         canUndo={mutation.canUndo}
         canRedo={mutation.canRedo}
         onApplyChanges={mutation.applyChanges}
         onDismissApplyStatus={mutation.dismissApplyStatus}
         onDismissMutationError={mutation.dismissMutationError}
+        onAcknowledgeDeleteRecovery={
+          mutation.canAcknowledgeDeleteRecovery
+            ? mutation.acknowledgeDeleteRecovery
+            : undefined
+        }
         onRevertChanges={mutation.revertChanges}
-        onDiscardUnresolved={mutation.discardUnresolvedPendingEdits}
+        onDiscardUnresolved={
+          mutation.applyConflictRefreshRequired
+            ? undefined
+            : mutation.discardUnresolvedPendingEdits
+        }
         onUndo={mutation.undoAction}
         onRedo={mutation.redoAction}
       />
@@ -448,6 +505,8 @@ export function TableView({
           !mutation.reconciliationRequired &&
           unresolvedPendingCount === 0
         }
+        canPasteIntoPersistedRows={canEditRows && unresolvedPendingCount === 0}
+        getPasteBlockReason={mutation.getPasteBlockReason}
         getRowMutationBlockReason={mutation.getRowMutationBlockReason}
         canSelectAndDeleteRows={
           canSelectAndDeleteRows &&
@@ -458,6 +517,7 @@ export function TableView({
         rowSelectionDisabled={mutationBusy}
         colSizes={data.colSizes}
         columns={data.columns}
+        nonSortableColumnNames={data.pageScopedColumnNames}
         editCell={mutation.editCell}
         filterDrafts={data.filterDrafts}
         loading={data.loading}
@@ -534,7 +594,7 @@ export function TableView({
           postMessage(resolveTableExportMessageType(exportChoice.format), {
             sort: exportChoice.sort,
             filters: exportChoice.filters,
-            columnOrder: getExportColumnOrder(),
+            columnOrder: exportChoice.columnOrder,
           });
           setExportChoice(null);
         }}
@@ -550,7 +610,7 @@ export function TableView({
               page: exportChoice.page,
               pageSize: exportChoice.pageSize,
             },
-            columnOrder: getExportColumnOrder(),
+            columnOrder: exportChoice.columnOrder,
           });
           setExportChoice(null);
         }}

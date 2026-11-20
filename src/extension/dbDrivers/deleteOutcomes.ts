@@ -127,7 +127,9 @@ export async function deleteRowsSequentially(
   context: DriverOperationContext | undefined,
   prepare: (
     identity: Record<string, unknown>,
-  ) => () => Promise<"deleted" | "notfound" | "unknown">,
+  ) =>
+    | (() => Promise<"deleted" | "notfound" | "unknown">)
+    | Promise<() => Promise<"deleted" | "notfound" | "unknown">>,
 ): Promise<DriverMutationResult> {
   const rowOutcomes: DeleteRowOutcome[] = identities.map(
     (primaryKeys, rowIndex) => ({
@@ -148,7 +150,10 @@ export async function deleteRowsSequentially(
     try {
       throwIfTransactionCancelled(context);
       row.status = "failed";
-      const execute = prepare(row.primaryKeys);
+      const prepared = prepare(row.primaryKeys);
+      const execute =
+        typeof prepared === "function" ? prepared : await prepared;
+      throwIfTransactionCancelled(context);
       row.status = "unknown";
       report();
       row.status = await execute();

@@ -7,7 +7,6 @@ import {
   useState,
 } from "react";
 import {
-  NULL_SENTINEL,
   normalizeBinaryHexDisplayPrefix,
   type TypeCategory,
 } from "../../../shared/tableTypes";
@@ -44,7 +43,7 @@ export function EditInput({
   onCancel,
   onDirtyChange,
 }: {
-  initial: string;
+  initial: string | null;
   initialMissing?: boolean;
   nullable: boolean;
   category?: TypeCategory;
@@ -52,15 +51,14 @@ export function EditInput({
   showDefaultButton?: boolean;
   onSetDefault?: () => void;
   readOnly?: boolean;
-  onCommit: (v: string) => void;
+  onCommit: (v: string | null) => void;
   onCancel: () => void;
   onDirtyChange?: (dirty: boolean) => void;
 }) {
-  const isInitiallyNull = initial === NULL_SENTINEL;
+  const isInitiallyNull = initial === null;
+  const initialText = normalizeEditInitialValue(initial ?? "", category);
   const [isNull, setIsNull] = useState(isInitiallyNull);
-  const [val, setVal] = useState(
-    isInitiallyNull ? "" : normalizeEditInitialValue(initial, category),
-  );
+  const [val, setVal] = useState(initialText);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -233,8 +231,7 @@ export function EditInput({
     !readOnly &&
     ((initialMissing && editedRef.current) ||
       isNull !== isInitiallyNull ||
-      (!isNull &&
-        normalizedValue !== normalizeEditInitialValue(initial, category)));
+      (!isNull && normalizedValue !== initialText));
   const onDirtyChangeRef = useRef(onDirtyChange);
   onDirtyChangeRef.current = onDirtyChange;
   useEffect(() => {
@@ -247,7 +244,7 @@ export function EditInput({
       onCancel();
       return;
     }
-    onCommit(isNull ? NULL_SENTINEL : normalizeEditInitialValue(val, category));
+    onCommit(isNull ? null : normalizedValue);
   };
   const inputStyle: React.CSSProperties = {
     ...buildTextInputStyle("sm"),
@@ -362,7 +359,7 @@ export function EditInput({
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => {
             finishEditing();
-            onCommit(NULL_SENTINEL);
+            onCommit(null);
           }}
           title="Set field to NULL"
           style={nullBtnStyle}
@@ -455,7 +452,6 @@ export function EditInput({
     </div>
   );
 }
-export function valueToEditString(value: unknown): string {
-  if (value == null) return NULL_SENTINEL;
-  return formatScalarValueForDisplay(value);
+export function toEditValue(value: unknown): string | null {
+  return value == null ? null : formatScalarValueForDisplay(value);
 }

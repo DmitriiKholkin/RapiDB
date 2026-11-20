@@ -1,3 +1,7 @@
+import {
+  isSqlDeleteObservation,
+  type SqlDeleteObservation,
+} from "../sqlDeleteObservation";
 import type { ColumnTypeMeta, MongoValueTypeHint } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -37,6 +41,8 @@ export interface ApplyResultPayload {
   warning?: string;
   failedRows?: number[];
   rowOutcomes?: ApplyRowOutcome[];
+  /** Update request indexes with a confirmed stale-row conflict, and no writes in this Apply. */
+  conflictRows?: number[];
   insertApplied?: boolean;
   insertRowOutcomes?: ApplyRowOutcome[];
 }
@@ -188,6 +194,8 @@ export type TablePanelMessage =
         filters?: unknown;
         sort?: TableSortPayload | null;
         refreshMetadata?: boolean;
+        refreshData?: boolean;
+        conflictRefresh?: boolean;
       }
     >
   | WebviewMessageEnvelope<
@@ -207,6 +215,7 @@ export type TablePanelMessage =
       {
         operationId: string;
         primaryKeysList?: Array<Record<string, unknown>>;
+        sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
       }
     >
   | WebviewMessageEnvelope<
@@ -237,9 +246,10 @@ export type TablePanelMessage =
     >
   | WebviewMessageEnvelope<"readClipboard", ClipboardReadPayload>
   | WebviewMessageEnvelope<"writeClipboard", ClipboardWritePayload>
+  | WebviewMessageEnvelope<"deleteRecoveryResolved", { operationId: string }>
   | WebviewMessageEnvelope<
       "unsavedChangesState",
-      { hasUnsavedChanges: boolean }
+      { hasUnsavedChanges: boolean; hasDeleteRecovery?: boolean }
     >;
 
 function isRowUpdateMessagePayload(
@@ -285,7 +295,9 @@ function isMongoValueTypeHint(value: unknown): value is MongoValueTypeHint {
       (typeof value.bsonSubtype === "number" &&
         Number.isInteger(value.bsonSubtype) &&
         value.bsonSubtype >= 0 &&
-        value.bsonSubtype <= 255))
+        value.bsonSubtype <= 255)) &&
+    (value.dbRefTextVersion === undefined ||
+      (value.nativeType === "dbRef" && value.dbRefTextVersion === 1))
   );
 }
 
@@ -365,6 +377,8 @@ export function parseTablePanelMessage(
           filters: payload.filters,
           sort,
           refreshMetadata: payload.refreshMetadata === true,
+          ...(payload.refreshData === true && { refreshData: true }),
+          ...(payload.conflictRefresh === true && { conflictRefresh: true }),
         },
       };
     }
@@ -438,9 +452,25 @@ export function parseTablePanelMessage(
       if (primaryKeysList !== undefined && !isArrayOfRecords(primaryKeysList)) {
         return null;
       }
+      const sqlDeleteObservations = payload.sqlDeleteObservations;
+      if (
+        sqlDeleteObservations !== undefined &&
+        (!Array.isArray(sqlDeleteObservations) ||
+          ![...sqlDeleteObservations].every(
+            (value) => value === null || isSqlDeleteObservation(value),
+          ))
+      ) {
+        return null;
+      }
       return {
         type: envelope.type,
-        payload: { operationId, primaryKeysList },
+        payload: {
+          operationId,
+          primaryKeysList,
+          ...(sqlDeleteObservations !== undefined
+            ? { sqlDeleteObservations }
+            : {}),
+        },
       };
     }
 
@@ -500,12 +530,28 @@ export function parseTablePanelMessage(
       return payload ? { type: envelope.type, payload } : null;
     }
 
+    case "deleteRecoveryResolved": {
+      const payload = parseRequiredPayloadRecord(envelope);
+      const operationId = payload && readOperationId(payload);
+      return operationId
+        ? { type: envelope.type, payload: { operationId } }
+        : null;
+    }
+
     case "unsavedChangesState": {
       const payload = parseRequiredPayloadRecord(envelope);
-      return payload && typeof payload.hasUnsavedChanges === "boolean"
+      return payload &&
+        typeof payload.hasUnsavedChanges === "boolean" &&
+        (payload.hasDeleteRecovery === undefined ||
+          typeof payload.hasDeleteRecovery === "boolean")
         ? {
             type: envelope.type,
-            payload: { hasUnsavedChanges: payload.hasUnsavedChanges },
+            payload: {
+              hasUnsavedChanges: payload.hasUnsavedChanges,
+              ...(payload.hasDeleteRecovery !== undefined && {
+                hasDeleteRecovery: payload.hasDeleteRecovery,
+              }),
+            },
           }
         : null;
     }
@@ -521,4 +567,5 @@ export interface TableInitPayload {
   isView?: boolean;
   connectionReadOnly?: boolean;
   connectionSessionKey?: string;
+  requiresSqlDeleteObservation?: boolean;
 }

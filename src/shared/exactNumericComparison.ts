@@ -9,6 +9,9 @@ const EXACT_NUMERIC_RE =
   /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
 const FORMATTED_NUMERIC_RE =
   /^([+-]?)\s*(\p{Sc}?)\s*([+-]?)\s*([\d.,][\d.,'\s]*)\s*(\p{Sc}?)\s*([+-]?)$/u;
+// Accept thousands grouping and South Asian grouping, each with one separator.
+const GROUPED_INTEGER_RE =
+  /^(?:\d{1,3}([.,'])\d{3}(?:\1\d{3})*|\d{1,2}([.,'])(?:\d{2}\2)+\d{3})$/;
 
 function parseExactNumericValue(value: unknown): ExactNumericValue | null {
   let text: string;
@@ -75,9 +78,11 @@ function normalizeFormattedNumericValue(value: string): string | null {
   if (signs.length > 1 || (parenthesized && signs.length > 0)) return null;
   if (match[2] && match[5]) return null;
   const negative = parenthesized || signs[0] === "-";
-  const digitsAndSeparators = match[4].replace(/[^\d.,]/g, "");
-  if (!/\d/.test(digitsAndSeparators)) return null;
+  const numberBody = match[4].replace(/\s/g, "");
+  if (!/\d$/.test(numberBody)) return null;
 
+  // Keep the existing decimal inference; validate apostrophe grouping below.
+  const digitsAndSeparators = numberBody.replace(/'/g, "");
   const lastDot = digitsAndSeparators.lastIndexOf(".");
   const lastComma = digitsAndSeparators.lastIndexOf(",");
   const hasDot = lastDot >= 0;
@@ -91,7 +96,6 @@ function normalizeFormattedNumericValue(value: string): string | null {
     const integerDigits = digitsAndSeparators.slice(0, lastSeparator);
     const digitsAfter = digitsAndSeparators.slice(lastSeparator + 1).length;
     const grouping =
-      digitsAfter === 0 ||
       integerDigits.includes(separator) ||
       (/^[1-9]\d{0,2}$/.test(integerDigits) && digitsAfter === 3);
     if (!grouping) {
@@ -99,22 +103,22 @@ function normalizeFormattedNumericValue(value: string): string | null {
     }
   }
 
-  let normalized: string;
-  if (decimalSeparator) {
-    const decimalIndex = digitsAndSeparators.lastIndexOf(decimalSeparator);
-    const integerPart = digitsAndSeparators
-      .slice(0, decimalIndex)
-      .replace(/[^\d]/g, "");
-    const fractionalPart = digitsAndSeparators
-      .slice(decimalIndex + 1)
-      .replace(/[^\d]/g, "");
-    if (fractionalPart.length === 0) return null;
-    normalized = `${integerPart || "0"}.${fractionalPart}`;
-  } else {
-    normalized = digitsAndSeparators.replace(/[^\d]/g, "");
+  const decimalIndex = decimalSeparator
+    ? numberBody.lastIndexOf(decimalSeparator)
+    : numberBody.length;
+  const integerPart = numberBody.slice(0, decimalIndex);
+  const fractionalPart = numberBody.slice(decimalIndex + 1);
+  if (
+    (integerPart &&
+      !/^\d+$/.test(integerPart) &&
+      !GROUPED_INTEGER_RE.test(integerPart)) ||
+    (decimalSeparator && !/^\d+$/.test(fractionalPart))
+  ) {
+    return null;
   }
 
-  return `${negative ? "-" : ""}${normalized}`;
+  const integer = integerPart.replace(/[.,']/g, "") || "0";
+  return `${negative ? "-" : ""}${integer}${decimalSeparator ? `.${fractionalPart}` : ""}`;
 }
 
 function compareMagnitude(

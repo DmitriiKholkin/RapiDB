@@ -488,6 +488,47 @@ describe("TablePanel", () => {
     TablePanel.disposeAll();
   });
 
+  it.each([
+    "aux",
+    "temp",
+    "main",
+  ])("does not restore a SQLite %s draft unless it belongs to main", async (schema) => {
+    const { connectionManager } = await openSchemaRefreshPath();
+    connectionManager.getConnection.mockReturnValue({
+      name: "SQLite",
+      type: "sqlite",
+    });
+    TablePanel.registerSerializer(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+    );
+    const serializer = vscodeMock.serializers.get("rapidb.tablePanel") as {
+      deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+    };
+    const panel = vscodeMock.createWebviewPanel();
+    const onDispose = vi.fn();
+    panel.onDidDispose(onDispose);
+    await serializer.deserializeWebviewPanel(panel, {
+      initialState: {
+        view: "table",
+        connectionId: "conn-2",
+        database: schema,
+        schema,
+        table: "restored_items",
+      },
+      tableDraft: { newRows: [{ label: { value: "old draft" } }] },
+    });
+    if (schema === "main") {
+      expect(onDispose).not.toHaveBeenCalled();
+      expect(panel.webview.html).toBe("<html></html>");
+    } else {
+      expect(onDispose).toHaveBeenCalledOnce();
+      expect(vscodeMock.module.window.showWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("attachment identity cannot be verified"),
+      );
+    }
+  });
+
   function lazyRestoreRegistryFixture() {
     const refreshListeners = new Set<(id?: string) => void>();
     const invalidationListeners = new Set<(id: string) => void>();
@@ -2400,6 +2441,7 @@ describe("TablePanel", () => {
       [{ column: "id", operator: "gte", value: "1" }],
       expect.any(AbortSignal),
       ["name", "id"],
+      type === "exportCSV" ? "csv" : "json",
     );
   });
 
@@ -3674,6 +3716,64 @@ describe("TablePanel", () => {
     });
   });
 
+  it("scopes Elasticsearch pages per viewer and resets on query changes, refresh and disposal", async () => {
+    const connectionManager = {
+      getConnection: () => ({ name: "ES", type: "elasticsearch" }),
+      getDefaultPageSize: () => 25,
+      onDidDisconnect: () => ({ dispose: vi.fn() }),
+    };
+    TablePanel.createOrShow(
+      { extensionUri: {} } as never,
+      connectionManager as never,
+      "conn-1",
+      "default",
+      "indices",
+      "records",
+    );
+    const panel = createdPanel();
+    if (!panel) throw new Error("Expected table panel instance");
+    let fetchId = 0;
+    const read = async (options: Record<string, unknown> = {}) => {
+      await panel.webview.dispatchMessage({
+        type: "fetchPage",
+        payload: { fetchId: ++fetchId, page: 1, pageSize: 25, ...options },
+      });
+      const args: unknown[] = getPageMock.mock.lastCall ?? [];
+      const scope = args.at(-1);
+      if (!(scope instanceof AbortSignal))
+        throw new Error("Expected an Elasticsearch browsing scope");
+      expect(scope.aborted).toBe(false);
+      return scope;
+    };
+    const first = await read();
+    expect(await read({ page: 7 })).toBe(first);
+    const filters = [{ column: "_id", operator: "eq", value: "some-id" }];
+    const filtered = await read({ filters });
+    expect(first.aborted).toBe(true);
+    const sort = { column: "_source", direction: "desc" };
+    const sorted = await read({ filters, sort });
+    expect(filtered.aborted).toBe(true);
+    const resized = await read({ filters, sort, pageSize: 10 });
+    expect(sorted.aborted).toBe(true);
+    const refreshed = await read({
+      filters,
+      sort,
+      pageSize: 10,
+      refreshMetadata: true,
+    });
+    expect(resized.aborted).toBe(true);
+    const dataOnly = await read({
+      filters,
+      sort,
+      pageSize: 10,
+      refreshData: true,
+    });
+    expect(refreshed.aborted).toBe(true);
+    expect(await read({ filters, sort, pageSize: 10, page: 2 })).toBe(dataOnly);
+    panel.dispose();
+    expect(dataOnly.aborted).toBe(true);
+  });
+
   it("routes deleteRows through mutation preview when prepared plan exists", async () => {
     const connectionManager = {
       getConnection: vi.fn(() => ({ name: "Main" })),
@@ -4189,17 +4289,16 @@ describe("TablePanel", () => {
     );
   });
 
-  it("uses driver capabilities to classify filter errors", async () => {
-    getPageMock.mockRejectedValueOnce(
-      new Error("invalid input syntax for type uuid"),
-    );
+  it("redacts known credentials in filter errors without changing driver classification", async () => {
+    const password = "synthetic-filter-password-11";
+    const message = `invalid input syntax for type uuid: ${password}`;
+    getPageMock.mockRejectedValueOnce(new Error(message));
+    const isTableFilterError = vi.fn((value: string) => value === message);
 
     const connectionManager = {
       getConnection: vi.fn(() => ({ name: "Main" })),
-      getDriverCapabilities: vi.fn(() => ({
-        isTableFilterError: (message: string) =>
-          /invalid input syntax/i.test(message),
-      })),
+      getConnectionDiagnosticContext: () => ({ password }),
+      getDriverCapabilities: vi.fn(() => ({ isTableFilterError })),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       getDefaultPageSize: vi.fn(() => 25),
     };
@@ -4229,13 +4328,50 @@ describe("TablePanel", () => {
       },
     });
 
+    expect(isTableFilterError).toHaveBeenCalledWith(message);
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "tableError",
       payload: {
         fetchId: 3,
-        error: "invalid input syntax for type uuid",
+        error: "invalid input syntax for type uuid: [REDACTED]",
         isFilterError: true,
       },
     });
+  });
+
+  it("redacts the table's unexpected driver errors in the toast and the console", async () => {
+    const password = "synthetic-table-password-11";
+    const failure = new Error(`Driver is unavailable: ${password}`);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const connectionManager = {
+        getConnection: () => ({ name: "Main", type: "pg" }),
+        getConnectionDiagnosticContext: () => ({ password }),
+        getDefaultPageSize: () => 25,
+        getDriver: () => {
+          throw failure;
+        },
+        onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
+      };
+      TablePanel.createOrShow(
+        { extensionUri: {} } as never,
+        connectionManager as never,
+        "conn-1",
+        "db1",
+        "public",
+        "users",
+      );
+      await createdPanel()?.webview.dispatchMessage({ type: "exportCSV" });
+      expect(vscodeMock.module.window.showErrorMessage).toHaveBeenCalledWith(
+        "[RapiDB] Unexpected error: Driver is unavailable: [REDACTED]",
+      );
+      expect(log).toHaveBeenCalledWith(
+        "[RapiDB] TablePanel unhandled error:",
+        expect.stringContaining("Driver is unavailable: [REDACTED]"),
+      );
+      expect(JSON.stringify(log.mock.calls)).not.toContain(password);
+    } finally {
+      log.mockRestore();
+    }
   });
 });

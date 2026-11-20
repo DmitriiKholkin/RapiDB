@@ -66,10 +66,9 @@ async function determineVersion(
     "release-version-",
   );
   const outputPath = join(root, "github-output");
-  await writeFile(
-    join(root, "package.json"),
-    JSON.stringify({ version: currentVersion }),
-  );
+  const manifestPath = join(root, "package.json");
+  const manifest = JSON.stringify({ version: currentVersion });
+  await writeFile(manifestPath, manifest);
   await writeFile(outputPath, "");
   const inputs = {
     "inputs.version_bump": bump,
@@ -100,6 +99,7 @@ async function determineVersion(
   expect(result.error).toBeUndefined();
   expect(result.signal).toBeNull();
   expect(result.status).not.toBeNull();
+  expect(await readFile(manifestPath, "utf8")).toBe(manifest);
   return { ...result, output: await readFile(outputPath, "utf8") };
 }
 
@@ -120,7 +120,7 @@ const adversarialVersions = [
 ];
 
 describe("release workflow quality gates", () => {
-  it("requires typecheck and lint before any release steps", () => {
+  it("requires typecheck, lint, and version validation before release side effects", () => {
     const steps = workflow.jobs.release.steps;
     const installIndex = steps.findIndex((step) => step.run === "npm ci");
     const checkIndex = steps.findIndex((step) => step.run === "npm run check");
@@ -129,6 +129,19 @@ describe("release workflow quality gates", () => {
     expect(installIndex).toBeGreaterThanOrEqual(0);
     expect(checkIndex).toBe(installIndex + 1);
     expect(versionIndex).toBe(checkIndex + 1);
+
+    let previousIndex = versionIndex;
+    for (const name of [
+      "Bump version in package.json",
+      "Sync package-lock.json",
+      "Package VSIX",
+      "Commit version bump",
+      "Create GitHub Release",
+    ]) {
+      const index = steps.findIndex((step) => step.name === name);
+      expect(index, name).toBeGreaterThan(previousIndex);
+      previousIndex = index;
+    }
 
     for (const step of steps.slice(checkIndex)) {
       expect(step.if).toBeUndefined();
@@ -209,10 +222,7 @@ describe("release workflow version input boundary", () => {
     "0.0.0",
     "1.2.3",
     "10.20.30",
-    "1.2.3-beta",
-    "1.2.3-rc.1",
-    "1.2.3-RC.2",
-  ])("preserves custom release/prerelease %j and all downstream outputs", async (version) => {
+  ])("preserves stable custom version %j and all downstream outputs", async (version) => {
     const result = await determineVersion("custom", version);
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
@@ -221,13 +231,28 @@ describe("release workflow version input boundary", () => {
     );
   });
 
+  it("reports a missing custom version before writing outputs", async () => {
+    const result = await determineVersion("custom");
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("::error::Custom version is required");
+    expect(result.stderr).toBe("");
+    expect(result.output).toBe("");
+  });
+
   it.each([
-    "",
     "1.2",
     "v1.2.3",
     "1.2.3.4",
+    "01.2.3",
+    "1.02.3",
+    "1.2.03",
+    "1.2.9007199254740992",
     "1.2.3-",
+    "1.2.3-beta",
+    "1.2.3-rc.1",
+    "1.2.3-RC.2",
     "1.2.3+build.1",
+    "1.2.3-rc.1+build.1",
     "1.2.3-alpha-beta",
     " 1.2.3",
     "1.2.3 ",
@@ -235,7 +260,9 @@ describe("release workflow version input boundary", () => {
   ])("rejects invalid/adversarial custom input %j before output or execution", async (version) => {
     const result = await determineVersion("custom", version);
     expect(result.status).toBe(1);
-    expect(result.stdout).toContain("::error::");
+    expect(result.stdout).toContain(
+      "::error::VS Code Marketplace requires a stable X.Y.Z version",
+    );
     expect(result.stderr).toBe("");
     expect(result.output).toBe("");
   });
@@ -289,7 +316,22 @@ describe("release workflow version input boundary", () => {
   });
 
   it.each([
+    ["1.2.9007199254740991", "patch"],
+    ["1.9007199254740991.0", "minor"],
+    ["9007199254740991.0.0", "major"],
+  ])("rejects a %s %s bump outside the SemVer integer range", async (current, bump) => {
+    const result = await determineVersion(bump, "", current);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain(
+      "::error::VS Code Marketplace requires a stable X.Y.Z version",
+    );
+    expect(result.stderr).toBe("");
+    expect(result.output).toBe("");
+  });
+
+  it.each([
     "1.2",
+    "1.2.9007199254740992",
     "1.2.3+",
     "1.2.3-rc+",
     `1.2.3$(${markerCommand})`,

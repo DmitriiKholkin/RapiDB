@@ -3,6 +3,7 @@ import {
   extractCredentialBearingUriSecret,
   hasConnectionConfigSecrets,
   resolveStoredCredentialBearingUri,
+  restoreCredentialBearingUri,
   sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
   sanitizePersistedConnectionConfig,
@@ -308,6 +309,58 @@ describe("connection URI secret handling", () => {
       "https://cluster.example.com/api?region=us-east-1",
     );
     expect(persisted.useSecretStorage).toBe(true);
+  });
+
+  it.each([
+    [
+      "X-Amz-Algorithm",
+      "x-aMz-%53ignature",
+      "X-Amz-Credential",
+      "X-Amz-Security-Token",
+    ],
+    [
+      "X-Goog-Algorithm",
+      "%58-gOoG-Signature",
+      "X-Goog-Credential",
+      "X-Goog-Security-Token",
+    ],
+  ])("protects %s signed URLs without rewriting ordinary parameters", (algorithm, signature, credential, token) => {
+    const safe = "https://service.example.test/api?mode=a%20b&mode=%7e#section";
+    const signed = `https://service.example.test/api?${algorithm}=FAKE-ALGORITHM&mode=a%20b&${signature}=fake%2Bsignature&mode=%7e&${credential}=fake%2Fcredential&${token}=fake%3Dtoken#section`;
+    expect(extractCredentialBearingUriSecret(signed)).toBe(signed);
+    expect(sanitizeCredentialBearingUri(signed)).toBe(safe);
+    expect(restoreCredentialBearingUri(safe, signed, true)).toBe(signed);
+    expect(restoreCredentialBearingUri(safe, signed, false)).toBe(safe);
+    expect(sanitizeCredentialBearingUri(safe)).toBe(safe);
+    expect(extractCredentialBearingUriSecret(safe)).toBeUndefined();
+    expect(sanitizeCredentialBearingUri(`${safe}&${signature}=fake`)).toBe(
+      safe.split("#")[0],
+    );
+    for (const edited of [
+      safe.replace("service.example.test", "other.example.test"),
+      safe.replace("mode=a%20b", "mode=write"),
+      signed.replace("fake%2Bsignature", "replacement-signature"),
+    ]) {
+      expect(restoreCredentialBearingUri(edited, signed, true)).toBe(edited);
+    }
+  });
+
+  it("keeps signed endpoints in explicitly plaintext and hand-written settings, but not in responses", () => {
+    const config: ConnectionConfig = {
+      id: "signed-endpoint",
+      name: "Signed endpoint",
+      type: "elasticsearch",
+      endpoint:
+        "https://service.example.test/api?X-Goog-Credential=fake%2Fcredential&mode=read",
+    };
+    for (const useSecretStorage of [undefined, false]) {
+      expect(
+        sanitizePersistedConnectionConfig({ ...config, useSecretStorage }),
+      ).toEqual({ ...config, useSecretStorage: false });
+    }
+    expect(sanitizeConnectionConfigForResponse(config).endpoint).toBe(
+      "https://service.example.test/api?mode=read",
+    );
   });
 
   it("preserves harmless URI formatting exactly", () => {

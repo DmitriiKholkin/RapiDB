@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { ConnectionFormSubmission } from "../../src/shared/webviewContracts/connection";
 import { ConnectionFormView } from "../../src/webview/components/ConnectionFormView";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 import {
   clearPostedMessages,
   dispatchIncomingMessage,
@@ -215,7 +216,7 @@ describe("ConnectionFormView", () => {
     "   ",
     "1",
     "65535",
-  ])("uses defaults only for empty port fields: %j", async (value) => {
+  ])("inherits a blank PostgreSQL port and defaults a blank SSH port: %j", async (value) => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={null} />);
     await user.type(screen.getByLabelText("Connection name"), "Ports");
@@ -242,7 +243,7 @@ describe("ConnectionFormView", () => {
     expect(getLastPostedMessage()).toMatchObject({
       type: "saveConnection",
       payload: {
-        port: value.trim() ? Number(value) : 5432,
+        port: value.trim() ? Number(value) : undefined,
         ssh: { port: value.trim() ? Number(value) : 22 },
       },
     });
@@ -720,7 +721,7 @@ describe("ConnectionFormView", () => {
     );
     await user.type(
       screen.getByLabelText("Elasticsearch cloud id"),
-      "deployment:ZXM=",
+      "deployment:ZXhhbXBsZS50ZXN0JGVz",
     );
 
     clearPostedMessages();
@@ -732,7 +733,7 @@ describe("ConnectionFormView", () => {
         type: "elasticsearch",
         endpoint: undefined,
         apiKey: "api-key",
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
         useSecretStorage: true,
       }),
     });
@@ -827,6 +828,52 @@ describe("ConnectionFormView", () => {
     });
   });
 
+  it("blocks Test and Save for a malformed SSH pin and accepts a padded pin", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+
+    await user.type(screen.getByLabelText("Connection name"), "PG SSH");
+    await fillRequiredPostgresFields(user);
+    await user.click(
+      screen.getByRole("switch", { name: /connect through ssh bastion/i }),
+    );
+    await user.type(screen.getByLabelText("SSH host"), "bastion.example.com");
+    await user.type(screen.getByLabelText("SSH username"), "tunnel");
+    await user.selectOptions(screen.getByLabelText("SSH auth method"), [
+      "password",
+    ]);
+    await user.selectOptions(
+      screen.getByLabelText("SSH host verification mode"),
+      ["manual"],
+    );
+    await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
+    const fingerprint = screen.getByLabelText("SSH host fingerprint SHA256");
+    await user.type(fingerprint, "SHA256:a");
+
+    clearPostedMessages();
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    expect(getPostedMessages()).toEqual([]);
+    expect(
+      screen.getByText(/must use the OpenSSH SHA256 fingerprint format/),
+    ).toBeTruthy();
+
+    await submitCreateConnection(user);
+    expect(getPostedMessages()).toEqual([]);
+    expect(
+      screen.getByText(/must use the OpenSSH SHA256 fingerprint format/),
+    ).toBeTruthy();
+
+    await user.clear(fingerprint);
+    await user.type(fingerprint, `  ${SSH_HOST_FINGERPRINT_SHA256}=  `);
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: {
+        ssh: { hostFingerprintSha256: `${SSH_HOST_FINGERPRINT_SHA256}=` },
+      },
+    });
+  });
+
   it("posts SSH password payloads with the default Secret Storage choice", async () => {
     const user = userEvent.setup();
 
@@ -852,7 +899,7 @@ describe("ConnectionFormView", () => {
     await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
     await user.type(
       screen.getByLabelText("SSH host fingerprint SHA256"),
-      "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      SSH_HOST_FINGERPRINT_SHA256,
     );
 
     clearPostedMessages();
@@ -872,8 +919,7 @@ describe("ConnectionFormView", () => {
           password: "ssh-secret",
           privateKey: undefined,
           passphrase: undefined,
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
       }),
     });
@@ -898,7 +944,7 @@ describe("ConnectionFormView", () => {
     await user.type(screen.getByLabelText("SSH password"), "ssh-secret");
     await user.type(
       screen.getByLabelText("SSH host fingerprint SHA256"),
-      "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      SSH_HOST_FINGERPRINT_SHA256,
     );
     await user.click(
       screen.getByRole("switch", {
@@ -1088,7 +1134,7 @@ describe("ConnectionFormView", () => {
         username: "tunnel",
         authMethod: "privateKey" as const,
         hostVerificationMode: "manual" as const,
-        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
       useSecretStorage: true,
       hasStoredSshPrivateKey: true,
@@ -1121,8 +1167,7 @@ describe("ConnectionFormView", () => {
           password: undefined,
           privateKey: "",
           passphrase: "",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         hasStoredSshPrivateKey: true,
         hasStoredSshPassphrase: true,
@@ -1381,6 +1426,50 @@ describe("ConnectionFormView", () => {
 });
 
 describe("MongoDB connection editor", () => {
+  it.each([
+    ["/%zz", "database path"],
+    ["/db?%=private-option-value", "option name"],
+  ])("blocks Test and Save for malformed URI encoding in %s", async (suffix, component) => {
+    const user = userEvent.setup();
+    render(
+      <ConnectionFormView
+        existing={{
+          id: "mongo-encoding",
+          type: "mongodb",
+          name: "Mongo encoding",
+          mongoConnectionMode: "uri",
+          connectionUri: "mongodb://host/app",
+        }}
+      />,
+    );
+    const input = screen.getByLabelText("MongoDB connection URI");
+    await user.clear(input);
+    await user.type(input, `mongodb://user:uri-secret@host${suffix}`);
+    clearPostedMessages();
+
+    const message = `MongoDB URI ${component} has invalid percent-encoding. Use %25 for a literal percent sign.`;
+    for (const button of [/test connection/i, /save changes/i]) {
+      await user.click(screen.getByRole("button", { name: button }));
+      expect(screen.getByText(`✗ ${message}`)).toBeTruthy();
+      expect(getLastPostedMessage()).toBeUndefined();
+    }
+
+    const corrected = "mongodb://user:p%25@host/a%25zz?app%4Eame=a%2526b";
+    await user.clear(input);
+    await user.type(input, corrected);
+    await user.click(screen.getByRole("button", { name: /test connection/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "testConnection",
+      payload: { connectionUri: corrected },
+    });
+    dispatchTestResult({ success: true });
+    await user.click(screen.getByRole("button", { name: /save changes/i }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "saveConnection",
+      payload: { connectionUri: corrected },
+    });
+  });
+
   it("submits the same authSource and credentials for Test and Save, while keeping editor drafts", async () => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={null} />);

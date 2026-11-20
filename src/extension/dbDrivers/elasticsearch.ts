@@ -28,6 +28,7 @@ import {
 import { deleteRowsSequentially } from "./deleteOutcomes";
 import {
   drainElasticsearchCleanup,
+  ElasticsearchBrowsingSnapshotExpiredError,
   ElasticsearchPitSession,
 } from "./elasticsearchPitSession";
 import {
@@ -35,6 +36,7 @@ import {
   stringifyElasticsearchJson,
 } from "./elasticsearchSerializer";
 import { getMetadataContext } from "./metadataCancellation";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   applyFilters,
   applySort,
@@ -50,6 +52,7 @@ import {
   getDefaultDriverTimeoutSettings,
   getQueryRemainingTimeoutMs,
   throwIfQueryCancelled,
+  throwIfTransactionCancelled,
 } from "./timeout";
 import type {
   ColumnMeta,
@@ -110,6 +113,7 @@ class SshTlsHttpConnection extends HttpConnection {
 
 const ELASTICSEARCH_READ_ONLY_QUERY_REASON =
   "[RapiDB] Read-only Elasticsearch connections allow only GET requests and POST _search requests.";
+const MAX_ELASTICSEARCH_BROWSING_SNAPSHOTS = 8;
 const ELASTICSEARCH_COMPATIBILITY_HEADERS = {
   accept: "application/vnd.elasticsearch+json; compatible-with=8",
   "content-type": "application/vnd.elasticsearch+json; compatible-with=8",
@@ -123,7 +127,7 @@ interface ElasticsearchRestCommand {
   body?: unknown;
 }
 
-interface ElasticsearchMutationIdentity {
+interface ElasticsearchDocumentTarget {
   index: string;
   id: string;
   routing?: string;
@@ -131,10 +135,48 @@ interface ElasticsearchMutationIdentity {
   if_primary_term: number;
 }
 
+interface ElasticsearchMutationIdentity {
+  target: ElasticsearchDocumentTarget;
+  indexUuid: string;
+  epoch: number;
+}
+
+interface ElasticsearchReadIdentity {
+  table: string;
+  epoch: number;
+  indexUuids: ReadonlyMap<string, string>;
+}
+
+type ElasticsearchIndexSettings = Awaited<
+  ReturnType<Client["indices"]["getSettings"]>
+>;
+
+type ElasticsearchPitMetadata = {
+  window: number;
+  unknownWindow: boolean;
+  identity: ElasticsearchReadIdentity;
+};
+
+type ElasticsearchBrowsingSnapshot = {
+  key: string;
+  reader?: ElasticsearchPitSession;
+  metadata?: ElasticsearchPitMetadata;
+};
+
+function isElasticsearchIndexUuid(value: unknown): value is string {
+  // Elasticsearch's generated base64url UUID. In particular, reject "_na_".
+  return typeof value === "string" && /^[A-Za-z0-9_-]{22}$/.test(value);
+}
+
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
   private connected = false;
   private readonly pitReaders = new Set<ElasticsearchPitSession>();
+  private readonly browsingSnapshots = new WeakMap<
+    AbortSignal,
+    ElasticsearchBrowsingSnapshot
+  >();
+  private readonly activeBrowsingReaders = new Set<ElasticsearchPitSession>();
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
   private readonly identitySecret = randomBytes(32);
@@ -1353,6 +1395,89 @@ export class ElasticsearchDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     request.signal?.throwIfAborted();
+    const timeoutMs = this.timeoutSettingsProvider().dbOperationTimeoutMs;
+    const deadline = Math.min(
+      request.deadline ?? Infinity,
+      Date.now() + timeoutMs,
+    );
+    const scope = request.browsingSnapshot;
+    if (!scope) return this.readPageWithinPit(request, deadline, timeoutMs);
+    scope.throwIfAborted();
+    const { snapshot, reader } = this.getBrowsingSnapshot(
+      scope,
+      request,
+      timeoutMs,
+    );
+    return reader.runPage(deadline, request.signal, () =>
+      this.readPageWithinPit(request, deadline, timeoutMs, snapshot),
+    );
+  }
+
+  private getBrowsingSnapshot(
+    scope: AbortSignal,
+    request: DriverTablePageRequest,
+    timeoutMs: number,
+  ): {
+    snapshot: ElasticsearchBrowsingSnapshot;
+    reader: ElasticsearchPitSession;
+  } {
+    const key = JSON.stringify([
+      request.database,
+      request.schema,
+      request.table,
+      request.pageSize,
+      request.filters,
+      request.sort,
+    ]);
+    const previous = this.browsingSnapshots.get(scope);
+    if (previous) {
+      // Never silently switch PITs once the viewer may have seen its order.
+      const reader = previous.reader;
+      if (!reader || reader.signal.aborted || previous.key !== key) {
+        reader?.expireBrowsingSnapshot();
+        throw new ElasticsearchBrowsingSnapshotExpiredError();
+      }
+      this.activeBrowsingReaders.delete(reader);
+      this.activeBrowsingReaders.add(reader);
+      return { snapshot: previous, reader };
+    }
+
+    const client = this.requireClient();
+    const oldest = this.activeBrowsingReaders.values().next().value;
+    if (
+      oldest &&
+      this.activeBrowsingReaders.size >= MAX_ELASTICSEARCH_BROWSING_SNAPSHOTS
+    ) {
+      this.activeBrowsingReaders.delete(oldest);
+      oldest.expireBrowsingSnapshot();
+    }
+    const snapshot: ElasticsearchBrowsingSnapshot = { key };
+    const reader = new ElasticsearchPitSession(
+      client,
+      timeoutMs,
+      "readTablePage",
+      scope,
+      Infinity,
+      () => {
+        snapshot.reader = undefined;
+        snapshot.metadata = undefined;
+        this.activeBrowsingReaders.delete(reader);
+        this.pitReaders.delete(reader);
+      },
+    );
+    snapshot.reader = reader;
+    this.browsingSnapshots.set(scope, snapshot);
+    this.activeBrowsingReaders.add(reader);
+    this.pitReaders.add(reader);
+    return { snapshot, reader };
+  }
+
+  private async readPageWithinPit(
+    request: DriverTablePageRequest,
+    deadline: number,
+    timeoutMs: number,
+    snapshot?: ElasticsearchBrowsingSnapshot,
+  ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
     const columns = this.describeIndexColumnsSync();
     const columnMetaByName = new Map(
@@ -1372,8 +1497,9 @@ export class ElasticsearchDriver implements IDBDriver {
         Math.min(size, 500),
         !request.skipCount,
         request.signal,
-        request.deadline ??
-          Date.now() + this.timeoutSettingsProvider().dbOperationTimeoutMs,
+        deadline,
+        undefined,
+        snapshot,
       )) {
         totalCount = batch.totalCount;
         const start = Math.max(0, offset - seen);
@@ -1389,11 +1515,6 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
 
-    const timeoutMs = this.timeoutSettingsProvider().dbOperationTimeoutMs;
-    const deadline = Math.min(
-      request.deadline ?? Infinity,
-      Date.now() + timeoutMs,
-    );
     const rows: Record<string, unknown>[] = [];
     for await (const batch of this.readPitBatches(
       request.table,
@@ -1402,6 +1523,7 @@ export class ElasticsearchDriver implements IDBDriver {
       request.signal,
       deadline,
       ELASTICSEARCH_READ_BUDGET.hardCap,
+      snapshot,
     )) {
       rows.push(...batch.rows);
     }
@@ -1478,77 +1600,44 @@ export class ElasticsearchDriver implements IDBDriver {
     signal?: AbortSignal,
     pageDeadline = Infinity,
     fullIndexSafetyCap?: number,
+    snapshot?: ElasticsearchBrowsingSnapshot,
   ): AsyncGenerator<{ rows: Record<string, unknown>[]; totalCount: number }> {
     signal?.throwIfAborted();
     const client = this.requireClient();
-    const reader = new ElasticsearchPitSession(
-      client,
-      this.timeoutSettingsProvider().dbOperationTimeoutMs,
-      pageDeadline === Infinity ? "exportTableChunks" : "readTablePage",
-      signal,
-      pageDeadline,
-      () => this.pitReaders.delete(reader),
-    );
-    this.pitReaders.add(reader);
+    const scopedReader = snapshot?.reader;
+    if (snapshot && !scopedReader)
+      throw new ElasticsearchBrowsingSnapshotExpiredError();
+    const reader =
+      scopedReader ??
+      new ElasticsearchPitSession(
+        client,
+        this.timeoutSettingsProvider().dbOperationTimeoutMs,
+        pageDeadline === Infinity ? "exportTableChunks" : "readTablePage",
+        signal,
+        pageDeadline,
+        () => this.pitReaders.delete(reader),
+      );
+    if (!snapshot) this.pitReaders.add(reader);
     let failed = false;
     try {
       let size = this.clampSearchSize(requestedSize);
-      let initialized = false;
-      let unknownWindow = false;
+      let metadata = snapshot?.metadata;
       let cursor: number | undefined;
       let totalCount = 0;
       let readCount = 0;
       let first = true;
       while (true) {
-        const response = await reader.advance(async () => {
-          if (!initialized) {
-            try {
-              const settings = await reader.request((options) =>
-                client.indices.getSettings(
-                  {
-                    index: table,
-                    name: "index.max_result_window",
-                    include_defaults: true,
-                  },
-                  options,
-                ),
-              );
-              for (const entry of Object.values(settings)) {
-                const window = Number(
-                  entry.settings?.index?.max_result_window ??
-                    entry.defaults?.index?.max_result_window ??
-                    ELASTICSEARCH_READ_BUDGET.hardCap,
-                );
-                if (!Number.isSafeInteger(window) || window < 1)
-                  throw new Error(
-                    "Invalid Elasticsearch max_result_window setting.",
-                  );
-                size = Math.min(size, window);
-              }
-            } catch (error) {
-              if (this.elasticsearchStatus(error) !== 403) throw error;
-              unknownWindow = true;
-            }
-            await reader.request(
-              (options) =>
-                client.openPointInTime(
-                  {
-                    index: table,
-                    keep_alive: "1m",
-                  },
-                  options,
-                ),
-              (result) => reader.recordPitId(result.id),
-            );
-            initialized = true;
-          }
+        const { response, identity } = await reader.advance(async () => {
+          metadata ??= await this.openPit(client, reader, table);
+          if (snapshot) snapshot.metadata = metadata;
+          size = Math.min(size, metadata.window);
           while (true) {
             reader.check();
             const pitId = reader.pitId;
             if (!pitId)
               throw new Error("Elasticsearch returned an invalid PIT ID.");
             try {
-              return await reader.request(
+              const response = await reader.request(
                 (options) =>
                   client.search(
                     {
@@ -1567,9 +1656,12 @@ export class ElasticsearchDriver implements IDBDriver {
                   if (result.pit_id) reader.recordPitId(result.pit_id);
                 },
               );
+              return { response, identity: metadata.identity };
             } catch (error) {
+              if (snapshot && this.elasticsearchStatus(error) === 404)
+                throw new ElasticsearchBrowsingSnapshotExpiredError();
               if (
-                !unknownWindow ||
+                !metadata.unknownWindow ||
                 size === 1 ||
                 !this.isResultWindowError(error)
               )
@@ -1635,7 +1727,7 @@ export class ElasticsearchDriver implements IDBDriver {
         }
         if (hits.length > 0 || first) {
           yield {
-            rows: this.hitsToRows(hits, table),
+            rows: this.hitsToRows(hits, identity),
             totalCount,
           };
           reader.check();
@@ -1647,13 +1739,82 @@ export class ElasticsearchDriver implements IDBDriver {
       failed = true;
       throw error;
     } finally {
-      const wasAborted = reader.signal.aborted;
-      if (failed && wasAborted) void reader.close().catch(() => undefined);
-      else
-        await reader.waitForClose().catch((error: unknown) => {
-          if (!failed) throw error;
-        });
+      if (!snapshot) {
+        if (failed && reader.signal.aborted)
+          void reader.close().catch(() => undefined);
+        else
+          await reader.waitForClose().catch((error: unknown) => {
+            if (!failed) throw error;
+          });
+      }
     }
+  }
+
+  private async openPit(
+    client: Client,
+    reader: ElasticsearchPitSession,
+    table: string,
+  ): Promise<ElasticsearchPitMetadata> {
+    const epoch = this.connectionEpoch;
+    let window = ELASTICSEARCH_READ_BUDGET.hardCap;
+    let unknownWindow = false;
+    const indexUuids = new Map<string, string>();
+    try {
+      const settings = await reader.request((options) =>
+        client.indices.getSettings(
+          {
+            index: table,
+            name: ["index.max_result_window", "index.uuid"],
+            include_defaults: true,
+          },
+          options,
+        ),
+      );
+      for (const [index, entry] of Object.entries(settings)) {
+        const uuid = entry?.settings?.index?.uuid;
+        if (isElasticsearchIndexUuid(uuid)) indexUuids.set(index, uuid);
+        const indexWindow = Number(
+          entry?.settings?.index?.max_result_window ??
+            entry?.defaults?.index?.max_result_window ??
+            ELASTICSEARCH_READ_BUDGET.hardCap,
+        );
+        if (!Number.isSafeInteger(indexWindow) || indexWindow < 1)
+          throw new Error("Invalid Elasticsearch max_result_window setting.");
+        window = Math.min(window, indexWindow);
+      }
+    } catch (error) {
+      if (this.elasticsearchStatus(error) !== 403) throw error;
+      unknownWindow = true;
+    }
+    await reader.request(
+      (options) =>
+        client.openPointInTime({ index: table, keep_alive: "1m" }, options),
+      (result) => reader.recordPitId(result.id),
+    );
+    // PIT IDs are opaque. Confirm the named generations on both sides
+    // of PIT creation before issuing write identities for its hits.
+    if (indexUuids.size) {
+      try {
+        const settings = await reader.request((options) =>
+          client.indices.getSettings(
+            { index: table, name: "index.uuid" },
+            options,
+          ),
+        );
+        for (const [index, uuid] of indexUuids) {
+          if (
+            !Object.hasOwn(settings, index) ||
+            settings[index]?.settings?.index?.uuid !== uuid
+          )
+            indexUuids.delete(index);
+        }
+      } catch {
+        reader.check();
+        // Being unable to confirm metadata makes rows read-only, not unreadable.
+        indexUuids.clear();
+      }
+    }
+    return { window, unknownWindow, identity: { table, epoch, indexUuids } };
   }
 
   private assertCompleteSearch(response: {
@@ -1775,11 +1936,13 @@ export class ElasticsearchDriver implements IDBDriver {
           ? this.originalSourceScript(update.originalValues, document)
           : undefined;
         const replace = Object.hasOwn(update.changes, "_source");
+        await this.checkMutationIndexGeneration(client, identity, context);
+        this.checkMutationDispatch(client, identity, context);
         writeMayHaveApplied = true;
         const response = conditional
           ? await client.update(
               {
-                ...identity,
+                ...identity.target,
                 script,
                 refresh: "wait_for",
               },
@@ -1788,7 +1951,7 @@ export class ElasticsearchDriver implements IDBDriver {
           : replace
             ? await client.index(
                 {
-                  ...identity,
+                  ...identity.target,
                   document,
                   refresh: "wait_for",
                 },
@@ -1796,7 +1959,7 @@ export class ElasticsearchDriver implements IDBDriver {
               )
             : await client.update(
                 {
-                  ...identity,
+                  ...identity.target,
                   doc: document,
                   refresh: "wait_for",
                 },
@@ -1804,7 +1967,11 @@ export class ElasticsearchDriver implements IDBDriver {
               );
         writeMayHaveApplied = false;
         if (response.result === "noop" && conditional) {
-          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+          updateRowOutcomes.push({
+            rowIndex,
+            status: "not_applied",
+            conflict: true,
+          });
         } else if (
           response.result === "updated" ||
           response.result === "created" ||
@@ -1816,13 +1983,21 @@ export class ElasticsearchDriver implements IDBDriver {
           updateRowOutcomes.push({ rowIndex, status: "unknown" });
         }
       } catch (error: unknown) {
+        const versionConflict = this.isVersionConflict(error);
+        if (writeMayHaveApplied && versionConflict) {
+          updateRowOutcomes.push({
+            rowIndex,
+            status: "not_applied",
+            conflict: true,
+          });
+        }
         throw failedDriverUpdateRows(
           error,
           request.updates.length,
           updateRowOutcomes,
           rowIndex,
           affectedRows,
-          writeMayHaveApplied && !this.isVersionConflict(error),
+          writeMayHaveApplied && !versionConflict,
         );
       }
     }
@@ -1872,14 +2047,16 @@ export class ElasticsearchDriver implements IDBDriver {
     return deleteRowsSequentially(
       request.primaryKeyValuesList,
       context,
-      (entry) => {
+      async (entry) => {
         const identity = this.resolveMutationIdentity(request.table, entry);
         const client = this.requireClient();
+        await this.checkMutationIndexGeneration(client, identity, context);
         return async () => {
+          this.checkMutationDispatch(client, identity, context);
           try {
             const result = await client.delete(
               {
-                ...identity,
+                ...identity.target,
                 refresh: "wait_for",
               },
               context ? { signal: context.signal } : undefined,
@@ -2001,7 +2178,7 @@ export class ElasticsearchDriver implements IDBDriver {
     const replace = Object.hasOwn(changes, "_source") && !conditional;
     return this.formatRestCommand(
       replace ? "PUT" : "POST",
-      this.mutationIdentityPath(identity, replace ? "_doc" : "_update"),
+      this.mutationIdentityPath(identity.target, replace ? "_doc" : "_update"),
       conditional
         ? { script: this.originalSourceScript(originalValues, document) }
         : replace
@@ -2077,7 +2254,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
     const identity = this.resolveMutationIdentity(table, primaryKeys);
     return this.formatRestCommand(
       "DELETE",
-      this.mutationIdentityPath(identity, "_doc"),
+      this.mutationIdentityPath(identity.target, "_doc"),
     );
   }
 
@@ -2413,16 +2590,16 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       _seq_no?: unknown;
       _primary_term?: unknown;
     }>,
-    table?: string,
+    identity?: ElasticsearchReadIdentity,
   ): Record<string, unknown>[] {
     return hits.map((hit) => {
       const source = this.normalizeSourceDocument(hit._source);
       return {
         _id: hit._id,
-        ...(table === undefined
+        ...(identity === undefined
           ? {}
           : {
-              _identity: this.encodeRowIdentity(table, hit),
+              _identity: this.encodeRowIdentity(identity, hit),
             }),
         _source: stringifyElasticsearchJson(source),
       };
@@ -2430,7 +2607,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
   }
 
   private encodeRowIdentity(
-    table: string,
+    identity: ElasticsearchReadIdentity,
     hit: {
       _index?: unknown;
       _id?: unknown;
@@ -2451,16 +2628,19 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       Number(hit._primary_term) < 1
     )
       return null;
+    const indexUuid = identity.indexUuids.get(hit._index);
+    if (!isElasticsearchIndexUuid(indexUuid)) return null;
     const payload = Buffer.from(
       JSON.stringify([
-        1,
-        this.connectionEpoch,
-        table,
+        2,
+        identity.epoch,
+        identity.table,
         hit._index,
         hit._id,
         hit._routing ?? null,
         hit._seq_no,
         hit._primary_term,
+        indexUuid,
       ]),
     ).toString("base64url");
     return `${payload}.${this.signRowIdentity(payload)}`;
@@ -2478,7 +2658,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
   ): ElasticsearchMutationIdentity {
     const invalid = () =>
       new Error(
-        "Elasticsearch mutation requires a complete, unchanged _id/_identity from the current table read. Refresh the table and retry.",
+        "Elasticsearch mutation requires a complete, unchanged _id/_identity from the current table read, including the index generation. Refresh the table and check index metadata permissions if the problem persists.",
       );
     const token = primaryKeys._identity;
     if (typeof token !== "string") throw invalid();
@@ -2496,11 +2676,20 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
     } catch {
       throw invalid();
     }
-    if (!Array.isArray(identity) || identity.length !== 8) throw invalid();
-    const [version, epoch, readTable, index, id, routing, seqNo, primaryTerm] =
-      identity as unknown[];
+    if (!Array.isArray(identity) || identity.length !== 9) throw invalid();
+    const [
+      version,
+      epoch,
+      readTable,
+      index,
+      id,
+      routing,
+      seqNo,
+      primaryTerm,
+      indexUuid,
+    ] = identity as unknown[];
     if (
-      version !== 1 ||
+      version !== 2 ||
       epoch !== this.connectionEpoch ||
       readTable !== table ||
       typeof index !== "string" ||
@@ -2514,20 +2703,82 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       seqNo < 0 ||
       typeof primaryTerm !== "number" ||
       !Number.isSafeInteger(primaryTerm) ||
-      primaryTerm < 1
+      primaryTerm < 1 ||
+      !isElasticsearchIndexUuid(indexUuid)
     )
       throw invalid();
     return {
-      index,
-      id,
-      ...(routing === null ? {} : { routing }),
-      if_seq_no: seqNo,
-      if_primary_term: primaryTerm,
+      indexUuid,
+      epoch: this.connectionEpoch,
+      target: {
+        index,
+        id,
+        ...(routing === null ? {} : { routing }),
+        if_seq_no: seqNo,
+        if_primary_term: primaryTerm,
+      },
     };
   }
 
+  private checkMutationDispatch(
+    client: Client,
+    { epoch }: ElasticsearchMutationIdentity,
+    context?: DriverOperationContext,
+  ): void {
+    try {
+      throwIfTransactionCancelled(context);
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        "Elasticsearch mutation cancelled before sending the document request.",
+        error,
+      );
+    }
+    if (
+      epoch !== this.connectionEpoch ||
+      !this.connected ||
+      this.client !== client
+    )
+      throw new MutationNotExecutedError(
+        "Elasticsearch connection changed. Refresh the table and retry.",
+      );
+  }
+
+  private async checkMutationIndexGeneration(
+    client: Client,
+    { target: { index }, indexUuid }: ElasticsearchMutationIdentity,
+    context?: DriverOperationContext,
+  ): Promise<void> {
+    let settings: ElasticsearchIndexSettings;
+    try {
+      throwIfTransactionCancelled(context);
+      // Check the hit's concrete index, not the alias/data stream originally
+      // browsed. Never cache this check across writes. Elasticsearch's document
+      // APIs cannot condition writes on index UUID; this is not atomic.
+      settings = await client.indices.getSettings(
+        { index, name: "index.uuid", local: false },
+        context ? { signal: context.signal } : undefined,
+      );
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        context?.signal.aborted
+          ? "Elasticsearch mutation cancelled before sending the document request."
+          : "Elasticsearch could not verify the concrete index generation. Refresh the table and check index metadata permissions.",
+        error,
+      );
+    }
+    if (
+      !settings ||
+      Object.keys(settings).length !== 1 ||
+      !Object.hasOwn(settings, index) ||
+      settings[index]?.settings?.index?.uuid !== indexUuid
+    )
+      throw new MutationNotExecutedError(
+        "Elasticsearch concrete index generation changed or could not be verified. Refresh the table before editing or deleting.",
+      );
+  }
+
   private mutationIdentityPath(
-    identity: ElasticsearchMutationIdentity,
+    identity: ElasticsearchDocumentTarget,
     endpoint: "_doc" | "_update",
   ): string {
     const params = new URLSearchParams({

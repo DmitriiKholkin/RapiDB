@@ -63,4 +63,25 @@ describe("messaging", () => {
 
     unsubscribe();
   });
+
+  it("still runs later listeners without logging payloads or thrown errors", () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const later = vi.fn();
+    const unsubscribeFirst = onMessage("testReply", () => {
+      throw new Error("example sensitive exception");
+    });
+    const unsubscribeLater = onMessage("testReply", later);
+    try {
+      const payload = { description: "example sensitive payload" };
+      dispatchIncomingMessage("testReply", payload);
+      expect(later).toHaveBeenCalledWith(payload);
+      expect(log.mock.calls).toEqual([
+        ["RapiDB: a webview message listener failed."],
+      ]);
+    } finally {
+      unsubscribeLater();
+      unsubscribeFirst();
+      log.mockRestore();
+    }
+  });
 });

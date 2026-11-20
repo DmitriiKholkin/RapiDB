@@ -31,12 +31,19 @@ export type {
   QueryEditorPresentation,
   QueryEditorSqlDialect,
   QueryInitialState,
+  QueryOperationIdentity,
   QueryPanelMessage,
+  QueryResultCounts,
   QueryResultExportPayload,
   QueryResultSet,
   QuerySchemaPayload,
+  QueryTargetBinding,
 } from "./query";
-export { parseBookmarkSavedPayload, parseQueryPanelMessage } from "./query";
+export {
+  parseBookmarkSavedPayload,
+  parseQueryPanelMessage,
+  parseQueryTargetBinding,
+} from "./query";
 export type {
   PanelRetentionMode,
   PanelRetentionState,

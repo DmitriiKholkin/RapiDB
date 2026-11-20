@@ -4,7 +4,9 @@ import type {
   DdlOnlyDbObjectKind,
 } from "../../shared/dbObjectKinds";
 import { DB_OBJECT_KINDS } from "../../shared/dbObjectKinds";
+import type { MySQLTimestampRowIdentity } from "../../shared/mysqlTimestampRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
+import type { SqlDeleteObservation } from "../../shared/sqlDeleteObservation";
 import type {
   ColumnMeta,
   ColumnTypeMeta,
@@ -21,8 +23,10 @@ import type {
 } from "../../shared/tableTypes";
 import type {
   QueryEditorPresentation,
+  QueryResultCounts,
   QueryResultSet,
 } from "../../shared/webviewContracts";
+import type { SQLiteAttachmentTarget } from "./sqliteAttachmentTarget";
 
 export {
   type ColumnMeta,
@@ -52,25 +56,39 @@ export interface TableInfo {
   routineIdentity?: string;
 }
 export type TableInfoList = TableInfo[] & { truncated?: boolean };
-export interface QueryResult {
+export interface QueryJsonExportOverrides {
+  /** Exact integers keyed by column ID, aligned with display rows. JSON only. */
+  jsonExportCellOverrides?: readonly (
+    | Readonly<Record<string, bigint>>
+    | undefined
+  )[];
+}
+export interface DriverQueryResultSet
+  extends QueryResultSet,
+    QueryJsonExportOverrides {}
+export interface QueryResult
+  extends QueryResultCounts,
+    QueryJsonExportOverrides {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
-  exportRows?: Record<string, unknown>[];
+  /** Positional export data. An undefined entry falls back to the display row. */
+  exportRows?: (Record<string, unknown> | undefined)[];
+  /** When supplied, exportRows are JSON-only; CSV uses the display rows. */
+  serializeJsonExportRow?: (entries: readonly [string, unknown][]) => string;
   responseMetadata?: Record<string, unknown>[];
   missingCells?: QueryMissingCell[];
-  rowCount: number;
   executionTimeMs: number;
-  affectedRows?: number;
-  /** No exact mutation total is available; rowCount is only a rowset count. */
-  affectedRowsUnknown?: boolean;
   truncated?: boolean;
-  resultSets?: QueryResultSet[];
+  resultSets?: DriverQueryResultSet[];
   resultSetsTruncated?: boolean;
+  /** Execution warnings that do not imply an incomplete response. */
+  warnings?: string[];
   error?: string;
 }
 export interface DatabaseExecutionScope {
   database?: string;
+  sqliteAttachmentTarget?: SQLiteAttachmentTarget;
 }
 export interface QueryExecutionOptions extends DatabaseExecutionScope {
   requestToken?: number;
@@ -185,6 +203,11 @@ export interface DriverTablePageRequest {
   filters: FilterExpression[];
   sort: DriverSortConfig | null;
   skipCount: boolean;
+  omitRowIdentity?: boolean;
+  observeSqlDelete?: boolean;
+  conflictRefresh?: boolean;
+  /** Stable across pages of one viewer/query. Abort when that view is reset. */
+  browsingSnapshot?: AbortSignal;
   signal?: AbortSignal;
   deadline?: number;
 }
@@ -195,6 +218,8 @@ export interface DriverTablePageResult {
   mongoIdTypes?: Array<"objectId" | "string" | null>;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
+  mysqlTimestampRowIdentities?: MySQLTimestampRowIdentity[];
+  sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -214,6 +239,8 @@ export type DriverTableExportChunk = Pick<
 > & {
   missingCells?: QueryMissingCell[];
 };
+
+export type DriverTableExportFormat = "csv" | "json";
 
 export interface DriverUpdateRowsRequest {
   database: string;
@@ -249,6 +276,8 @@ export interface DriverMutationResult {
 export interface DriverUpdateRowOutcome {
   rowIndex: number;
   status: "applied" | "not_applied" | "unknown";
+  /** The row no longer matched the update's identity or concurrency condition. */
+  conflict?: true;
 }
 export interface DriverOperationContext {
   signal: AbortSignal;
@@ -285,6 +314,11 @@ export interface IDBDriver {
   listDatabases(): Promise<DatabaseInfo[]>;
   listSchemas(database: string): Promise<SchemaInfo[]>;
   listObjects(database: string, schema: string): Promise<TableInfoList>;
+  getSQLiteAttachmentTarget?(schema: string): Promise<SQLiteAttachmentTarget>;
+  describeSQLiteAttachmentColumns?(
+    target: SQLiteAttachmentTarget,
+    table: string,
+  ): Promise<ColumnTypeMeta[]>;
   describeTable(
     database: string,
     schema: string,
@@ -371,6 +405,7 @@ export interface IDBDriver {
   formatTableExportChunk?(
     chunk: DriverTableExportChunk,
     selectedColumns?: readonly string[],
+    format?: DriverTableExportFormat,
   ): DriverTableExportChunk;
   validateTableUpdates?(
     updates: readonly Pick<
@@ -431,6 +466,8 @@ export interface IDBDriver {
   quoteIdentifier(name: string): string;
   qualifiedTableName(database: string, schema: string, table: string): string;
   buildTableDataProjection?(columns: readonly ColumnTypeMeta[]): string;
+  /** Project a stored key without the display/driver conversion; null opts out. */
+  buildTablePrimaryKeyExpr?(column: ColumnTypeMeta): string | null;
   buildVerificationValueExpr?(column: ColumnTypeMeta): string;
   formatTableDataValue?(
     value: unknown,
@@ -463,6 +500,17 @@ export interface IDBDriver {
     options?: { preserveNativeType?: boolean },
   ): unknown;
   coercePrimaryKeyValue?(value: unknown, column: ColumnTypeMeta): unknown;
+  buildPrimaryKeyComparison?(
+    column: ColumnTypeMeta,
+    value: unknown,
+    paramIndex: number,
+  ): MutationSqlExpression | null;
+  /** Locate an explicit key after a write, from input rather than a loaded row identity. */
+  buildWrittenPrimaryKeyComparison?(
+    column: ColumnTypeMeta,
+    value: unknown,
+    paramIndex: number,
+  ): MutationSqlExpression | null;
   coerceOriginalValue?(value: unknown, column: ColumnTypeMeta): unknown;
   buildOriginalValueComparison?(
     column: ColumnTypeMeta,
@@ -492,12 +540,16 @@ export interface IDBDriver {
     value: string | [string, string] | undefined,
     paramIndex: number,
   ): FilterConditionResult | null;
+  /** Optional hidden projection for cursor values not preserved by display SQL. */
+  buildCursorValueExpr?(column: ColumnTypeMeta): string | undefined;
   buildCursorComparison?(
     column: ColumnTypeMeta,
     operator: "eq" | "gt" | "lt",
     rawValue: unknown,
     paramIndex: number,
   ): FilterConditionResult;
+  /** Leading SQL keywords for a generated Table Viewer mutation. */
+  buildTableMutationVerb?(verb: "INSERT" | "UPDATE"): string;
   buildInsertDefaultValuesSql(
     qualifiedTableName: string,
     columns?: readonly ColumnTypeMeta[],
@@ -525,6 +577,14 @@ export interface TransactionVerification {
     expectedValue: unknown;
     originalValue?: unknown;
   }>;
+  /** SQLite appends exact, indexed predicates from the resolved RETURNING tokens. */
+  sqlitePrimaryKeyColumns?: string[];
+  /** A NULL key is not unique; SQLite must capture and verify a physical rowid. */
+  sqliteNullableKeyUpdate?: {
+    schema: string;
+    table: string;
+    columns: string[];
+  };
   identity?: {
     operationIndex: number;
     parameterIndexes: number[];
@@ -541,6 +601,9 @@ export interface TransactionOperation {
   params?: unknown[];
   checkAffectedRows?: boolean;
   expectedAffectedRows?: number;
+  guardedDelete?: boolean;
+  /** Lock one key before Oracle re-reads LOB contents in DELETE. */
+  oracleDeleteRowLock?: { sql: string; params: unknown[] };
   captureIdentity?: {
     sql?: string;
     params?: unknown[];
@@ -548,17 +611,28 @@ export interface TransactionOperation {
       sql: string;
       zero?: { columnName: string; keyIndex: number; guardSql: string };
     };
-    mysqlKeyGuard?: { sql: string; params: unknown[] };
+    mysqlKeyGuard?: { sql: string; params: unknown[]; mutation?: "update" };
     oracleOutTypes?: Array<"string" | "buffer">;
     mssqlSelect?: string;
     mssqlInsertTarget?: { database: string; schema: string; table: string };
   };
 }
 
+export class GuardedDeleteConflictError extends Error {
+  constructor() {
+    super(
+      "A selected row changed, was replaced, or was deleted since it was loaded. The delete could not match it. Refresh the table and review the rows before retrying.",
+    );
+  }
+}
+
 export function assertTransactionAffectedRows(
   operation: TransactionOperation,
   affectedRows: number,
 ): void {
+  if (operation.guardedDelete && affectedRows === 0) {
+    throw new GuardedDeleteConflictError();
+  }
   if (operation.checkAffectedRows && affectedRows === 0) {
     throw new Error(
       "Row not found — the row may have been modified or deleted by another user",

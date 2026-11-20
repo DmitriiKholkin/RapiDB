@@ -11,6 +11,7 @@ import type {
 } from "mysql2/promise";
 import * as mysql from "mysql2/promise";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import { isMySQLTimestampPrimaryKeyValue } from "../../shared/mysqlTimestampRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -43,6 +44,10 @@ import {
   numberToDecimalString,
 } from "./numericUtils";
 import {
+  buildSqlDeleteSnapshot,
+  readSqlDeleteObservations,
+} from "./sqlDeleteSnapshot";
+import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
   throwIfTransactionCancelled,
@@ -61,6 +66,7 @@ import type {
   DriverTablePageResult,
   FilterConditionResult,
   FilterOperator,
+  MutationSqlExpression,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
   QueryColumnMeta,
@@ -75,7 +81,6 @@ import {
   assertTransactionAffectedRows,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
-  NULL_SENTINEL,
 } from "./types";
 
 const MYSQL_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -1382,7 +1387,7 @@ function canonicalizeMysqlBitPersistedEditValue(
 ): {
   canonical: string;
 } | null {
-  if (value === NULL_SENTINEL || value === null) {
+  if (value === null) {
     return { canonical: "__rapidb_null__" };
   }
   if (Buffer.isBuffer(value)) {
@@ -1416,6 +1421,7 @@ const MYSQL_POOL_CONNECTION_LIMIT = 5;
 const MYSQL_KILL_QUERY_TIMEOUT_MS = 5000;
 const MYSQL_SESSION_PROBE_TIMEOUT_MS = 2000;
 const MYSQL_SESSION_INIT_SQL = "SET SESSION autocommit = 1";
+const MYSQL_NO_BACKSLASH_ESCAPES_STATUS = 0x0200;
 const MYSQL_UTC_TIMESTAMP_OPERAND =
   "CONVERT_TZ(?, '+00:00', @@session.time_zone)";
 const MYSQL_TIMESTAMP_EPOCH_OPERAND = "CAST(? AS DECIMAL(20,6))";
@@ -1449,13 +1455,11 @@ function mysqlServerIdentitySql(connection: object): string {
     ? "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_uuid, @@hostname, @@port) AS server_identity"
     : "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_id, @@hostname, @@port) AS server_identity";
 }
-function mysqlHandshakeAutocommit(connection: object): boolean {
+function mysqlHandshakeStatus(connection: object): unknown {
   const handshake = Reflect.get(connection, "_handshakePacket");
-  const statusFlags =
-    handshake && typeof handshake === "object"
-      ? Reflect.get(handshake, "statusFlags")
-      : undefined;
-  return typeof statusFlags === "number" && (statusFlags & 2) !== 0;
+  return handshake && typeof handshake === "object"
+    ? Reflect.get(handshake, "statusFlags")
+    : undefined;
 }
 function readMysqlServerIdentity(
   rows: unknown,
@@ -1558,6 +1562,7 @@ export class MySQLDriver extends BaseDBDriver {
   private killQueryConnectionOptions?: ConnectionOptions;
   private readonly killTargets = new WeakMap<object, MysqlKillTarget>();
   private readonly sessionReady = new WeakMap<object, Promise<void>>();
+  private readonly previewBackslashEscapes = new WeakMap<object, boolean>();
   private forceSessionAutocommit = false;
   private readonly tableIndexCache = new Map<
     string,
@@ -1656,8 +1661,22 @@ export class MySQLDriver extends BaseDBDriver {
         const forget = () => connections.delete(native);
         native.once("end", forget);
         native.once("error", forget);
+        const status = mysqlHandshakeStatus(native);
+        if (
+          typeof status === "number" &&
+          Number.isInteger(status) &&
+          status >= 0 &&
+          status <= 0xffff
+        ) {
+          this.previewBackslashEscapes.set(
+            native,
+            (status & MYSQL_NO_BACKSLASH_ESCAPES_STATUS) === 0,
+          );
+        }
         const setAutocommit =
-          this.forceSessionAutocommit || !mysqlHandshakeAutocommit(native);
+          this.forceSessionAutocommit ||
+          typeof status !== "number" ||
+          (status & 2) === 0;
         if (setAutocommit) {
           native.query(MYSQL_SESSION_INIT_SQL, (error: Error | null) => {
             if (error) this.failSessionInitialization(native, error);
@@ -1667,8 +1686,19 @@ export class MySQLDriver extends BaseDBDriver {
         this.sessionReady.set(
           native,
           new Promise<void>((resolve) => {
-            native.query(identitySql, (error: Error | null, rows: unknown) => {
+            const probeSql = `${identitySql}, @@SESSION.sql_mode AS sql_mode`;
+            native.query(probeSql, (error: Error | null, rows: unknown) => {
               const row = Array.isArray(rows) ? rows[0] : undefined;
+              const mode =
+                !error && row && typeof row === "object"
+                  ? Reflect.get(row, "sql_mode")
+                  : undefined;
+              if (typeof mode === "string") {
+                this.previewBackslashEscapes.set(
+                  native,
+                  !/(?:^|,)\s*NO_BACKSLASH_ESCAPES\s*(?:,|$)/i.test(mode),
+                );
+              }
               if (
                 !error &&
                 !setAutocommit &&
@@ -1923,9 +1953,47 @@ export class MySQLDriver extends BaseDBDriver {
 
   protected override getQuestionMarkPlaceholderOptions() {
     return {
+      dialect: "mysql",
       hashLineComments: true,
       dashCommentRequiresWhitespace: true,
     } as const;
+  }
+
+  override materializePreviewSql(
+    sql: string,
+    params?: readonly unknown[],
+  ): string {
+    if (!params?.length || !sql.includes("\\")) {
+      return super.materializePreviewSql(sql, params);
+    }
+    // A preview is not pinned to a pool session. If live sessions disagree,
+    // only render SQL whose bind substitution is independent of that mode.
+    const modes = new Set<boolean>();
+    if (this.pool) {
+      for (const native of this.poolConnections.get(this.pool) ?? []) {
+        // mysql2 clears this immediately on destroy, before socket events.
+        if (Reflect.get(native, "_pool") === null) continue;
+        modes.add(this.previewBackslashEscapes.get(native) ?? true);
+      }
+    }
+    const options = this.getQuestionMarkPlaceholderOptions();
+    const preview = this.materializePreviewSqlWithOptions(sql, params, {
+      ...options,
+      backslashEscapes: modes.has(true) || !modes.has(false),
+    });
+    if (
+      modes.size > 1 &&
+      preview !==
+        this.materializePreviewSqlWithOptions(sql, params, {
+          ...options,
+          backslashEscapes: false,
+        })
+    ) {
+      throw new Error(
+        "[RapiDB] Preview parameter mismatch: MySQL sessions disagree on backslash escaping.",
+      );
+    }
+    return preview;
   }
 
   async recycleConnectionAfterTimeout(_context?: {
@@ -2311,6 +2379,10 @@ export class MySQLDriver extends BaseDBDriver {
             ? undefined
             : extraMetadata.generatedKind === "stored",
         isPrimaryKey: Number(r.IS_PRIMARY_KEY) === 1,
+        ...(Number(r.IS_PRIMARY_KEY) === 1 &&
+        mysqlTypeName(r.COLUMN_TYPE) === "timestamp"
+          ? { mysqlTimestampPrimaryKey: true }
+          : {}),
         primaryKeyOrdinal:
           r.PRIMARY_KEY_ORDINAL == null
             ? undefined
@@ -2913,16 +2985,24 @@ export class MySQLDriver extends BaseDBDriver {
       request.schema,
       request.table,
     );
-    const selectList = columns
-      .map((column, index) => {
+    const identityColumns = request.omitRowIdentity
+      ? []
+      : columns.flatMap((column) => {
+          const expression = this.buildTablePrimaryKeyExpr(column);
+          return expression ? [{ column, expression }] : [];
+        });
+    const deleteSnapshot = request.observeSqlDelete
+      ? buildSqlDeleteSnapshot("mysql", this, columns)
+      : undefined;
+    const selectExpressions = [
+      ...columns.map((column) => {
         const quoted = this.quoteIdentifier(column.name);
-        const expression =
-          column.category === "spatial"
-            ? `CASE WHEN ST_SRID(${quoted}) = 0 THEN ST_AsText(${quoted}) ELSE CONCAT('SRID=', ST_SRID(${quoted}), ';', ST_AsText(${quoted})) END`
-            : quoted;
-        return `${expression} AS ${this.quoteIdentifier(`__rapidb_col_${index}`)}`;
-      })
-      .join(", ");
+        return column.category === "spatial"
+          ? `CASE WHEN ST_SRID(${quoted}) = 0 THEN ST_AsText(${quoted}) ELSE CONCAT('SRID=', ST_SRID(${quoted}), ';', ST_AsText(${quoted})) END`
+          : quoted;
+      }),
+      ...identityColumns.map(({ expression }) => expression),
+    ];
     const offset = (request.page - 1) * request.pageSize;
     const sortExpression = request.sort
       ? `${qualifiedTableName}.${this.quoteIdentifier(request.sort.column)}`
@@ -3022,10 +3102,25 @@ export class MySQLDriver extends BaseDBDriver {
       fetchPageSize,
       whereParams.length + 1,
     );
-    const dataResult = await this.query(
-      `SELECT ${selectList} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`,
-      [...whereParams, ...pagination.params],
-      { signal },
+    const read = (extra: readonly string[] = []) =>
+      this.query(
+        `SELECT ${[...selectExpressions, ...extra]
+          .map(
+            (expression, index) =>
+              `${expression} AS ${this.quoteIdentifier(`__rapidb_col_${index}`)}`,
+          )
+          .join(
+            ", ",
+          )} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`,
+        [...whereParams, ...pagination.params],
+        { signal },
+      );
+    const dataResult = await read(deleteSnapshot?.expressions).catch(
+      (error: unknown) => {
+        if (!deleteSnapshot) throw error;
+        signal.throwIfAborted();
+        return read();
+      },
     );
 
     const fetchedRows = dataResult.rows.map((row) =>
@@ -3048,6 +3143,35 @@ export class MySQLDriver extends BaseDBDriver {
     return {
       columns,
       rows,
+      ...(deleteSnapshot
+        ? {
+            sqlDeleteObservations: readSqlDeleteObservations(
+              deleteSnapshot,
+              dataResult.rows.slice(0, rows.length),
+              selectExpressions.length,
+            ),
+          }
+        : {}),
+      ...(identityColumns.length > 0
+        ? {
+            mysqlTimestampRowIdentities: dataResult.rows
+              .slice(0, rows.length)
+              .map((row) =>
+                Object.fromEntries(
+                  identityColumns.map(({ column }, index) => {
+                    const key = {
+                      $rapidbMySqlTimestampKey:
+                        row[`__col_${columns.length + index}`],
+                    };
+                    return [
+                      column.name,
+                      isMySQLTimestampPrimaryKeyValue(key) ? key : null,
+                    ];
+                  }),
+                ),
+              ),
+          }
+        : {}),
       totalCount,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -3760,10 +3884,13 @@ export class MySQLDriver extends BaseDBDriver {
             ),
           );
           throwIfTransactionCancelled(context);
-          if (existing.length)
+          if (existing.length) {
             throw new Error(
-              "INSERT verification cannot identify a new row at an already existing primary key; the transaction was not committed.",
+              op.captureIdentity?.mysqlKeyGuard?.mutation === "update"
+                ? "UPDATE verification cannot identify the edited row at an already existing primary key; the transaction was not committed."
+                : "INSERT verification cannot identify a new row at an already existing primary key; the transaction was not committed.",
             );
+          }
         }
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
@@ -4102,6 +4229,85 @@ export class MySQLDriver extends BaseDBDriver {
     }
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, _paramIndex)}`;
   }
+  private isTimestampKey(column: ColumnTypeMeta): boolean {
+    return (
+      column.isPrimaryKey && mysqlTypeName(column.nativeType) === "timestamp"
+    );
+  }
+  buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string | null {
+    if (!this.isTimestampKey(column)) return null;
+    return `CAST(UNIX_TIMESTAMP(${this.quoteIdentifier(column.name)}) AS DECIMAL(20,6))`;
+  }
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (!this.isTimestampKey(column))
+      return this.coerceInputValue(value, column);
+    if (isMySQLTimestampPrimaryKeyValue(value)) return value;
+    throw this.missingTimestampKeyError(column);
+  }
+  buildPrimaryKeyComparison(
+    column: ColumnTypeMeta,
+    value: unknown,
+  ): MutationSqlExpression | null {
+    if (!this.isTimestampKey(column)) return null;
+    const name = this.quoteIdentifier(column.name);
+    // NULL is a bind slot for a key captured on the transaction connection.
+    if (value === null) return this.timestampEpochPredicate(name, null);
+    if (!isMySQLTimestampPrimaryKeyValue(value)) {
+      throw this.missingTimestampKeyError(column);
+    }
+    return this.withTimestampKeyPrefilter(
+      name,
+      this.timestampEpochPredicate(name, value.$rapidbMySqlTimestampKey),
+      value.$rapidbMySqlTimestampKey,
+      MYSQL_TIMESTAMP_PREFILTER_SECONDS * 2n,
+    );
+  }
+  private missingTimestampKeyError(column: ColumnTypeMeta): Error {
+    return new Error(
+      `Refresh the table before changing rows: MySQL TIMESTAMP primary key "${column.name}" requires an exact stored identity.`,
+    );
+  }
+  private timestampEpochPredicate(
+    name: string,
+    epoch: string | null,
+  ): MutationSqlExpression {
+    return {
+      sql: `UNIX_TIMESTAMP(${name}) = ${MYSQL_TIMESTAMP_EPOCH_OPERAND}`,
+      params: [epoch],
+    };
+  }
+  buildWrittenPrimaryKeyComparison(
+    column: ColumnTypeMeta,
+    value: unknown,
+  ): MutationSqlExpression | null {
+    if (!this.isTimestampKey(column)) return null;
+    const input = this.coerceInputValue(value, column);
+    const explicitInstant = this.buildOriginalValueComparisonWithParams(
+      column,
+      input,
+    );
+    if (explicitInstant) return explicitInstant;
+    const precision =
+      /^timestamp\(([0-6])\)$/i.exec(column.nativeType.trim())?.[1] ?? "0";
+    const name = this.quoteIdentifier(column.name);
+    // Interpret a local write on the same session as the DML. Compare the
+    // resulting instant, not any candidate row's wall clock. DATETIME(p)
+    // applies the column's rounding/truncation before the time-zone conversion.
+    const exact = {
+      sql: `UNIX_TIMESTAMP(${name}) = NULLIF(UNIX_TIMESTAMP(CAST(? AS DATETIME(${precision}))), 0)`,
+      params: [input],
+    };
+    // The UTC interpretation of the wall clock is only an estimate for the
+    // index range; actual offset, DST and rounding are resolved by MySQL.
+    const approximateEpoch =
+      typeof input === "string" ? mysqlTimestampEpoch(`${input}+00:00`) : null;
+    return this.withTimestampKeyPrefilter(
+      name,
+      exact,
+      approximateEpoch,
+      MYSQL_TIMESTAMP_PREFILTER_SECONDS * 2n,
+    );
+  }
   buildMutationValueExpr(
     column: ColumnTypeMeta,
     value: unknown,
@@ -4141,25 +4347,14 @@ export class MySQLDriver extends BaseDBDriver {
       hasMysqlTimezoneOffset(value) &&
       normalizeMysqlDatetimeInput(value) !== null
     ) {
-      const name = this.quoteIdentifier(column.name);
       const epoch = mysqlTimestampEpochParam("[RapiDB]", column.name, value);
-      const exact = `UNIX_TIMESTAMP(${name}) = ${MYSQL_TIMESTAMP_EPOCH_OPERAND}`;
-      const seconds = BigInt(epoch.split(".")[0]);
-      if (
-        seconds <= MYSQL_TIMESTAMP_PREFILTER_SECONDS ||
-        seconds + MYSQL_TIMESTAMP_PREFILTER_SECONDS >=
-          MYSQL_FROM_UNIXTIME_SAFE_MAX
-      ) {
-        return { sql: exact, params: [epoch] };
-      }
-      return {
-        sql: `${name} BETWEEN FROM_UNIXTIME(?) AND FROM_UNIXTIME(?) AND ${exact}`,
-        params: [
-          Number(seconds - MYSQL_TIMESTAMP_PREFILTER_SECONDS),
-          Number(seconds + MYSQL_TIMESTAMP_PREFILTER_SECONDS + 1n),
-          epoch,
-        ],
-      };
+      const name = this.quoteIdentifier(column.name);
+      return this.withTimestampKeyPrefilter(
+        name,
+        this.timestampEpochPredicate(name, epoch),
+        epoch,
+        MYSQL_TIMESTAMP_PREFILTER_SECONDS,
+      );
     }
     if (column.category !== "spatial") return null;
     if (typeof value !== "string") {
@@ -4172,6 +4367,31 @@ export class MySQLDriver extends BaseDBDriver {
     return {
       sql: `ST_SRID(${name}) = ? AND ST_AsBinary(${name}) = ST_AsBinary(ST_GeomFromText(?, ?))`,
       params: [srid ?? 0, wkt, srid ?? 0],
+    };
+  }
+  private withTimestampKeyPrefilter(
+    name: string,
+    exact: MutationSqlExpression,
+    approximateEpoch: string | null,
+    radius: bigint,
+  ): MutationSqlExpression {
+    if (approximateEpoch === null) return exact;
+    const seconds = BigInt(approximateEpoch.split(".")[0]);
+    // The wide range helps an index find candidates; it does not decide which
+    // instant to match (a local equality would lose one side of an overlap).
+    if (
+      seconds <= radius ||
+      seconds + radius + 1n >= MYSQL_FROM_UNIXTIME_SAFE_MAX
+    ) {
+      return exact;
+    }
+    return {
+      sql: `${name} BETWEEN FROM_UNIXTIME(?) AND FROM_UNIXTIME(?) AND ${exact.sql}`,
+      params: [
+        Number(seconds - radius),
+        Number(seconds + radius + 1n),
+        ...exact.params,
+      ],
     };
   }
   override buildOriginalValueComparison(
@@ -4199,7 +4419,6 @@ export class MySQLDriver extends BaseDBDriver {
   coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (
       typeof value === "string" &&
-      value !== NULL_SENTINEL &&
       ["date", "datetime", "timestamp"].includes(
         mysqlTypeName(column.nativeType),
       )
@@ -4216,7 +4435,6 @@ export class MySQLDriver extends BaseDBDriver {
   }
   override coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
-    if (value === NULL_SENTINEL) return null;
     if (column.category === "json" && typeof value === "object") {
       return JSON.stringify(value);
     }

@@ -74,14 +74,14 @@ function createClient(processID?: number, secretKey?: number): MockClient {
 }
 
 const drivers: PostgresDriver[] = [];
-async function connectedDriver(client: MockClient) {
+async function connectedDriver(client: MockClient, inheritPort = false) {
   const pool = createPool(client);
   const driver = new PostgresDriver({
     id: "session-safety",
     name: "PG",
     type: "pg",
     host: "db.internal",
-    port: 6543,
+    port: inheritPort ? undefined : 6543,
     database: "main",
   });
   drivers.push(driver);
@@ -106,9 +106,14 @@ afterEach(async () => {
 });
 
 describe("PostgreSQL backend cancellation", () => {
-  it("sends a keyed CancelRequest before discarding a cancelled editor query", async () => {
+  it.each([
+    false,
+    true,
+  ])("sends a keyed CancelRequest to the connected port before discarding a cancelled editor query (inherited=%s)", async (inheritPort) => {
+    vi.stubEnv("PGPORT", "6543");
     const client = createClient(4242, 99);
-    const { driver } = await connectedDriver(client);
+    const { driver } = await connectedDriver(client, inheritPort);
+    vi.stubEnv("PGPORT", "6544");
     let rejectRunning!: (error: Error) => void;
     client.query.mockReturnValueOnce(
       new Promise((_resolve, reject) => {

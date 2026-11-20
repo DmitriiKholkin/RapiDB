@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   connectWithProgress: vi.fn(),
@@ -23,7 +23,7 @@ vi.mock("../../src/extension/panels/tablePanel", () => ({
   TablePanel: { createOrShow: vi.fn() },
 }));
 
-async function registerCommands() {
+async function registerCommands(overrides: Record<string, unknown> = {}) {
   const { registerExplorerCommands } = await import(
     "../../src/extension/commands/explorerCommands"
   );
@@ -31,6 +31,9 @@ async function registerCommands() {
   const connectionManager = {
     isConnected: vi.fn(() => false),
     getDriver: vi.fn(() => undefined),
+    getConnectedDriverSessionKey: vi.fn(() => "source-session"),
+    initializeConnectionCredentialRevision: vi.fn(() => undefined),
+    ...overrides,
   };
   registerExplorerCommands(
     {
@@ -72,5 +75,132 @@ describe("explorer commands when connect does not complete", () => {
 
     expect(mocks.connectWithProgress).toHaveBeenCalled();
     expect(mocks.erdCreateOrShow).not.toHaveBeenCalled();
+  });
+});
+
+describe("explorer driver error diagnostics", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["rapidb.newQuery", "Cannot connect"],
+    ["rapidb.showDDL", "DDL error"],
+    ["rapidb.openRoutine", "Cannot load function definition"],
+  ])("redacts bare credentials in %s logs and notifications", async (command, heading) => {
+    const password = "synthetic-driver-password-11";
+    const failure = new Error(`Permission denied for ${password}`);
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const driver = {
+      getCreateTableDDL: vi.fn().mockRejectedValue(failure),
+      getRoutineDefinition: vi.fn().mockRejectedValue(failure),
+    };
+    if (command === "rapidb.newQuery") {
+      mocks.connectWithProgress.mockRejectedValueOnce(failure);
+    }
+    const commands = await registerCommands({
+      isConnected: () => command !== "rapidb.newQuery",
+      getConnection: () => ({ type: "pg" }),
+      getConnectionDiagnosticContext: () => ({ password }),
+      getDriver: () => driver,
+      getDriverEntityManifest: () => undefined,
+    });
+
+    await commands.get(command)?.({
+      connectionId: "conn-1",
+      kind: command === "rapidb.openRoutine" ? "function" : "table",
+      objectName: "example",
+      database: "app_db",
+    });
+
+    expect(mocks.showErrorMessage).toHaveBeenCalledExactlyOnceWith(
+      `[RapiDB] ${heading}: Permission denied for [REDACTED]`,
+    );
+    expect(log).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("[RapiDB]"),
+      expect.stringContaining("Permission denied for [REDACTED]"),
+    );
+    expect(JSON.stringify(log.mock.calls)).not.toContain(password);
+    expect(mocks.queryCreateOrShow).not.toHaveBeenCalled();
+  });
+});
+
+describe("PostgreSQL definition database routing", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    ["rapidb.showDDL", "table", true],
+    ["rapidb.showDDL", "function", false],
+    ["rapidb.openRoutine", "function", false],
+  ])("passes the literal database from %s (%s) into the editor", async (command, kind, forceNew) => {
+    const database = '  Case:"δοκιμή"/?%  ';
+    const lookup = vi.fn().mockResolvedValue("selected definition");
+    const commands = await registerCommands({
+      isConnected: () => true,
+      getConnection: () => ({ type: "pg", database: "default_db" }),
+      getDriver: () => ({
+        getCreateTableDDL: lookup,
+        getRoutineDefinition: lookup,
+      }),
+      getDriverEntityManifest: () => undefined,
+      getQueryEditorPresentation: () => undefined,
+    });
+    await commands.get(command)?.({
+      connectionId: "conn-1",
+      kind,
+      objectName: "example",
+      database,
+      schema: "public",
+    });
+    expect(lookup).toHaveBeenCalledExactlyOnceWith(
+      database,
+      "public",
+      "example",
+      ...(kind === "function" ? ["function", undefined] : []),
+    );
+    expect(mocks.queryCreateOrShow).toHaveBeenCalledExactlyOnceWith(
+      expect.anything(),
+      expect.anything(),
+      "conn-1",
+      "selected definition",
+      forceNew,
+      forceNew ? true : undefined,
+      false,
+      undefined,
+      database,
+      { connectionId: "conn-1", sessionKey: "source-session" },
+    );
+  });
+
+  it.each([
+    ["rapidb.showDDL", "table"],
+    ["rapidb.openRoutine", "function"],
+  ])("does not fetch from the default database when %s has no selected database", async (command, kind) => {
+    const lookup = vi.fn().mockResolvedValue("default database definition");
+    const commands = await registerCommands({
+      isConnected: () => true,
+      getConnection: () => ({ type: "pg", database: "default_db" }),
+      getDriver: () => ({
+        getCreateTableDDL: lookup,
+        getRoutineDefinition: lookup,
+      }),
+      getDriverEntityManifest: () => undefined,
+    });
+    await commands.get(command)?.({
+      connectionId: "conn-1",
+      kind,
+      objectName: "example",
+    });
+    expect(lookup).not.toHaveBeenCalled();
+    expect(mocks.queryCreateOrShow).not.toHaveBeenCalled();
+    expect(mocks.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("database is unknown"),
+    );
   });
 });

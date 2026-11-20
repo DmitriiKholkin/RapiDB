@@ -20,12 +20,14 @@ export interface HistoryEntry {
   id: string;
   sql: string;
   connectionId: string;
+  postgresDatabase?: string;
   executedAt: string;
 }
 export interface BookmarkEntry {
   id: string;
   sql: string;
   connectionId: string;
+  postgresDatabase?: string;
   savedAt: string;
 }
 export interface ConnectAttempt {

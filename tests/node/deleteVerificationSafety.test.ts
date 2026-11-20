@@ -170,8 +170,8 @@ describe("DELETE affected-row verification requires rollback support", () => {
   });
 });
 
-describe("batched single-key DELETE verifies each requested key", () => {
-  it("rolls back when a duplicated key hides a missing key and deletes exact batches", async () => {
+describe("SQLite DELETE verifies each requested key", () => {
+  it("rolls back when a requested key is duplicated and deletes exact batches", async () => {
     const directory = await createProjectTempDir("sqlite-delete-keys");
     const config = {
       id: "sqlite-delete-keys",
@@ -217,9 +217,9 @@ describe("batched single-key DELETE verifies each requested key", () => {
         [{ id: 1 }, { id: 2 }],
       );
       if (!unsafe) throw new Error("Expected a delete plan");
-      expect(unsafe.operations).toHaveLength(1);
+      expect(unsafe.operations).toHaveLength(2);
       await expect(service.executePreparedDeletePlan(unsafe)).rejects.toThrow(
-        /expected 2/,
+        /expected 1/,
       );
       expect(await remaining()).toEqual([1, 1, 3, 4]);
 

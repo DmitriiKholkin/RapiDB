@@ -182,6 +182,28 @@ const fakeDriver: IDBDriver = {
   materializePreviewSql: (sql, params = []) => `${sql} -- ${params.join(",")}`,
 };
 
+const fakePostgresConnection: ConnectionConfig = {
+  id: "conn-1",
+  name: "Table helpers PostgreSQL",
+  type: "pg",
+  host: "localhost",
+  port: 5432,
+  database: "main",
+  username: "postgres",
+  readOnly: false,
+};
+
+function postgresManager(
+  driver: IDBDriver,
+  connection: ConnectionConfig = fakePostgresConnection,
+) {
+  return {
+    getDriver: (id: string) => (id === connection.id ? driver : undefined),
+    getConnection: (id: string) =>
+      id === connection.id ? connection : undefined,
+  };
+}
+
 describe("table helpers", () => {
   it.each([
     false,
@@ -489,8 +511,8 @@ describe("table helpers", () => {
 
   it("adds original edited values to SQL update predicates", () => {
     const result = prepareApplyChangesPlan(
-      { getDriver: () => fakeDriver } as never,
-      "conn-1",
+      postgresManager(fakeDriver) as never,
+      fakePostgresConnection.id,
       "main",
       "public",
       "fixture_rows",
@@ -597,10 +619,10 @@ describe("table helpers", () => {
         });
       },
     };
-    const manager = { getDriver: () => driver } as never;
+    const manager = postgresManager(driver) as never;
     const prepared = prepareApplyChangesPlan(
       manager,
-      "conn-1",
+      fakePostgresConnection.id,
       "main",
       "public",
       "fixture_rows",
@@ -642,10 +664,8 @@ describe("table helpers", () => {
 
   it("returns executable preview statements for valid row updates and skips empty changes", () => {
     const result = prepareApplyChangesPlan(
-      {
-        getDriver: () => fakeDriver,
-      } as never,
-      "conn-1",
+      postgresManager(fakeDriver) as never,
+      fakePostgresConnection.id,
       "main",
       "public",
       "fixture_rows",
@@ -751,11 +771,10 @@ describe("table helpers", () => {
       },
     };
 
+    const manager = postgresManager(strictDriver) as never;
     const prepared = prepareApplyChangesPlan(
-      {
-        getDriver: () => strictDriver,
-      } as never,
-      "conn-1",
+      manager,
+      fakePostgresConnection.id,
       "main",
       "public",
       "fixture_rows",
@@ -784,12 +803,7 @@ describe("table helpers", () => {
         : [],
     );
 
-    const result = await executePreparedApplyPlan(
-      {
-        getDriver: () => strictDriver,
-      } as never,
-      prepared.plan,
-    );
+    const result = await executePreparedApplyPlan(manager, prepared.plan);
 
     expect(result.success).toBe(true);
     expect(result.warning).toBeUndefined();
@@ -799,16 +813,12 @@ describe("table helpers", () => {
   });
 
   it("uses column-aware PostgreSQL preview materialization for typed array updates", () => {
-    const postgresDriver = new PostgresDriver({
-      id: "pg-preview-test",
+    const connection: ConnectionConfig = {
+      ...fakePostgresConnection,
+      id: "conn-pg",
       name: "pg-preview-test",
-      type: "pg",
-      host: "localhost",
-      port: 5432,
-      database: "postgres",
-      username: "postgres",
-      password: "postgres",
-    } as ConnectionConfig);
+    };
+    const postgresDriver = new PostgresDriver(connection);
 
     const postgresColumns: ColumnTypeMeta[] = [
       {
@@ -839,10 +849,8 @@ describe("table helpers", () => {
     ];
 
     const result = prepareApplyChangesPlan(
-      {
-        getDriver: () => postgresDriver,
-      } as never,
-      "conn-pg",
+      postgresManager(postgresDriver, connection) as never,
+      connection.id,
       "main",
       "public",
       "fixture_rows",

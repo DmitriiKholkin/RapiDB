@@ -1,4 +1,10 @@
 import type React from "react";
+import type { MssqlSqlVariantRowIdentity } from "../../../shared/mssqlSqlVariantRowIdentity";
+import type { MySQLTimestampRowIdentity } from "../../../shared/mysqlTimestampRowIdentity";
+import type { OracleTemporalRowIdentity } from "../../../shared/oracleTemporalRowIdentity";
+import type { PostgresArrayRowIdentity } from "../../../shared/postgresArrayRowIdentity";
+import type { SqlDeleteObservation } from "../../../shared/sqlDeleteObservation";
+import type { SQLiteRowIdentity } from "../../../shared/sqliteRowIdentity";
 import {
   type ColumnTypeMeta as ColumnMeta,
   deriveApplicableFilterDrafts,
@@ -29,6 +35,8 @@ export type PendingRestoreEntry = BasePendingRestoreEntry & {
   originalTypes?: Map<string, MongoValueTypeHint>;
   baselinePresenceVersion?: 1;
   baselineMissing?: boolean;
+  /** The backend rejected this row. A matching key on a new read is not consent to retarget it. */
+  applyConflict?: true;
 };
 export { TOOLBAR_H };
 
@@ -70,6 +78,12 @@ export interface FetchSnapshot {
   filters: FilterExpression[];
 }
 
+export interface TableFetchOptions {
+  refreshMetadata?: boolean;
+  refreshData?: boolean;
+  conflictRefresh?: boolean;
+}
+
 export interface PendingRestoreState {
   entries: PendingRestoreEntry[];
 }
@@ -85,6 +99,8 @@ export interface PersistedTableMutation {
   kind: "apply" | "delete";
   unknown: boolean;
   operationId?: string;
+  applyConflict?: true;
+  conflictView?: PersistedTableViewState;
 }
 
 export interface PersistedTableViewState {
@@ -95,7 +111,7 @@ export interface PersistedTableViewState {
   filters: FilterDraftMap;
 }
 
-const TABLE_DRAFT_VERSION = 2;
+const TABLE_DRAFT_VERSION = 3;
 
 interface SerializedTableDraft {
   draftVersion: typeof TABLE_DRAFT_VERSION;
@@ -108,6 +124,7 @@ interface SerializedTableDraft {
       originalMissingFields?: string[];
       originalTypes?: Array<[string, MongoValueTypeHint]>;
       baselinePresenceVersion?: 1;
+      applyConflict?: true;
     }>;
   };
   newRows: Array<Record<string, { value: unknown } | { valueUndefined: true }>>;
@@ -156,6 +173,7 @@ export function serializeTableDraft(
         ...(entry.baselinePresenceVersion === 1
           ? { baselinePresenceVersion: 1 as const }
           : {}),
+        ...(entry.applyConflict && { applyConflict: true as const }),
       })),
     },
     newRows: newRows.map((row) =>
@@ -177,10 +195,14 @@ export function parsePersistedTableDraft(
   if (!isRecord(value) || value.tableKey !== expectedTableKey) return null;
   if (
     value.draftVersion !== undefined &&
+    value.draftVersion !== 2 &&
     value.draftVersion !== TABLE_DRAFT_VERSION
   )
     return null;
   const migrateLegacyDefault = value.draftVersion === undefined;
+  // Past insert drafts used a string to represent explicit NULL. Pending
+  // updates already stored real null, and baseline data must stay untouched.
+  const migrateInsertNull = value.draftVersion !== TABLE_DRAFT_VERSION;
   const state = value.restoreState;
   const newRows = value.newRows;
   if (
@@ -197,6 +219,7 @@ export function parsePersistedTableDraft(
     if (
       !isRecord(entry) ||
       typeof entry.originalSignature !== "string" ||
+      (entry.applyConflict !== undefined && entry.applyConflict !== true) ||
       !Array.isArray(entry.changes)
     ) {
       return null;
@@ -281,6 +304,7 @@ export function parsePersistedTableDraft(
       originalTypes,
       baselinePresenceVersion: entry.baselinePresenceVersion as 1 | undefined,
       baselineMissing: originalValues === undefined,
+      ...(entry.applyConflict === true && { applyConflict: true }),
     });
   }
 
@@ -295,10 +319,12 @@ export function parsePersistedTableDraft(
           name,
           {
             value:
-              migrateLegacyDefault &&
-              cell.value === LEGACY_INSERT_DEFAULT_SENTINEL
-                ? INSERT_DEFAULT_SENTINEL
-                : cell.value,
+              migrateInsertNull && cell.value === NULL_SENTINEL
+                ? null
+                : migrateLegacyDefault &&
+                    cell.value === LEGACY_INSERT_DEFAULT_SENTINEL
+                  ? INSERT_DEFAULT_SENTINEL
+                  : cell.value,
           },
         ]);
       } else if (
@@ -320,8 +346,21 @@ export function parsePersistedTableDraft(
       !isRecord(marker) ||
       (marker.kind !== "apply" && marker.kind !== "delete") ||
       typeof marker.unknown !== "boolean" ||
+      (marker.applyConflict !== undefined &&
+        (marker.applyConflict !== true ||
+          marker.kind !== "apply" ||
+          marker.unknown)) ||
       (marker.operationId !== undefined &&
         typeof marker.operationId !== "string")
+    )
+      return null;
+    const conflictView = parsePersistedTableViewState(
+      marker.conflictView,
+      expectedTableKey,
+    );
+    if (
+      marker.conflictView !== undefined &&
+      (!conflictView || marker.applyConflict !== true)
     )
       return null;
     mutation = {
@@ -330,6 +369,8 @@ export function parsePersistedTableDraft(
       ...(typeof marker.operationId === "string"
         ? { operationId: marker.operationId }
         : {}),
+      ...(conflictView && { conflictView }),
+      ...(marker.applyConflict === true && { applyConflict: true }),
     };
   }
 
@@ -537,10 +578,7 @@ export function buildInsertValues(
   return Object.fromEntries(
     Object.entries(draft)
       .filter(([, cell]) => cell.value !== INSERT_DEFAULT_SENTINEL)
-      .map(([columnName, cell]) => [
-        columnName,
-        cell.value === NULL_SENTINEL ? null : cell.value,
-      ]),
+      .map(([columnName, cell]) => [columnName, cell.value]),
   );
 }
 
@@ -568,6 +606,115 @@ export function stablePrimaryKeyPart(value: unknown): unknown {
   return value;
 }
 
+// The committed row object owns its identity. Keeping it off the object avoids
+// exposing it as a database column and keeps old/new pages distinct in recovery.
+const sqlDeleteObservations = new WeakMap<Row, SqlDeleteObservation>();
+
+export function registerSqlDeleteObservation(
+  row: Row,
+  observation: SqlDeleteObservation,
+): void {
+  sqlDeleteObservations.set(row, observation);
+}
+
+export function readSqlDeleteObservation(row: Row) {
+  return sqlDeleteObservations.get(row) ?? null;
+}
+
+const sqliteRowIdentities = new WeakMap<Row, SQLiteRowIdentity>();
+const postgresArrayRowIdentities = new WeakMap<Row, PostgresArrayRowIdentity>();
+const mysqlTimestampRowIdentities = new WeakMap<
+  Row,
+  MySQLTimestampRowIdentity
+>();
+const mssqlSqlVariantRowIdentities = new WeakMap<
+  Row,
+  MssqlSqlVariantRowIdentity
+>();
+const oracleTemporalRowIdentities = new WeakMap<
+  Row,
+  OracleTemporalRowIdentity
+>();
+
+export function registerSQLiteRowIdentity(
+  row: Row,
+  identity: SQLiteRowIdentity,
+): void {
+  sqliteRowIdentities.set(row, identity);
+}
+
+export function registerPostgresArrayRowIdentity(
+  row: Row,
+  identity: PostgresArrayRowIdentity,
+): void {
+  postgresArrayRowIdentities.set(row, identity);
+}
+
+export function registerMySQLTimestampRowIdentity(
+  row: Row,
+  identity: MySQLTimestampRowIdentity,
+): void {
+  mysqlTimestampRowIdentities.set(row, identity);
+}
+
+export function registerMssqlSqlVariantRowIdentity(
+  row: Row,
+  identity: MssqlSqlVariantRowIdentity,
+): void {
+  mssqlSqlVariantRowIdentities.set(row, identity);
+}
+
+export function registerOracleTemporalRowIdentity(
+  row: Row,
+  identity: OracleTemporalRowIdentity,
+): void {
+  oracleTemporalRowIdentities.set(row, identity);
+}
+
+function storedRowKey(row: Row, name: string): unknown {
+  const sqliteIdentity = sqliteRowIdentities.get(row);
+  if (sqliteIdentity) {
+    return Object.hasOwn(sqliteIdentity, name) ? sqliteIdentity[name] : null;
+  }
+  const postgresIdentity = postgresArrayRowIdentities.get(row);
+  if (postgresIdentity && Object.hasOwn(postgresIdentity, name)) {
+    return postgresIdentity[name];
+  }
+  const mysqlIdentity = mysqlTimestampRowIdentities.get(row);
+  if (mysqlIdentity && Object.hasOwn(mysqlIdentity, name)) {
+    return mysqlIdentity[name];
+  }
+  const oracleIdentity = oracleTemporalRowIdentities.get(row);
+  if (oracleIdentity && Object.hasOwn(oracleIdentity, name)) {
+    return oracleIdentity[name];
+  }
+  const mssqlIdentity = mssqlSqlVariantRowIdentities.get(row);
+  return mssqlIdentity && Object.hasOwn(mssqlIdentity, name)
+    ? mssqlIdentity[name]
+    : row[name];
+}
+
+export function rowMutationPrimaryKeys(
+  row: Row,
+  primaryKeyColumns: readonly string[],
+  mongoIdType: "objectId" | "string" | null | undefined,
+  mongoRowIdentity: boolean,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    primaryKeyColumns.map((name) => [
+      name,
+      name === "_id" && mongoRowIdentity
+        ? {
+            $rapidbMongoId: {
+              type: mongoIdType ?? "unsupported",
+              value: row[name],
+            },
+          }
+        : storedRowKey(row, name),
+    ]),
+  );
+}
+
 export function rowMutationBlockReason(
   row: Row | undefined,
   primaryKeyColumns: readonly string[],
@@ -578,10 +725,29 @@ export function rowMutationBlockReason(
     return "This row cannot be edited or deleted: a complete primary key is required.";
   }
   for (const name of primaryKeyColumns) {
+    const oracleIdentity = oracleTemporalRowIdentities.get(row);
+    if (
+      oracleIdentity &&
+      Object.hasOwn(oracleIdentity, name) &&
+      oracleIdentity[name] === null
+    ) {
+      return `This row cannot be edited or deleted: the exact identity for Oracle temporal primary key ${name} is unavailable. Refresh the table or use the Query Editor with an explicit era.`;
+    }
+    const variantIdentity = mssqlSqlVariantRowIdentities.get(row);
+    if (
+      variantIdentity &&
+      Object.hasOwn(variantIdentity, name) &&
+      variantIdentity[name] === null
+    ) {
+      return `This row cannot be edited or deleted: the exact identity for SQL Server sql_variant primary key ${name} is unavailable. Refresh the table or use the Query Editor with an explicitly typed key.`;
+    }
+    const key = storedRowKey(row, name);
     if (
       !Object.hasOwn(row, name) ||
       row[name] === null ||
-      row[name] === undefined
+      row[name] === undefined ||
+      key === null ||
+      key === undefined
     ) {
       return `This row cannot be edited or deleted: primary key ${name} is NULL or missing, so the row cannot be targeted safely.`;
     }
@@ -623,7 +789,10 @@ export function rowPrimaryKeySignature(
       return null;
     }
 
-    keyEntries.push([columnName, stablePrimaryKeyPart(row[columnName])]);
+    keyEntries.push([
+      columnName,
+      stablePrimaryKeyPart(storedRowKey(row, columnName)),
+    ]);
   }
 
   if (primaryKeyColumns.includes("_id") && mongoIdType !== undefined) {
@@ -720,6 +889,37 @@ function rowValueTypeHint(
   );
 }
 
+// In conflict review, don't collapse different wire values (in particular,
+// BSON document field order, missing properties, or distinct number types).
+function exactObservedValueEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true;
+  if (!left || !right || typeof left !== "object" || typeof right !== "object")
+    return false;
+  if (left instanceof Date || right instanceof Date)
+    return (
+      left instanceof Date &&
+      right instanceof Date &&
+      Object.is(left.getTime(), right.getTime())
+    );
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length !== right.length
+  )
+    return false;
+  const leftEntries = Object.entries(left);
+  const rightEntries = Object.entries(right);
+  return (
+    leftEntries.length === rightEntries.length &&
+    leftEntries.every(
+      ([key, value], index) =>
+        key === rightEntries[index][0] &&
+        exactObservedValueEqual(value, rightEntries[index][1]),
+    )
+  );
+}
+
 export function restorePendingEditsSafely(
   restoreState: PendingRestoreState | null,
   rows: readonly Row[],
@@ -727,6 +927,7 @@ export function restorePendingEditsSafely(
   mongoIdTypes: readonly ("objectId" | "string" | null)[] = [],
   mongoRowIdentity = false,
   rowValueTypes?: readonly Record<string, MongoValueTypeHint>[],
+  conflictReview = false,
 ): PendingRestoreResult {
   if (!restoreState || restoreState.entries.length === 0) {
     return { pendingEdits: new Map(), unresolved: [] };
@@ -753,13 +954,20 @@ export function restorePendingEditsSafely(
   const restored: PendingEdits = new Map();
   const unresolved: PendingRestoreEntry[] = [];
   const claimedRows = new Set<number>();
+  const preserveUnresolved = (entry: PendingRestoreEntry) =>
+    unresolved.push(conflictReview ? { ...entry, applyConflict: true } : entry);
 
   for (const entry of restoreState.entries) {
     const originalMatches = rowsBySignature.get(entry.originalSignature) ?? [];
-    if (originalMatches.length === 1 && !claimedRows.has(originalMatches[0])) {
+    if (
+      !entry.applyConflict &&
+      originalMatches.length === 1 &&
+      !claimedRows.has(originalMatches[0])
+    ) {
       const rowIdx = originalMatches[0];
       if (
         entry.baselineMissing ||
+        (conflictReview && !entry.originalValues) ||
         (entry.originalValues &&
           [...entry.changes.keys()].some(
             (name) =>
@@ -773,10 +981,17 @@ export function restorePendingEditsSafely(
               (entry.originalMissingFields?.has(name)
                 ? Object.hasOwn(rows[rowIdx], name)
                 : !Object.hasOwn(rows[rowIdx], name) ||
-                  JSON.stringify(
-                    stablePrimaryKeyPart(entry.originalValues.get(name)),
-                  ) !==
-                    JSON.stringify(stablePrimaryKeyPart(rows[rowIdx][name]))) ||
+                  (conflictReview
+                    ? !exactObservedValueEqual(
+                        entry.originalValues.get(name),
+                        rows[rowIdx][name],
+                      )
+                    : JSON.stringify(
+                        stablePrimaryKeyPart(entry.originalValues.get(name)),
+                      ) !==
+                      JSON.stringify(
+                        stablePrimaryKeyPart(rows[rowIdx][name]),
+                      ))) ||
               ((entry.originalTypes || rowValueTypes?.[rowIdx]) &&
                 (!entry.originalTypes?.has(name) ||
                   !rowValueTypes?.[rowIdx] ||
@@ -790,13 +1005,13 @@ export function restorePendingEditsSafely(
                     ))),
           ))
       ) {
-        unresolved.push(entry);
+        preserveUnresolved(entry);
         continue;
       }
       claimedRows.add(rowIdx);
       restored.set(rowIdx, new Map(entry.changes));
     } else {
-      unresolved.push(entry);
+      preserveUnresolved(entry);
     }
   }
 

@@ -28,6 +28,11 @@ const amount = {
   category: "decimal" as const,
   isPrimaryKey: false,
 };
+const mssqlAmount = {
+  ...amount,
+  type: "decimal(12,2)",
+  nativeType: "decimal(12,2)",
+};
 afterEach(() => vi.restoreAllMocks());
 
 describe("B02 INSERT identity type regressions", () => {
@@ -67,15 +72,15 @@ describe("B02 INSERT identity type regressions", () => {
       "string",
       "string",
     ]);
-    expect(plan.operation.sql).toContain("RETURNING TO_CHAR(");
+    expect(plan.operation.sql).toMatch(/RETURNING .*\bTO_CHAR\(/);
     if (nativeType.startsWith("TIMESTAMP"))
       expect(plan.operation.sql).toContain("FF9");
     if (nativeType.includes("TIME ZONE"))
       expect(plan.operation.sql).toContain("TIMESTAMP(9) WITH TIME ZONE");
     const captured =
       nativeType === "DATE"
-        ? "+2026-10-03 12:34:56"
-        : "+2026-10-03 07:04:56.987654321";
+        ? "-0001-10-03 12:34:56"
+        : "-0001-10-03 07:04:56.987654321";
     let mismatch = false;
     const closeCursor = vi.fn(async () => {});
     const execute = vi.fn(
@@ -218,6 +223,9 @@ describe("B02 INSERT identity type regressions", () => {
     expect(columns[0].nativeType).toBe(resolved);
     expect(plan.operation.sql).toContain(`[__col_0] ${resolved}`);
     expect(plan.operation.sql).not.toContain(alias);
+    if (base === "decimal") {
+      expect(plan.operation.sql).toContain("CAST(? AS decimal(28,10))");
+    }
     if (base.includes("char")) {
       expect(plan.operation.sql).toContain(
         "COLLATE Latin1_General_100_BIN2_UTF8",
@@ -307,10 +315,7 @@ describe("B02 INSERT identity type regressions", () => {
       nativeType,
       category: driver.mapTypeCategory(nativeType),
     };
-    const cols = [
-      column,
-      { ...amount, type: "decimal(12,2)", nativeType: "decimal(12,2)" },
-    ];
+    const cols = [column, mssqlAmount];
     const operation = buildInsertRowOperation(
       driver,
       "db",
@@ -407,7 +412,19 @@ describe("B02 INSERT identity type regressions", () => {
     ]);
     expect(verification?.identity).toBeDefined();
     const expression = operation.sql.split(" RETURNING ")[1].split(" INTO ")[0];
-    expect(verification?.sql).toContain(`${expression} = :1`);
+    if (nativeType === "DATE" || nativeType.startsWith("TIMESTAMP")) {
+      const format =
+        nativeType === "DATE"
+          ? "SYYYY-MM-DD HH24:MI:SS"
+          : "SYYYY-MM-DD HH24:MI:SS.FF9";
+      expect(expression).toContain(format);
+      expect(verification?.sql).toContain(format);
+      expect(verification?.sql).toContain(
+        nativeType === "DATE" ? "TO_DATE(:1," : "TO_TIMESTAMP(:1,",
+      );
+    } else {
+      expect(verification?.sql).toContain(`${expression} = :1`);
+    }
   });
 
   it.each([
@@ -428,7 +445,7 @@ describe("B02 INSERT identity type regressions", () => {
         "dbo",
         "t",
         { amount: "1.25" },
-        [column, amount],
+        [column, mssqlAmount],
         { backend: "mssql", columns: [column] },
       ),
     ).toThrow(/cannot capture/);
@@ -452,7 +469,7 @@ describe("B02 INSERT identity type regressions", () => {
       "dbo",
       "t",
       { amount: "1.25" },
-      [column, amount],
+      [column, mssqlAmount],
       { backend: "mssql", columns: [column] },
     );
     expect(operation.sql).toContain(
@@ -492,7 +509,7 @@ describe("B02 INSERT identity type regressions", () => {
         "dbo",
         "t",
         { amount: "1.25" },
-        [column, amount],
+        [column, mssqlAmount],
         { backend: "mssql", columns: [column] },
       ),
     ).toThrow(/collation metadata; no data was written/);
@@ -517,7 +534,7 @@ describe("B02 INSERT identity type regressions", () => {
         "dbo",
         "t",
         { amount: "1.25" },
-        [column, amount],
+        [column, mssqlAmount],
         { backend: "mssql", columns: [column] },
       ),
     ).toThrow(/collation metadata; no data was written/);

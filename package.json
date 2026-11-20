@@ -763,6 +763,12 @@
           "description": "Default number of rows per page in the Table Data Viewer. Allowed values: 25, 100, 500, 1000. Any other value will be ignored and 25 will be used.",
           "scope": "application"
         },
+        "rapidb.export.csvUtf8Bom": {
+          "type": "boolean",
+          "default": false,
+          "description": "Add a UTF-8 byte order mark (BOM) to query and table CSV exports so Excel can detect UTF-8 when opening them. Leave disabled for plain UTF-8 CSV.",
+          "scope": "application"
+        },
         "rapidb.feedbackPrompt.disabled": {
           "type": "boolean",
           "default": false,
@@ -902,6 +908,7 @@
     "@aws-sdk/util-dynamodb": "3.996.2",
     "@dagrejs/dagre": "3.0.0",
     "@elastic/elasticsearch": "9.4.2",
+    "@smithy/core": "3.24.7",
     "@smithy/node-http-handler": "4.7.5",
     "@tanstack/react-table": "8.21.3",
     "@tanstack/react-virtual": "3.13.26",

@@ -57,7 +57,7 @@ function lastFetchId(): number {
   return payload.fetchId;
 }
 
-function mountMutationController(rows: Row[]) {
+function mountMutationController(rows: Row[], selected = new Set<number>()) {
   const refs = {
     loadingRef: { current: false },
     columnsRef: { current: columns },
@@ -72,7 +72,7 @@ function mountMutationController(rows: Row[]) {
     useTableMutationController({
       ...refs,
       canEditRows: true,
-      selected: new Set<number>(),
+      selected,
     }),
   );
   const commit = (nextRows: Row[]) =>
@@ -83,6 +83,25 @@ function mountMutationController(rows: Row[]) {
   commit(rows);
   return Object.assign(hook, { commit });
 }
+
+it("does not post a SQL Viewer delete without the observed row snapshot", () => {
+  const hook = mountMutationController(
+    [{ id: 1, name: "Alice" }],
+    new Set([0]),
+  );
+  act(() =>
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+      requiresSqlDeleteObservation: true,
+    }),
+  );
+  act(() => hook.result.current.deleteSelected());
+  expect(hook.result.current.mutErr).toMatch(/original row snapshot/);
+  expect(
+    getPostedMessages().filter(({ type }) => type === "deleteRows"),
+  ).toEqual([]);
+});
 
 function pressUndo(target: EventTarget = document.body) {
   let event: KeyboardEvent | undefined;

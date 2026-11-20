@@ -276,17 +276,29 @@ describe("ErdPanel", () => {
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "erdLoading",
       payload: {
+        loadId: 1,
         forceReload: true,
       },
+    });
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "erdGraph",
+      payload: expect.objectContaining({ loadId: 1 }),
     });
 
     ErdPanel.disposeAll();
   });
 
-  it("warns when the loaded graph is partial", async () => {
+  it.each([
+    [undefined, "may be incomplete"],
+    ["redis-prefixes", "Redis key prefix discovery reached its scan limit"],
+  ])("warns when the loaded graph is partial (truncation: %s)", async (discoveryTruncated, warning) => {
     const { ErdPanel } = await import("../../src/extension/panels/erdPanel");
+    const emptyGraph = { nodes: [], edges: [], scope: {} };
+    const graph = discoveryTruncated
+      ? { ...emptyGraph, discoveryTruncated, metadataIncomplete: true }
+      : emptyGraph;
     getGraphMock.mockResolvedValueOnce({
-      graph: { nodes: [], edges: [], scope: {} },
+      graph,
       fromCache: false,
       partial: true,
     });
@@ -313,22 +325,21 @@ describe("ErdPanel", () => {
 
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "erdGraph",
-      payload: expect.objectContaining({ partial: true }),
+      payload: expect.objectContaining({ graph, partial: true }),
     });
     expect(showWarningMessageMock).toHaveBeenCalledWith(
-      expect.stringContaining("may be incomplete"),
+      expect.stringContaining(warning),
     );
 
-    getGraphMock.mockResolvedValueOnce({
-      graph: { nodes: [], edges: [], scope: {} },
-      fromCache: true,
-      partial: true,
-    });
+    const second = discoveryTruncated
+      ? { graph: emptyGraph, partial: false }
+      : { graph, partial: true };
+    getGraphMock.mockResolvedValueOnce({ ...second, fromCache: true });
     await panel.webview.dispatchMessage({ type: "ready" });
 
     expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
       type: "erdGraph",
-      payload: expect.objectContaining({ fromCache: true, partial: true }),
+      payload: expect.objectContaining({ ...second, fromCache: true }),
     });
     expect(showWarningMessageMock).toHaveBeenCalledTimes(1);
 
@@ -397,6 +408,7 @@ describe("ErdPanel", () => {
     expect(panel.webview.postMessage).toHaveBeenCalledWith({
       type: "erdError",
       payload: {
+        loadId: 1,
         error: "Metadata fetch failed",
       },
     });
@@ -597,7 +609,7 @@ describe("ErdPanel", () => {
       expect(panel.webview.postMessage).toHaveBeenCalledTimes(1);
       expect(panel.webview.postMessage).toHaveBeenCalledWith({
         type: "erdLoading",
-        payload: { forceReload: false },
+        payload: { loadId: 1, forceReload: false },
       });
       expect(showWarningMessageMock).not.toHaveBeenCalled();
 
@@ -803,7 +815,7 @@ describe("ErdPanel", () => {
         );
         expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
           type: "erdError",
-          payload: { error: "Not connected" },
+          payload: { loadId: 1, error: "Not connected" },
         });
 
         connectionManager.fireConnect();
@@ -854,7 +866,7 @@ describe("ErdPanel", () => {
         await panel.webview.dispatchMessage({ type: "ready" });
         expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
           type: "erdError",
-          payload: { error: "Metadata fetch failed" },
+          payload: { loadId: 1, error: "Metadata fetch failed" },
         });
 
         connectionManager.fireConnect();
@@ -882,7 +894,7 @@ describe("ErdPanel", () => {
       await panel.webview.dispatchMessage({ type: "ready" });
       expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
         type: "erdError",
-        payload: { error: "Not connected" },
+        payload: { loadId: 1, error: "Not connected" },
       });
 
       ErdPanel.createOrShow(context, connectionManager as never, scope);

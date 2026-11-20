@@ -14,6 +14,9 @@ interface QueryToolbarProps {
   bookmarking: boolean;
   canFormat: boolean;
   connectionId: string;
+  postgresDatabase?: string;
+  pinnedTargetUnavailable: boolean;
+  targetReviewRequired: boolean;
   connections: readonly ConnectionEntry[];
   formatButtonTitle: string;
   schemaError?: string | null;
@@ -33,6 +36,9 @@ export function QueryToolbar({
   bookmarking,
   canFormat,
   connectionId,
+  postgresDatabase,
+  pinnedTargetUnavailable,
+  targetReviewRequired,
   connections,
   formatButtonTitle,
   schemaError,
@@ -48,51 +54,76 @@ export function QueryToolbar({
 }: QueryToolbarProps): React.ReactElement {
   const noConnection = !selectedConnectionId;
   const queryRunning = status === "running";
-  const runDisabled = queryRunning || noConnection;
+  const runDisabled =
+    queryRunning ||
+    noConnection ||
+    pinnedTargetUnavailable ||
+    targetReviewRequired;
   const connectionDisabled =
     queryRunning || (connections.length === 0 && !selectedConnectionId);
-  const bookmarkDisabled =
-    bookmarked || bookmarking || noConnection || queryRunning;
+  const bookmarkDisabled = bookmarked || bookmarking || runDisabled;
   const clearDisabled = noConnection || queryRunning;
   const formatDisabled = noConnection || !canFormat || queryRunning;
+  const pinnedTarget =
+    postgresDatabase === undefined
+      ? undefined
+      : `${connections[0]?.name ?? connectionId} / ${JSON.stringify(postgresDatabase)}${pinnedTargetUnavailable ? " (connection unavailable)" : ""}`;
   return (
     <div style={queryToolbarStyle}>
-      <select
-        aria-label="Active connection"
-        style={querySelectStyle}
-        value={selectedConnectionId}
-        disabled={connectionDisabled}
-        onChange={(event) => onConnectionChange(event.target.value)}
-      >
-        {connections.length === 0 ? (
-          <option value={selectedConnectionId}>
-            {selectedConnectionId ? connectionId : "—"}
-          </option>
-        ) : (
-          <>
-            {!selectedConnectionId && (
-              <option value="" disabled>
-                —
-              </option>
-            )}
-            {connections.map((connection) => (
-              <option key={connection.id} value={connection.id}>
-                {connection.name} ({connection.type})
-              </option>
-            ))}
-          </>
-        )}
-      </select>
-
-      {connections.length === 0 && selectedConnectionId && (
-        <Icon
-          name="sync"
-          size={11}
-          spin
-          style={{ opacity: 0.55, marginLeft: 2, flexShrink: 0 }}
-          title="Loading connections…"
-        />
+      {pinnedTarget !== undefined ? (
+        <span
+          title={`${pinnedTarget}\nOpen a new query to use a different target.`}
+          style={{
+            minWidth: 0,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "pre",
+          }}
+        >
+          Pinned target: {pinnedTarget}
+        </span>
+      ) : (
+        <select
+          aria-label="Active connection"
+          style={querySelectStyle}
+          value={selectedConnectionId}
+          disabled={connectionDisabled}
+          onChange={(event) => onConnectionChange(event.target.value)}
+        >
+          {connections.length === 0 ? (
+            <option value={selectedConnectionId}>
+              {selectedConnectionId ? connectionId : "—"}
+            </option>
+          ) : (
+            <>
+              {!connections.some(({ id }) => id === selectedConnectionId) && (
+                <option value={selectedConnectionId} disabled>
+                  {selectedConnectionId
+                    ? "Previous connection unavailable"
+                    : "—"}
+                </option>
+              )}
+              {connections.map((connection) => (
+                <option key={connection.id} value={connection.id}>
+                  {connection.name} ({connection.type})
+                </option>
+              ))}
+            </>
+          )}
+        </select>
       )}
+
+      {postgresDatabase === undefined &&
+        connections.length === 0 &&
+        selectedConnectionId && (
+          <Icon
+            name="sync"
+            size={11}
+            spin
+            style={{ opacity: 0.55, marginLeft: 2, flexShrink: 0 }}
+            title="Loading connections…"
+          />
+        )}
 
       <button
         type="button"

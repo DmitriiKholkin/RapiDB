@@ -1,5 +1,9 @@
 import oracledb from "oracledb";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import {
+  isOracleSignedTemporalText,
+  isOracleTemporalPrimaryKeyValue,
+} from "../../shared/oracleTemporalRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -27,6 +31,12 @@ import {
   getMetadataContext,
   withMetadataResource,
 } from "./metadataCancellation";
+import { MutationNotExecutedError } from "./mutationExecutionState";
+import {
+  oracleTemporalIdentityComparison,
+  oracleTemporalIdentityKind,
+  oracleTemporalIdentityProjection,
+} from "./oracleTemporalIdentity";
 import {
   indexedPlaceholderOffsets,
   replaceIndexedPlaceholders,
@@ -68,7 +78,7 @@ import type {
 import {
   assertTransactionAffectedRows,
   DATETIME_SQL_RE,
-  NULL_SENTINEL,
+  GuardedDeleteConflictError,
 } from "./types";
 
 const ORACLE_ENTITY_MANIFEST: DriverEntityManifest = {
@@ -989,7 +999,7 @@ function canonicalOracleJsonObject(value: unknown): string | null {
   }
 }
 function oracleObjectJsonValue(value: unknown, column: ColumnTypeMeta): string {
-  if (value === NULL_SENTINEL || value === null) {
+  if (value === null) {
     return JSON.stringify(null);
   }
   const normalized = parseOracleObjectRecord(
@@ -1238,8 +1248,7 @@ function canonicalOracleTemporalEdit(
   value: unknown,
   column: ColumnTypeMeta,
 ): string | null {
-  if (value === null || value === NULL_SENTINEL || value === "")
-    return "__rapidb_oracle_temporal_null__";
+  if (value === null || value === "") return "__rapidb_oracle_temporal_null__";
   const text = oracleTemporalBindText(value, column);
   if (text === null) return null;
   const normalized = normalizeOracleTemporalText(text);
@@ -3575,9 +3584,29 @@ END;`,
     };
     context?.signal.addEventListener("abort", cancel, { once: true });
     try {
+      if (operations.some((op) => op.oracleDeleteRowLock)) {
+        await conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+      }
       const identities = new TransactionIdentityStore();
       for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
+        if (op.oracleDeleteRowLock) {
+          // A DBMS_LOB write can leave the row version unchanged. A DELETE
+          // that begins while that write holds a lock can otherwise compare
+          // the LOB at the old statement SCN. Lock the key, then compare and
+          // delete at a new statement SCN without giving up that lock.
+          const lock = replacePositionalParams(
+            op.oracleDeleteRowLock.sql,
+            op.oracleDeleteRowLock.params,
+          );
+          const result = await conn.execute(
+            lock.sql,
+            lock.binds as oracledb.BindParameters,
+            { autoCommit: false, maxRows: 2 },
+          );
+          throwIfTransactionCancelled(context);
+          if (result.rows?.length !== 1) throw new GuardedDeleteConflictError();
+        }
         let finalSql = op.sql;
         let binds: Record<string, unknown> | unknown[] = {};
         if (op.params && op.params.length > 0) {
@@ -3666,6 +3695,9 @@ END;`,
           `Oracle transaction and rollback failed; the outcome may be unknown. ${normalizeUnknownError(e).message}; rollback: ${normalizeUnknownError(rollbackError).message}`,
         );
       }
+      if (e instanceof GuardedDeleteConflictError) {
+        throw new MutationNotExecutedError(e.message, e);
+      }
       throw e;
     } finally {
       context?.signal.removeEventListener("abort", cancel);
@@ -3726,6 +3758,12 @@ END;`,
       };
     }
     const typeName = oracleTypeName(enriched.nativeType);
+    if (
+      enriched.isPrimaryKey &&
+      oracleTemporalIdentityKind(enriched.nativeType)
+    ) {
+      enriched.oracleTemporalPrimaryKey = true;
+    }
     if (typeName === "BFILE") {
       return { ...enriched, isReadOnly: true };
     }
@@ -3863,11 +3901,63 @@ END;`,
     return columns
       .map(
         (column) =>
-          `${this.buildVerificationValueExpr(column)} AS ${this.quoteIdentifier(column.name)}`,
+          `${this.buildTableDisplayValueExpr(column)} AS ${this.quoteIdentifier(column.name)}`,
       )
       .join(", ");
   }
+  buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string | null {
+    const kind =
+      column.isPrimaryKey && oracleTemporalIdentityKind(column.nativeType);
+    // Oracle does not permit TIMESTAMP WITH TIME ZONE as a primary key.
+    return kind && kind !== "timeZone"
+      ? oracleTemporalIdentityProjection(
+          kind,
+          this.quoteIdentifier(column.name),
+        )
+      : null;
+  }
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    const kind =
+      column.isPrimaryKey && oracleTemporalIdentityKind(column.nativeType);
+    if (!kind) return this.coerceInputValue(value, column);
+    if (
+      kind === "timeZone" ||
+      !isOracleTemporalPrimaryKeyValue(value) ||
+      (kind === "date") !== (value.$rapidbOracleTemporalKey.length === 20)
+    ) {
+      throw new Error(
+        `Refresh the table to load the exact stored identity for Oracle primary key "${column.name}". Displayed temporal values cannot safely target a row.`,
+      );
+    }
+    return value;
+  }
+  buildPrimaryKeyComparison(
+    column: ColumnTypeMeta,
+    value: unknown,
+    paramIndex: number,
+  ): MutationSqlExpression | null {
+    const kind =
+      column.isPrimaryKey && oracleTemporalIdentityKind(column.nativeType);
+    if (!kind) return null;
+    const key = this.coercePrimaryKeyValue(value, column);
+    if (!isOracleTemporalPrimaryKeyValue(key)) return null;
+    return {
+      sql: oracleTemporalIdentityComparison(
+        kind,
+        this.quoteIdentifier(column.name),
+        "=",
+        paramIndex,
+      ),
+      params: [key.$rapidbOracleTemporalKey],
+    };
+  }
   buildVerificationValueExpr(column: ColumnTypeMeta): string {
+    return (
+      this.buildTablePrimaryKeyExpr(column) ??
+      this.buildTableDisplayValueExpr(column)
+    );
+  }
+  private buildTableDisplayValueExpr(column: ColumnTypeMeta): string {
     const identifier = this.quoteIdentifier(column.name);
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
       return `XMLSERIALIZE(CONTENT ${identifier} AS CLOB NO INDENT)`;
@@ -3946,8 +4036,7 @@ END;`,
     paramIndex?: number,
   ): MutationSqlExpression | null {
     if (oracleTypeName(column.nativeType) === "XMLTYPE") {
-      if (value === null || value === NULL_SENTINEL)
-        return { sql: "NULL", params: [] };
+      if (value === null) return { sql: "NULL", params: [] };
       if (paramIndex === undefined)
         throw new Error("Oracle XML mutation requires a bind parameter index.");
       return {
@@ -3957,7 +4046,7 @@ END;`,
       };
     }
     if (column.collectionKind === "varray") {
-      if (value === null || value === NULL_SENTINEL) {
+      if (value === null) {
         return { sql: "NULL", params: [] };
       }
       if (paramIndex === undefined) {
@@ -3994,8 +4083,7 @@ END;`,
         "Oracle object mutation requires a bind parameter index.",
       );
     }
-    if (value === null || value === NULL_SENTINEL)
-      return { sql: "NULL", params: [] };
+    if (value === null) return { sql: "NULL", params: [] };
     const normalized = parseOracleObjectRecord(
       value,
       column.objectAttributes,
@@ -4012,13 +4100,23 @@ END;`,
       params: column.objectAttributes.map(() => JSON.stringify(normalized)),
     };
   }
+  buildCursorValueExpr(column: ColumnTypeMeta): string | undefined {
+    const kind = oracleTemporalIdentityKind(column.nativeType);
+    return kind
+      ? oracleTemporalIdentityProjection(
+          kind,
+          this.quoteIdentifier(column.name),
+        )
+      : undefined;
+  }
   override buildCursorComparison(
     column: ColumnTypeMeta,
     operator: "eq" | "gt" | "lt",
     rawValue: unknown,
     paramIndex: number,
   ): FilterConditionResult {
-    if (!this.isDatetimeWithTime(column.nativeType)) {
+    const kind = oracleTemporalIdentityKind(column.nativeType);
+    if (!kind) {
       return super.buildCursorComparison(
         column,
         operator,
@@ -4026,27 +4124,22 @@ END;`,
         paramIndex,
       );
     }
-    const timezoneAware = isTimezoneAwareOracleTemporal(column.nativeType);
-    const dateOnly = oracleTypeName(column.nativeType) === "DATE";
-    const text =
-      dateOnly && typeof rawValue === "string" && isValidDateOnly(rawValue)
-        ? `${rawValue} 00:00:00`
-        : normalizeOracleTemporalValue(rawValue, {
-            preserveExplicitTimezoneText: !timezoneAware,
-          });
-    if (text === null) {
-      throw new Error(`Invalid temporal export cursor for ${column.name}.`);
+    if (
+      !isOracleSignedTemporalText(rawValue) ||
+      (kind === "date") !== (rawValue.length === 20)
+    ) {
+      throw new Error(
+        `Missing exact Oracle temporal export cursor for ${column.name}.`,
+      );
     }
-    const name = this.quoteIdentifier(column.name);
-    const expression = timezoneAware
-      ? `SYS_EXTRACT_UTC(CAST(${name} AS TIMESTAMP(9) WITH TIME ZONE))`
-      : name;
-    const bind = dateOnly
-      ? `TO_DATE(:${paramIndex}, 'YYYY-MM-DD HH24:MI:SS')`
-      : `TO_TIMESTAMP(:${paramIndex}, 'YYYY-MM-DD HH24:MI:SS.FF')`;
     return {
-      sql: `${expression} ${this.sqlOperator(operator)} ${bind}`,
-      params: [dateOnly ? text.replace(/\.\d+$/, "") : text],
+      sql: oracleTemporalIdentityComparison(
+        kind,
+        this.quoteIdentifier(column.name),
+        operator === "eq" ? "=" : operator === "gt" ? ">" : "<",
+        paramIndex,
+      ),
+      params: [rawValue],
     };
   }
   override buildSetExpr(column: ColumnTypeMeta, paramIndex: number): string {
@@ -4159,6 +4252,9 @@ END;`,
   getUpdateTableAlias(): string {
     return "RAPIDB_UPDATE_ROW";
   }
+  protected override getQuestionMarkPlaceholderOptions() {
+    return { dialect: "oracle" } as const;
+  }
   materializePreviewInsertSql(
     sql: string,
     params: readonly unknown[] | undefined,
@@ -4177,7 +4273,11 @@ END;`,
     if (!params || params.length === 0) {
       return sql;
     }
-    const offsets = indexedPlaceholderOffsets(sql, ":", { dialect: "oracle" });
+    const offsets = indexedPlaceholderOffsets(
+      sql,
+      ":",
+      this.getQuestionMarkPlaceholderOptions(),
+    );
     return replaceIndexedPlaceholders(sql, offsets, ({ index, text }) => {
       if (index < 0 || index >= params.length) {
         return text;
@@ -4283,7 +4383,6 @@ END;`,
         : value;
     }
     if (value === null || value === undefined) return value;
-    if (value === NULL_SENTINEL) return null;
     if (value instanceof Date && this.isDatetimeWithTime(column.nativeType)) {
       const text = oracleTemporalBindText(value, column);
       if (text === null)
@@ -4469,7 +4568,7 @@ END;`,
       return this.checkPersistedEdit(column, expectedValue.val, options);
     }
     if (column.collectionKind === "varray") {
-      if (expectedValue === null || expectedValue === NULL_SENTINEL) {
+      if (expectedValue === null) {
         if (options === undefined) return { ok: true, shouldVerify: true };
         return options.persistedValue === null
           ? { ok: true, shouldVerify: true }
@@ -4505,7 +4604,7 @@ END;`,
       };
     }
     if (usesOracleJsonTextValues(column.nativeType)) {
-      const isNull = expectedValue === null || expectedValue === NULL_SENTINEL;
+      const isNull = expectedValue === null;
       if (isNull) {
         return options === undefined || options.persistedValue === null
           ? { ok: true, shouldVerify: true }
@@ -4555,7 +4654,7 @@ END;`,
       (column.category === "other" &&
         canonicalOracleJsonObject(expectedValue) !== null);
     if (isNamedObject) {
-      if (expectedValue === null || expectedValue === NULL_SENTINEL) {
+      if (expectedValue === null) {
         return options === undefined || options.persistedValue === null
           ? { ok: true, shouldVerify: true }
           : {
@@ -4637,7 +4736,7 @@ END;`,
         expectedValue,
         options,
         (value) => {
-          if (value === NULL_SENTINEL || value === null || value === "") {
+          if (value === null || value === "") {
             return { canonical: "\u0000__RAPIDB_ORACLE_FLOAT_NULL__\u0000" };
           }
           if (
@@ -4675,9 +4774,7 @@ END;`,
               /TIMESTAMP(?:\((\d+)\))?/i.exec(column.nativeType)?.[1] ?? 6,
             );
       const text =
-        expectedValue === null ||
-        expectedValue === NULL_SENTINEL ||
-        expectedValue === ""
+        expectedValue === null || expectedValue === ""
           ? null
           : oracleTemporalBindText(expectedValue, column);
       const fraction = text
@@ -4695,6 +4792,21 @@ END;`,
         expectedValue,
         options,
         (value) => {
+          if (this.buildTablePrimaryKeyExpr(column)) {
+            if (isOracleSignedTemporalText(value)) {
+              return { canonical: trimOracleTemporalFraction(value) };
+            }
+            const input = canonicalOracleTemporalEdit(value, column);
+            if (input !== null) {
+              return {
+                canonical:
+                  value === null || value === ""
+                    ? input
+                    : ` ${input.replace("T", " ").replace(/Z$/, "")}`,
+              };
+            }
+            return null;
+          }
           const canonical = canonicalOracleTemporalEdit(value, column);
           return canonical === null ? null : { canonical };
         },
@@ -4709,7 +4821,7 @@ END;`,
           expectedText,
           options,
           (value) => {
-            if (value === NULL_SENTINEL || value === null) {
+            if (value === null) {
               return { canonical: "\u0000__RAPIDB_ORACLE_XML_NULL__\u0000" };
             }
             if (typeof value !== "string") {

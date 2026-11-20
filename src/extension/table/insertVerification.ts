@@ -7,7 +7,7 @@ import type {
 } from "../dbDrivers/types";
 import {
   mssqlInsertIdentityExpression,
-  oracleInsertIdentity,
+  oracleCapturedIdentityComparison,
 } from "./insertIdentitySql";
 import { buildInsertRowOperation } from "./insertSql";
 import { writableEntries } from "./updateSql";
@@ -100,7 +100,7 @@ export function prepareInsertVerification(
       }
       operation.captureIdentity = {
         mysqlInsertId: {
-          sql: `SELECT ${keys.map((column, index) => `${driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${driver.quoteIdentifier(mysqlAutoKey.name)} = ${driver.buildInsertValueExpr(mysqlAutoKey, 1)} LIMIT 2`,
+          sql: `SELECT ${keys.map((column, index) => `${driver.buildTablePrimaryKeyExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${driver.quoteIdentifier(mysqlAutoKey.name)} = ${driver.buildInsertValueExpr(mysqlAutoKey, 1)} LIMIT 2`,
           ...(writable.some(
             ([name, value]) =>
               name === mysqlAutoKey.name &&
@@ -130,6 +130,14 @@ export function prepareInsertVerification(
     const name = driver.quoteIdentifier(column.name);
     const mysqlKey =
       backend === "mysql" && !captureKeys && keyValues[index] !== null;
+    const written = mysqlKey
+      ? driver.buildWrittenPrimaryKeyComparison?.(
+          column,
+          keyValues[index],
+          index + 1,
+        )
+      : null;
+    if (written) return { ...written, comparison: written.sql };
     const comparison =
       mysqlKey && column.category !== "spatial"
         ? driver.buildOriginalValueComparisonWithParams?.(
@@ -167,25 +175,46 @@ export function prepareInsertVerification(
     };
     operation.expectedAffectedRows = 1;
   }
+  const select = `SELECT ${values.map(({ column }, index) => `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified}`;
+  if (backend === "sqlite" && driver.buildTablePrimaryKeyExpr) {
+    return {
+      rowIndex: 0,
+      mutation: "insert",
+      sql: select,
+      params: keys.map(() => null),
+      values,
+      sqlitePrimaryKeyColumns: keys.map(({ name }) => name),
+      identity: {
+        operationIndex: 0,
+        parameterIndexes: keys.map((_, index) => index),
+        allowNull: true,
+      },
+    };
+  }
   return {
     rowIndex: 0,
     mutation: "insert",
-    sql: `SELECT ${values.map(({ column }, index) => `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`).join(", ")} FROM ${qualified} WHERE ${keys
+    sql: `${select} WHERE ${keys
       .map((column, index) => {
         if (!captureKeys) return keyBinds[index].comparison;
+        if (
+          (backend === "pg" && column.postgresArrayPrimaryKey) ||
+          (backend === "mysql" && driver.buildTablePrimaryKeyExpr?.(column))
+        ) {
+          return (
+            driver.buildPrimaryKeyComparison?.(column, null, index + 1)?.sql ??
+            keyBinds[index].comparison
+          );
+        }
         const name = driver.quoteIdentifier(column.name);
+        if (backend === "oracle") {
+          return oracleCapturedIdentityComparison(column, name, index + 1);
+        }
         const expression =
-          captureKeys && backend === "oracle"
-            ? oracleInsertIdentity(column, name).expression
-            : captureKeys && backend === "mssql"
-              ? mssqlInsertIdentityExpression(column, name)
-              : name;
-        const bind =
-          captureKeys && (backend === "mssql" || backend === "oracle")
-            ? backend === "oracle"
-              ? `:${index + 1}`
-              : "?"
-            : keyBinds[index].sql;
+          backend === "mssql"
+            ? mssqlInsertIdentityExpression(column, name)
+            : name;
+        const bind = backend === "mssql" ? "?" : keyBinds[index].sql;
         return `${expression} ${backend === "sqlite" ? "IS" : "="} ${bind}`;
       })
       .join(" AND ")}`,

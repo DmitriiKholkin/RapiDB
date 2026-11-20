@@ -78,13 +78,17 @@ function setup() {
     sort: null,
   };
   const view = render(<TableGrid {...props} />);
-  const request = (row: number) => {
+  const select = (row: number) => {
     const cell = view.container.querySelector<HTMLElement>(
       `td[data-row="${row}"][data-col="0"]`,
     );
     if (!cell) throw new Error("Missing cell");
     fireEvent.mouseDown(cell, { button: 0 });
     fireEvent.mouseUp(document);
+    return cell;
+  };
+  const request = (row: number) => {
+    select(row);
     clearPostedMessages();
     fireEvent.paste(window);
     const message = getLastPostedMessage();
@@ -95,10 +99,76 @@ function setup() {
     act(() => {
       dispatchIncomingMessage("clipboardText", { ...payload, text });
     });
-  return { ...view, props, request, reply, onBatchCellEdit, onMixedBatchEdit };
+  return {
+    ...view,
+    props,
+    select,
+    request,
+    reply,
+    onBatchCellEdit,
+    onMixedBatchEdit,
+  };
 }
 
 describe("delayed grid clipboard replies", () => {
+  it.each([
+    "native",
+    "shortcut",
+    "menu",
+  ] as const)("reports a loading block before requesting clipboard text (%s)", (source) => {
+    const grid = setup();
+    const cell = grid.select(0);
+    grid.props.loadingRef.current = true;
+    clearPostedMessages();
+
+    if (source === "menu") {
+      fireEvent.contextMenu(cell);
+      fireEvent.click(screen.getByRole("menuitem", { name: "Paste" }));
+    } else if (source === "shortcut") {
+      fireEvent.keyDown(document.activeElement as HTMLElement, {
+        key: "v",
+        ctrlKey: true,
+      });
+    } else {
+      fireEvent.paste(window);
+    }
+
+    expect(getLastPostedMessage()).toBeUndefined();
+    expect(
+      screen.getByText(/Wait for the table to finish loading/),
+    ).toBeTruthy();
+  });
+
+  it("reports a matching reply blocked by a load before re-render and never applies it later", () => {
+    const grid = setup();
+    const payload = grid.request(-1);
+    grid.props.loadingRef.current = true;
+    grid.props.fetchEpochRef.current++;
+
+    grid.reply({ ...payload, requestId: "unrelated" });
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    grid.reply(payload);
+    expect(
+      screen.getByText(/Wait for the table to finish loading/),
+    ).toBeTruthy();
+
+    grid.props.loadingRef.current = false;
+    grid.reply(payload);
+    expect(grid.onMixedBatchEdit).not.toHaveBeenCalled();
+    grid.reply(grid.request(-1));
+    expect(grid.onMixedBatchEdit).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+  });
+
+  it("does not report a loading block for an empty clipboard reply", () => {
+    const grid = setup();
+    const payload = grid.request(0);
+    grid.props.loadingRef.current = true;
+    grid.reply(payload, "");
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
+    expect(grid.onBatchCellEdit).not.toHaveBeenCalled();
+  });
+
   it.each([
     "button",
     "select",
@@ -118,10 +188,12 @@ describe("delayed grid clipboard replies", () => {
     const select = controls.getByRole("combobox", { name: "Outside select" });
     const focused = target === "select" ? select : button;
     focused.focus();
+    grid.props.loadingRef.current = true;
     clearPostedMessages();
     expect(fireEvent.paste(target === "window" ? window : focused)).toBe(true);
     expect(getLastPostedMessage()).toBeUndefined();
     expect(grid.onBatchCellEdit).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
   });
 
   it("does not capture native paste or its shortcut on controls inside the grid", () => {
@@ -213,11 +285,13 @@ describe("delayed grid clipboard replies", () => {
     if (!cell || !scroll) throw new Error("Missing grid cell");
     fireEvent.mouseDown(cell, { button: 0 });
     fireEvent.mouseUp(document);
+    grid.props.loadingRef.current = true;
     clearPostedMessages();
     expect(fireEvent.keyDown(scroll, { key: "v", ctrlKey: true })).toBe(true);
     expect(fireEvent.paste(scroll)).toBe(true);
     expect(getLastPostedMessage()).toBeUndefined();
     expect(grid.onBatchCellEdit).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Paste failed/)).toBeNull();
   });
 
   it("supports the keyboard paste shortcut for a draft without edit permission", () => {

@@ -66,6 +66,7 @@ describe("MongoDB query truncation through controller and file export", () => {
     vi.doMock("vscode", () => ({
       Uri: { file: (fsPath: string) => ({ fsPath }) },
       ProgressLocation: { Notification: 15 },
+      workspace: { getConfiguration: () => ({ get: () => false }) },
       window: ui,
     }));
   });
@@ -79,7 +80,13 @@ describe("MongoDB query truncation through controller and file export", () => {
     }
   });
 
-  async function createHarness(documents: MongoDocument[]) {
+  async function createHarness(
+    documents: MongoDocument[],
+    options?: {
+      rowLimit?: number;
+      command?: (command: MongoDocument, options?: MongoDocument) => unknown;
+    },
+  ) {
     const { MongoDBDriver } = await import(
       "../../src/extension/dbDrivers/mongodb"
     );
@@ -155,7 +162,10 @@ describe("MongoDB query truncation through controller and file export", () => {
     Object.assign(driver, {
       connected: true,
       client: {
-        db: () => ({ collection: () => ({ find, aggregate, insertOne }) }),
+        db: () => ({
+          command: options?.command,
+          collection: () => ({ find, aggregate, insertOne }),
+        }),
       },
     });
     const query = vi.spyOn(driver, "query");
@@ -176,7 +186,7 @@ describe("MongoDB query truncation through controller and file export", () => {
       isConnected: () => true,
       getDriver: () => driver,
       getDriverCapabilities: () => driver.getCapabilities(),
-      getQueryRowLimit: () => HARD_CAP,
+      getQueryRowLimit: () => options?.rowLimit ?? HARD_CAP,
       addToHistory: vi.fn(async () => undefined),
       refreshSchemaCache: vi.fn(),
     };
@@ -195,15 +205,19 @@ describe("MongoDB query truncation through controller and file export", () => {
         });
         expect(query).toHaveBeenCalledOnce();
         const raw: QueryResult = await query.mock.results[0].value;
-        const formatted = formatQueryResult(raw, HARD_CAP);
+        const formatted = formatQueryResult(raw, options?.rowLimit ?? HARD_CAP);
+        const { exportRows, serializeJsonExportRow, ...webviewResult } =
+          formatted;
         expect(view.postMessage).toHaveBeenLastCalledWith({
           type: "queryResult",
-          payload: formatted,
+          payload: webviewResult,
         });
         expect(cached).toEqual({
           columns: formatted.columns,
           columnMeta: formatted.columnMeta,
           rows: formatted.rows,
+          ...(exportRows ? { exportRows } : {}),
+          ...(serializeJsonExportRow ? { serializeJsonExportRow } : {}),
           missingCells: formatted.missingCells,
           truncated: formatted.truncated,
           truncatedAt: formatted.truncatedAt,
@@ -343,21 +357,55 @@ describe("MongoDB query truncation through controller and file export", () => {
     expect(ui.showErrorMessage).not.toHaveBeenCalled();
   });
 
-  it("keeps BSON numeric metadata and JSON serialization consistent in multi-command results", async () => {
-    const { Long, Decimal128 } = await import("mongodb");
+  it("keeps display and CSV values but exports BSON as canonical Extended JSON", async () => {
+    const { BSON, Decimal128, Double, Long, ObjectId, Timestamp } =
+      await import("mongodb");
+    const id = new ObjectId("507f1f77bcf86cd799439011");
+    const date = new Date("2024-01-01T12:34:56.789Z");
     const documents = [
       {
-        _id: "a",
+        _id: id,
+        date,
         long: Long.fromString("9223372036854775807"),
         decimal: Decimal128.fromString("1.25"),
         precise: Decimal128.fromString("123456789.987654321"),
-        text: "123",
+        payload: {
+          items: [new Timestamp({ t: 42, i: 1 }), new Double(1), "123"],
+          $rapiDB: { type: "json-null" },
+        },
       },
-      { _id: "b", long: null, decimal: null, precise: null, text: null },
+      { _id: "b", date: null, long: null },
       { _id: "c" },
     ];
     const single = await createHarness(documents);
-    const { raw: singleRaw } = await single.execute(readQuery("find"));
+    const { raw: singleRaw, formatted } = await single.execute(
+      readQuery("find"),
+    );
+    const [idColumn, dateColumn, longColumn] = ["_id", "date", "long"].map(
+      (name) => `__col_${singleRaw.columns.indexOf(name)}`,
+    );
+    expect(formatted.rows[0]).toMatchObject({
+      [idColumn]: id.toHexString(),
+      [dateColumn]: "2024-01-01 12:34:56.789",
+      [longColumn]: "9223372036854775807",
+    });
+    const payload = {
+      columnOrder: [longColumn, idColumn, dateColumn],
+      sort: [{ id: idColumn, desc: true }],
+    };
+    const csvPath = join(tempDir, "bson.csv");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: csvPath });
+    await single.controller.handleMessage({
+      type: "exportResultsCSV",
+      payload,
+    });
+    expect(await readFile(csvPath, "utf8")).toBe(
+      "long,_id,date\n" +
+        "MISSING,c,MISSING\n" +
+        "(NULL),b,(NULL)\n" +
+        "9223372036854775807,507f1f77bcf86cd799439011,2024-01-01 12:34:56.789\n",
+    );
+
     const multi = await createHarness(documents);
     const { raw: multiRaw } = await multi.execute(
       "db.c.find({});db.c.aggregate([])",
@@ -374,16 +422,179 @@ describe("MongoDB query truncation through controller and file export", () => {
     }
     const one = await readFile(join(tempDir, "single.json"), "utf8");
     const combined = await readFile(join(tempDir, "multi.json"), "utf8");
-    expect(one).toContain('"long":9223372036854775807');
-    expect(one).toContain('"decimal":1.25');
-    expect(one).toContain('"precise":"123456789.987654321"');
-    expect(one).toContain('"text":"123"');
-    expect(JSON.parse(combined)).toEqual([
-      ...JSON.parse(one),
-      ...JSON.parse(one),
+    const canonical = documents.map((document) =>
+      BSON.EJSON.serialize(document, { relaxed: false }),
+    );
+    expect(JSON.parse(one)).toEqual(canonical);
+    expect(JSON.parse(combined)).toEqual([...canonical, ...canonical]);
+    expect(BSON.EJSON.parse(one, { relaxed: false })).toEqual(documents);
+
+    const selectedPath = join(tempDir, "selected.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: selectedPath });
+    await single.controller.handleMessage({
+      type: "exportResultsJSON",
+      payload,
+    });
+    const selected = JSON.parse(await readFile(selectedPath, "utf8"));
+    expect(selected).toEqual([
+      { _id: "c" },
+      { long: null, _id: "b", date: null },
+      {
+        long: { $numberLong: "9223372036854775807" },
+        _id: { $oid: id.toHexString() },
+        date: { $date: { $numberLong: String(date.getTime()) } },
+      },
     ]);
-    expect(combined.match(/"long":9223372036854775807/g)).toHaveLength(2);
+    expect(Object.keys(selected[2])).toEqual(["long", "_id", "date"]);
     expect(ui.showErrorMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "foo",
+    "(?>foo)",
+  ])("preserves BSON command display and exports with pattern %s", async (pattern) => {
+    const { BSON, BSONRegExp, Double, Long } = await import("mongodb");
+    const response = {
+      score: new Double(1),
+      small: Long.fromNumber(2),
+      large: Long.fromString("9007199254740993"),
+      pattern: new BSONRegExp(pattern, "imsux"),
+      nested: { items: [new BSONRegExp("a.b", "su")] },
+    };
+    const bytes = BSON.serialize(response);
+    const command = vi.fn((_command, options) =>
+      BSON.deserialize(bytes, options),
+    );
+    const harness = await createHarness([], { command });
+    const { raw, formatted } = await harness.execute(
+      'db.c.insertOne({_id:"new"});db.adminCommand({ping:1})',
+    );
+    expect(command).toHaveBeenCalledWith(
+      { ping: 1 },
+      { useBigInt64: false, promoteValues: false, bsonRegExp: true, raw: true },
+    );
+    const columnKey = (column: string) =>
+      `__col_${raw.columns.indexOf(column)}`;
+    for (const [column, value] of Object.entries({
+      score: 1,
+      small: 2,
+      large: "9007199254740993",
+      pattern: `/${pattern}/imsux`,
+      nested: '{"items":["/a.b/su"]}',
+    })) {
+      expect(formatted.rows[1][columnKey(column)]).toBe(value);
+    }
+
+    const csvPath = join(tempDir, "command.csv");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: csvPath });
+    await harness.controller.handleMessage({
+      type: "exportResultsCSV",
+      payload: { columnOrder: ["pattern", "nested"].map(columnKey) },
+    });
+    expect(await readFile(csvPath, "utf8")).toBe(
+      `pattern,nested\nMISSING,MISSING\n/${pattern}/imsux,"{""items"":[""/a.b/su""]}"\n`,
+    );
+
+    const outputPath = join(tempDir, "command.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: outputPath });
+    await harness.controller.handleMessage({
+      type: "exportResultsJSON",
+      payload: {
+        sort: [{ id: columnKey("score"), desc: false }],
+        columnOrder: raw.columns.map((_, index) => `__col_${index}`).reverse(),
+      },
+    });
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+    const json = await readFile(outputPath, "utf8");
+    expect(JSON.parse(json)).toEqual(
+      expect.arrayContaining([
+        { acknowledged: true, insertedId: "written-after-cap" },
+        BSON.EJSON.serialize(response, { relaxed: false }),
+      ]),
+    );
+    expect(BSON.EJSON.parse(json, { relaxed: false })).toEqual(
+      expect.arrayContaining([response]),
+    );
+  });
+
+  it("serializes only retained rows and selected columns; ambiguous BSON fails only JSON export", async () => {
+    const { Long } = await import("mongodb");
+    const harness = await createHarness(
+      [
+        {
+          _id: "a",
+          long: Long.fromString("9007199254740993"),
+          $oid: "literal",
+        },
+        { _id: "b", $numberLong: "not exported" },
+      ],
+      { rowLimit: 1 },
+    );
+    const { raw, formatted } = await harness.execute(readQuery("find"));
+    expect(raw.exportRows).toHaveLength(2);
+    expect(formatted.exportRows).toHaveLength(1);
+    ui.showWarningMessage.mockResolvedValue(EXPORT_CONFIRMATION);
+
+    const csvPath = join(tempDir, "literal.csv");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: csvPath });
+    await harness.controller.handleMessage({ type: "exportResultsCSV" });
+    expect(await readFile(csvPath, "utf8")).toContain("literal");
+
+    const jsonPath = join(tempDir, "literal.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: jsonPath });
+    await harness.controller.handleMessage({ type: "exportResultsJSON" });
+    expect(ui.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining('literal document key "$oid"'),
+    );
+    expect(await readdir(tempDir)).toEqual(["literal.csv"]);
+
+    const longColumn = `__col_${raw.columns.indexOf("long")}`;
+    ui.showErrorMessage.mockClear();
+    await harness.controller.handleMessage({
+      type: "exportResultsJSON",
+      payload: { columnOrder: [longColumn] },
+    });
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(jsonPath, "utf8"))).toEqual([
+      { long: { $numberLong: "9007199254740993" } },
+    ]);
+  });
+
+  it("does not export a late BSON reply after results from another connection replace it", async () => {
+    const { Long } = await import("mongodb");
+    let finishOldReply: ((result: MongoDocument) => void) | undefined;
+    const oldReply = new Promise<MongoDocument>((resolve) => {
+      finishOldReply = resolve;
+    });
+    const command = vi.fn(({ ping }) =>
+      ping === 1 ? oldReply : { value: Long.fromString("9007199254740995") },
+    );
+    const { controller } = await createHarness([], { command });
+    const oldQuery = controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "db.runCommand({ping:1})",
+        connectionId: "old",
+      },
+    });
+    await vi.waitFor(() => expect(command).toHaveBeenCalledOnce());
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: {
+        queryText: "db.runCommand({ping:2})",
+        connectionId: "new",
+      },
+    });
+    finishOldReply?.({ value: Long.fromString("9007199254740993") });
+    await oldQuery;
+
+    const outputPath = join(tempDir, "latest.json");
+    ui.showSaveDialog.mockResolvedValue({ fsPath: outputPath });
+    await controller.handleMessage({ type: "exportResultsJSON" });
+    expect(ui.showErrorMessage).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(outputPath, "utf8"))).toEqual([
+      { value: { $numberLong: "9007199254740995" } },
+    ]);
   });
 
   const truncatedCases = READ_METHODS.flatMap((method) =>

@@ -29,6 +29,7 @@ describe("export publishing without hard links", () => {
     vi.doMock("vscode", () => ({
       Uri: { file: (fsPath: string) => ({ fsPath }) },
       ProgressLocation: { Notification: 15 },
+      workspace: { getConfiguration: () => ({ get: () => false }) },
       window: {
         showSaveDialog: vi.fn(async () => ({ fsPath: outputPath })),
         withProgress: vi.fn(async (_options, task) =>
@@ -48,10 +49,13 @@ describe("export publishing without hard links", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  async function exportWithLink(linkSync: typeof fs.linkSync): Promise<void> {
+  async function exportWithLink(
+    linkSync: typeof fs.linkSync,
+    copyFileSync = fs.copyFileSync,
+  ): Promise<void> {
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-      return { ...actual, linkSync };
+      return { ...actual, linkSync, copyFileSync };
     });
     const { exportTableDataAsCsv } = await import(
       "../../src/extension/utils/exportService"
@@ -64,11 +68,21 @@ describe("export publishing without hard links", () => {
     "ENOTSUP",
     "EXDEV",
     "ENOSYS",
-  ])("copies a new export exclusively when hard links fail with %s", async (code) => {
-    await exportWithLink(
-      vi.fn(() => {
-        throw unsupportedLinkError(code);
-      }) as never,
+  ])("copies a new export exclusively when the hard-link probe fails with %s", async (code) => {
+    const linkSync = vi.fn<typeof fs.linkSync>(() => {
+      throw unsupportedLinkError(code);
+    });
+    const copyFileSync = vi.fn(fs.copyFileSync);
+    await exportWithLink(linkSync, copyFileSync);
+
+    expect(linkSync).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\.tmp$/),
+      expect.stringMatching(/\.probe$/),
+    );
+    expect(copyFileSync).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\.tmp$/),
+      outputPath,
+      fs.constants.COPYFILE_EXCL,
     );
 
     expect(showErrorMessage).not.toHaveBeenCalled();
@@ -77,33 +91,84 @@ describe("export publishing without hard links", () => {
     expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
   });
 
-  it("does not overwrite a file that appears before the copy fallback publishes", async () => {
-    vi.doMock("node:fs", async () => {
-      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
-      return {
-        ...actual,
-        linkSync: vi.fn(() => {
-          throw unsupportedLinkError("EPERM");
-        }),
-      };
+  it("copies a new export exclusively when the probe succeeds but the final link fails with ENOTSUP", async () => {
+    const linkSync = vi.fn<typeof fs.linkSync>((source, destination) => {
+      if (destination === outputPath) throw unsupportedLinkError("ENOTSUP");
+      fs.linkSync(source, destination);
     });
-    const { exportTableDataAsCsv } = await import(
-      "../../src/extension/utils/exportService"
-    );
-    await exportTableDataAsCsv({
-      fileName: "raced",
-      loadChunks: async function* () {
-        fs.writeFileSync(outputPath, "competing file", { flag: "wx" });
-        yield* chunks();
-      },
+    const copyFileSync = vi.fn<typeof fs.copyFileSync>((...args) => {
+      const [source, destination] = args;
+      expect(fs.readFileSync(source, "utf8")).toBe("id\n1\n");
+      expect(fs.existsSync(destination)).toBe(false);
+      fs.copyFileSync(...args);
     });
+    await exportWithLink(linkSync, copyFileSync);
 
-    expect(fs.readFileSync(outputPath, "utf8")).toBe("competing file");
+    expect(linkSync).toHaveBeenCalledTimes(2);
+    expect(linkSync).toHaveBeenNthCalledWith(
+      1,
+      expect.stringMatching(/\.tmp$/),
+      expect.stringMatching(/\.probe$/),
+    );
+    expect(linkSync).toHaveBeenNthCalledWith(
+      2,
+      expect.stringMatching(/\.tmp$/),
+      outputPath,
+    );
+    expect(copyFileSync).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\.tmp$/),
+      outputPath,
+      fs.constants.COPYFILE_EXCL,
+    );
+    expect(showErrorMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
     expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
-    expect(showErrorMessage).toHaveBeenCalled();
   });
 
-  it("removes a partially copied export when the copy fallback fails", async () => {
+  it("falls back to a copy for a new export with a 255-byte destination basename", async () => {
+    const basename = `${"表".repeat(10)}${"a".repeat(221)}.csv`;
+    outputPath = path.join(tempDir, basename);
+    const linkSync = vi.fn<typeof fs.linkSync>(() => {
+      throw unsupportedLinkError("ENOTSUP");
+    });
+    await exportWithLink(linkSync);
+
+    expect(showErrorMessage).not.toHaveBeenCalled();
+    expect(linkSync).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
+    expect(fs.readdirSync(tempDir)).toEqual([basename]);
+  });
+
+  it.each([
+    "probe",
+    "final link",
+  ])("does not overwrite a file that appears as the copy fallback publishes after an unsupported %s", async (phase) => {
+    const linkSync = vi.fn<typeof fs.linkSync>((source, destination) => {
+      if (phase === "probe" || destination === outputPath) {
+        throw unsupportedLinkError("EPERM");
+      }
+      fs.linkSync(source, destination);
+    });
+    const copyFileSync = vi.fn<typeof fs.copyFileSync>((...args) => {
+      fs.writeFileSync(outputPath, "competing file", { flag: "wx" });
+      fs.copyFileSync(...args);
+    });
+    await exportWithLink(linkSync, copyFileSync);
+
+    expect(linkSync).toHaveBeenCalledTimes(phase === "probe" ? 1 : 2);
+    expect(copyFileSync).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\.tmp$/),
+      outputPath,
+      fs.constants.COPYFILE_EXCL,
+    );
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("competing file");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("EEXIST"),
+    );
+  });
+
+  it("does not remove a newer file after the copy fallback fails", async () => {
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
       return {
@@ -112,7 +177,11 @@ describe("export publishing without hard links", () => {
           throw unsupportedLinkError("EPERM");
         }),
         copyFileSync: vi.fn((_source: unknown, destination: unknown) => {
-          actual.writeFileSync(String(destination), "id\n", { flag: "wx" });
+          const filePath = String(destination);
+          actual.writeFileSync(filePath, "id\n", { flag: "wx" });
+          // Simulate runtime cleanup of a partial copy, then another save.
+          actual.unlinkSync(filePath);
+          actual.writeFileSync(filePath, "another export", { flag: "wx" });
           throw Object.assign(new Error("ENOSPC: no space left on device"), {
             code: "ENOSPC",
           });
@@ -124,20 +193,25 @@ describe("export publishing without hard links", () => {
     );
     await exportTableDataAsCsv({ fileName: "partial", loadChunks: chunks });
 
-    expect(fs.existsSync(outputPath)).toBe(false);
-    expect(fs.readdirSync(tempDir)).toEqual([]);
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("another export");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
     expect(showErrorMessage).toHaveBeenCalledWith(
       expect.stringContaining("ENOSPC"),
     );
   });
 
-  it("keeps failing for hard-link errors that are not unsupported-filesystem errors", async () => {
-    await exportWithLink(
-      vi.fn(() => {
+  it("does not fall back to copying on an unexpected final hard-link EIO", async () => {
+    const linkSync = vi.fn<typeof fs.linkSync>((source, destination) => {
+      if (destination === outputPath) {
         throw Object.assign(new Error("EIO: i/o error, link"), { code: "EIO" });
-      }) as never,
-    );
+      }
+      fs.linkSync(source, destination);
+    });
+    const copyFileSync = vi.fn(fs.copyFileSync);
+    await exportWithLink(linkSync, copyFileSync);
 
+    expect(linkSync).toHaveBeenCalledTimes(2);
+    expect(copyFileSync).not.toHaveBeenCalled();
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.readdirSync(tempDir)).toEqual([]);
     expect(showErrorMessage).toHaveBeenCalledWith(

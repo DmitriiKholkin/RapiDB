@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NULL_SENTINEL } from "../../src/extension/dbDrivers/types";
+import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 import type { ClipboardReadPayload } from "../../src/shared/webviewContracts";
 import { EditInput } from "../../src/webview/components/table/EditInput";
 import {
@@ -31,6 +31,44 @@ afterEach(() => {
 });
 
 describe("EditInput", () => {
+  it("opens and blurs the former NULL marker as ordinary text", () => {
+    const onCommit = vi.fn();
+    const onDirtyChange = vi.fn();
+    render(
+      <EditInput
+        initial={NULL_SENTINEL}
+        nullable
+        category="text"
+        onCommit={onCommit}
+        onCancel={vi.fn()}
+        onDirtyChange={onDirtyChange}
+      />,
+    );
+
+    const input = screen.getByLabelText("Cell value") as HTMLTextAreaElement;
+    expect(input.value).toBe(NULL_SENTINEL);
+    expect(onDirtyChange).toHaveBeenLastCalledWith(false);
+    fireEvent.blur(input);
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(NULL_SENTINEL);
+  });
+
+  it("commits marker text typed into a NULL cell as text, not NULL", () => {
+    const onCommit = vi.fn();
+    render(
+      <EditInput
+        initial={null}
+        nullable
+        category="text"
+        onCommit={onCommit}
+        onCancel={vi.fn()}
+      />,
+    );
+    const input = screen.getByLabelText("Cell value");
+    fireEvent.change(input, { target: { value: NULL_SENTINEL } });
+    fireEvent.blur(input);
+    expect(onCommit).toHaveBeenCalledExactlyOnceWith(NULL_SENTINEL);
+  });
+
   it.each([
     ["0x", "0x"],
     ["0xab", ""],
@@ -213,7 +251,7 @@ describe("EditInput", () => {
     expect(input.selectionEnd).toBe(3);
     if (action === "blur" || action === "enter" || action === "null") {
       expect(onCommit).toHaveBeenCalledExactlyOnceWith(
-        action === "null" ? NULL_SENTINEL : "typed",
+        action === "null" ? null : "typed",
       );
     } else expect(onCommit).not.toHaveBeenCalled();
     expect(onCancel).toHaveBeenCalledTimes(action === "escape" ? 1 : 0);
@@ -314,7 +352,7 @@ describe("EditInput", () => {
   });
 
   it.each([
-    NULL_SENTINEL,
+    null,
     "base",
   ])("treats an empty clipboard as a no-op for %s", (initial) => {
     const onCommit = vi.fn();
@@ -336,7 +374,7 @@ describe("EditInput", () => {
     expect(input.selectionStart).toBe(0);
     expect(input.selectionEnd).toBe(selectionEnd);
     expect(document.activeElement).toBe(input);
-    if (initial === NULL_SENTINEL) expect(input.placeholder).toBe("NULL");
+    if (initial === null) expect(input.placeholder).toBe("NULL");
     fireEvent.blur(input);
     expect(onCommit).toHaveBeenCalledExactlyOnceWith(initial);
   });
@@ -372,7 +410,7 @@ describe("EditInput", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="binary"
         onCommit={onCommit}
@@ -460,7 +498,7 @@ describe("EditInput", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         onCommit={onCommit}
         onCancel={() => undefined}
@@ -533,7 +571,7 @@ describe("EditInput", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         onCommit={onCommit}
         onCancel={() => undefined}
@@ -550,14 +588,14 @@ describe("EditInput", () => {
       fireEvent.keyDown(input, { key: "Enter" });
     }
 
-    expect(onCommit).toHaveBeenCalledWith(NULL_SENTINEL);
+    expect(onCommit).toHaveBeenCalledWith(null);
   });
 
   it("commits text entered into an initially NULL value", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         onCommit={onCommit}
         onCancel={() => undefined}
@@ -580,7 +618,7 @@ it.each([
   const onCancel = vi.fn();
   const { unmount } = render(
     <EditInput
-      initial={NULL_SENTINEL}
+      initial={null}
       initialMissing
       nullable
       onCommit={onCommit}
@@ -595,7 +633,7 @@ it.each([
   unmount();
   render(
     <EditInput
-      initial={NULL_SENTINEL}
+      initial={null}
       initialMissing
       nullable
       onCommit={onCommit}

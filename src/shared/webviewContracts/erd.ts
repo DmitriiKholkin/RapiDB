@@ -72,6 +72,15 @@ export interface ErdGraph {
   omittedTables?: ErdOmittedTable[];
   externalReferences?: ErdExternalReference[];
   metadataIncomplete?: boolean;
+  discoveryTruncated?: "redis-prefixes" | "objects";
+}
+
+export function formatErdDiscoveryNotice(
+  kind: NonNullable<ErdGraph["discoveryTruncated"]>,
+): string {
+  return kind === "redis-prefixes"
+    ? 'Redis key prefix discovery reached its scan limit. Some prefixes may be missing from this diagram. Open "All keys" in Explorer to browse the keyspace directly.'
+    : "Table discovery stopped early. Some tables may be missing from this diagram.";
 }
 
 export interface ErdInitialState extends PanelRetentionState {

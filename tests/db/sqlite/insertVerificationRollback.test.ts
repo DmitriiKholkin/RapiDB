@@ -405,6 +405,7 @@ describe("INSERT verification transaction rollback (B02)", () => {
         verifications: [
           {
             ...plan.verification,
+            sqlitePrimaryKeyColumns: undefined,
             sql: "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000000) SELECT sum(x) FROM n WHERE ? IS NOT NULL",
           },
         ],

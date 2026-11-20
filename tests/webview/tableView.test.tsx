@@ -194,7 +194,17 @@ describe("table draft persistence", () => {
 });
 
 function captureTableMutationOperationId(): void {
-  const payload = getRawLastPostedMessage()?.payload;
+  const payload = getPostedMessages()
+    .reverse()
+    .find(({ type }) =>
+      [
+        "applyChanges",
+        "insertRow",
+        "deleteRows",
+        "confirmMutationPreview",
+        "cancelMutationPreview",
+      ].includes(type),
+    )?.payload;
   if (
     payload &&
     typeof payload === "object" &&
@@ -554,7 +564,7 @@ function lastFetchPayload(): {
   filters?: unknown;
   sort?: unknown;
 } {
-  const payload = getLastPostedMessage()?.payload;
+  const payload = postedMessagesOfType("fetchPage").at(-1)?.payload;
   if (!payload || typeof payload !== "object") {
     throw new Error("Expected a fetchPage payload to be posted");
   }
@@ -579,6 +589,7 @@ function renderTableView(overrides?: {
   isView?: boolean;
   table?: string;
   displayTableName?: string;
+  strictMode?: boolean;
 }) {
   return render(
     <TableView
@@ -592,6 +603,7 @@ function renderTableView(overrides?: {
       table={overrides?.table ?? "users"}
       displayTableName={overrides?.displayTableName}
     />,
+    { reactStrictMode: overrides?.strictMode },
   );
 }
 
@@ -615,6 +627,7 @@ async function initializeCommittedTableData(overrides?: {
     defaultPageSize?: number;
     isView?: boolean;
     table?: string;
+    strictMode?: boolean;
   };
   totalCount?: number;
 }) {
@@ -839,7 +852,7 @@ describe("TableView", () => {
     const edit = {
       rowIdx: 0,
       column: optionalColumn,
-      newVal: NULL_SENTINEL,
+      newVal: null,
       originalVal: undefined,
     };
 
@@ -886,7 +899,7 @@ describe("TableView", () => {
         selected: new Set<number>(),
       }),
     );
-    const commit = (newVal: string) => {
+    const commit = (newVal: string | null) => {
       const edit = {
         rowIdx: 0,
         column: optionalColumn,
@@ -907,11 +920,74 @@ describe("TableView", () => {
       }
     };
 
-    act(() => commit("changed"));
-    expect(result.current.pendingEdits.get(0)?.get("optional")).toBe("changed");
-
     act(() => commit(NULL_SENTINEL));
+    expect(result.current.pendingEdits.get(0)?.get("optional")).toBe(
+      NULL_SENTINEL,
+    );
+
+    act(() => commit(null));
     expect(result.current.pendingEdits).toEqual(new Map());
+  });
+
+  it("keeps the former NULL marker distinct from the structured dialog's NULL action", async () => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData({
+      columnDefs: [columns[0], { ...columns[1], nullable: true }],
+      dataRows: [
+        { id: 1, name: NULL_SENTINEL },
+        { id: 2, name: "ordinary text" },
+      ],
+    });
+    const open = (row: number) =>
+      fireEvent.doubleClick(getBodyCell("name", row));
+    open(0);
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).value,
+    ).toBe(NULL_SENTINEL);
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+
+    open(1);
+    fireEvent.change(screen.getByLabelText("Cell data"), {
+      target: { value: NULL_SENTINEL },
+    });
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+
+    open(0);
+    await user.click(screen.getByRole("button", { name: "NULL" }));
+    await user.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(getLastPostedMessage()?.payload).toEqual(
+      expect.objectContaining({
+        updates: expect.arrayContaining([
+          expect.objectContaining({
+            primaryKeys: { id: 2 },
+            changes: { name: NULL_SENTINEL },
+            originalValues: { name: "ordinary text" },
+          }),
+          expect.objectContaining({
+            primaryKeys: { id: 1 },
+            changes: { name: null },
+            originalValues: { name: NULL_SENTINEL },
+          }),
+        ]),
+      }),
+    );
+  });
+
+  it("does not stage a mutation when an inline editor opens and blurs the former NULL marker", async () => {
+    await initializeCommittedTableData({
+      columnDefs: [columns[0], { ...columns[1], category: "other" }],
+      dataRows: [{ id: 1, name: NULL_SENTINEL }],
+    });
+    fireEvent.doubleClick(getBodyCell("name"));
+    const input = screen.getByLabelText("Cell value") as HTMLTextAreaElement;
+    expect(input.value).toBe(NULL_SENTINEL);
+    fireEvent.blur(input);
+
+    expect(getBodyCell("name").textContent).toBe(NULL_SENTINEL);
+    expect(screen.queryByRole("button", { name: "Apply Changes" })).toBeNull();
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
   });
 
   it("uses the display name throughout loading and committed accessible labels", async () => {
@@ -2176,6 +2252,7 @@ describe("TableView", () => {
           error: "Write acknowledgement lost.",
           changesPossible: true,
           outcomeUnknown: true,
+          ...(kind === "delete" ? { affectedRows: 0, rowOutcomes: [] } : {}),
         },
       ),
     );
@@ -2231,6 +2308,8 @@ describe("TableView", () => {
       dispatchIncomingMessage("deleteResult", {
         success: false,
         error: "Delete acknowledgement lost.",
+        affectedRows: 0,
+        rowOutcomes: [],
         changesPossible: true,
         outcomeUnknown: true,
       }),
@@ -2325,6 +2404,8 @@ describe("TableView", () => {
       dispatchIncomingMessage("deleteResult", {
         success: false,
         error: "Delete acknowledgement lost.",
+        affectedRows: 0,
+        rowOutcomes: [],
         changesPossible: true,
         outcomeUnknown: true,
       }),
@@ -2374,6 +2455,8 @@ describe("TableView", () => {
       dispatchIncomingMessage("deleteResult", {
         success: false,
         error: "Known delete failure",
+        affectedRows: 0,
+        rowOutcomes: [],
         changesPossible: true,
         outcomeUnknown: false,
       }),
@@ -3673,6 +3756,10 @@ describe("TableView", () => {
         operationId,
         success,
         error: success ? undefined : "Late delete error",
+        affectedRows: success ? 1 : 0,
+        rowOutcomes: [],
+        changesPossible: true,
+        outcomeUnknown: false,
       }),
     );
     await waitFor(() =>
@@ -4371,7 +4458,7 @@ describe("TableView", () => {
     await act(async () => dispatchRawIncomingMessage("deleteResult", result));
     expect(postedMessagesOfType("fetchPage")).toHaveLength(fetchCount);
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
-    expect(getRawLastPostedMessage()).toMatchObject({
+    expect(postedMessagesOfType("applyChanges").at(-1)).toMatchObject({
       type: "applyChanges",
       payload: {
         updates: [
@@ -4581,7 +4668,7 @@ describe("TableView", () => {
     );
     expect(getBodyCell("name", 2).textContent).toContain("Pending Bob");
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
-    expect(getRawLastPostedMessage()).toMatchObject({
+    expect(postedMessagesOfType("applyChanges").at(-1)).toMatchObject({
       type: "applyChanges",
       payload: {
         updates: [
@@ -4740,6 +4827,65 @@ describe("TableView", () => {
   });
 
   it.each([
+    { scenario: "no server diagnostic", error: undefined },
+    { scenario: "server diagnostic", error: "The connection closed." },
+    {
+      scenario: "complete server warning",
+      error:
+        "Delete partially changed the data: 1 row(s) confirmed deleted. An in-flight write may finish after this refresh; refresh again and verify before retrying. The connection closed.",
+    },
+  ])("shows the confirmed delete count and late-write guidance in one warning ($scenario)", async ({
+    error,
+  }) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByLabelText("Select row 2"));
+    await user.click(screen.getByRole("button", { name: "Delete (2)" }));
+    const { operationId, primaryKeysList } = getRawLastPostedMessage()
+      ?.payload as {
+      operationId: string;
+      primaryKeysList: unknown[];
+    };
+    expect(primaryKeysList).toEqual([{ id: 1 }, { id: 2 }]);
+
+    await act(async () =>
+      dispatchRawIncomingMessage("deleteResult", {
+        operationId,
+        success: false,
+        affectedRows: 1,
+        changesPossible: true,
+        outcomeUnknown: true,
+        ...(error === undefined ? {} : { error }),
+        rowOutcomes: [
+          {
+            rowIndex: 0,
+            primaryKeys: { id: 1 },
+            status: "deleted",
+            success: true,
+          },
+          {
+            rowIndex: 1,
+            primaryKeys: { id: 2 },
+            status: "unknown",
+            success: false,
+          },
+        ],
+      }),
+    );
+
+    const warning = screen.getByText(/1 row(?:\(s\))? confirmed deleted/);
+    expect(warning.textContent).toMatch(
+      /(?:first refresh may precede a late write|in-flight write may finish after this refresh); refresh again and verify before retrying/,
+    );
+    if (error) expect(warning.textContent).toContain(error);
+    expect(warning.textContent?.match(/confirmed deleted/g)).toHaveLength(1);
+    expect(
+      warning.textContent?.match(/refresh again and verify before retrying/g),
+    ).toHaveLength(1);
+  });
+
+  it.each([
     false,
     true,
   ])("reconciles partial deletes (unknown=%s), preserving edits and identity-safe undo/redo", async (outcomeUnknown) => {
@@ -4815,7 +4961,7 @@ describe("TableView", () => {
     expect(getBodyCell("name").textContent).toContain("Pending Bob");
     await user.click(screen.getByLabelText("Select row 1"));
     await user.click(screen.getByRole("button", { name: "Delete (1)" }));
-    const retry = getRawLastPostedMessage()?.payload as {
+    const retry = postedMessagesOfType("deleteRows").at(-1)?.payload as {
       operationId: string;
       primaryKeysList: unknown[];
     };
@@ -4840,6 +4986,7 @@ describe("TableView", () => {
         changesPossible: false,
         outcomeUnknown: false,
         error: "Rejected before mutation",
+        rowOutcomes: [],
       }),
     );
     expect(screen.getByText("Rejected before mutation")).toBeTruthy();
@@ -4864,6 +5011,7 @@ describe("TableView", () => {
         affectedRows: 1,
         changesPossible: true,
         outcomeUnknown: false,
+        rowOutcomes: [],
       }),
     );
     await act(async () =>
@@ -5592,6 +5740,108 @@ describe("TableView", () => {
     expect(
       screen.getByRole("textbox", { name: "id filter start" }),
     ).toHaveProperty("value", "25");
+    expect(screen.getByText(/requires both bounds/)).toBeTruthy();
+  });
+
+  it("does not reapply an immediate filter and clear its server error in Strict Mode", async () => {
+    await initializeCommittedTableData({
+      columnDefs: [
+        columns[0],
+        {
+          ...columns[1],
+          filterOperators: [...columns[1].filterOperators, "is_null"],
+        },
+      ],
+      renderOverrides: { strictMode: true },
+    });
+    vi.useFakeTimers();
+    clearPostedMessages();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Is NULL/ }));
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    act(() => {
+      dispatchIncomingMessage("tableError", {
+        fetchId: lastFetchPayload().fetchId,
+        error: "Server rejected the filter",
+        isFilterError: true,
+      });
+    });
+    expect(screen.getByText("Server rejected the filter")).toBeTruthy();
+
+    act(() => vi.advanceTimersByTime(DEBOUNCE));
+
+    expect(screen.getByText("Server rejected the filter")).toBeTruthy();
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+  });
+
+  it("combines immediate edits to different filters in the same batch", async () => {
+    await initializeCommittedTableData({
+      columnDefs: columns.map((column) => ({
+        ...column,
+        filterOperators: [...column.filterOperators, "is_null"],
+      })),
+    });
+    clearPostedMessages();
+
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    const selectNull = (column: string) =>
+      within(
+        screen.getByRole("menu", { name: `${column} filter operators` }),
+      ).getByRole("menuitemradio", { name: /Is NULL/ });
+    const id = selectNull("id");
+    const name = selectNull("name");
+    act(() => {
+      fireEvent.click(id);
+      fireEvent.click(name);
+    });
+
+    expect(postedMessagesOfType("fetchPage")).toHaveLength(1);
+    expect(lastFetchPayload().filters).toEqual([
+      { column: "id", operator: "is_null" },
+      { column: "name", operator: "is_null" },
+    ]);
+  });
+
+  it("dismisses the displayed draft error without hiding a batched newer error", async () => {
+    await initializeCommittedTableData({
+      columnDefs: [
+        {
+          ...columns[0],
+          filterOperators: [...columns[0].filterOperators, "between"],
+        },
+        {
+          ...columns[1],
+          filterOperators: [...columns[1].filterOperators, "in"],
+        },
+      ],
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "name filter operator" }),
+    );
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /In list/ }));
+    fireEvent.keyDown(screen.getByLabelText("name filter value"), {
+      key: "Enter",
+    });
+    expect(screen.getByText(/requires at least one value/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "id filter operator" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Between/ }));
+    act(() => {
+      fireEvent.keyDown(screen.getByLabelText("id filter start"), {
+        key: "Enter",
+      });
+      fireEvent.click(
+        screen.getByRole("button", { name: "Dismiss filter error" }),
+      );
+    });
+
     expect(screen.getByText(/requires both bounds/)).toBeTruthy();
   });
 
@@ -6396,9 +6646,15 @@ describe("TableView", () => {
       }),
     );
     if (timing === "after") await act(async () => reply());
-    expect(getBodyCell("name", 0).textContent).toBe("Saved Bob");
     const retainedValue = timing === "read-error" ? "Newer edit" : "Retained";
-    expect(getBodyCell("name", 1).textContent).toBe(retainedValue);
+    if (timing === "read-error") {
+      // A late success for a failed fetch is ignored, so row order is unchanged.
+      expect(getBodyCell("name", 0).textContent).toBe(retainedValue);
+      expect(getBodyCell("name", 1).textContent).toBe("Bob");
+    } else {
+      expect(getBodyCell("name", 0).textContent).toBe("Saved Bob");
+      expect(getBodyCell("name", 1).textContent).toBe(retainedValue);
+    }
     await user.click(screen.getByRole("button", { name: "Apply Changes" }));
     expect(getLastPostedMessage()).toMatchObject({
       type: "applyChanges",
@@ -6621,7 +6877,7 @@ describe("TableView", () => {
         outcomeUnknown: false,
         rowOutcomes: [
           {
-            rowIndex: 1,
+            rowIndex: 0,
             success: false,
             status: "skipped",
             message: "Transaction was not executed; no changes were made.",
@@ -6667,10 +6923,10 @@ describe("TableView", () => {
           "UPDATE verification failed; the transaction was not committed. The persisted value differs.",
         changesPossible: false,
         outcomeUnknown: false,
-        failedRows: [1],
+        failedRows: [0],
         rowOutcomes: [
           {
-            rowIndex: 1,
+            rowIndex: 0,
             success: false,
             status: "verification_failed",
             columns: ["name"],

@@ -1,4 +1,10 @@
-import { act, fireEvent, render, renderHook } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+} from "@testing-library/react";
 import { createRef } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
@@ -8,6 +14,7 @@ import {
   clearPostedMessages,
   dispatchIncomingMessage,
   getLastPostedMessage,
+  getPostedMessages,
 } from "./testUtils";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -54,6 +61,128 @@ function setup() {
 }
 
 describe("queued table edits", () => {
+  it.each([
+    0, -1,
+  ])("shows a paste error when a write starts before the reply for row %s", (row) => {
+    const { result } = setup();
+    act(() => {
+      result.current.startInsertRow();
+      result.current.commitDraftCellEdit(0, column, "A");
+    });
+    const view = render(
+      <TableGrid
+        canEditRows
+        canSelectAndDeleteRows={false}
+        colSizes={{}}
+        columns={[column]}
+        editCell={null}
+        filterDrafts={{}}
+        loading={false}
+        loadingRef={{ current: false }}
+        fetchEpochRef={{ current: 0 }}
+        newRows={result.current.newRows}
+        onCancelEdit={vi.fn()}
+        onBatchCellEdit={result.current.commitBatchCellEdits}
+        onCommitCellEdit={vi.fn()}
+        onCommitDraftCellEdit={vi.fn()}
+        onMixedBatchEdit={result.current.commitMixedBatchEdits}
+        onFilterDraftChange={vi.fn()}
+        onSelectionChange={vi.fn()}
+        onSort={vi.fn()}
+        onOpenStructuredCell={vi.fn()}
+        onStartDraftEdit={vi.fn()}
+        onStartEdit={vi.fn()}
+        pendingEdits={result.current.pendingEdits}
+        rows={[{ id: 1, value: "A" }]}
+        scrollRef={createRef()}
+        selected={new Set()}
+        sort={null}
+      />,
+    );
+    const cell = view.container.querySelector<HTMLElement>(
+      `td[data-row="${row}"][data-col="0"]`,
+    );
+    if (!cell) throw new Error("Missing grid cell");
+    fireEvent.mouseDown(cell, { button: 0 });
+    fireEvent.mouseUp(document);
+    clearPostedMessages();
+    fireEvent.paste(window);
+    const request = getLastPostedMessage();
+    expect(request?.type).toBe("readClipboard");
+
+    act(() => {
+      result.current.applyChanges();
+      expect(getLastPostedMessage()?.type).toBe("applyChanges");
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "not staged",
+      });
+      expect(
+        result.current.commitBatchDraftCellEdits(0, [
+          { column, newVal: "not staged" },
+        ]),
+      ).toEqual([
+        { kind: "blocked", message: expect.stringMatching(/in progress/) },
+      ]);
+    });
+    expect(screen.getByText(/A table operation is in progress/)).toBeTruthy();
+    expect(result.current.pendingEdits.size).toBe(0);
+    expect(result.current.newRows[0].value.value).toBe("A");
+  });
+
+  it.each([
+    [false, /Refresh and verify the previous table operation/],
+    [true, /The previous insert outcome is unknown/],
+  ] as const)("blocks batch paste during reconciliation (unknown insert: %s)", (unknown, message) => {
+    const { result } = setup();
+    clearPostedMessages();
+    act(() => {
+      result.current.startInsertRow();
+      result.current.commitDraftCellEdit(0, column, "A");
+      result.current.applyChanges();
+    });
+    const request = getPostedMessages().find(
+      ({ type }) => type === "applyChanges",
+    );
+    expect(request).toBeDefined();
+    const { operationId } = request?.payload as { operationId: string };
+    act(() => {
+      dispatchIncomingMessage("applyResult", {
+        operationId,
+        success: false,
+        changesPossible: true,
+        outcomeUnknown: unknown,
+      });
+      if (unknown) {
+        // A verification read does not make the unknown insert draft editable.
+        result.current.handleRowsCommitted(
+          [{ id: 1, value: "A" }],
+          ["id"],
+          [],
+          [],
+        );
+      }
+    });
+
+    const persisted = { rowIdx: 0, column, newVal: "B", originalVal: "A" };
+    const draft = { rowIdx: 0, column, newVal: "B" };
+    const blocked = [
+      { kind: "blocked", message: expect.stringMatching(message) },
+    ];
+    act(() => {
+      expect(result.current.commitBatchCellEdits([persisted])).toEqual(blocked);
+      expect(
+        result.current.commitMixedBatchEdits([draft], [persisted]),
+      ).toEqual(blocked);
+      expect(result.current.commitBatchDraftCellEdits(0, [draft])).toEqual(
+        blocked,
+      );
+      expect(result.current.commitMixedBatchEdits([], [])).toBeUndefined();
+    });
+    expect(result.current.newRows[0].value.value).toBe("A");
+    expect(result.current.pendingEdits.size).toBe(0);
+  });
+
   it("applies a delayed clipboard reply after a draft edit is queued but before commit", () => {
     const { result } = setup();
     act(() => result.current.startInsertRow());

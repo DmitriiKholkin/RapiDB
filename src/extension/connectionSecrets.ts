@@ -1,8 +1,10 @@
 import {
   AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
   hasAmbiguousUriCredentials,
+  isSignedUrlParameterName,
   splitUriAuthorityPrefix,
 } from "../shared/connectionUriSecurity";
+import { assertMongoUriOptionNameEncoding } from "../shared/mongoConnection";
 import type {
   ConnectionConfig,
   StoredConnectionConfig,
@@ -67,7 +69,25 @@ export function trimOptionalUriValue(
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
-function redactCredentialBearingUri(uri: string): string {
+function uriParameter(part: string): { raw: string; name: string } {
+  const rawName = part.split("=", 1)[0];
+  let name = rawName;
+  try {
+    name = decodeURIComponent(rawName);
+  } catch {}
+  return { raw: part, name };
+}
+
+function isCredentialParameterName(name: string): boolean {
+  return (
+    CREDENTIAL_QUERY_PARAMETER.test(name) || isSignedUrlParameterName(name)
+  );
+}
+
+function classifyCredentialBearingUri(uri: string): {
+  sanitized: string;
+  hasSignedParameters: boolean;
+} {
   if (hasAmbiguousUriCredentials(uri)) {
     throw new Error(AMBIGUOUS_URI_CREDENTIALS_MESSAGE);
   }
@@ -81,34 +101,30 @@ function redactCredentialBearingUri(uri: string): string {
   const query = queryIndex >= 0 ? withoutFragment.slice(queryIndex + 1) : "";
   const base =
     queryIndex >= 0 ? withoutFragment.slice(0, queryIndex) : withoutFragment;
-  const filteredQuery = query
-    .split("&")
-    .filter((part) => {
-      const rawKey = part.split("=", 1)[0];
-      try {
-        return !CREDENTIAL_QUERY_PARAMETER.test(decodeURIComponent(rawKey));
-      } catch {
-        return !CREDENTIAL_QUERY_PARAMETER.test(rawKey);
-      }
-    })
+  const queryParts = query.split("&").map(uriParameter);
+  const fragmentParts = fragment.split("&").map(uriParameter);
+  const hasSignedParameters =
+    queryParts.some(({ name }) => isSignedUrlParameterName(name)) ||
+    fragmentParts.some(({ name }) => isSignedUrlParameterName(name));
+  const filteredQuery = queryParts
+    .filter(({ name }) => !isCredentialParameterName(name))
+    .map(({ raw }) => raw)
     .join("&");
-  const fragmentHasCredential = fragment.split("&").some((part) => {
-    const rawKey = part.split("=", 1)[0];
-    try {
-      return CREDENTIAL_QUERY_PARAMETER.test(decodeURIComponent(rawKey));
-    } catch {
-      return CREDENTIAL_QUERY_PARAMETER.test(rawKey);
-    }
-  });
+  const fragmentHasCredential = fragmentParts.some(({ name }) =>
+    isCredentialParameterName(name),
+  );
   const keepFragment = fragment.length > 0 && !fragmentHasCredential;
   if (
     authorityRedacted === uri &&
     filteredQuery === query &&
     (fragment.length === 0 || keepFragment)
   ) {
-    return uri;
+    return { sanitized: uri, hasSignedParameters };
   }
-  return `${base}${filteredQuery ? `?${filteredQuery}` : ""}${keepFragment ? `#${fragment}` : ""}`;
+  return {
+    sanitized: `${base}${filteredQuery ? `?${filteredQuery}` : ""}${keepFragment ? `#${fragment}` : ""}`,
+    hasSignedParameters,
+  };
 }
 
 export function sanitizeCredentialBearingUri(
@@ -119,7 +135,7 @@ export function sanitizeCredentialBearingUri(
     return normalized;
   }
 
-  return redactCredentialBearingUri(normalized);
+  return classifyCredentialBearingUri(normalized).sanitized;
 }
 
 export function extractCredentialBearingUriSecret(
@@ -130,7 +146,7 @@ export function extractCredentialBearingUriSecret(
     return undefined;
   }
 
-  return redactCredentialBearingUri(normalized) !== normalized
+  return classifyCredentialBearingUri(normalized).sanitized !== normalized
     ? normalized
     : undefined;
 }
@@ -530,6 +546,14 @@ export function restoreCredentialBearingUri(
   const parts = pattern.exec(submitted);
   if (!oldParts || !parts) return submitted;
 
+  const { sanitized, hasSignedParameters } = classifyCredentialBearingUri(
+    previous.trim(),
+  );
+  if (hasSignedParameters) {
+    // Keep a signed URL intact, never merge its signature into an edited URL.
+    return submitted === sanitized ? previous : submitted;
+  }
+
   const splitSuffix = (suffix: string) => {
     const hashIndex = suffix.indexOf("#");
     const beforeFragment = hashIndex < 0 ? suffix : suffix.slice(0, hashIndex);
@@ -550,7 +574,7 @@ export function restoreCredentialBearingUri(
   const credentials =
     at >= 0 && !replacesCredentials ? oldParts[2].slice(0, at + 1) : "";
   const oldSuffix = splitSuffix(oldParts[3]);
-  const safeParts = pattern.exec(sanitizeCredentialBearingUri(previous) ?? "");
+  const safeParts = pattern.exec(sanitized);
   const safeQuery = splitSuffix(safeParts?.[3] ?? "").query;
   const nextSuffix = splitSuffix(parts[3]);
   const query = nextSuffix.query;
@@ -580,5 +604,14 @@ export function restoreMongoUriCredentials(
   previous: string | undefined,
   keep: boolean,
 ): string | undefined {
-  return restoreCredentialBearingUri(value, previous, keep);
+  const submitted = trimOptionalUriValue(value);
+  if (submitted && previous && keep) {
+    try {
+      assertMongoUriOptionNameEncoding(submitted);
+    } catch {
+      // Credential merging can reserialize the query and mask bad escapes.
+      return submitted;
+    }
+  }
+  return restoreCredentialBearingUri(submitted, previous, keep);
 }

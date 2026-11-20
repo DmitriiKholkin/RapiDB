@@ -1,3 +1,4 @@
+/** Former NULL marker, retained for old insert drafts. Not a database null value. */
 export const NULL_SENTINEL = "\x00__NULL__\x00";
 
 export type TypeCategory =
@@ -51,14 +52,32 @@ export interface QueryMissingCell {
 const UUID_VALUE_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const INTEGER_VALUE_RE = /^[+-]?\d+$/;
-const DECIMAL_VALUE_RE = /^[+-]?(?:\d+\.\d*|\d*\.\d+|\d+(?:[eE][+-]?\d+))$/;
-const DATE_VALUE_RE = /^\d{4}-\d{2}-\d{2}$/;
-const TIME_VALUE_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+const DECIMAL_VALUE_RE =
+  /^[+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)$/;
+const DATE_VALUE_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+// ISO end-of-day 24:00 is allowed only with zero minutes, seconds and fraction.
+const TIME_VALUE_RE =
+  /^(?:(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?|24:00(?::00(?:\.0+)?)?)$/;
 const DATETIME_VALUE_RE =
-  /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?: ?(?:Z|[+-]\d{2}:\d{2}))?$/i;
+  /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)(?: ?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))?$/i;
 const HEX_BINARY_DIGITS_RE = /^[0-9a-f]+$/i;
 const SPATIAL_VALUE_RE =
   /^(?:srid=\d+;)?\s*(?:point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|circularstring|compoundcurve|curvepolygon|multicurve|multisurface|polyhedralsurface|tin|triangle)\s*\(/i;
+
+function isCalendarDate(value: string): boolean {
+  const match = DATE_VALUE_RE.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1) return false;
+
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return day <= (leapYear ? 29 : 28);
+  }
+  return day <= ([4, 6, 9, 11].includes(month) ? 30 : 31);
+}
 
 export function normalizeBinaryHexDisplayPrefix(value: string): string {
   if (
@@ -138,11 +157,16 @@ export function inferValueCategory(value: unknown): TypeCategory | null {
     return "spatial";
   }
 
-  if (DATETIME_VALUE_RE.test(trimmed)) {
+  const datetime = DATETIME_VALUE_RE.exec(trimmed);
+  if (
+    datetime &&
+    isCalendarDate(datetime[1]) &&
+    TIME_VALUE_RE.test(datetime[2])
+  ) {
     return "datetime";
   }
 
-  if (DATE_VALUE_RE.test(trimmed)) {
+  if (isCalendarDate(trimmed)) {
     return "date";
   }
 
@@ -266,6 +290,14 @@ export interface ColumnMeta {
   isPrimaryKey: boolean;
   primaryKeyOrdinal?: number;
   primaryKeyRole?: PrimaryKeyRole;
+  /** PostgreSQL array key whose native text must travel outside display cells. */
+  postgresArrayPrimaryKey?: boolean;
+  /** MySQL TIMESTAMP key whose stored instant must travel outside display cells. */
+  mysqlTimestampPrimaryKey?: boolean;
+  /** SQL Server sql_variant key whose typed identity must travel outside display cells. */
+  mssqlSqlVariantPrimaryKey?: boolean;
+  /** Oracle temporal key whose era and precision must travel outside display cells. */
+  oracleTemporalPrimaryKey?: boolean;
   isForeignKey: boolean;
 }
 
@@ -273,6 +305,10 @@ export interface ColumnTypeMeta extends ColumnMeta {
   category: TypeCategory;
   nativeType: string;
   bsonSubtype?: number;
+  /** SQLite rowid alias: stored values are non-null and unique, even if INSERT accepts NULL. */
+  sqliteRowidAlias?: true;
+  /** Redis value column: category describes comparisons, not stored or editable values. */
+  redisValue?: true;
   filterable: boolean;
   filterOperators: FilterOperator[];
   valueSemantics: ValueSemantics;
@@ -282,6 +318,8 @@ export interface MongoValueTypeHint {
   category: TypeCategory;
   nativeType: string;
   bsonSubtype?: number;
+  /** Distinguishes lossless DBRef baseline text from older display-only text. */
+  dbRefTextVersion?: 1;
 }
 
 export function isServerGeneratedColumn(

@@ -1,3 +1,10 @@
+import { isMssqlSqlVariantPrimaryKeyColumn } from "../../shared/mssqlSqlVariantRowIdentity";
+import { mssqlSqlVariantPrimaryKeyExpression } from "../dbDrivers/mssqlSqlVariantIdentity";
+import {
+  oracleTemporalIdentityComparison,
+  oracleTemporalIdentityKind,
+  oracleTemporalIdentityProjection,
+} from "../dbDrivers/oracleTemporalIdentity";
 import type { ColumnTypeMeta } from "../dbDrivers/types";
 
 export function oracleInsertIdentity(
@@ -8,6 +15,7 @@ export function oracleInsertIdentity(
   outType: "string" | "buffer";
 } {
   const native = column.nativeType.toUpperCase().trim();
+  const temporal = oracleTemporalIdentityKind(native);
   let expression = name;
   if (native === "BINARY_FLOAT" || native === "BINARY_DOUBLE") {
     const converter =
@@ -21,13 +29,8 @@ export function oracleInsertIdentity(
     column.category === "float"
   ) {
     expression = `TO_CHAR(${name}, 'TM9', 'NLS_NUMERIC_CHARACTERS=''.,''')`;
-  } else if (native === "DATE") {
-    expression = `TO_CHAR(${name}, 'SYYYY-MM-DD HH24:MI:SS', 'NLS_DATE_LANGUAGE=American')`;
-  } else if (native.startsWith("TIMESTAMP")) {
-    const timestamp = native.includes("TIME ZONE")
-      ? `SYS_EXTRACT_UTC(CAST(${name} AS TIMESTAMP(9) WITH TIME ZONE))`
-      : name;
-    expression = `TO_CHAR(${timestamp}, 'SYYYY-MM-DD HH24:MI:SS.FF9', 'NLS_DATE_LANGUAGE=American')`;
+  } else if (temporal) {
+    expression = oracleTemporalIdentityProjection(temporal, name);
   } else if (column.category === "interval") {
     expression = `TO_CHAR(${name})`;
   } else if (native === "ROWID") {
@@ -46,21 +49,25 @@ export function oracleInsertIdentity(
   return { expression, outType: "string" };
 }
 
+export function oracleCapturedIdentityComparison(
+  column: ColumnTypeMeta,
+  name: string,
+  paramIndex: number,
+): string {
+  const temporal = oracleTemporalIdentityKind(column.nativeType);
+  return temporal
+    ? oracleTemporalIdentityComparison(temporal, name, "=", paramIndex)
+    : `${oracleInsertIdentity(column, name).expression} = :${paramIndex}`;
+}
+
 export function mssqlInsertIdentityExpression(
   column: ColumnTypeMeta,
   name: string,
 ): string {
   const native = column.nativeType.toLowerCase().trim();
   if (native === "hierarchyid") return `${name}.ToString()`;
-  if (native === "sql_variant") {
-    const properties = [
-      "BaseType",
-      "Precision",
-      "Scale",
-      "MaxLength",
-      "Collation",
-    ];
-    return `CONCAT(${properties.map((property) => `CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, '${property}'))`).join(", ':', ")}, ':', CONVERT(varchar(max), CONVERT(varbinary(8000), ${name}), 2))`;
+  if (isMssqlSqlVariantPrimaryKeyColumn(column)) {
+    return mssqlSqlVariantPrimaryKeyExpression(name);
   }
   if (column.category === "float")
     return `CONVERT(varchar(32), CONVERT(varbinary(8), ${name}), 2)`;
@@ -93,6 +100,7 @@ export function mssqlInsertIdentityCollation(
 }
 
 export function mssqlInsertIdentityType(column: ColumnTypeMeta): string {
+  if (isMssqlSqlVariantPrimaryKeyColumn(column)) return "sql_variant";
   const native = column.nativeType.trim();
   const type = /^(?:timestamp|rowversion)$/i.test(native)
     ? "binary(8)"

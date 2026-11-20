@@ -1176,28 +1176,13 @@ describe("SQLite better-sqlite3 runtime adapter", () => {
     expect(vscodeIgnore).not.toContain("!.rapidb-vscode/better-sqlite3/**");
   });
 
-  it("prefers the installed SQLite runtime cache before the default package", async () => {
-    const rootDir = await createManagedRuntimeFixture("sqlite-runtime-cache");
-    const probe = probeInstalledBetterSqlite3Runtime(join(rootDir, "dist"));
-    if (!probe.installedPackagePath || !probe.installedBinaryPath) {
-      throw new Error("Managed SQLite runtime paths could not be resolved.");
-    }
-    await mkdir(join(probe.installedPackagePath, "build", "Release"), {
-      recursive: true,
-    });
-    await writeFile(
-      join(probe.installedPackagePath, "package.json"),
-      JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
-      "utf8",
-    );
-    await writeFile(probe.installedBinaryPath, "stub", "utf8");
-
-    expect(
-      resolveBetterSqlite3LoadTargets(join(rootDir, "dist"), true),
-    ).toEqual([probe.installedPackagePath, "better-sqlite3"]);
-    expect(
-      resolveBetterSqlite3LoadTargets(join(rootDir, "dist"), false),
-    ).toEqual(["better-sqlite3"]);
+  it("prefers a validated managed path before the default package", () => {
+    const managedPackagePath = "/cache/node_modules/better-sqlite3";
+    expect(resolveBetterSqlite3LoadTargets(managedPackagePath)).toEqual([
+      managedPackagePath,
+      "better-sqlite3",
+    ]);
+    expect(resolveBetterSqlite3LoadTargets(null)).toEqual(["better-sqlite3"]);
   });
 
   it("refuses to install a missing runtime without authorization", async () => {

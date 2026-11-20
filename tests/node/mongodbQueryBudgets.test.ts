@@ -379,7 +379,13 @@ describe("MongoDB find and aggregate limit semantics", () => {
     );
     expect(harness.find).toHaveBeenCalledWith(
       {},
-      { projection: { value: 1 }, promoteValues: false, bsonRegExp: true },
+      {
+        projection: { value: 1 },
+        useBigInt64: false,
+        promoteValues: false,
+        bsonRegExp: true,
+        raw: true,
+      },
     );
     expect(harness.cursors[0].sort).toHaveBeenCalledWith({ _id: 1 });
     expect(harness.cursors[0].skip).toHaveBeenCalledWith(4);

@@ -1,10 +1,11 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMutationNotExecutedError } from "../../src/extension/dbDrivers/mutationExecutionState";
 import { SQLiteWorkerClient } from "../../src/extension/dbDrivers/sqliteWorkerClient";
 import {
   configureSQLiteInstaller,
+  probeInstalledBetterSqlite3Runtime,
   resetSQLiteInstallerForTests,
 } from "../../src/extension/utils/sqliteInstaller";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
@@ -50,7 +51,7 @@ async function startClient(): Promise<{
 const logPath = process.env.RAPIDB_SQLITE_WORKER_TEST_LOG;
 process.on("message", (request) => {
   const sql = request.args && request.args[0];
-  fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, method: request.method, sql }) + "\\n");
+  fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, method: request.method, sql, runtimeTargets: request.runtimeTargets }) + "\\n");
   if (request.method === "connect") {
     process.send({ id: request.id, value: "connected" });
     return;
@@ -97,7 +98,12 @@ async function requests(logPath: string) {
     .filter(Boolean)
     .map(
       (line) =>
-        JSON.parse(line) as { pid: number; method: string; sql?: string },
+        JSON.parse(line) as {
+          pid: number;
+          method: string;
+          sql?: string;
+          runtimeTargets?: string[];
+        },
     );
 }
 
@@ -120,7 +126,19 @@ function diagnostic(error: Error) {
 }
 
 describe("SQLite worker request queue failures", () => {
-  it("surfaces managed runtime installation failures before spawning a worker", async () => {
+  it("forwards the installer-selected target before the development fallback", async () => {
+    const directory = await createProjectTempDir("sqlite-worker-managed-path");
+    const managedPackagePath = join(directory, "better-sqlite3");
+    installerOverride.install = Promise.resolve(managedPackagePath);
+
+    const { logPath } = await startClient();
+    expect((await requests(logPath))[0]?.runtimeTargets).toEqual([
+      managedPackagePath,
+      require.resolve("better-sqlite3"),
+    ]);
+  });
+
+  it("surfaces repair denial for an unvalidated cache before spawning a worker", async () => {
     const directory = await createProjectTempDir(
       "sqlite-worker-install-denied",
     );
@@ -128,6 +146,16 @@ describe("SQLite worker request queue failures", () => {
       storageRoot: join(directory, ".global-storage"),
       allowInstall: () => false,
     });
+    const { installedPackagePath, installedBinaryPath } =
+      probeInstalledBetterSqlite3Runtime(__dirname);
+    if (!installedPackagePath || !installedBinaryPath) {
+      throw new Error("Could not resolve managed SQLite fixture paths");
+    }
+    await mkdir(dirname(installedBinaryPath), { recursive: true });
+    await writeFile(join(installedPackagePath, "package.json"), "{}");
+    await writeFile(installedBinaryPath, "");
+    const missingWorker = join(directory, "missingSqliteWorker.cjs");
+    vi.stubEnv("RAPIDB_SQLITE_WORKER_PATH", missingWorker);
 
     const client = new SQLiteWorkerClient();
     clients.add(client);

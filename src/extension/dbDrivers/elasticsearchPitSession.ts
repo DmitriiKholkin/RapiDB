@@ -1,8 +1,20 @@
 import { type Client, errors } from "@elastic/elasticsearch";
 import { DriverTimeoutError } from "./timeout";
 
+const BROWSING_IDLE_MS = 45_000;
+const BROWSING_LIFETIME_MS = 5 * 60_000;
+
+export class ElasticsearchBrowsingSnapshotExpiredError extends Error {
+  constructor() {
+    super(
+      "Elasticsearch browsing snapshot ended. Refresh the table to start a new snapshot.",
+    );
+  }
+}
+
 function cancellation(signal: AbortSignal): Error {
-  return signal.reason instanceof DriverTimeoutError
+  return signal.reason instanceof DriverTimeoutError ||
+    signal.reason instanceof ElasticsearchBrowsingSnapshotExpiredError
     ? signal.reason
     : new DOMException("Elasticsearch read cancelled", "AbortError");
 }
@@ -43,6 +55,9 @@ export class ElasticsearchPitSession {
   private closing: Promise<void> | undefined;
   private readonly closes = new Map<string, Promise<void>>();
   private activeDeadline = Infinity;
+  private activePage?: Promise<void>;
+  private idleTimer?: ReturnType<typeof setTimeout>;
+  private lifetimeTimer?: ReturnType<typeof setTimeout>;
   private readonly onAbort = () => {
     if (this.externalSignal)
       this.controller.abort(cancellation(this.externalSignal));
@@ -54,7 +69,7 @@ export class ElasticsearchPitSession {
     private readonly timeoutMs: number,
     private readonly operationName: string,
     private readonly externalSignal: AbortSignal | undefined,
-    private readonly pageDeadline: number,
+    private pageDeadline: number,
     private readonly onClosed: () => void,
   ) {
     externalSignal?.addEventListener("abort", this.onAbort, { once: true });
@@ -68,6 +83,76 @@ export class ElasticsearchPitSession {
     )
       this.expire();
     if (this.signal.aborted) throw cancellation(this.signal);
+  }
+
+  /** Serialize use of the latest PIT ID, but give each page its own deadline. */
+  async runPage<T>(
+    deadline: number,
+    signal: AbortSignal | undefined,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    const deadlineController = new AbortController();
+    const deadlineError = new DriverTimeoutError(
+      "dbOperation",
+      this.operationName,
+      this.timeoutMs,
+    );
+    const deadlineTimer = Number.isFinite(deadline)
+      ? setTimeout(
+          () => deadlineController.abort(deadlineError),
+          Math.max(0, deadline - Date.now()),
+        )
+      : undefined;
+    const pageSignal = signal
+      ? AbortSignal.any([signal, deadlineController.signal])
+      : deadlineController.signal;
+    const waitSignal = AbortSignal.any([pageSignal, this.signal]);
+    try {
+      while (this.activePage) await untilAborted(this.activePage, waitSignal);
+      if (waitSignal.aborted) throw cancellation(waitSignal);
+      if (Date.now() >= deadline) throw deadlineError;
+
+      clearTimeout(this.idleTimer);
+      this.lifetimeTimer ??= this.browsingTimer(BROWSING_LIFETIME_MS);
+      let release!: () => void;
+      this.activePage = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const abortPage = () => {
+        this.controller.abort(cancellation(pageSignal));
+        void this.close().catch(() => undefined);
+      };
+      this.pageDeadline = deadline;
+      pageSignal.addEventListener("abort", abortPage, { once: true });
+      try {
+        const result = await read();
+        this.check();
+        this.idleTimer = this.browsingTimer(BROWSING_IDLE_MS);
+        return result;
+      } catch (error) {
+        if (this.signal.aborted) void this.close().catch(() => undefined);
+        else await this.waitForClose().catch(() => undefined);
+        throw error;
+      } finally {
+        pageSignal.removeEventListener("abort", abortPage);
+        this.pageDeadline = Infinity;
+        this.activePage = undefined;
+        release();
+      }
+    } finally {
+      clearTimeout(deadlineTimer);
+    }
+  }
+
+  private browsingTimer(ms: number): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => this.expireBrowsingSnapshot(), ms);
+    timer.unref();
+    return timer;
+  }
+
+  expireBrowsingSnapshot(): void {
+    this.controller.abort(new ElasticsearchBrowsingSnapshotExpiredError());
+    void this.close().catch(() => undefined);
   }
 
   private expire(): void {
@@ -117,9 +202,15 @@ export class ElasticsearchPitSession {
       return value;
     });
     this.pending = promise;
-    const result = await untilAborted(promise, this.signal);
-    this.check();
-    return result;
+    try {
+      const result = await untilAborted(promise, this.signal);
+      this.check();
+      return result;
+    } finally {
+      // Leave a still-pending request for close() to drain after cancellation;
+      // do not retain completed search responses between browsing pages.
+      if (!this.signal.aborted) this.pending = undefined;
+    }
   }
 
   recordPitId(id: string): void {
@@ -160,6 +251,8 @@ export class ElasticsearchPitSession {
   close(): Promise<void> {
     if (!this.closing) {
       this.controller.abort();
+      clearTimeout(this.idleTimer);
+      clearTimeout(this.lifetimeTimer);
       this.externalSignal?.removeEventListener("abort", this.onAbort);
       this.closing = (async () => {
         if (this.pending) await drainElasticsearchCleanup(this.pending, 50);

@@ -1,7 +1,10 @@
 import type { ConnectionConfig } from "./connectionConfig";
 import {
+  assertMongoUriOptionNameEncoding,
+  decodeMongoUriDatabasePath,
   getMongoConnectionUri,
   normalizeMongoConnectionConfig,
+  parseMongoUriPathAndQuery,
 } from "./mongoConnection";
 
 export function resolveMongoDatabaseName(
@@ -16,10 +19,9 @@ export function resolveMongoDatabaseName(
   const uri = getMongoConnectionUri(config);
   if (!uri) return "admin";
 
-  const match = /^mongodb(?:\+srv)?:\/\/[^/?#]*(.*)$/.exec(uri);
-  if (!match) throw new Error("Invalid MongoDB connection URI.");
-  const parsed = new URL(`mongodb://placeholder${match[1]}`);
-  const database = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  const parsed = parseMongoUriPathAndQuery(uri);
+  const database = decodeMongoUriDatabasePath(parsed.pathname);
+  assertMongoUriOptionNameEncoding(uri);
   if (database) return database;
 
   for (const [key, value] of parsed.searchParams) {

@@ -132,6 +132,34 @@ describe("connection method selection and legacy profiles", () => {
     expect(payload().port).toBeUndefined();
   });
 
+  it("allows a saved PostgreSQL port to be cleared for both Test and Save", async () => {
+    const user = userEvent.setup();
+    const finishTest = () => {
+      const { requestId } = getLastPostedMessage()?.payload as {
+        requestId: string;
+      };
+      act(() =>
+        dispatchIncomingMessage("testResult", { requestId, success: true }),
+      );
+    };
+    render(<ConnectionFormView existing={{ ...pg, port: 5544 }} />);
+    expect(screen.getByText(/including PGPORT/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "testConnection",
+      payload: { port: 5544 },
+    });
+    finishTest();
+    await user.clear(screen.getByLabelText("Port"));
+    await user.click(screen.getByRole("button", { name: "Test Connection" }));
+    expect(getLastPostedMessage()?.type).toBe("testConnection");
+    expect(payload().port).toBeUndefined();
+    finishTest();
+    await save(user);
+    expect(getLastPostedMessage()?.type).toBe("saveConnection");
+    expect(payload().port).toBeUndefined();
+  });
+
   it("preserves legacy Elasticsearch priorities and explicitly switches to API key", async () => {
     const user = userEvent.setup();
     render(
@@ -142,7 +170,7 @@ describe("connection method selection and legacy profiles", () => {
           type: "elasticsearch",
           host: "unused",
           endpoint: "https://old.local",
-          cloudId: "deployment:ZXM=",
+          cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
           username: "elastic",
           hasStoredSecret: true,
           hasStoredApiKey: true,
@@ -167,7 +195,7 @@ describe("connection method selection and legacy profiles", () => {
     expect(screen.queryByLabelText("Elasticsearch endpoint")).toBeNull();
     await save(user);
     expect(payload()).toMatchObject({
-      cloudId: "deployment:ZXM=",
+      cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
       username: "elastic",
       clearApiKey: false,
     });

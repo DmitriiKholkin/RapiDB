@@ -1,7 +1,10 @@
 import {
+  BSON,
   BSONSymbol,
   Code,
   DBRef,
+  Double,
+  Long,
   MongoOperationTimeoutError,
   ObjectId,
   Timestamp,
@@ -359,24 +362,138 @@ describe("MongoDB DBRef and DBPointer values", () => {
     const ref = columns.find((entry) => entry.name === "ref");
     expect(ref?.nativeType).toBe("dbRef");
     expect(ref?.isReadOnly).not.toBe(true);
-    expect(s.driver.checkPersistedEdit(ref as never, "x")).toBeNull();
+    expect.assert(ref);
+    const objectIdRef = `{"$ref":"other","$id":{"$oid":"${oid.toHexString()}"}}`;
+    expect(s.driver.checkPersistedEdit(ref, objectIdRef)).toBeNull();
     const page = await s.driver.readTablePage(pageRequest());
     const hint = page.mongoValueTypes?.[0]?.ref;
     expect(hint?.nativeType).toBe("dbRef");
+    expect(page.rows[0].ref).toBe(objectIdRef);
     expect(() =>
       s.driver.validateTableUpdates([
         {
-          changes: { ref: `{"$ref":"other","$id":"${oid.toHexString()}"}` },
+          changes: { ref: objectIdRef },
           originalTypes: { ref: hint as never },
         },
       ]),
     ).not.toThrow();
+    expect(s.driver.coerceTableEditValue(objectIdRef, ref)).toEqual(
+      new DBRef("other", oid),
+    );
+    expect(s.driver.coerceOriginalValue(objectIdRef, ref)).toEqual(
+      new DBRef("other", oid),
+    );
+  });
+
+  it("round-trips SDK BSON reference IDs, database and custom fields into update and preview", async () => {
+    const hex = oid.toHexString();
+    const sdkDocument = BSON.deserialize(
+      BSON.serialize({
+        _id: "a",
+        ref: {
+          $ref: "other",
+          $id: hex,
+          $db: "related",
+          version: Long.fromString("9007199254740993"),
+          ratio: new Double(1),
+        },
+      }),
+      { promoteValues: false },
+    );
+    expect(sdkDocument.ref).toBeInstanceOf(DBRef);
+    expect(sdkDocument.ref.oid).toBe(hex);
+    const s = setup([sdkDocument]);
+    const page = await s.driver.readTablePage(pageRequest());
+    const ref = page.columns.find(({ name }) => name === "ref");
+    expect.assert(ref);
+    const text = page.rows[0].ref;
+    expect(text).toBe(
+      `{"$ref":"other","$id":{"$string":"${hex}"},"$db":"related","version":{"$numberLong":"9007199254740993"},"ratio":{"$numberDouble":"1.0"}}`,
+    );
+    expect(s.driver.coerceOriginalValue(text, ref)).toEqual(sdkDocument.ref);
+    expect(s.driver.coerceTableEditValue(text, ref)).toEqual(sdkDocument.ref);
     expect(
-      s.driver.coerceTableEditValue(
-        `{"$ref":"other","$id":"${oid.toHexString()}"}`,
-        ref as ColumnTypeMeta,
+      s.driver.coerceTableEditValue('{"$ref":"other","$id":"simple"}', ref),
+    ).toMatchObject({ oid: "simple" });
+    const preview = s.driver.buildMutationPreviewStatement(
+      "update",
+      "db",
+      "",
+      "items",
+      { primaryKeys: { _id: "a" }, changes: { ref: sdkDocument.ref } },
+    );
+    expect(preview).toContain(`"$id": "${hex}"`);
+    expect(preview).toContain('"$db": "related"');
+    expect(preview).toContain('"version": new NumberLong("9007199254740993")');
+    expect(preview).toContain('"ratio": Double(1)');
+  });
+
+  it("rejects ambiguous legacy reference edits and baselines instead of guessing", async () => {
+    const s = setup([{ _id: "a", ref: new DBRef("other", oid) }]);
+    const page = await s.driver.readTablePage(pageRequest());
+    const ref = page.columns.find(({ name }) => name === "ref");
+    expect.assert(ref);
+    const legacy = `{"$ref":"other","$id":"${oid.toHexString()}"}`;
+    expect(() => s.driver.coerceOriginalValue(legacy, ref)).toThrow(
+      /ambiguous/,
+    );
+    expect(() => s.driver.coerceTableEditValue(legacy, ref)).toThrow(
+      /ambiguous/,
+    );
+    expect(() =>
+      s.driver.validateTableUpdates([
+        {
+          changes: { ref: page.rows[0].ref },
+          originalValues: { ref: page.rows[0].ref },
+          originalTypes: { ref: { category: "other", nativeType: "dbRef" } },
+        },
+      ]),
+    ).toThrow(/legacy table baseline/);
+    expect(
+      await applyChangesTransactional(
+        s.manager as never,
+        "g4",
+        "db",
+        "",
+        "items",
+        [
+          {
+            primaryKeys: {
+              _id: { $rapidbMongoId: { type: "string", value: "a" } },
+            },
+            changes: { ref: legacy },
+            originalValues: { ref: page.rows[0].ref },
+            originalTypes: page.mongoValueTypes?.[0],
+          },
+        ],
+        page.columns,
       ),
-    ).toBeInstanceOf(DBRef);
+    ).toMatchObject({
+      success: false,
+      rowOutcomes: [{ status: "prevalidation_failed", columns: ["ref"] }],
+    });
+    expect(s.updateOne).not.toHaveBeenCalled();
+  });
+
+  it("blocks DBRef edits if literal BSON fields would be reinterpreted as Extended JSON", async () => {
+    const s = setup([
+      {
+        _id: "a",
+        ref: new DBRef("other", oid, undefined, {
+          metadata: { $oid: oid.toHexString() },
+        }),
+      },
+    ]);
+    const page = await s.driver.readTablePage(pageRequest());
+    expect(page.mongoValueTypes?.[0].ref.nativeType).toBe("bsonDbRef");
+    expect(() =>
+      s.driver.validateTableUpdates([
+        {
+          changes: { ref: "replacement" },
+          originalTypes: page.mongoValueTypes?.[0],
+        },
+      ]),
+    ).toThrow(/cannot be represented losslessly/);
   });
 
   it("marks only server-confirmed DBPointer fields and cells read-only", async () => {

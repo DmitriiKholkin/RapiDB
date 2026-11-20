@@ -1,9 +1,11 @@
 import { MutationNotExecutedError } from "./mutationExecutionState";
 import { SQLiteCoreDriver } from "./sqliteCore";
+import { SQLiteRuntimeLoadError } from "./sqliteRuntime";
 import {
   SQLITE_WORKER_METHODS,
   type SQLiteWorkerRequest,
   type SQLiteWorkerResponse,
+  sqliteWorkerRequestExpired,
 } from "./sqliteWorkerProtocol";
 import { TransactionVerificationError } from "./transactionVerification";
 
@@ -14,10 +16,13 @@ process.on("message", (request: SQLiteWorkerRequest) => {
     .then(async () => {
       const response: SQLiteWorkerResponse = { id: request.id };
       try {
-        if (Date.now() >= request.deadline)
-          throw new MutationNotExecutedError(
-            "SQLite operation deadline exceeded before it started. The request was NOT_EXECUTED (not executed).",
-          );
+        const checkDeadline = () => {
+          if (sqliteWorkerRequestExpired(request))
+            throw new MutationNotExecutedError(
+              "SQLite operation deadline exceeded before it started. The request was NOT_EXECUTED (not executed).",
+            );
+        };
+        checkDeadline();
         if (request.method === "connect") {
           if (!request.config || !request.runtimeTargets)
             throw new Error("Invalid SQLite worker startup");
@@ -25,8 +30,9 @@ process.on("message", (request: SQLiteWorkerRequest) => {
             request.config,
             undefined,
             request.runtimeTargets,
+            request.managedRuntimePackage,
           );
-          await driver.connect();
+          await driver.connect(checkDeadline);
         } else if (request.method === "disconnect") {
           await driver?.disconnect();
         } else {
@@ -57,6 +63,11 @@ process.on("message", (request: SQLiteWorkerRequest) => {
         response.error = {
           message: error instanceof Error ? error.message : String(error),
           name: error instanceof Error ? error.name : "Error",
+          ...(request.method === "connect" &&
+          error instanceof SQLiteRuntimeLoadError &&
+          error.managedNativeFailure
+            ? { managedNativeFailure: true }
+            : {}),
           ...(error instanceof TransactionVerificationError
             ? {
                 verificationFailure: error.verificationFailure,

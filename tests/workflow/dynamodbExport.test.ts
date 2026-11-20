@@ -239,7 +239,9 @@ describe.runIf(enabled)("dynamodb B04 public TablePanel CSV export", () => {
     const outputPath = join(tempDir, "sparse.csv");
     const state = createWorkflowVscodeState();
     state.showSaveDialog.mockResolvedValue({ fsPath: outputPath });
-    state.showWarningMessage.mockResolvedValue("Export Anyway");
+    state.showWarningMessage.mockImplementation(
+      async (_message, _options, action: string) => action,
+    );
     Object.assign(workflowState, state);
     delete window.__vscode;
     const context = await bootstrapWorkflowContext({

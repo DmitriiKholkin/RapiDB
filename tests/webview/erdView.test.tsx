@@ -1,21 +1,17 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { NodeChange } from "@xyflow/react";
-import { describe, expect, it, vi } from "vitest";
+import type { NodeChange, Viewport } from "@xyflow/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ErdGraph } from "../../src/shared/webviewContracts";
 import { ErdView } from "../../src/webview/components/ErdView";
 import {
   clearPostedMessages,
-  dispatchIncomingMessage,
+  dispatchIncomingMessage as dispatchRawIncomingMessage,
   expectNoAxeViolations,
   getPostedMessages,
 } from "./testUtils";
 
 const fitViewMock = vi.hoisted(() => vi.fn());
-const setViewportMock = vi.hoisted(() => vi.fn());
-const getViewportMock = vi.hoisted(() =>
-  vi.fn(() => ({ x: 0, y: 0, zoom: 1 })),
-);
 
 interface MockFlowNode {
   id: string;
@@ -36,11 +32,10 @@ interface FlowSnapshot {
   }>;
   onNodesChange?: (changes: NodeChange[]) => void;
   onNodeDragStop?: (event: MouseEvent, node: MockFlowNode) => void;
-  onMove?: (
-    event: null,
-    viewport: { x: number; y: number; zoom: number },
-  ) => void;
-  onMoveEnd?: () => void;
+  onMove?: (event: null, viewport: Viewport) => void;
+  onMoveEnd?: (event: null, viewport: Viewport) => void;
+  defaultViewport?: Viewport;
+  fitView?: boolean;
 }
 
 const flowSnapshot = vi.hoisted(() => ({ current: {} as FlowSnapshot }));
@@ -58,11 +53,6 @@ vi.mock("@xyflow/react", async (importOriginal) => {
         selected?: boolean;
       }>
     >;
-    onInit?: (instance: {
-      fitView: typeof fitViewMock;
-      setViewport: typeof setViewportMock;
-      getViewport: typeof getViewportMock;
-    }) => void;
     onNodeClick?: (
       event: React.MouseEvent,
       node: { id: string; data: unknown },
@@ -72,13 +62,6 @@ vi.mock("@xyflow/react", async (importOriginal) => {
 
   function ReactFlow(props: MockReactFlowProps): React.JSX.Element {
     flowSnapshot.current = props;
-    React.useEffect(() => {
-      props.onInit?.({
-        fitView: fitViewMock,
-        setViewport: setViewportMock,
-        getViewport: getViewportMock,
-      });
-    }, []);
 
     const TableNode = props.nodeTypes?.tableNode;
 
@@ -153,8 +136,6 @@ vi.mock("@xyflow/react", async (importOriginal) => {
       fitView: fitViewMock,
       zoomIn: vi.fn(),
       zoomOut: vi.fn(),
-      setViewport: setViewportMock,
-      getViewport: getViewportMock,
     };
   }
 
@@ -279,7 +260,44 @@ function vscodeStateMock() {
 }
 
 function lastSavedPositions(): Record<string, { x: number; y: number }> {
-  return vscodeStateMock().setState.mock.calls.at(-1)?.[0].nodePositions;
+  const { legacyPositions, pinnedPositions } = savedView();
+  return { ...legacyPositions, ...pinnedPositions };
+}
+
+function savedSnapshot() {
+  return vscodeStateMock().setState.mock.calls.at(-1)?.[0];
+}
+
+function savedView() {
+  return savedSnapshot().erdView;
+}
+
+function endMove(viewport: Viewport = { x: 0, y: 0, zoom: 1 }) {
+  flowSnapshot.current.onMoveEnd?.(null, viewport);
+}
+
+let lastLoadId = 0;
+let activeLoadId: number | undefined;
+beforeEach(() => {
+  lastLoadId = 0;
+  activeLoadId = undefined;
+});
+
+function dispatchIncomingMessage(
+  type: "erdLoading" | "erdGraph" | "erdError",
+  payload: object,
+) {
+  if (type === "erdLoading") {
+    activeLoadId = ++lastLoadId;
+    dispatchRawIncomingMessage(type, { ...payload, loadId: activeLoadId });
+    return;
+  }
+  if (activeLoadId === undefined) {
+    activeLoadId = ++lastLoadId;
+    dispatchRawIncomingMessage("erdLoading", { loadId: activeLoadId });
+  }
+  dispatchRawIncomingMessage(type, { ...payload, loadId: activeLoadId });
+  activeLoadId = undefined;
 }
 
 async function sendGraph(
@@ -295,7 +313,140 @@ function renderedPosition(id: string) {
   return flowSnapshot.current.nodes?.find((node) => node.id === id)?.position;
 }
 
+function disconnectedGraph(...tables: string[]): ErdGraph {
+  const graph = sampleGraph();
+  return {
+    ...graph,
+    edges: [],
+    nodes: tables.map((table) => ({
+      ...graph.nodes[0],
+      id: `app_db.public.${table}`,
+      table,
+    })),
+  };
+}
+
+function expectSeparatedTables(first: string, second: string) {
+  const a = renderedPosition(first);
+  const b = renderedPosition(second);
+  expect(a).toBeDefined();
+  expect(b).toBeDefined();
+  if (!a || !b) return;
+  // Same two-column cards; use the ERD layout footprint.
+  expect(Math.abs(a.x - b.x) >= 320 || Math.abs(a.y - b.y) >= 130).toBe(true);
+}
+
 describe("ErdView", () => {
+  it("reflows untouched tables when Reload adds a disconnected table in their old slot", async () => {
+    const view = render(<ErdView connectionId="conn-1" />);
+    await sendGraph(disconnectedGraph("users"));
+    const firstSlot = renderedPosition(USERS);
+    expect(firstSlot).toBeDefined();
+    await act(async () => {
+      const users = flowSnapshot.current.nodes?.find(
+        (node) => node.id === USERS,
+      );
+      if (!users) throw new Error("Expected users node");
+      flowSnapshot.current.onNodeDragStop?.(new MouseEvent("mouseup"), users);
+      endMove();
+    });
+
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Reload" }));
+    expect(getPostedMessages()).toContainEqual({ type: "reload" });
+    await act(async () => dispatchIncomingMessage("erdLoading", {}));
+    await sendGraph(disconnectedGraph("orders", "users"));
+
+    expect(renderedPosition(ORDERS)).toEqual(firstSlot);
+    expectSeparatedTables(ORDERS, USERS);
+    expect(lastSavedPositions()).toEqual({});
+
+    const persisted = savedSnapshot();
+    view.unmount();
+    vscodeStateMock().getState.mockReturnValue(persisted);
+    render(<ErdView connectionId="conn-1" />);
+    await sendGraph(disconnectedGraph("audit", "orders", "users"));
+    expect(renderedPosition(HIDDEN)).toEqual(firstSlot);
+    expectSeparatedTables(HIDDEN, ORDERS);
+    expectSeparatedTables(HIDDEN, USERS);
+  });
+
+  it("keeps a dragged table fixed and restores the viewport while laying out an insertion", async () => {
+    const view = render(<ErdView connectionId="conn-1" />);
+    await sendGraph(disconnectedGraph("users"));
+    const users = flowSnapshot.current.nodes?.find((node) => node.id === USERS);
+    if (!users) throw new Error("Expected users node");
+    const movedPosition = {
+      x: users.position.x + 20,
+      y: users.position.y + 15,
+    };
+    const viewport = { x: -55, y: 24, zoom: 0.6 };
+    await act(async () => {
+      flowSnapshot.current.onNodeDragStop?.(new MouseEvent("mouseup"), {
+        ...users,
+        position: movedPosition,
+      });
+      endMove(viewport);
+    });
+    const persisted = savedSnapshot();
+    expect(persisted.erdView).toMatchObject({
+      viewport,
+      pinnedPositions: { [USERS]: movedPosition },
+      legacyPositions: {},
+    });
+    view.unmount();
+
+    vscodeStateMock().getState.mockReturnValue(persisted);
+    render(<ErdView connectionId="conn-1" />);
+    const expanded = disconnectedGraph("orders", "users");
+    await sendGraph(expanded);
+    expect(flowSnapshot.current.defaultViewport).toEqual(viewport);
+    expect(flowSnapshot.current.fitView).toBe(false);
+    expect(renderedPosition(USERS)).toEqual(movedPosition);
+    expectSeparatedTables(ORDERS, USERS);
+    await sendGraph(disconnectedGraph("audit", "orders", "users"));
+    expect(flowSnapshot.current.defaultViewport).toEqual(viewport);
+    expect(flowSnapshot.current.fitView).toBe(false);
+    expect(renderedPosition(USERS)).toEqual(movedPosition);
+    expectSeparatedTables(HIDDEN, ORDERS);
+    expectSeparatedTables(HIDDEN, USERS);
+  });
+
+  it("does not discard ambiguous legacy coordinates to make room for a new table", async () => {
+    // This could be either the first automatic slot or an intentional placement.
+    const oldPosition = { x: 36, y: 36 };
+    vscodeStateMock().getState.mockReturnValue({
+      nodePositions: { [USERS]: oldPosition },
+    });
+    render(<ErdView connectionId="conn-1" />);
+    await sendGraph(disconnectedGraph("orders", "users"));
+    expect(renderedPosition(USERS)).toEqual(oldPosition);
+    expectSeparatedTables(ORDERS, USERS);
+    expect(savedView().legacyPositions).toEqual({ [USERS]: oldPosition });
+    expect(savedView().pinnedPositions).toEqual({});
+    expect(savedSnapshot()).not.toHaveProperty("nodePositions");
+  });
+
+  it("does not reuse pins or filters from a different ERD panel scope", async () => {
+    const viewport = { x: 8, y: 12, zoom: 0.5 };
+    vscodeStateMock().getState.mockReturnValue({
+      erdView: {
+        scopeKey: JSON.stringify(["conn-1", "app_db", "public"]),
+        pinnedPositions: { [USERS]: savedPositions[USERS] },
+        legacyPositions: {},
+        viewport,
+        hideIsolated: true,
+      },
+    });
+    render(<ErdView connectionId="conn-2" database="app_db" schema="public" />);
+    await sendGraph(disconnectedGraph("users"));
+    expect(renderedPosition(USERS)).not.toEqual(savedPositions[USERS]);
+    expect(flowSnapshot.current.defaultViewport).toBeUndefined();
+    expect(flowSnapshot.current.fitView).toBe(true);
+    expect(lastSavedPositions()).toEqual({});
+  });
+
   it.each([
     "search",
     "isolated",
@@ -342,7 +493,7 @@ describe("ErdView", () => {
     await sendGraph(graphWithHiddenNode(), "later-time");
     expect(lastSavedPositions()).toEqual(savedPositions);
 
-    const persisted = vscodeStateMock().setState.mock.calls.at(-1)?.[0];
+    const persisted = savedSnapshot();
     view.unmount();
     vscodeStateMock().getState.mockReturnValue(persisted);
     render(<ErdView connectionId="conn-1" />);
@@ -375,7 +526,7 @@ describe("ErdView", () => {
           removedNode,
         );
       }
-      flowSnapshot.current.onMoveEnd?.();
+      endMove();
     });
     expect(lastSavedPositions()[HIDDEN]).toBeUndefined();
     await sendGraph({ scope: {}, nodes: [], edges: [] });
@@ -409,33 +560,34 @@ describe("ErdView", () => {
       initialState,
       nodePositions: savedPositions,
     });
-    render(<ErdView connectionId="conn-1" />);
+    render(<ErdView connectionId="conn-1" database="app_db" schema="public" />);
     await sendGraph();
     await userEvent
       .setup()
       .click(screen.getByRole("checkbox", { name: "Hide isolated" }));
 
-    const persisted = vscodeStateMock().setState.mock.calls.at(-1)?.[0];
-    expect(persisted).toMatchObject({
+    expect(savedSnapshot()).toMatchObject({
       initialState,
-      hideIsolated: true,
-      nodePositions: savedPositions,
+      erdView: {
+        hideIsolated: true,
+        legacyPositions: savedPositions,
+        pinnedPositions: {},
+      },
     });
   });
 
-  it("commits viewport position snapshots before later filter persistence", async () => {
+  it("keeps viewport updates and node moves independent through later filter persistence", async () => {
     vscodeStateMock().getState.mockReturnValue({
       hideIsolated: true,
       nodePositions: savedPositions,
     });
     render(<ErdView connectionId="conn-1" />);
     await sendGraph();
-    getViewportMock.mockReturnValueOnce({ x: 10, y: 20, zoom: 0.5 });
     await act(async () => {
       flowSnapshot.current.onNodesChange?.([
         { type: "position", id: USERS, position: { x: 80, y: 90 } },
       ]);
-      flowSnapshot.current.onMoveEnd?.();
+      endMove({ x: 10, y: 20, zoom: 0.5 });
     });
     await userEvent
       .setup()
@@ -447,7 +599,7 @@ describe("ErdView", () => {
       ...savedPositions,
       [USERS]: { x: 80, y: 90 },
     });
-    expect(vscodeStateMock().setState.mock.calls.at(-1)?.[0].viewport).toEqual({
+    expect(savedView().viewport).toEqual({
       x: 10,
       y: 20,
       zoom: 0.5,
@@ -475,7 +627,7 @@ describe("ErdView", () => {
         },
       ]);
       flowSnapshot.current.onNodeDragStop?.(new MouseEvent("mouseup"), dragged);
-      flowSnapshot.current.onMoveEnd?.();
+      endMove();
     });
     expect(lastSavedPositions()).toEqual({
       ...savedPositions,
@@ -486,7 +638,7 @@ describe("ErdView", () => {
     expect(lastSavedPositions()[HIDDEN]).toEqual(savedPositions[HIDDEN]);
   });
 
-  it("merges live visible changes on refresh and keeps them when filters persist state", async () => {
+  it("keeps an in-progress drag on refresh and through filtering", async () => {
     vscodeStateMock().getState.mockReturnValue({
       nodePositions: savedPositions,
     });
@@ -528,17 +680,17 @@ describe("ErdView", () => {
     render(<ErdView connectionId="conn-1" />);
     await sendGraph(sampleGraph());
     await sendGraph();
-    const addedPosition = lastSavedPositions()[HIDDEN];
-    expect(Number.isFinite(addedPosition?.x)).toBe(true);
-    expect(Number.isFinite(addedPosition?.y)).toBe(true);
-    expect(addedPosition).not.toEqual({ x: 0, y: 0 });
+    expect(lastSavedPositions()[HIDDEN]).toBeUndefined();
     expect(lastSavedPositions()[USERS]).toEqual(savedPositions[USERS]);
     await userEvent
       .setup()
       .click(screen.getByRole("checkbox", { name: "Hide isolated" }));
-    expect(renderedPosition(HIDDEN)).toEqual(addedPosition);
+    const addedPosition = renderedPosition(HIDDEN);
+    expect(Number.isFinite(addedPosition?.x)).toBe(true);
+    expect(Number.isFinite(addedPosition?.y)).toBe(true);
+    expect(addedPosition).not.toEqual({ x: 0, y: 0 });
     await sendGraph(graphWithHiddenNode(), "next-response");
-    expect(lastSavedPositions()[HIDDEN]).toEqual(addedPosition);
+    expect(renderedPosition(HIDDEN)).toEqual(addedPosition);
   });
 
   it("keeps a newer live position after graph response commits and viewport saves", async () => {
@@ -586,13 +738,12 @@ describe("ErdView", () => {
     const addedPosition = renderedPosition(addedId);
     expect(Number.isFinite(addedPosition?.x)).toBe(true);
     expect(Number.isFinite(addedPosition?.y)).toBe(true);
-    expect(addedPosition).toEqual(lastSavedPositions()[addedId]);
+    expect(lastSavedPositions()[addedId]).toBeUndefined();
 
-    await act(async () => flowSnapshot.current.onMoveEnd?.());
+    await act(async () => endMove());
     expect(lastSavedPositions()).toEqual({
       [USERS]: { x: 40, y: 60 },
       [HIDDEN]: savedPositions[HIDDEN],
-      [addedId]: addedPosition,
     });
     expect(renderedPosition(USERS)).toEqual({ x: 40, y: 60 });
   });
@@ -616,7 +767,7 @@ describe("ErdView", () => {
     );
     expect(screen.queryByText("email")).toBeNull();
     expect(renderedPosition(USERS)).toEqual({ x: 40, y: 60 });
-    await act(async () => flowSnapshot.current.onMoveEnd?.());
+    await act(async () => endMove());
     expect(lastSavedPositions()).toEqual({
       ...savedPositions,
       [USERS]: { x: 40, y: 60 },
@@ -632,10 +783,10 @@ describe("ErdView", () => {
   it("retains auto-layout positions across filtering, LOD changes and graph refresh", async () => {
     render(<ErdView connectionId="conn-1" />);
     await sendGraph();
-    const positions = lastSavedPositions();
-    expect(Object.keys(positions).sort()).toEqual(
-      [USERS, ORDERS, HIDDEN].sort(),
-    );
+    const visiblePositions = () =>
+      [USERS, ORDERS, HIDDEN].map(renderedPosition);
+    const positions = visiblePositions();
+    expect(positions.every(Boolean)).toBe(true);
     await userEvent
       .setup()
       .click(screen.getByRole("checkbox", { name: "Hide isolated" }));
@@ -643,14 +794,15 @@ describe("ErdView", () => {
       flowSnapshot.current.onMove?.(null, { x: 0, y: 0, zoom: 0.2 }),
     );
     await sendGraph(graphWithHiddenNode(), "zoomed-out");
-    expect(lastSavedPositions()).toEqual(positions);
+    expect(visiblePositions()).toEqual([positions[0], positions[1], undefined]);
     await act(async () =>
       flowSnapshot.current.onMove?.(null, { x: 0, y: 0, zoom: 1 }),
     );
     await userEvent
       .setup()
       .click(screen.getByRole("checkbox", { name: "Hide isolated" }));
-    expect(renderedPosition(HIDDEN)).toEqual(positions[HIDDEN]);
+    expect(visiblePositions()).toEqual(positions);
+    expect(lastSavedPositions()).toEqual({});
   });
 
   it.each([
@@ -788,6 +940,31 @@ describe("ErdView", () => {
 
     expect(screen.getByText("Error:")).toBeTruthy();
     expect(screen.getByText("Could not load schema metadata")).toBeTruthy();
+  });
+
+  it.each([
+    "erdGraph",
+    "erdError",
+  ])("recovers from malformed current %s without dropping the committed graph", async (type) => {
+    render(<ErdView connectionId="conn-1" />);
+    await sendGraph(sampleGraph());
+    const oldId = ++lastLoadId;
+    const currentId = ++lastLoadId;
+    await act(async () => {
+      dispatchRawIncomingMessage("erdLoading", { loadId: oldId });
+      dispatchRawIncomingMessage("erdLoading", { loadId: currentId });
+      dispatchRawIncomingMessage(type, { loadId: oldId });
+      dispatchRawIncomingMessage(type, null);
+    });
+    expect(screen.getByText("Loading data...")).toBeTruthy();
+    await act(async () => {
+      dispatchRawIncomingMessage(type, { loadId: currentId, graph: null });
+    });
+    expect(screen.queryByText("Loading data...")).toBeNull();
+    expect(screen.getByText("public.users")).toBeTruthy();
+    expect(screen.getByText(/invalid ERD reply/)).toBeTruthy();
+    await sendGraph(sampleGraph());
+    expect(screen.queryByText(/invalid ERD reply/)).toBeNull();
   });
 
   it("retries the graph load from the error-only screen", async () => {

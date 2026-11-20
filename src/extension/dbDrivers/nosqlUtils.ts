@@ -93,13 +93,7 @@ export function inferColumnsFromRows(
       samples.map(
         (sample) =>
           inferValueCategory(sample) ??
-          (options?.consistentCategories &&
-          typeof sample === "string" &&
-          /^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(sample.trim())
-            ? "decimal"
-            : typeof sample === "string" && sample.trim()
-              ? "text"
-              : "other"),
+          (typeof sample === "string" && sample.trim() ? "text" : "other"),
       ),
     );
     const category =

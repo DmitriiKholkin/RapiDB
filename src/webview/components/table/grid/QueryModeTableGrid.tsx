@@ -1,7 +1,11 @@
 import type { SortingState } from "@tanstack/react-table";
 import { useEffect, useMemo, useState } from "react";
 import type { QueryResultExportPayload } from "../../../../shared/webviewContracts";
-import type { QueryResult, QueryStatus } from "../../../store";
+import {
+  hasQueryResultDetails,
+  type QueryResult,
+  type QueryStatus,
+} from "../../../store";
 import { postMessage } from "../../../utils/messaging";
 import { queryRunShortcutLabel } from "../../../utils/platform";
 import { Icon } from "../../Icon";
@@ -14,6 +18,20 @@ import {
 } from "./QueryResultsGrid";
 
 const QUERY_TOOLBAR_H = 28;
+
+function formatRowCount(count: number): string {
+  return `${count.toLocaleString()} row${count === 1 ? "" : "s"}`;
+}
+
+function formatAffectedRows(result: QueryResult): string | undefined {
+  if (result.affectedRowsUnknown) return "Affected row count unavailable";
+  const count = result.affectedRows;
+  if (count === undefined) return undefined;
+  if (result.affectedRowsKind === "processed-writes") {
+    return `${count.toLocaleString()} write request${count === 1 ? "" : "s"} processed`;
+  }
+  return `${formatRowCount(count)} affected${result.error && result.rowCountKind === "returned" ? " in completed requests" : ""}`;
+}
 
 export function QueryModeTableGrid({
   status,
@@ -87,8 +105,7 @@ export function QueryModeTableGrid({
     );
   }
 
-  const hasPartialResult =
-    Boolean(result && result.columns.length > 0) || resultSets.length > 0;
+  const hasPartialResult = result && hasQueryResultDetails(result);
   if ((status === "error" || result?.error) && !hasPartialResult) {
     return (
       <div
@@ -113,26 +130,42 @@ export function QueryModeTableGrid({
     );
   }
 
-  const hasResponseMetadata = (result?.responseMetadata?.length ?? 0) > 0;
+  const responseMetadata = result?.responseMetadata ?? [];
+  const hasResponseMetadata = responseMetadata.length > 0;
+  const responseWarnings = responseMetadata.flatMap(({ warning }) =>
+    typeof warning === "string" ? [warning] : [],
+  );
+  const warnings = [...(result?.warnings ?? []), ...responseWarnings];
+  const rowCountIsReturned = result?.rowCountKind === "returned";
+  const affectedRowsText = result ? formatAffectedRows(result) : undefined;
   if (
     !result ||
     !displayedResult ||
     (displayedResult?.columns.length === 0 &&
       !hasResponseMetadata &&
+      warnings.length === 0 &&
       resultSets.length === 0 &&
-      !result.resultSetsTruncated)
+      !result.resultSetsTruncated &&
+      !result.error)
   ) {
     return (
       <QueryEmptyState
         icon="pass"
         primary="Query executed successfully"
-        secondary={`${result?.affectedRowsUnknown ? "Affected row count unavailable" : `${result?.rowCount ?? 0} rows affected`} · ${result?.executionTimeMs ?? 0} ms`}
+        secondary={`${affectedRowsText ?? `${formatRowCount(result?.rowCount ?? 0)} ${rowCountIsReturned ? "returned" : "affected"}`} · ${result?.executionTimeMs ?? 0} ms`}
       />
     );
   }
 
   const { rowCount, executionTimeMs, truncated, truncatedAt } = displayedResult;
   const truncatedCount = truncatedAt ?? rowCount;
+  const returnedRowsText = rowCountIsReturned
+    ? truncated
+      ? `${truncatedCount.toLocaleString()} of ${formatRowCount(rowCount)} returned (display truncated)`
+      : `${formatRowCount(rowCount)} returned`
+    : truncated
+      ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
+      : formatRowCount(rowCount);
 
   return (
     <div
@@ -180,6 +213,20 @@ export function QueryModeTableGrid({
               )}
             </div>
           )}
+        </div>
+      )}
+      {!result.error && warnings.length > 0 && (
+        <div
+          role="status"
+          style={{
+            flexShrink: 0,
+            padding: "6px 12px",
+            fontSize: 12,
+            color: "var(--vscode-editorWarning-foreground, #CCA700)",
+          }}
+        >
+          {result.warnings?.length ? <strong>Query warning: </strong> : null}
+          {warnings.join(" ")}
         </div>
       )}
       {result.resultSetsTruncated && (
@@ -293,10 +340,10 @@ export function QueryModeTableGrid({
           iconMarginRight={3}
         />
         <span style={{ opacity: 0.7 }}>
-          {truncated
-            ? `${truncatedCount.toLocaleString()} rows (truncated — query returned more)`
-            : `${rowCount.toLocaleString()} row${rowCount !== 1 ? "s" : ""}`}
-          {result.affectedRowsUnknown && " · Affected row count unavailable"}
+          {returnedRowsText}
+          {affectedRowsText &&
+            (rowCountIsReturned || result.affectedRowsUnknown) &&
+            ` · ${affectedRowsText}`}
           <span style={{ opacity: 0.5, marginLeft: 6 }}>
             {executionTimeMs} ms
           </span>
@@ -324,15 +371,24 @@ export function QueryModeTableGrid({
             size={12}
             style={{ opacity: 0.8, flexShrink: 0 }}
           />
-          <span>
-            Result limited to <strong>{truncatedCount.toLocaleString()}</strong>{" "}
-            rows. The query returned more data. Use <code>LIMIT</code> in your
-            query or increase <em>RapiDB: Query Row Limit</em> in settings.
-          </span>
+          {rowCountIsReturned ? (
+            <span>
+              Result limited to{" "}
+              <strong>{formatRowCount(truncatedCount)}</strong>. Increase{" "}
+              <em>RapiDB: Query Row Limit</em> in settings to show more.
+            </span>
+          ) : (
+            <span>
+              Result limited to{" "}
+              <strong>{truncatedCount.toLocaleString()}</strong> rows. The query
+              returned more data. Use <code>LIMIT</code> in your query or
+              increase <em>RapiDB: Query Row Limit</em> in settings.
+            </span>
+          )}
         </div>
       )}
 
-      {result.responseMetadata && result.responseMetadata.length > 0 && (
+      {hasResponseMetadata && (
         <section
           aria-label="DynamoDB response metadata"
           style={{
@@ -356,19 +412,25 @@ export function QueryModeTableGrid({
               userSelect: "text",
             }}
           >
-            {JSON.stringify(result.responseMetadata, null, 2)}
+            {JSON.stringify(responseMetadata, null, 2)}
           </pre>
-          <div style={{ fontSize: 10, opacity: 0.65 }}>
-            Use LastEvaluatedKey as ExclusiveStartKey to continue a page.
-          </div>
+          {responseMetadata.some((entry) => entry.LastEvaluatedKey) && (
+            <div style={{ fontSize: 10, opacity: 0.65 }}>
+              Use LastEvaluatedKey as ExclusiveStartKey to continue a page.
+            </div>
+          )}
         </section>
       )}
 
       {displayedResult.columns.length === 0 ? (
         <QueryEmptyState
-          icon="pass"
+          icon={result.error || warnings.length > 0 ? "warning" : "pass"}
           primary="No rows in this response"
-          secondary={`${rowCount} rows · ${executionTimeMs} ms`}
+          secondary={
+            rowCountIsReturned
+              ? undefined
+              : `${rowCount} rows · ${executionTimeMs} ms`
+          }
         />
       ) : (
         <QueryResultsGrid

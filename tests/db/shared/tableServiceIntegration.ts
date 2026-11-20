@@ -413,7 +413,9 @@ export function registerTableServiceIntegrationTests(
       );
 
       expect(plan.previewStatements).toHaveLength(1);
-      expect(plan.previewStatements[0]).toContain("INSERT INTO");
+      expect(plan.previewStatements[0]).toContain(
+        engineId === "sqlite" ? "INSERT OR ABORT INTO" : "INSERT INTO",
+      );
 
       await mutationService.executePreparedInsertPlan(plan);
       await mutationService.updateRow(

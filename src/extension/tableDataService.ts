@@ -1,7 +1,10 @@
+import type { SqlDeleteObservation } from "../shared/sqlDeleteObservation";
 import type { ConnectionManager } from "./connectionManager";
+import type { SQLiteAttachmentTarget } from "./dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
   DriverTableExportChunk,
+  DriverTableExportFormat,
   FilterExpression,
 } from "./dbDrivers/types";
 import type {
@@ -36,6 +39,9 @@ export class TableDataService {
       this.readService,
     );
   }
+  bindSQLiteAttachmentTarget(target: SQLiteAttachmentTarget): void {
+    this.readService.bindSQLiteAttachmentTarget(target);
+  }
   clearForConnection(connectionId: string): void {
     this.readService.clearForConnection(connectionId);
   }
@@ -58,6 +64,9 @@ export class TableDataService {
     sort: SortConfig | null = null,
     skipCount = false,
     signal?: AbortSignal,
+    observeSqlDelete = false,
+    conflictRefresh = false,
+    browsingSnapshot?: AbortSignal,
   ): Promise<TablePage> {
     return this.readService.getPage(
       connectionId,
@@ -70,6 +79,10 @@ export class TableDataService {
       sort,
       skipCount,
       signal,
+      undefined,
+      observeSqlDelete,
+      conflictRefresh,
+      browsingSnapshot,
     );
   }
   getPageChunks(
@@ -153,6 +166,7 @@ export class TableDataService {
     schema: string,
     table: string,
     primaryKeyValuesList: Record<string, unknown>[],
+    observations?: readonly (SqlDeleteObservation | null)[],
   ): Promise<PreparedDeletePlan | null> {
     return this.mutationService.prepareDeleteRowsPlan(
       connectionId,
@@ -160,6 +174,7 @@ export class TableDataService {
       schema,
       table,
       primaryKeyValuesList,
+      observations,
     );
   }
   executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
@@ -190,6 +205,7 @@ export class TableDataService {
     filters: FilterExpression[] = [],
     signal?: AbortSignal,
     selectedColumns?: readonly string[],
+    format?: DriverTableExportFormat,
   ): AsyncGenerator<DriverTableExportChunk> {
     return this.readService.exportAll(
       connectionId,
@@ -201,6 +217,7 @@ export class TableDataService {
       filters,
       signal,
       selectedColumns,
+      format,
     );
   }
 }

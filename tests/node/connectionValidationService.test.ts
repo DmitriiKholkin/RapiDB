@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ConnectionValidationService } from "../../src/extension/services/connectionValidationService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 const service = new ConnectionValidationService();
 
@@ -138,7 +139,7 @@ describe("ConnectionValidationService", () => {
     { type: "mongodb", uri: "mongodb://host" },
     { type: "redis", connectionUri: "redis://host" },
     { type: "elasticsearch", endpoint: "https://host" },
-    { type: "elasticsearch", cloudId: "deployment:ZXM=" },
+    { type: "elasticsearch", cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz" },
   ] as const)("ignores unused database ports: %j", (config) => {
     expect(service.validate({ ...portConfig, ...config, port: 0 }).valid).toBe(
       true,
@@ -330,7 +331,7 @@ describe("ConnectionValidationService", () => {
     const elasticsearchWithCloudId = service.validate({
       type: "elasticsearch",
       name: "Elasticsearch",
-      cloudId: "deployment:ZXM=",
+      cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
     });
 
     expect(mongodbWithUriAlias.valid).toBe(true);
@@ -439,7 +440,7 @@ describe("ConnectionValidationService", () => {
         username: "tunnel",
         authMethod: "password",
         password: "ssh-secret",
-        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
     });
 
@@ -456,6 +457,64 @@ describe("ConnectionValidationService", () => {
         }),
       ]),
     );
+  });
+
+  describe("SSH host fingerprint validation", () => {
+    const digest = SSH_HOST_FINGERPRINT_SHA256.slice("SHA256:".length);
+
+    it.each([
+      ["too short", "SHA256:a"],
+      ["31-byte digest", `SHA256:${"A".repeat(42)}==`],
+      ["33-byte digest", `SHA256:${digest}A`],
+      ["double padding", `${SSH_HOST_FINGERPRINT_SHA256}==`],
+      ["internal padding", `SHA256:${digest.slice(0, -1)}=8`],
+      ["noncanonical trailing bits", `SHA256:${digest.slice(0, -1)}9`],
+      ["padded noncanonical trailing bits", `SHA256:${digest.slice(0, -1)}9=`],
+      ["URL-safe alphabet", SSH_HOST_FINGERPRINT_SHA256.replace("+", "-")],
+    ])("rejects %s even when TOFU is enabled", (_reason, fingerprint) => {
+      for (const hostVerificationMode of [
+        "manual",
+        "trustOnFirstUse",
+      ] as const) {
+        const result = service.validate({
+          ...portConfig,
+          ssh: {
+            ...portSsh,
+            hostVerificationMode,
+            hostFingerprintSha256: fingerprint,
+          },
+        });
+
+        expect(result.valid, hostVerificationMode).toBe(false);
+        expect(result.issues).toEqual([
+          {
+            code: "invalid",
+            fields: ["ssh"],
+            message:
+              'Field "ssh.hostFingerprintSha256" must use the OpenSSH SHA256 fingerprint format.',
+          },
+        ]);
+      }
+    });
+
+    it.each([
+      ["OpenSSH", SSH_HOST_FINGERPRINT_SHA256],
+      [
+        "padded and surrounded by whitespace",
+        `  ${SSH_HOST_FINGERPRINT_SHA256}=  `,
+      ],
+    ])("accepts a real host fingerprint in %s format", (_format, fingerprint) => {
+      expect(
+        service.validate({
+          ...portConfig,
+          ssh: {
+            ...portSsh,
+            hostVerificationMode: "manual",
+            hostFingerprintSha256: fingerprint,
+          },
+        }).valid,
+      ).toBe(true);
+    });
   });
 
   it("allows trust-on-first-use SSH verification without a pre-entered fingerprint", () => {

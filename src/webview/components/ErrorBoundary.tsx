@@ -3,21 +3,31 @@ import { buildButtonStyle } from "../utils/buttonStyles";
 
 interface Props {
   context?: string;
+  hideOnError?: { label: string; message: string };
   children: React.ReactNode;
 }
 
 interface State {
   hasError: boolean;
   error: Error | null;
+  retried: boolean;
+  hidden: boolean;
 }
 
 export class ErrorBoundary extends React.Component<Props, State> {
   constructor(props: Props) {
     super(props);
-    this.state = { hasError: false, error: null };
+    this.state = {
+      hasError: false,
+      error: null,
+      retried: false,
+      hidden: false,
+    };
   }
 
-  static getDerivedStateFromError(error: Error): State {
+  static getDerivedStateFromError(
+    error: Error,
+  ): Pick<State, "hasError" | "error"> {
     return { hasError: true, error };
   }
 
@@ -31,16 +41,29 @@ export class ErrorBoundary extends React.Component<Props, State> {
   }
 
   private handleRetry = (): void => {
-    this.setState({ hasError: false, error: null });
+    this.setState({ hasError: false, error: null, retried: true });
+  };
+
+  private handleHide = (): void => {
+    this.setState({ hidden: true, error: null });
   };
 
   render(): React.ReactNode {
-    if (!this.state.hasError) {
+    const { hasError, error, retried, hidden } = this.state;
+    const { hideOnError } = this.props;
+    if (hidden && hideOnError) {
+      return (
+        <div role="status" style={{ margin: 16, fontSize: 13 }}>
+          {hideOnError.message}
+        </div>
+      );
+    }
+    if (!hasError) {
       return this.props.children;
     }
 
     const ctx = this.props.context ?? "View";
-    const msg = this.state.error?.message ?? "Unknown error";
+    const msg = error?.message ?? "Unknown error";
 
     return (
       <div
@@ -58,7 +81,9 @@ export class ErrorBoundary extends React.Component<Props, State> {
           gap: 10,
         }}
       >
-        <strong style={{ fontSize: 14 }}>⚠ {ctx} crashed</strong>
+        <strong role="alert" style={{ fontSize: 14 }}>
+          ⚠ {ctx} crashed
+        </strong>
         <pre
           style={{
             margin: 0,
@@ -73,18 +98,40 @@ export class ErrorBoundary extends React.Component<Props, State> {
         >
           {msg}
         </pre>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           <button
             type="button"
             onClick={this.handleRetry}
-            style={buildButtonStyle("primary", { size: "sm" })}
+            style={buildButtonStyle(retried ? "ghost" : "primary", {
+              size: "sm",
+            })}
           >
             Retry
           </button>
-          <span style={{ fontSize: 11, opacity: 0.6, alignSelf: "center" }}>
-            Check the Developer Console (Help → Toggle Developer Tools) for the
-            full stack trace.
-          </span>
+          {hideOnError && (
+            <button
+              type="button"
+              onClick={this.handleHide}
+              style={buildButtonStyle(retried ? "primary" : "ghost", {
+                size: "sm",
+              })}
+            >
+              {hideOnError.label}
+            </button>
+          )}
+        </div>
+        {retried && !hideOnError && (
+          <div>
+            Use <strong>Developer: Reload Webviews</strong> from the VS Code
+            Command Palette. This reloads all webviews, so save work in other
+            panels and let active operations finish first. Verify any uncertain
+            write before repeating it. If reloading does not help, report the
+            error and stack trace.
+          </div>
+        )}
+        <div style={{ fontSize: 11, opacity: 0.6 }}>
+          Check the Developer Console (Help → Toggle Developer Tools) for the
+          full stack trace.
         </div>
       </div>
     );

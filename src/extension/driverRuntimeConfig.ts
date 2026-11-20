@@ -1,8 +1,10 @@
 import type { ConnectionConfig } from "./connectionManagerModels";
+import type { DynamoDBSshEndpoint } from "./dbDrivers/dynamodbConnection";
 import type { SshRuntimeTransport } from "./services/sshRuntime";
 
 export interface ConnectionRuntimeOverrides {
   transport?: SshRuntimeTransport;
+  dynamoDBSshEndpoint?: DynamoDBSshEndpoint;
   tlsServername?: string;
   mssqlServerName?: string;
 }

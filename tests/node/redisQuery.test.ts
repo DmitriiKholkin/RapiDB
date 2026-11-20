@@ -21,6 +21,10 @@ import {
 } from "../../src/extension/dbDrivers/redisKeyspace";
 import { logger } from "../../src/extension/utils/logger";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
+import {
+  defaultFilterOperator,
+  serializeFilterDrafts,
+} from "../../src/shared/tableTypes";
 
 function createDriver() {
   const driver = new RedisDriver({
@@ -55,6 +59,23 @@ describe("RedisDriver — query()", () => {
     expect(result.rowCount).toBe(1);
     expect(result.columns).toEqual(["result"]);
     expect(result.rows[0]?.__col_0).toBe("OK");
+  });
+
+  it("does not normalize non-canonical integer text in decoded replies", async () => {
+    const { driver, sendCommand } = createDriver();
+    sendCommand
+      .mockResolvedValueOnce("007")
+      .mockResolvedValueOnce(["0000", { value: "-00" }, 0]);
+
+    const single = await driver.query("GET key");
+    expect(single.rows[0]?.__col_0).toBe("007");
+
+    const nested = await driver.query("EVAL script 0");
+    expect(JSON.parse(String(nested.rows[0]?.__col_0))).toEqual([
+      "0000",
+      { value: "-00" },
+      0,
+    ]);
   });
 
   it("returns completed statements when a later statement hits a transport failure", async () => {
@@ -1087,6 +1108,46 @@ describe("RedisDriver — metadata and pages", () => {
     });
   });
 
+  it.each([
+    ["2026-13-45", "2026-13-46", "13-45"],
+    ["25:99", "25:98", ":99"],
+  ])("filters impossible temporal Redis values as text (%s)", async (first, second, search) => {
+    const { driver } = createDriver();
+    const client = {
+      scan: vi.fn().mockResolvedValue({
+        cursor: "0",
+        keys: ["labels:1", "labels:2"],
+      }),
+      type: vi.fn().mockResolvedValue("string"),
+      get: vi.fn(async (key: string) => (key === "labels:1" ? first : second)),
+    };
+    Object.assign(driver, { client: withRedisReplyMapping(client) });
+
+    const request = {
+      database: "db0",
+      schema: "db0",
+      table: "labels",
+      page: 1,
+      pageSize: 10,
+      sort: null,
+      skipCount: false,
+    };
+    const { columns } = await driver.readTablePage({ ...request, filters: [] });
+    const column = columns.find(({ name }) => name === "value");
+    expect(column).toMatchObject({
+      category: "text",
+      filterOperators: ["like", "is_null", "is_not_null"],
+    });
+    if (!column) throw new Error("Missing Redis value column");
+    const filters = serializeFilterDrafts(columns, {
+      value: { operator: defaultFilterOperator(column), value: search },
+    });
+    const page = await driver.readTablePage({ ...request, filters });
+
+    expect(page.rows.map(({ value }) => value)).toEqual([first]);
+    expect(page.totalCount).toBe(1);
+  });
+
   it("filters rows by ttl column values", async () => {
     const driver = new RedisDriver({
       id: "redis-ttl-filter-test",
@@ -1692,7 +1753,7 @@ describe("RedisDriver — metadata and pages", () => {
       affectedRows: 1,
       updateRowOutcomes: [
         { rowIndex: 0, status: "applied" },
-        { rowIndex: 1, status: "not_applied" },
+        { rowIndex: 1, status: "not_applied", conflict: true },
       ],
     });
   });

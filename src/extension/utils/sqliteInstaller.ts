@@ -125,8 +125,17 @@ interface InstalledRuntimeManifest {
   libc: string;
 }
 
+export interface SQLiteManagedRuntimeSnapshot {
+  readonly packagePath: string;
+  readonly revision: string;
+}
+
 let installerConfiguration: SQLiteInstallerConfiguration | null = null;
 let inFlightInstall: Promise<string | null> | null = null;
+const inFlightRepairs = new Map<
+  string,
+  { signals: Set<AbortSignal | undefined>; result: Promise<string | null> }
+>();
 let obsoleteRuntimeCleanupDone = false;
 
 function installerLog(message: string): void {
@@ -328,7 +337,11 @@ function installedBinaryPathFor(baseDir: string): string | null {
   if (!installedPackagePath) {
     return null;
   }
-  return join(installedPackagePath, "build", "Release", "better_sqlite3.node");
+  return sqliteNativeBindingPath(installedPackagePath);
+}
+
+export function sqliteNativeBindingPath(packagePath: string): string {
+  return join(packagePath, "build", "Release", "better_sqlite3.node");
 }
 
 function installedManifestPathFor(baseDir: string): string | null {
@@ -372,6 +385,42 @@ function manifestMatches(baseDir: string): boolean {
     actual.arch === expected.arch &&
     actual.libc === expected.libc
   );
+}
+
+// Capture only an existing, manifest-matched managed binary. An installation
+// just attempted by this connection is not eligible for another download.
+export function snapshotSQLiteManagedRuntime(
+  baseDir: string,
+): SQLiteManagedRuntimeSnapshot | null {
+  try {
+    const root = runtimeRootFor(baseDir);
+    const packagePath = installedPackagePathFor(baseDir);
+    if (!root || !packagePath || !installerConfiguration) return null;
+    const binaryPath = sqliteNativeBindingPath(packagePath);
+    const storageRoot = installerConfiguration.storageRoot;
+    let directory = dirname(binaryPath);
+    while (true) {
+      if (!isRealDirectory(directory)) return null;
+      if (directory === storageRoot) break;
+      const parent = dirname(directory);
+      if (parent === directory) return null;
+      directory = parent;
+    }
+    if (
+      !lstatSync(join(root, "runtime.json")).isFile() ||
+      !lstatSync(join(packagePath, "package.json")).isFile() ||
+      !manifestMatches(baseDir)
+    )
+      return null;
+    const binary = lstatSync(binaryPath, { bigint: true });
+    if (!binary.isFile()) return null;
+    return {
+      packagePath,
+      revision: `${binary.dev}:${binary.ino}:${binary.ctimeNs}:${binary.size}`,
+    };
+  } catch {
+    return null;
+  }
 }
 
 function copyDirectory(sourceRoot: string, targetRoot: string): void {
@@ -1780,6 +1829,154 @@ async function installManagedRuntime(baseDir: string): Promise<string | null> {
   );
 }
 
+const SQLITE_REPAIR_SMOKE_SCRIPT = `
+  const Database = require(process.argv[1]);
+  const db = new Database(":memory:", { nativeBinding: process.argv[2] });
+  try {
+    if (db.prepare("SELECT 1 AS ok").get().ok !== 1)
+      throw new Error("Unexpected SQLite smoke test result");
+  } finally {
+    db.close();
+  }
+`;
+
+async function smokeTestStagedSQLiteRuntime(
+  tempRoot: string,
+  packagePath: string,
+  binaryPath: string,
+): Promise<void> {
+  try {
+    await execFileAsync(
+      process.execPath,
+      [
+        "--input-type=commonjs",
+        "-e",
+        SQLITE_REPAIR_SMOKE_SCRIPT,
+        packagePath,
+        binaryPath,
+      ],
+      {
+        cwd: tempRoot,
+        env: {
+          ...process.env,
+          ELECTRON_RUN_AS_NODE: "1",
+          NODE_OPTIONS: "",
+          NODE_PATH: "",
+        },
+        timeout: 15_000,
+        killSignal: "SIGKILL",
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
+    throw new Error("The staged SQLite native binary failed its smoke test.", {
+      cause: error,
+    });
+  }
+}
+
+// A connection may report a failure after another window has already repaired
+// that generation. Compare again under the same lock used for installation.
+export async function repairSQLiteManagedRuntime(
+  baseDir: string,
+  failed: SQLiteManagedRuntimeSnapshot,
+  signal?: AbortSignal,
+): Promise<string | null> {
+  if (signal?.aborted) return null;
+  const configuration = installerConfiguration;
+  const runtimeRoot = runtimeRootFor(baseDir);
+  if (
+    !configuration ||
+    !runtimeRoot ||
+    failed.packagePath !== installedPackagePathFor(baseDir)
+  )
+    return null;
+
+  const key = `${failed.packagePath}\0${failed.revision}`;
+  let repair = inFlightRepairs.get(key);
+  if (!repair) {
+    const signals = new Set<AbortSignal | undefined>();
+    const wanted = () => [...signals].some((entry) => !entry?.aborted);
+    const result = Promise.resolve()
+      .then(() =>
+        withInstallLock<string | null>(
+          `${runtimeRoot}.lock`,
+          async () => {
+            const current = snapshotSQLiteManagedRuntime(baseDir);
+            if (
+              !current ||
+              !wanted() ||
+              installerConfiguration !== configuration
+            )
+              return null;
+            if (current.revision !== failed.revision)
+              return current.packagePath;
+            if (
+              configuration.allowInstall &&
+              !(await configuration.allowInstall())
+            )
+              throw new Error("SQLite runtime repair was not authorized.");
+            if (!wanted() || installerConfiguration !== configuration)
+              return null;
+
+            // Stage and verify with the same host executable/mode as the
+            // worker. Once authorized, finish the shared job even if a
+            // connection is cancelled; only active callers will reconnect.
+            const tempRoot = mkdtempSync(`${runtimeRoot}.tmp-${process.pid}-`);
+            try {
+              copyBundledRuntimeScaffold(baseDir, tempRoot);
+              await downloadPrebuiltBinary(tempRoot, baseDir);
+              const stagedPackage = join(
+                tempRoot,
+                "node_modules",
+                "better-sqlite3",
+              );
+              const stagedBinary = sqliteNativeBindingPath(stagedPackage);
+              await smokeTestStagedSQLiteRuntime(
+                tempRoot,
+                stagedPackage,
+                stagedBinary,
+              );
+              const latest = snapshotSQLiteManagedRuntime(baseDir);
+              if (!latest || installerConfiguration !== configuration)
+                return null;
+              if (latest.revision !== failed.revision)
+                return latest.packagePath;
+              // Replace only the installer-owned binary, never the directory.
+              renameSync(
+                stagedBinary,
+                sqliteNativeBindingPath(latest.packagePath),
+              );
+              installerLog(
+                `Repaired the managed SQLite native binary at ${latest.packagePath}.`,
+              );
+              return latest.packagePath;
+            } finally {
+              rmSync(tempRoot, { recursive: true, force: true });
+            }
+          },
+          () => {
+            // withInstallLock uses null for "not completed." Cancellation
+            // while waiting for the lock must not start new work.
+            if (!wanted() || installerConfiguration !== configuration)
+              throw new Error("SQLite runtime repair was cancelled.");
+            const current = snapshotSQLiteManagedRuntime(baseDir);
+            return current && current.revision !== failed.revision
+              ? current.packagePath
+              : null;
+          },
+        ),
+      )
+      .finally(() => inFlightRepairs.delete(key));
+    repair = { signals, result };
+    inFlightRepairs.set(key, repair);
+  }
+  // Distinct callers normally have distinct signals; leave them registered
+  // only for the lifetime of the shared job.
+  repair.signals.add(signal);
+  return repair.result;
+}
+
 export function configureSQLiteInstaller(
   configuration: SQLiteInstallerConfiguration,
 ): void {
@@ -1830,20 +2027,10 @@ export function probeInstalledBetterSqlite3Runtime(
   };
 }
 
-export function resolveInstalledBetterSqlite3PackagePath(
-  baseDir: string,
-): string | null {
-  const probe = probeInstalledBetterSqlite3Runtime(baseDir);
-  return probe.installedPackageExists && probe.installedBinaryExists
-    ? probe.installedPackagePath
-    : null;
-}
-
 export async function ensureSQLiteRuntimeInstalled(
   baseDir: string,
 ): Promise<string | null> {
-  const installedPackagePath =
-    resolveInstalledBetterSqlite3PackagePath(baseDir);
+  const installedPackagePath = installedPackagePathFor(baseDir);
   if (installedPackagePath && refreshInstalledRuntimeUse(baseDir)) {
     await removeObsoleteSQLiteRuntimesOnce(baseDir);
     return installedPackagePath;

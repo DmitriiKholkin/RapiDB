@@ -5,17 +5,24 @@ import type {
 import type { ConnectionManager } from "../connectionManager";
 import { isMutationNotExecutedError } from "../dbDrivers/mutationExecutionState";
 import { isPostgresStatementRejectedAndRolledBack } from "../dbDrivers/postgresStatementRejection";
+import { sqliteTableSchema } from "../dbDrivers/sqliteAttachmentTarget";
 import { TransactionVerificationError } from "../dbDrivers/transactionVerification";
 import type {
   ColumnTypeMeta,
   DriverMutationResult,
   DriverUpdateRowOutcome,
   IDBDriver,
+  MutationSqlExpression,
+  TransactionOperation,
   TransactionOptions,
   TransactionVerification,
 } from "../dbDrivers/types";
 import { DriverUpdateRowsError } from "../dbDrivers/updateRowOutcomes";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
+import {
+  oracleCapturedIdentityComparison,
+  oracleInsertIdentity,
+} from "./insertIdentitySql";
 import {
   applyRowTypeHints,
   buildPrevalidationFailedResult,
@@ -30,6 +37,7 @@ import type {
   VerificationTarget,
 } from "./tableDataContracts";
 import {
+  appendPrimaryKeyComparison,
   buildUpdateRowSql,
   coercePrimaryKeyValues,
   coerceRecord,
@@ -109,11 +117,20 @@ export async function executeAtomicSqlApplyPlan(
       return { success: false, error: "Not connected" };
     }
     const database = apply?.database ?? inserts[0]?.database;
+    const sqliteAttachmentTarget =
+      apply?.sqliteAttachmentTarget ?? inserts[0]?.sqliteAttachmentTarget;
+    const sameAttachment = (plan: PreparedApplyPlan | PreparedInsertPlan) =>
+      plan.sqliteAttachmentTarget?.schema === sqliteAttachmentTarget?.schema &&
+      plan.sqliteAttachmentTarget?.generation ===
+        sqliteAttachmentTarget?.generation;
     if (
-      (apply && apply.connectionId !== connectionId) ||
+      (apply &&
+        (apply.connectionId !== connectionId || !sameAttachment(apply))) ||
       inserts.some(
         (plan) =>
-          plan.connectionId !== connectionId || plan.database !== database,
+          plan.connectionId !== connectionId ||
+          plan.database !== database ||
+          !sameAttachment(plan),
       )
     ) {
       throw new Error(
@@ -143,7 +160,18 @@ export async function executeAtomicSqlApplyPlan(
     );
     const verifications = [
       ...insertVerifications,
-      ...(options.verifications ?? []),
+      ...(options.verifications ?? []).map((verification) =>
+        verification.identity
+          ? {
+              ...verification,
+              identity: {
+                ...verification.identity,
+                operationIndex:
+                  verification.identity.operationIndex + inserts.length,
+              },
+            }
+          : verification,
+      ),
     ];
     const operations = [
       ...inserts.map((plan) => ({
@@ -183,6 +211,7 @@ export async function executeAtomicSqlApplyPlan(
     executionStarted = true;
     await driver.runTransaction(operations, undefined, {
       ...options,
+      ...(sqliteAttachmentTarget ? { sqliteAttachmentTarget } : {}),
       ...(verifications.length ? { verifications } : {}),
     });
     return {
@@ -403,12 +432,26 @@ export function prepareApplyChangesPlan(
   const previewStatements: string[] = [];
   const verificationTargets: VerificationTarget[] = [];
   const skippedRows = new Set<number>();
+  const keyColumns = columns.filter((column) => column.isPrimaryKey);
+  const backend = connectionManager.getConnection(connectionId)?.type;
+  const hasPostgresArrayKey = keyColumns.some(
+    (column) => column.postgresArrayPrimaryKey,
+  );
+  const hasOracleTemporalKey =
+    backend === "oracle" &&
+    keyColumns.some((column) => driver.buildTablePrimaryKeyExpr?.(column));
+  const hasSQLiteKey =
+    backend === "sqlite" &&
+    !hasPostgresArrayKey &&
+    Boolean(driver.buildPrimaryKeyComparison) &&
+    keyColumns.some((column) => driver.buildTablePrimaryKeyExpr?.(column));
   for (const [
     rowIndex,
     { primaryKeys, changes, originalValues },
   ] of updates.entries()) {
     const verificationValues: VerificationTarget["values"] = [];
     const verificationPrimaryKeys = { ...primaryKeys };
+    const sqliteNullKeyColumns: string[] = [];
     for (const [columnName, nextValue] of Object.entries(
       filterWritableRecord(changes, columnMetaByName),
     )) {
@@ -418,6 +461,9 @@ export function prepareApplyChangesPlan(
       }
       if (column.isPrimaryKey) {
         verificationPrimaryKeys[columnName] = nextValue;
+        if (hasSQLiteKey && nextValue === null) {
+          sqliteNullKeyColumns.push(columnName);
+        }
       }
       const check = driver.checkPersistedEdit(column, nextValue);
       if (check?.shouldVerify) {
@@ -448,24 +494,108 @@ export function prepareApplyChangesPlan(
       skippedRows.add(rowIndex);
       continue;
     }
+    // Capture the stored key instead of guessing it from SET. Triggers can
+    // change the key, and a temporal display value does not carry Oracle's era.
+    const captureSQLiteRowid = sqliteNullKeyColumns.length > 0;
+    const captureColumns =
+      !captureSQLiteRowid &&
+      verificationValues.length > 0 &&
+      (hasPostgresArrayKey ||
+        (hasOracleTemporalKey &&
+          keyColumns.some((column) => Object.hasOwn(changes, column.name))) ||
+        (hasSQLiteKey &&
+          keyColumns.some((column) => Object.hasOwn(changes, column.name))))
+        ? keyColumns
+        : undefined;
+    const operationIndex = operations.length;
+    const oracleReturning =
+      hasOracleTemporalKey && captureColumns
+        ? captureColumns.map((column) =>
+            oracleInsertIdentity(column, driver.quoteIdentifier(column.name)),
+          )
+        : undefined;
+    const sql = oracleReturning
+      ? `${operation.sql} RETURNING ${oracleReturning.map(({ expression }) => expression).join(", ")} INTO ${oracleReturning.map((_, index) => `:${operation.params.length + index + 1}`).join(", ")}`
+      : captureColumns
+        ? `${operation.sql} RETURNING ${captureColumns
+            .map((column, index) => {
+              const expr =
+                driver.buildTablePrimaryKeyExpr?.(column) ??
+                driver.quoteIdentifier(column.name);
+              return hasSQLiteKey
+                ? expr
+                : `${expr} AS ${driver.quoteIdentifier(`__col_${index}`)}`;
+            })
+            .join(", ")}`
+        : operation.sql;
+    const writtenKeyComparisons = Object.fromEntries(
+      verificationValues.length > 0
+        ? keyColumns.flatMap((column) => {
+            if (!Object.hasOwn(changes, column.name)) return [];
+            const comparison = driver.buildWrittenPrimaryKeyComparison?.(
+              column,
+              changes[column.name],
+              1,
+            );
+            return comparison ? [[column.name, comparison]] : [];
+          })
+        : [],
+    );
+    const mysqlKeyGuard =
+      backend === "mysql" && Object.keys(writtenKeyComparisons).length > 0
+        ? buildMySQLUpdatedKeyGuard(
+            driver,
+            driver.qualifiedTableName(database, schema, table),
+            columnMetaByName,
+            primaryKeysByRow[rowIndex] ?? primaryKeys,
+            verificationPrimaryKeys,
+            writtenKeyComparisons,
+          )
+        : undefined;
     operations.push({
-      sql: operation.sql,
+      sql,
       params: operation.params,
       checkAffectedRows: true,
       expectedAffectedRows: 1,
+      ...(captureColumns || captureSQLiteRowid || mysqlKeyGuard
+        ? {
+            captureIdentity: oracleReturning
+              ? {
+                  oracleOutTypes: oracleReturning.map(({ outType }) => outType),
+                }
+              : mysqlKeyGuard
+                ? { mysqlKeyGuard }
+                : {},
+          }
+        : {}),
     });
+    const previewSql = oracleReturning ? operation.sql : sql;
     previewStatements.push(
       typeof previewDriver.materializePreviewColumnSql === "function"
         ? previewDriver.materializePreviewColumnSql(
-            operation.sql,
+            previewSql,
             operation.params,
             previewColumns,
           )
-        : driver.materializePreviewSql(operation.sql, operation.params),
+        : driver.materializePreviewSql(previewSql, operation.params),
     );
     verificationTargets.push({
       rowIndex,
-      primaryKeys: verificationPrimaryKeys,
+      primaryKeys: hasSQLiteKey ? primaryKeys : verificationPrimaryKeys,
+      ...(captureColumns || captureSQLiteRowid
+        ? {
+            capturedIdentity: {
+              columns: captureColumns ?? [],
+              operationIndex,
+              sqlite: hasSQLiteKey,
+              ...(captureSQLiteRowid ? { sqliteNullKeyColumns } : {}),
+              ...(oracleReturning ? { oracle: true } : {}),
+            },
+          }
+        : {}),
+      ...(Object.keys(writtenKeyComparisons).length > 0
+        ? { writtenKeyComparisons }
+        : {}),
       values: verificationValues,
     });
   }
@@ -709,6 +839,15 @@ function buildDriverApplyResult(
     return { success: true, rowOutcomes };
   }
 
+  const conflictRows =
+    appliedCount === 0 && unknownCount === 0
+      ? (result.updateRowOutcomes ?? []).flatMap(
+          ({ rowIndex, conflict, status }) =>
+            conflict === true && status === "not_applied"
+              ? [executableRowIndexes[rowIndex]]
+              : [],
+        )
+      : [];
   const message =
     failedRows.length === 0
       ? `The update was applied to ${appliedCount} row(s), but the driver reported an error. Refresh the table and verify the data. ${error}`
@@ -725,6 +864,7 @@ function buildDriverApplyResult(
     changesPossible: appliedCount > 0 || unknownCount > 0,
     outcomeUnknown: unknownCount > 0,
     rowOutcomes,
+    ...(conflictRows.length > 0 && { conflictRows }),
   };
 }
 
@@ -872,38 +1012,143 @@ function buildTransactionOptions(
   );
   const verifications: TransactionVerification[] = [];
   for (const target of targets) {
-    if (target.values.length === 0) {
+    const captured = target.capturedIdentity;
+    const sqliteNullKeyColumns = captured?.sqliteNullKeyColumns;
+    if (target.values.length === 0 && !sqliteNullKeyColumns) {
       continue;
     }
     const parameters: unknown[] = [];
-    const whereParts = Object.entries(target.primaryKeys).map(
-      ([columnName, rawValue]) => {
-        const column = columnMetaByName.get(columnName);
-        parameters.push(
-          column ? driver.coerceInputValue(rawValue, column) : rawValue,
+    const whereParts = target.capturedIdentity
+      ? []
+      : buildVerificationKeyWhereParts(
+          driver,
+          columnMetaByName,
+          target.primaryKeys,
+          parameters,
+          target.writtenKeyComparisons,
         );
-        const placeholder = column
-          ? driver.buildInsertValueExpr(column, parameters.length)
-          : "?";
-        return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
-      },
-    );
-    const sql = `SELECT ${target.values
+    if (captured && !captured.sqlite) {
+      captured.columns.forEach((column) => {
+        if (captured.oracle) {
+          whereParts.push(
+            oracleCapturedIdentityComparison(
+              column,
+              driver.quoteIdentifier(column.name),
+              parameters.length + 1,
+            ),
+          );
+          parameters.push(null);
+          return;
+        }
+        whereParts.push(
+          appendPrimaryKeyComparison(driver, column, null, parameters),
+        );
+      });
+    }
+    const projection = target.values
       .map(
         ({ column }, index) =>
           `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`,
       )
-      .join(
-        ", ",
-      )} FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`;
+      .join(", ");
+    const sql = `SELECT ${projection || "1"} FROM ${qualifiedTableName}${captured?.sqlite ? "" : ` WHERE ${whereParts.join(" AND ")}`}`;
+    const parameterIndexes = sqliteNullKeyColumns
+      ? [0]
+      : (captured?.columns.map((_, index) => index) ?? []);
     verifications.push({
       rowIndex: target.rowIndex,
+      ...(captured?.sqlite ? { mutation: "update" as const } : {}),
       sql,
-      params: parameters,
+      params: captured?.sqlite ? parameterIndexes.map(() => null) : parameters,
       values: target.values,
+      ...(captured
+        ? {
+            ...(sqliteNullKeyColumns
+              ? {
+                  sqliteNullableKeyUpdate: {
+                    schema: sqliteTableSchema(database, schema),
+                    table,
+                    columns: sqliteNullKeyColumns,
+                  },
+                }
+              : captured.sqlite
+                ? {
+                    sqlitePrimaryKeyColumns: captured.columns.map(
+                      ({ name }) => name,
+                    ),
+                  }
+                : {}),
+            identity: {
+              operationIndex: captured.operationIndex,
+              parameterIndexes,
+            },
+          }
+        : {}),
     });
   }
-  return { database, ...(verifications.length ? { verifications } : {}) };
+  return {
+    database,
+    ...(plan.sqliteAttachmentTarget
+      ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+      : {}),
+    ...(verifications.length ? { verifications } : {}),
+  };
+}
+
+function buildVerificationKeyWhereParts(
+  driver: IDBDriver,
+  columns: Map<string, ColumnTypeMeta>,
+  keys: Record<string, unknown>,
+  params: unknown[],
+  written?: Record<string, MutationSqlExpression>,
+): string[] {
+  return Object.entries(keys).map(([name, raw]) => {
+    const comparison = written && Object.hasOwn(written, name) && written[name];
+    if (comparison) {
+      params.push(...comparison.params);
+      return comparison.sql;
+    }
+    const column = columns.get(name);
+    const value = column
+      ? driver.coercePrimaryKeyValue
+        ? driver.coercePrimaryKeyValue(raw, column)
+        : driver.coerceInputValue(raw, column)
+      : raw;
+    return appendPrimaryKeyComparison(driver, column ?? name, value, params);
+  });
+}
+
+function buildMySQLUpdatedKeyGuard(
+  driver: IDBDriver,
+  qualified: string,
+  columns: Map<string, ColumnTypeMeta>,
+  oldKey: Record<string, unknown>,
+  newKey: Record<string, unknown>,
+  written: Record<string, MutationSqlExpression>,
+): NonNullable<
+  NonNullable<TransactionOperation["captureIdentity"]>["mysqlKeyGuard"]
+> {
+  const params: unknown[] = [];
+  const destination = buildVerificationKeyWhereParts(
+    driver,
+    columns,
+    newKey,
+    params,
+    written,
+  ).join(" AND ");
+  const source = buildVerificationKeyWhereParts(
+    driver,
+    columns,
+    oldKey,
+    params,
+  ).join(" AND ");
+  // A trigger could redirect the UPDATE. Don't let verification then succeed
+  // by reading a different row that was already at the expected instant.
+  return {
+    sql: `SELECT 1 FROM ${qualified} WHERE ${destination} AND NOT (${source}) LIMIT 1 FOR UPDATE`,
+    params,
+    mutation: "update",
+  };
 }
 
 async function assertMutationRollbackSupport(

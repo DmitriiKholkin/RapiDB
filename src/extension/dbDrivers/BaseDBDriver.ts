@@ -59,7 +59,6 @@ import {
   DATE_ONLY_RE,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
-  NULL_SENTINEL,
   resolveFilterOperators,
 } from "./types";
 
@@ -119,7 +118,7 @@ function ensureSqlTerminator(sql: string): string {
   return trimmed.endsWith(";") ? trimmed : `${trimmed};`;
 }
 function formatGenericPreviewSqlLiteral(value: unknown): string {
-  if (value === null || value === undefined || value === NULL_SENTINEL) {
+  if (value === null || value === undefined) {
     return "NULL";
   }
   if (typeof value === "string") {
@@ -307,7 +306,6 @@ function splitNumericFilterInList(rawValue: string): string[] {
     .map((part) => part.trim())
     .filter(Boolean);
 }
-const PERSISTED_EDIT_NULL_TOKEN = "\x00__RAPIDB_PERSISTED_EDIT_NULL__\x00";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 interface ExactNumericConstraint {
@@ -315,7 +313,7 @@ interface ExactNumericConstraint {
   scale: number | null;
 }
 interface CanonicalPersistedEditValue {
-  canonical: string;
+  canonical: string | null;
 }
 type PersistedEditCanonicalizer = (
   value: unknown,
@@ -383,7 +381,7 @@ function shiftDecimalPoint(
   return `${sign}${digits.slice(0, decimalIndex)}.${digits.slice(decimalIndex)}`;
 }
 function parseDecimalString(value: unknown): string | null {
-  if (value === null || value === undefined || value === NULL_SENTINEL) {
+  if (value === null || value === undefined) {
     return null;
   }
   if (typeof value === "bigint") {
@@ -512,8 +510,8 @@ function buildValidationMessage(
 function canonicalizeNullishPersistedEditValue(
   value: unknown,
 ): CanonicalPersistedEditValue | null {
-  if (value === NULL_SENTINEL || value === null) {
-    return { canonical: PERSISTED_EDIT_NULL_TOKEN };
+  if (value === null) {
+    return { canonical: null };
   }
   return null;
 }
@@ -601,7 +599,7 @@ function canonicalizeJsonPersistedEditValue(
   normalizeNumbers = false,
 ): CanonicalPersistedEditValue | null {
   const canonical = canonicalizeJsonPersistedEditText(value);
-  if (!canonical || !normalizeNumbers) {
+  if (!canonical || canonical.canonical === null || !normalizeNumbers) {
     return canonical;
   }
   const normalized = canonicalizeJsonNumericValues(canonical.canonical);
@@ -1195,12 +1193,22 @@ export abstract class BaseDBDriver implements IDBDriver {
     return {};
   }
   materializePreviewSql(sql: string, params?: readonly unknown[]): string {
+    return this.materializePreviewSqlWithOptions(
+      sql,
+      params,
+      this.getQuestionMarkPlaceholderOptions(),
+    );
+  }
+  protected materializePreviewSqlWithOptions(
+    sql: string,
+    params: readonly unknown[] | undefined,
+    placeholderOptions: QuestionMarkPlaceholderOptions,
+  ): string {
     if (!params || params.length === 0) {
       return sql;
     }
     const formatLiteral = (value: unknown) =>
       this.formatPreviewSqlLiteral(value);
-    const placeholderOptions = this.getQuestionMarkPlaceholderOptions();
     if (indexedPlaceholderOffsets(sql, "$", placeholderOptions).length > 0) {
       return materializeIndexedPreviewSql(
         sql,
@@ -1223,7 +1231,7 @@ export abstract class BaseDBDriver implements IDBDriver {
       sql,
       params,
       formatLiteral,
-      this.getQuestionMarkPlaceholderOptions(),
+      placeholderOptions,
     );
   }
   protected hasBooleanSemantics(
@@ -1244,7 +1252,6 @@ export abstract class BaseDBDriver implements IDBDriver {
   }
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (value === null || value === undefined || value === "") return value;
-    if (value === NULL_SENTINEL) return null;
     if (typeof value !== "string") return value;
     const booleanValue = this.parseBooleanInput(value);
     if (this.hasBooleanSemantics(column) && booleanValue !== null) {

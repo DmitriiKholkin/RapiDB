@@ -41,18 +41,52 @@ function graph(extra: Partial<ErdGraph> = {}): ErdGraph {
   };
 }
 
+let lastLoadId = 0;
 async function sendGraph(value: ErdGraph) {
   await act(async () => {
+    const loadId = ++lastLoadId;
+    dispatchIncomingMessage("erdLoading", { loadId });
     dispatchIncomingMessage("erdGraph", {
+      loadId,
       graph: value,
       fromCache: false,
-      partial: Boolean(value.omittedTables),
+      partial: Boolean(value.metadataIncomplete || value.omittedTables),
       loadedAt: new Date().toISOString(),
     });
   });
 }
 
 describe("ErdView graph notices", () => {
+  it("shows a persistent Redis scan limit notice alongside the diagram until a complete reload", async () => {
+    render(<ErdView connectionId="conn-1" database="db0" />);
+    const discovered = graph({
+      scope: { database: "db0" },
+      nodes: graph().nodes.map((node) => ({
+        ...node,
+        id: JSON.stringify(["db0", "db0", "orders"]),
+        database: "db0",
+        schema: "db0",
+      })),
+    });
+    await sendGraph({
+      ...discovered,
+      metadataIncomplete: true,
+      discoveryTruncated: "redis-prefixes",
+    });
+
+    expect(screen.getByTestId("react-flow")).toBeTruthy();
+    expect(
+      screen.getByRole("status", { name: "Diagram warnings" }).textContent,
+    ).toContain(
+      'Redis key prefix discovery reached its scan limit. Some prefixes may be missing from this diagram. Open "All keys" in Explorer to browse the keyspace directly.',
+    );
+
+    await sendGraph(discovered);
+    expect(
+      screen.queryByRole("status", { name: "Diagram warnings" }),
+    ).toBeNull();
+  });
+
   it("shows omitted tables and references outside the diagram", async () => {
     render(<ErdView connectionId="conn-1" />);
     await sendGraph(

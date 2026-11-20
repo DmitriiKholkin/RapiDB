@@ -14,6 +14,10 @@ import {
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
 import { MockEventEmitter } from "../support/mockVscode";
+import {
+  OTHER_SSH_HOST_FINGERPRINT_SHA256,
+  SSH_HOST_FINGERPRINT_SHA256,
+} from "../support/sshFingerprints";
 
 const driverInstances: FakeDriver[] = [];
 const driverConnectImpls = new Map<string, () => Promise<void>>();
@@ -267,15 +271,13 @@ function createSshRedisConfig(
       authMethod: "password",
       hostVerificationMode: "manual",
       password: "ssh-secret",
-      hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+      hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       ...ssh,
     },
   };
 }
 
-function createControllableRuntime(
-  fingerprint = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
-) {
+function createControllableRuntime(fingerprint = SSH_HOST_FINGERPRINT_SHA256) {
   const listeners = new Set<(error: Error) => void>();
   const runtime: SshRuntime & { close(): void; listenerCount(): number } = {
     transport: {
@@ -517,7 +519,7 @@ describe("ConnectionManager SSH tunnel lifecycle", () => {
 
 describe("SSH trust-on-first-use pinning", () => {
   it("pins the host key after the SSH handshake even when the database login fails", async () => {
-    const fingerprint = "SHA256:FirstSeenBastionKey1234567890+/";
+    const fingerprint = OTHER_SSH_HOST_FINGERPRINT_SHA256;
     const config = createSshRedisConfig("tofu-db-failure", {
       hostVerificationMode: "trustOnFirstUse",
       hostFingerprintSha256: undefined,

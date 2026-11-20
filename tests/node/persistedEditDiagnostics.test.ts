@@ -5,7 +5,6 @@ import { MySQLDriver } from "../../src/extension/dbDrivers/mysql";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const driver = new PostgresDriver({
   id: "persisted-edit-diagnostics",
@@ -79,10 +78,8 @@ describe("MSSQL exact temporal persistence", () => {
         sqlServer.checkPersistedEdit(meta, literal("12:00:00.12345678"))?.ok,
       ).toBe(false);
     });
-    it.each([
-      null,
-      NULL_SENTINEL,
-    ])(`${type} verifies SQL NULL (%s)`, (value) => {
+    it(`${type} verifies SQL NULL`, () => {
+      const value = null;
       const meta = column(`${type}(0)`, type === "time" ? "time" : "datetime");
       expect(sqlServer.checkPersistedEdit(meta, value)).toEqual({
         ok: true,

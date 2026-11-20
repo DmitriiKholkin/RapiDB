@@ -1,3 +1,7 @@
+import {
+  MISSING_DELETE_OBSERVATION,
+  type SqlDeleteObservation,
+} from "../../shared/sqlDeleteObservation";
 import type { ConnectionManager } from "../connectionManager";
 import {
   buildDeleteResult,
@@ -9,6 +13,11 @@ import {
   isMutationNotExecutedError,
   MutationNotExecutedError,
 } from "../dbDrivers/mutationExecutionState";
+import {
+  buildSqlDeleteSnapshot,
+  sqlDeleteSnapshotComparison,
+} from "../dbDrivers/sqlDeleteSnapshot";
+import type { SQLiteAttachmentTarget } from "../dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
   DriverMutationResult,
@@ -30,6 +39,7 @@ import type {
   TableColumnsProvider,
 } from "./tableDataContracts";
 import {
+  appendPrimaryKeyComparison,
   buildUpdateRowSql,
   coercePrimaryKeyValues,
   coerceRecord,
@@ -528,14 +538,25 @@ export class TableMutationService {
       await driver.runTransaction(
         [{ ...plan.operation, checkAffectedRows: true }],
         undefined,
-        { database: plan.database, verifications: [plan.verification] },
+        {
+          database: plan.database,
+          ...(plan.sqliteAttachmentTarget
+            ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+            : {}),
+          verifications: [plan.verification],
+        },
       );
       return;
     }
     const result = await driver.query(
       plan.operation.sql,
       plan.operation.params,
-      { database: plan.database },
+      {
+        database: plan.database,
+        ...(plan.sqliteAttachmentTarget
+          ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+          : {}),
+      },
     );
     if (result.error) throw new Error(result.error);
     // An unavailable mutation total is not a confirmed zero-row write.
@@ -573,6 +594,7 @@ export class TableMutationService {
     schema: string,
     table: string,
     primaryKeyValuesList: Record<string, unknown>[],
+    observations?: readonly (SqlDeleteObservation | null)[],
   ): Promise<PreparedDeletePlan | null> {
     if (primaryKeyValuesList.length === 0) {
       return null;
@@ -593,6 +615,9 @@ export class TableMutationService {
       columns.map((column) => [column.name, column]),
     );
     if (driver.deleteRows) {
+      if (observations !== undefined) {
+        throw new Error(MISSING_DELETE_OBSERVATION);
+      }
       const coercedPrimaryKeyValuesList = primaryKeyValuesList.map(
         (criteria) => {
           return coercePrimaryKeyValues(driver, criteria, columns, "delete");
@@ -665,15 +690,53 @@ export class TableMutationService {
       );
       return normalizedPrimaryKeys;
     });
-    const coercedPrimaryKeys = uniquePrimaryKeyIdentities(
+    const { uniqueIndexes, uniquePositions } = uniquePrimaryKeyIdentities(
       allCoercedPrimaryKeys,
-    ).uniqueIndexes.map((index) => allCoercedPrimaryKeys[index]);
+    );
+    const coercedPrimaryKeys = uniqueIndexes.map(
+      (index) => allCoercedPrimaryKeys[index],
+    );
     if (coercedPrimaryKeys.length === 0) {
       return null;
     }
     const backend = this.connectionManager.getConnection(connectionId)?.type;
+    const guarded = observations !== undefined;
+    const snapshot = guarded
+      ? buildSqlDeleteSnapshot(backend, driver, columns)
+      : undefined;
+    if (guarded) {
+      if (!snapshot || observations.length !== primaryKeyValuesList.length) {
+        throw new Error(MISSING_DELETE_OBSERVATION);
+      }
+      for (const [index, observation] of observations.entries()) {
+        if (
+          !observation ||
+          observation.shape !== snapshot.shape ||
+          observation.values.length !== snapshot.expressions.length ||
+          ![...observation.values].every(
+            (value) =>
+              typeof value === "string" && snapshot.valuePattern.test(value),
+          )
+        ) {
+          throw new Error(MISSING_DELETE_OBSERVATION);
+        }
+        const first = observations[uniqueIndexes[uniquePositions[index]]];
+        if (
+          !first ||
+          observation.values.some((value, i) => value !== first.values[i])
+        ) {
+          throw new Error(MISSING_DELETE_OBSERVATION);
+        }
+      }
+    }
     const operations =
+      !guarded &&
       primaryKeyColumnNames.length === 1 &&
+      !driver.buildPrimaryKeyComparison?.(
+        primaryKeyColumns[0],
+        coercedPrimaryKeys[0][primaryKeyColumnNames[0]],
+        1,
+      ) &&
       (backend === "pg" ||
         backend === "sqlite" ||
         backend === "mssql" ||
@@ -690,6 +753,21 @@ export class TableMutationService {
             qualifiedTableName,
             columnMetaByName,
             coercedPrimaryKeys,
+            snapshot && observations
+              ? (index, parameters) =>
+                  snapshot.expressions.map((expression, i) => {
+                    const value = observations[uniqueIndexes[index]]?.values[i];
+                    if (value === undefined)
+                      throw new Error(MISSING_DELETE_OBSERVATION);
+                    parameters.push(value);
+                    return sqlDeleteSnapshotComparison(
+                      backend,
+                      expression,
+                      parameters.length,
+                    );
+                  })
+              : undefined,
+            snapshot?.oracleLobLock,
           );
     if (operations.length > 1) {
       const atomicityRisk = await driver.getMutationAtomicityRisk?.(
@@ -817,6 +895,9 @@ export class TableMutationService {
     try {
       await driver.runTransaction(plan.operations, undefined, {
         database: plan.database,
+        ...(plan.sqliteAttachmentTarget
+          ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+          : {}),
       });
       committed = true;
       const columns = await this.columnsProvider.getColumns(
@@ -832,6 +913,7 @@ export class TableMutationService {
         plan.table,
         columns,
         plan.verificationCriteriaList,
+        plan.sqliteAttachmentTarget,
       );
     } catch (error) {
       if (!committed && isMutationNotExecutedError(error)) {
@@ -861,6 +943,7 @@ export class TableMutationService {
     table: string,
     columns: ColumnTypeMeta[],
     criteriaList: Record<string, unknown>[],
+    sqliteAttachmentTarget?: SQLiteAttachmentTarget,
   ): Promise<void> {
     const existenceChecks = await pMapWithLimit(
       criteriaList,
@@ -873,6 +956,7 @@ export class TableMutationService {
           table,
           columns,
           criteria,
+          sqliteAttachmentTarget,
         ),
     );
     if (existenceChecks.some((exists) => exists)) {
@@ -888,6 +972,7 @@ export class TableMutationService {
     table: string,
     columns: ColumnTypeMeta[],
     criteria: Record<string, unknown>,
+    sqliteAttachmentTarget?: SQLiteAttachmentTarget,
   ): Promise<boolean> {
     const criteriaEntries = Object.entries(criteria);
     if (criteriaEntries.length === 0) {
@@ -902,18 +987,21 @@ export class TableMutationService {
       columns.map((column) => [column.name, column]),
     );
     const parameters: unknown[] = [];
-    const whereParts = criteriaEntries.map(([columnName, value]) => {
-      parameters.push(value);
-      const column = columnMetaByName.get(columnName);
-      const placeholder = column
-        ? driver.buildInsertValueExpr(column, parameters.length)
-        : "?";
-      return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
-    });
+    const whereParts = criteriaEntries.map(([columnName, value]) =>
+      appendPrimaryKeyComparison(
+        driver,
+        columnMetaByName.get(columnName) ?? columnName,
+        value,
+        parameters,
+      ),
+    );
     const result = await driver.query(
       `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
       parameters,
-      { database },
+      {
+        database,
+        ...(sqliteAttachmentTarget ? { sqliteAttachmentTarget } : {}),
+      },
     );
     if (result.error) throw new Error(result.error);
     return result.rows.length > 0;
@@ -952,21 +1040,34 @@ export class TableMutationService {
     qualifiedTableName: string,
     columnMetaByName: Map<string, ColumnTypeMeta>,
     rows: Record<string, unknown>[],
+    appendObservation?: (rowIndex: number, parameters: unknown[]) => string[],
+    oracleLobLock?: boolean,
   ): TransactionOperation[] {
-    return rows.map((row) => {
+    return rows.map((row, rowIndex) => {
       const parameters: unknown[] = [];
-      const whereParts = Object.keys(row).map((columnName) => {
-        parameters.push(row[columnName]);
-        const column = columnMetaByName.get(columnName);
-        const placeholder = column
-          ? driver.buildInsertValueExpr(column, parameters.length)
-          : "?";
-        return `${driver.quoteIdentifier(columnName)} = ${placeholder}`;
-      });
+      const whereParts = Object.entries(row).map(([columnName, value]) =>
+        appendPrimaryKeyComparison(
+          driver,
+          columnMetaByName.get(columnName) ?? columnName,
+          value,
+          parameters,
+        ),
+      );
+      const oracleDeleteRowLock = oracleLobLock
+        ? {
+            sql: `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")} FOR UPDATE`,
+            params: [...parameters],
+          }
+        : undefined;
+      if (appendObservation) {
+        whereParts.push(...appendObservation(rowIndex, parameters));
+      }
       return {
         sql: `DELETE FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
         params: parameters,
         expectedAffectedRows: 1,
+        ...(appendObservation ? { guardedDelete: true } : {}),
+        ...(oracleDeleteRowLock ? { oracleDeleteRowLock } : {}),
       };
     });
   }

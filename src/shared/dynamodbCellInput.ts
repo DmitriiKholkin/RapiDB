@@ -4,9 +4,17 @@ export const DYNAMODB_NATIVE_CELL_VALUE_PREFIX =
   "DynamoDB native value (nested sets/binary): ";
 
 export type DynamoDbSetSubtype = "string" | "number" | "binary";
-const NUMBER_RE = /^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+const NUMBER_RE = /^([+-]?)(?:(\d+)(?:\.(\d+))?|\.(\d+))(?:[eE]([+-]?\d+))?$/;
+const NUMBER_SET_INPUT_ERROR =
+  "Enter a valid DynamoDB number set containing at least one number.";
+const MAX_NUMBER_PRECISION = 38;
+const MIN_NUMBER_ORDER = -130;
+const MAX_NUMBER_ORDER = 125;
+const MAX_NUMBER_DIGITS = "9".repeat(MAX_NUMBER_PRECISION);
 const BASE64_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+class DynamoDbSetInputError extends Error {}
 
 export function hasDuplicateDynamoDbNumbers(
   entries: readonly string[],
@@ -19,39 +27,101 @@ export function hasDuplicateDynamoDbNumbers(
 }
 
 export function parseDynamoDbNumberSetJson(text: string): string[] {
-  const values: unknown = JSON.parse(text);
+  // Quote bare JSON numbers before parsing so even large values stay exact.
+  const quoted = text.replace(
+    /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
+    (token) => (token.startsWith('"') ? token : `"${token}"`),
+  );
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(quoted);
+  } catch {
+    throw new DynamoDbSetInputError(NUMBER_SET_INPUT_ERROR);
+  }
+  return parseDynamoDbNumberSetEntries(parsed);
+}
+
+export function parseDynamoDbNumberSetInput(text: string): string[] {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<<"))
+    return parseDynamoDbSetLiteral(trimmed, "number");
+  if (trimmed.startsWith("[")) return parseDynamoDbNumberSetJson(trimmed);
+
+  // Preserve the existing plain comma-separated form.
+  const entries = trimmed
+    .replace(/>>$/, "")
+    .replace(/\]$/, "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (entries.some((entry) => entry.startsWith("+")))
+    throw new DynamoDbSetInputError(NUMBER_SET_INPUT_ERROR);
+  return parseDynamoDbNumberSetEntries(entries);
+}
+
+export function parseDynamoDbNumberSetEntries(values: unknown): string[] {
   if (
     !Array.isArray(values) ||
-    !values.length ||
-    !values.every(
-      (value) => typeof value === "number" || typeof value === "string",
-    )
+    values.length === 0 ||
+    !values.every((entry): entry is string => typeof entry === "string")
   )
-    throw new Error(
-      "Enter a valid DynamoDB number set containing at least one number.",
+    throw new DynamoDbSetInputError(NUMBER_SET_INPUT_ERROR);
+
+  const comparisonTokens = values.map((entry) => {
+    const match = NUMBER_RE.exec(entry);
+    if (!match) throw new DynamoDbSetInputError(NUMBER_SET_INPUT_ERROR);
+    const [, sign, integer = "", fraction, leadingDotFraction, rawExponent] =
+      match;
+    const digits = integer + (fraction ?? leadingDotFraction ?? "");
+    const firstNonzero = digits.search(/[1-9]/);
+    if (firstNonzero === -1) return "0";
+
+    // The bound allows the coefficient's decimal position to cancel even a
+    // large exponent. Only convert the small, exact integer needed for this.
+    const decimalOffset = integer.length - firstNonzero - 1;
+    const exponentDigits = rawExponent?.replace(/^[+-]?0*/, "") ?? "";
+    const exponentMagnitude =
+      exponentDigits.length >
+      String(Math.abs(decimalOffset) - MIN_NUMBER_ORDER).length
+        ? Infinity
+        : Number(exponentDigits);
+    const order =
+      decimalOffset +
+      (rawExponent?.startsWith("-") ? -exponentMagnitude : exponentMagnitude);
+    if (order < MIN_NUMBER_ORDER)
+      throw new DynamoDbSetInputError(
+        "DynamoDB number set value underflows the minimum nonzero magnitude (1e-130).",
+      );
+
+    let lastNonzero = digits.length - 1;
+    while (digits[lastNonzero] === "0") lastNonzero--;
+    const precision = lastNonzero - firstNonzero + 1;
+    if (
+      order > MAX_NUMBER_ORDER ||
+      (order === MAX_NUMBER_ORDER &&
+        precision > MAX_NUMBER_PRECISION &&
+        digits.startsWith(MAX_NUMBER_DIGITS, firstNonzero))
+    )
+      throw new DynamoDbSetInputError(
+        "DynamoDB number set value overflows the maximum magnitude.",
+      );
+    if (precision > MAX_NUMBER_PRECISION)
+      throw new DynamoDbSetInputError(
+        "DynamoDB number set values may have at most 38 significant digits.",
+      );
+
+    // Compare bounded, exact tokens; keep the original spelling for writes.
+    return `${sign}${digits.slice(firstNonzero, lastNonzero + 1)}e${order - precision + 1}`;
+  });
+  if (hasDuplicateDynamoDbNumbers(comparisonTokens))
+    throw new DynamoDbSetInputError(
+      "DynamoDB number set values must be unique.",
     );
-  const tokens =
-    text.match(
-      /"(?:\\.|[^"\\])*"|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/g,
-    ) ?? [];
-  const entries = tokens.map((token) =>
-    token.startsWith('"') ? (JSON.parse(token) as string) : token,
-  );
-  if (!entries.every((entry) => NUMBER_RE.test(entry)))
-    throw new Error(
-      "Enter a valid DynamoDB number set containing at least one number.",
-    );
-  if (hasDuplicateDynamoDbNumbers(entries))
-    throw new Error("DynamoDB number set values must be unique.");
-  return entries;
+  return values;
 }
 
 function isCanonicalBase64(value: string): boolean {
-  if (
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-      value,
-    )
-  )
+  if (value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value))
     return false;
   if (value.endsWith("=="))
     return (BASE64_ALPHABET.indexOf(value.at(-3) ?? "") & 15) === 0;
@@ -60,16 +130,71 @@ function isCanonicalBase64(value: string): boolean {
   return true;
 }
 
-function isBinaryInput(value: string): boolean {
-  if (/^(?:0x|\\x)/i.test(value)) {
-    const hex = value.slice(2);
-    return hex.length % 2 === 0 && /^[a-f\d]*$/i.test(hex);
+export function parseDynamoDbBinarySetEntries(
+  values: unknown,
+  format: "cell" | "envelope",
+): string[] {
+  const fail = (): never => {
+    throw new DynamoDbSetInputError(
+      format === "envelope"
+        ? "Enter a non-empty DynamoDB binary set of canonical base64 strings in the AttributeValue envelope."
+        : "Enter a non-empty DynamoDB binary set of hex or canonical base64 strings.",
+    );
+  };
+  if (!Array.isArray(values) || values.length === 0) return fail();
+  const base64Values = values.map((value: unknown) => {
+    if (typeof value !== "string") return fail();
+    const entry = format === "cell" ? value.trim() : value;
+    if (format === "cell" && /^(?:0x|\\x)/i.test(entry)) {
+      const hex = entry.slice(2);
+      if (hex.length % 2 !== 0 || !/^[a-f\d]*$/i.test(hex)) return fail();
+      return btoa(
+        hex.replace(/../g, (byte) =>
+          String.fromCharCode(Number.parseInt(byte, 16)),
+        ),
+      );
+    }
+    // An explicit empty string is empty binary; whitespace alone is not.
+    if ((!entry && value) || !isCanonicalBase64(entry)) return fail();
+    return entry;
+  });
+  if (new Set(base64Values).size !== base64Values.length) {
+    throw new DynamoDbSetInputError(
+      "DynamoDB binary set values must be unique.",
+    );
   }
+  return base64Values;
+}
+
+export function parseDynamoDbBinarySetInput(text: string): string[] {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<<"))
+    return parseDynamoDbSetLiteral(trimmed, "binary");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {}
+  return parseDynamoDbBinarySetEntries(parsed, "cell");
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
   return (
+    Array.isArray(value) &&
     value.length > 0 &&
-    value.length % 4 === 0 &&
-    /^[A-Za-z0-9+/]+={0,2}$/.test(value)
+    value.every((entry) => typeof entry === "string")
   );
+}
+
+export function parseDynamoDbStringSetInput(text: string): string[] | null {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<<"))
+    return parseDynamoDbSetLiteral(trimmed, "string");
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    return isNonEmptyStringArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export function parseDynamoDbSetLiteral(
@@ -121,16 +246,16 @@ export function parseDynamoDbSetLiteral(
       entry = body.slice(start, pos).trim();
       if (!entry || subtype === "string") return fail();
     }
-    if (subtype === "number" && !NUMBER_RE.test(entry)) return fail();
-    if (subtype === "binary" && !isBinaryInput(entry.trim())) return fail();
     entries.push(entry);
     while (/\s/.test(body[pos] ?? "") && pos < body.length) pos++;
     if (pos === body.length) break;
     if (body[pos++] !== "," || body.slice(pos).trim() === "") return fail();
   }
-  if (subtype === "number" && hasDuplicateDynamoDbNumbers(entries))
-    throw new Error("DynamoDB number set values must be unique.");
-  return entries.length > 0 ? entries : fail();
+  if (entries.length === 0) return fail();
+  if (subtype === "number") return parseDynamoDbNumberSetEntries(entries);
+  if (subtype === "binary")
+    return parseDynamoDbBinarySetEntries(entries, "cell");
+  return entries;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -153,25 +278,13 @@ function isAttributeValue(value: unknown): boolean {
     case "NULL":
       return content === true;
     case "SS":
-      return (
-        Array.isArray(content) &&
-        content.length > 0 &&
-        content.every((v) => typeof v === "string")
-      );
+      return isNonEmptyStringArray(content);
     case "NS":
-      return (
-        Array.isArray(content) &&
-        content.length > 0 &&
-        content.every((v) => typeof v === "string" && NUMBER_RE.test(v)) &&
-        !hasDuplicateDynamoDbNumbers(content)
-      );
+      parseDynamoDbNumberSetEntries(content);
+      return true;
     case "BS":
-      return (
-        Array.isArray(content) &&
-        content.length > 0 &&
-        new Set(content).size === content.length &&
-        content.every((v) => typeof v === "string" && isCanonicalBase64(v))
-      );
+      parseDynamoDbBinarySetEntries(content, "envelope");
+      return true;
     case "L":
       return Array.isArray(content) && content.every(isAttributeValue);
     case "M":
@@ -205,30 +318,30 @@ export function getDynamoDbNativeCellValidationError(
         trimmed.slice(DYNAMODB_NATIVE_CELL_VALUE_PREFIX.length),
       );
       if (
-        isAttributeValue(value) &&
         isRecord(value) &&
-        Object.hasOwn(value, expectedTag)
+        Object.hasOwn(value, expectedTag) &&
+        isAttributeValue(value)
       )
         return null;
-    } catch {}
+    } catch (error) {
+      if (error instanceof DynamoDbSetInputError) return error.message;
+    }
     return `Enter a valid DynamoDB ${nativeType} AttributeValue envelope.`;
   }
-  if (nativeType.endsWith(" set") && trimmed.startsWith("<<")) {
+  if (nativeType === "string set") {
     try {
-      parseDynamoDbSetLiteral(
-        trimmed,
-        nativeType.split(" ")[0] as DynamoDbSetSubtype,
-      );
-      return null;
+      return parseDynamoDbStringSetInput(trimmed) === null
+        ? "Enter a DynamoDB string set as a <<'...'>> literal or a non-empty JSON array of strings."
+        : null;
     } catch (error) {
       return error instanceof Error
         ? error.message
         : "Enter a valid DynamoDB set literal.";
     }
   }
-  if (nativeType === "number set" && trimmed.startsWith("[")) {
+  if (nativeType === "number set") {
     try {
-      parseDynamoDbNumberSetJson(trimmed);
+      parseDynamoDbNumberSetInput(trimmed);
       return null;
     } catch (error) {
       return error instanceof Error
@@ -238,17 +351,13 @@ export function getDynamoDbNativeCellValidationError(
   }
   if (nativeType === "binary set") {
     try {
-      const values: unknown = JSON.parse(trimmed);
-      if (
-        Array.isArray(values) &&
-        values.length > 0 &&
-        values.every(
-          (value) => typeof value === "string" && isBinaryInput(value.trim()),
-        )
-      )
-        return null;
-    } catch {}
-    return "Enter a non-empty DynamoDB binary set of hex or base64 strings.";
+      parseDynamoDbBinarySetInput(trimmed);
+      return null;
+    } catch (error) {
+      return error instanceof Error
+        ? error.message
+        : "Enter a valid binary set.";
+    }
   }
   if (nativeType === "list") {
     try {

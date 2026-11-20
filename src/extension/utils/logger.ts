@@ -68,9 +68,9 @@ export const logger = {
     emit("warn", undefined, message);
   },
 
-  error(context: string, error: unknown): Error {
-    const normalized = normalizeUnknownError(error);
-    const safeContext = redactDiagnosticText(context, error);
+  error(context: string, error: unknown, secretContext?: unknown): Error {
+    const normalized = normalizeUnknownError(error, secretContext);
+    const safeContext = redactDiagnosticText(context, [secretContext, error]);
     if (activeSink === consoleSink) {
       console.error(`${PREFIX} ${safeContext}:`, normalized);
     } else {

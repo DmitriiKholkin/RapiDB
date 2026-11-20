@@ -74,6 +74,13 @@ function lastFetch() {
   return fetchPages().at(-1);
 }
 
+function clearMessagesAfterFetch() {
+  const fetchId = lastFetch()?.payload.fetchId;
+  expect(typeof fetchId).toBe("number");
+  clearPostedMessages();
+  return { fetchId };
+}
+
 async function replyToFetch(
   rows: Record<string, unknown>[],
   totalCount: number,
@@ -409,19 +416,16 @@ describe("page clamping after the row count shrinks", () => {
     await replyToFetch([{ id: 2, qty: 1 }], pageSize * 3);
     fireEvent.click(screen.getByRole("button", { name: "Next →" }));
     await waitFor(() => expect(lastFetch()?.payload.page).toBe(3));
-    clearPostedMessages();
 
-    await replyToFetch([], pageSize + 1);
+    await replyToFetch([], pageSize + 1, clearMessagesAfterFetch());
     await waitFor(() => expect(lastFetch()?.payload.page).toBe(2));
     expect(fetchPages()).toHaveLength(1);
 
-    clearPostedMessages();
-    await replyToFetch([], 0);
+    await replyToFetch([], 0, clearMessagesAfterFetch());
     await waitFor(() => expect(lastFetch()?.payload.page).toBe(1));
     expect(fetchPages()).toHaveLength(1);
 
-    clearPostedMessages();
-    await replyToFetch([], 0);
+    await replyToFetch([], 0, clearMessagesAfterFetch());
     await act(async () => {});
     expect(fetchPages()).toHaveLength(0);
     expect(screen.getByText("Page 1 of 1")).toBeTruthy();
@@ -432,9 +436,8 @@ describe("page clamping after the row count shrinks", () => {
     await initTable([{ id: 1, qty: 1 }], pageSize * 3);
     fireEvent.click(screen.getByRole("button", { name: "Next →" }));
     await waitFor(() => expect(lastFetch()?.payload.page).toBe(2));
-    clearPostedMessages();
 
-    await replyToFetch([{ id: 2, qty: 1 }], 1);
+    await replyToFetch([{ id: 2, qty: 1 }], 1, clearMessagesAfterFetch());
     await act(async () => {});
     expect(fetchPages()).toHaveLength(0);
     expect(bodyCell("id").textContent).toBe("2");
@@ -454,9 +457,8 @@ describe("page clamping after the row count shrinks", () => {
 
     await refreshConnection();
     await waitFor(() => expect(lastFetch()?.payload.page).toBe(2));
-    clearPostedMessages();
 
-    await replyToFetch([], 1);
+    await replyToFetch([], 1, clearMessagesAfterFetch());
     await act(async () => {});
     expect(fetchPages()).toHaveLength(0);
   });

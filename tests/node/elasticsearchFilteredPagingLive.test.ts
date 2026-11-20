@@ -93,5 +93,65 @@ describe.skipIf(!endpoint)(
         }),
       ).rejects.toThrow("10000-row safety limit");
     }, 30000);
+
+    it("keeps arbitrary viewer pages in one snapshot across document changes", async () => {
+      const { driver, index } = await fixture(9, 3);
+      const scope = new AbortController();
+      const request = {
+        database: "default",
+        schema: "indices",
+        table: index,
+        page: 1,
+        pageSize: 3,
+        skipCount: false,
+        filters: [],
+        sort: null,
+      };
+      const read = (page: number) =>
+        driver.readTablePage({
+          ...request,
+          page,
+          browsingSnapshot: scope.signal,
+        });
+      try {
+        const first = await read(1);
+        const removed = String(first.rows[0]._id);
+        await client.delete({ index, id: removed, refresh: true });
+        await client.index({
+          index,
+          id: "new-doc",
+          document: { ordinal: 100 },
+          refresh: true,
+        });
+        const third = await read(3);
+        const second = await read(2);
+        const ids = [...first.rows, ...second.rows, ...third.rows].map(
+          (row) => row._id,
+        );
+        expect(new Set(ids)).toEqual(
+          new Set(Array.from({ length: 9 }, (_, i) => `doc-${i}`)),
+        );
+        expect((await read(1)).rows).toEqual(first.rows);
+        expect((await read(4)).rows).toEqual([]);
+        expect(second.totalCount).toBe(9);
+        expect(second.rows[0]._identity).toEqual(expect.any(String));
+        scope.abort();
+
+        const refreshed = new AbortController();
+        try {
+          const fresh = await driver.readTablePage({
+            ...request,
+            pageSize: 9,
+            browsingSnapshot: refreshed.signal,
+          });
+          expect(fresh.rows.map((row) => row._id)).toContain("new-doc");
+          expect(fresh.rows.map((row) => row._id)).not.toContain(removed);
+        } finally {
+          refreshed.abort();
+        }
+      } finally {
+        scope.abort();
+      }
+    }, 30000);
   },
 );

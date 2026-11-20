@@ -1,6 +1,11 @@
 export const AMBIGUOUS_URI_CREDENTIALS_MESSAGE =
   "Ambiguous URI credentials. Use a single URI scheme and percent-encode reserved characters and whitespace in URI usernames and passwords.";
 
+/** Matches decoded AWS/GCS signing parameter names as a group. */
+export function isSignedUrlParameterName(name: string): boolean {
+  return /^x-(?:amz|goog)-/i.test(name);
+}
+
 export function splitUriAuthorityPrefix(value: string): {
   prefix: string;
   remainder: string;

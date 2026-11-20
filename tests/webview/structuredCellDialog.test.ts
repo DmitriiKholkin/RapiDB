@@ -36,6 +36,7 @@ describe("DynamoDB native structured drafts", () => {
   it.each([
     '["0x01", "Ag=="]',
     '["0x"]',
+    '[""]',
     '[" 0xAB "]',
     '["AAAA"]',
   ])("accepts Binary Set JSON %s", (text) => {
@@ -45,6 +46,20 @@ describe("DynamoDB native structured drafts", () => {
         nativeType: "binary set",
       }),
     ).toBeNull();
+  });
+  it.each([
+    ["string set", '["tag", false]', /JSON array of strings/],
+    ["binary set", '["AR=="]', /canonical base64/],
+    ["binary set", "<<0x01, AQ==>>", /unique/],
+    ["number set", "[1e10000]", /overflow/],
+    ["number set", "<<1e-131>>", /underflow/],
+  ])("rejects invalid %s drafts: %s", (nativeType, text, message) => {
+    expect(
+      getStructuredCellDraftValidationError(text, {
+        category: "array",
+        nativeType,
+      }),
+    ).toMatch(message);
   });
   it.each([
     "{}",
@@ -71,6 +86,7 @@ describe("DynamoDB native structured drafts", () => {
   });
   it.each([
     ["string set", "array", "<<'a', 'O''Brien', 'a,b'>>"],
+    ["string set", "array", '["  spaced  ", "", "42"]'],
     ["number set", "array", "<<1.25, 9007199254740993, 7.50>>"],
     ["binary set", "array", "<<0x01, 0x02>>"],
     [

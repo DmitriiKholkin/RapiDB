@@ -167,6 +167,28 @@ describe("formatQueryResult", () => {
     expect(formatted.rows).toEqual([{ __col_0: "Infinity" }]);
   });
 
+  it.each([
+    "bigint[]",
+    "_int8",
+    "pg_catalog._numeric",
+    "pg_catalog.numeric(30, 10)[][]",
+  ])("preserves exact numeric array tokens for %s", (nativeType) => {
+    const formatted = formatQueryResult(
+      {
+        columns: ["n"],
+        columnMeta: [{ category: "array", nativeType }],
+        rows: [{ __col_0: [["9223372036854775807", null]] }],
+        rowCount: 1,
+        executionTimeMs: 1,
+      },
+      100,
+    );
+
+    expect(formatted.rows).toEqual([
+      { __col_0: "[[9223372036854775807,null]]" },
+    ]);
+  });
+
   it("formats PostgreSQL circle and interval-like objects without legacy JSON output", () => {
     const formatted = formatQueryResult(
       {

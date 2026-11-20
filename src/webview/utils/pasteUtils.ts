@@ -3,6 +3,9 @@ import type { ColumnTypeMeta } from "../../shared/tableTypes";
 import { NULL_SENTINEL } from "../../shared/tableTypes";
 
 const TSV_NULL_MARKER = "NULL";
+// Some system clipboards terminate plain text at a NUL byte. Frame this exact
+// literal without NULs; a quoted field always preserves the spelling as text.
+const TSV_LEGACY_NULL_LITERAL = "\\x00__NULL__\\x00";
 const DATE_KEYWORD_RE =
   /^(?:[+-]?infinity|epoch|now|today|tomorrow|yesterday)$/i;
 const QUOTED_VALUE_RE = /^(["']).*\1$/s;
@@ -101,6 +104,13 @@ export interface PasteValidationError {
   message: string;
 }
 
+export type PasteError =
+  | PasteValidationError
+  | { kind: "blocked"; message: string };
+
+export const PASTE_LOADING_MESSAGE =
+  "Wait for the table to finish loading, then paste again.";
+
 export interface PasteValidationResult {
   errors: PasteValidationError[];
   rows: Array<
@@ -116,7 +126,13 @@ function serializeTsvCell(value: string | null): string {
   if (value === null) {
     return TSV_NULL_MARKER;
   }
-  return value === "" || value === TSV_NULL_MARKER || /["\t\r\n]/.test(value)
+  if (value === NULL_SENTINEL) {
+    return TSV_LEGACY_NULL_LITERAL;
+  }
+  return value === "" ||
+    value === TSV_NULL_MARKER ||
+    value === TSV_LEGACY_NULL_LITERAL ||
+    /["\t\r\n]/.test(value)
     ? `"${value.replace(/"/g, '""')}"`
     : value;
 }
@@ -163,7 +179,9 @@ export function parseTsv(text: string): PasteData {
   let endedWithRowDelimiter = false;
 
   const finishField = () => {
-    row.push(field);
+    row.push(
+      !fieldQuoted && field === TSV_LEGACY_NULL_LITERAL ? NULL_SENTINEL : field,
+    );
     rowQuoted.push(fieldQuoted);
     field = "";
     fieldQuoted = false;
@@ -237,7 +255,7 @@ export function validatePasteValue(
   quoted = false,
   options: PasteValidationOptions = {},
 ): { valid: boolean; coercedValue: unknown; error?: string } {
-  if (value === NULL_SENTINEL || (!quoted && value === TSV_NULL_MARKER)) {
+  if (!quoted && value === TSV_NULL_MARKER) {
     if (column.nullable) {
       return { valid: true, coercedValue: null };
     }
@@ -247,6 +265,10 @@ export function validatePasteValue(
       error: `Column "${column.name}" does not allow NULL values`,
     };
   }
+
+  // Redis stores strings verbatim and interprets collection input using the
+  // key's actual type. Its inferred comparison category must not coerce either.
+  if (column.redisValue) return { valid: true, coercedValue: value };
 
   switch (column.category) {
     case "integer":
@@ -450,14 +472,12 @@ export function validatePasteData(
 export function formatNormalizedPasteValue(
   originalValue: string,
   normalized: unknown,
-): string {
+): string | null {
   if (
     normalized === null &&
-    (originalValue === NULL_SENTINEL ||
-      originalValue === TSV_NULL_MARKER ||
-      originalValue === "")
+    (originalValue === TSV_NULL_MARKER || originalValue === "")
   ) {
-    return NULL_SENTINEL;
+    return null;
   }
   if (normalized === null || normalized === undefined) {
     return originalValue;

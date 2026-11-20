@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DeleteExecutionError } from "../../src/extension/dbDrivers/deleteOutcomes";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { IDBDriver } from "../../src/extension/dbDrivers/types";
+import { DriverUpdateRowsError } from "../../src/extension/dbDrivers/updateRowOutcomes";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import {
   type PreparedDeletePlan,
@@ -83,17 +85,38 @@ afterEach(() => {
 
 async function setup(
   driver: IDBDriver,
-  config: { id: string; name: string; type: string },
+  config: { id: string; name: string; type: string; password?: string },
+  skipPreview = false,
 ) {
+  let connected = true;
+  let generation = 0;
+  let removed = false;
   const disconnectListeners = new Set<(id: string) => void>();
+  const invalidateListeners = new Set<(id: string) => void>();
+  const sessionListeners = new Set<(id: string) => void>();
+  const connectListeners = new Set<() => void>();
   const refreshListeners = new Set<(id?: string) => void>();
   const manager = {
     getDriver: () => driver,
-    getConnection: () => config,
+    getConnection: () => (removed ? undefined : config),
+    getConnectionDiagnosticContext: () => config,
+    getConnectionSessionGeneration: () => generation,
     getDefaultPageSize: () => 25,
-    getSkipTableMutationPreview: () => false,
+    getSkipTableMutationPreview: () => skipPreview,
     getQueryEditorPresentation: () => undefined,
-    isConnected: () => true,
+    isConnected: () => connected,
+    onDidInvalidateConnectionMetadata: (listener: (id: string) => void) => {
+      invalidateListeners.add(listener);
+      return { dispose: () => invalidateListeners.delete(listener) };
+    },
+    onDidChangeConnectionSession: (listener: (id: string) => void) => {
+      sessionListeners.add(listener);
+      return { dispose: () => sessionListeners.delete(listener) };
+    },
+    onDidConnect: (listener: () => void) => {
+      connectListeners.add(listener);
+      return { dispose: () => connectListeners.delete(listener) };
+    },
     onDidDisconnect: (listener: (id: string) => void) => {
       disconnectListeners.add(listener);
       return { dispose: () => disconnectListeners.delete(listener) };
@@ -123,7 +146,19 @@ async function setup(
     panel,
     onDispose,
     disconnect: () => {
+      connected = false;
+      for (const listener of invalidateListeners) listener(config.id);
       for (const listener of disconnectListeners) listener(config.id);
+    },
+    reconnect: () => {
+      connected = true;
+      for (const listener of invalidateListeners) listener(config.id);
+      for (const listener of connectListeners) listener();
+    },
+    changeTarget: (remove: boolean) => {
+      removed = remove;
+      generation++;
+      for (const listener of sessionListeners) listener(config.id);
     },
     refreshSchemas: () => {
       for (const listener of refreshListeners) listener(config.id);
@@ -131,13 +166,17 @@ async function setup(
   };
 }
 
-async function setupPostgres(columns = pgColumns) {
-  const config = { id: "pg-audit", name: "PG", type: "pg" };
+async function setupPostgres(
+  columns = pgColumns,
+  password?: string,
+  skipPreview = false,
+) {
+  const config = { id: "pg-audit", name: "PG", type: "pg", password };
   const driver = new PostgresDriver(config as never);
   const describeColumns = vi
     .spyOn(driver, "describeColumns")
     .mockResolvedValue(columns);
-  return { ...(await setup(driver, config)), describeColumns };
+  return { ...(await setup(driver, config, skipPreview)), describeColumns };
 }
 
 function deletePlan(): PreparedDeletePlan {
@@ -153,6 +192,219 @@ function deletePlan(): PreparedDeletePlan {
     verificationCriteriaList: [{ id: 1 }],
   };
 }
+
+it.each([
+  "conflict",
+  "other no-write error",
+  "partial",
+  "unknown",
+] as const)("only signals confirmed no-write conflicts in an Apply reply (%s)", async (kind) => {
+  const config = { id: "mongo-m6", name: "MongoDB", type: "mongodb" };
+  const driver = new MongoDBDriver(config as never);
+  Object.assign(driver, { connected: true, supportsAtomicUpdateRows: true });
+  const columns = [
+    column("_id", {
+      nativeType: "string",
+      isPrimaryKey: true,
+      nullable: false,
+    }),
+    column("name", { nativeType: "string" }),
+  ];
+  vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
+  const update = vi.spyOn(driver, "updateRows");
+  const evidence = {
+    affectedRows: kind === "partial" ? 1 : 0,
+    updateRowOutcomes: [
+      {
+        rowIndex: 0,
+        status: "not_applied" as const,
+        ...(kind !== "other no-write error" && { conflict: true as const }),
+      },
+      ...(kind === "partial"
+        ? [{ rowIndex: 1, status: "applied" as const }]
+        : []),
+      ...(kind === "unknown"
+        ? [{ rowIndex: 1, status: "unknown" as const }]
+        : []),
+    ],
+  };
+  if (kind === "other no-write error") {
+    update.mockRejectedValue(
+      new DriverUpdateRowsError("Refresh the table and retry.", evidence),
+    );
+  } else {
+    update.mockResolvedValue(evidence);
+  }
+  const { panel } = await setup(driver, config, true);
+  const operationId = "m6-apply";
+  await panel.dispatchMessage({
+    type: "applyChanges",
+    payload: {
+      operationId,
+      updates: [
+        mongoEdit("skip", {}),
+        mongoEdit("one", { name: "draft" }),
+        ...(kind === "partial" || kind === "unknown"
+          ? [mongoEdit("two", { name: "draft" })]
+          : []),
+      ],
+    },
+  });
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)?.type).toBe("applyResult"),
+  );
+  expect(
+    update,
+    JSON.stringify(panel.hostMessages().at(-1)?.payload),
+  ).toHaveBeenCalledOnce();
+  const result = panel.hostMessages().at(-1);
+  expect(result).toMatchObject({
+    type: "applyResult",
+    payload: {
+      operationId,
+      success: false,
+      changesPossible: kind === "partial" || kind === "unknown",
+      outcomeUnknown: kind === "unknown",
+    },
+  });
+  if (kind === "conflict")
+    expect(result?.payload).toHaveProperty("conflictRows", [1]);
+  else expect(result?.payload).not.toHaveProperty("conflictRows");
+});
+
+function mongoEdit(id: string, changes: Record<string, unknown>) {
+  return {
+    primaryKeys: { _id: { $rapidbMongoId: { type: "string", value: id } } },
+    changes,
+    originalValues: { name: "old" },
+  };
+}
+
+it("starts a fresh conflict page read without changing the host's pinned target", async () => {
+  const config = { id: "mongo-m6-read", name: "MongoDB", type: "mongodb" };
+  const driver = new MongoDBDriver(config as never);
+  const columns = [column("_id", { isPrimaryKey: true }), column("name")];
+  vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
+  const pageRead = vi.spyOn(driver, "readTablePage");
+  let release = () => {};
+  pageRead
+    .mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { columns, rows: [{ _id: "one", name: "old" }], totalCount: 1 };
+    })
+    .mockResolvedValue({
+      columns,
+      rows: [{ _id: "one", name: "current" }],
+      totalCount: 1,
+    });
+  const { panel } = await setup(driver, config);
+  const oldRead = panel.dispatchMessage({
+    type: "fetchPage",
+    payload: { fetchId: 1, page: 2, pageSize: 25 },
+  });
+  try {
+    await vi.waitFor(() => expect(pageRead).toHaveBeenCalledOnce());
+    await panel.dispatchMessage({
+      type: "fetchPage",
+      payload: {
+        fetchId: 2,
+        page: 2,
+        pageSize: 25,
+        conflictRefresh: true,
+        table: "not-the-pinned-table",
+      },
+    });
+    await vi.waitFor(() => expect(pageRead).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)?.type).toBe("tableData"),
+    );
+    expect(pageRead).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        database: "db",
+        schema: "public",
+        table: "items",
+        page: 2,
+        pageSize: 25,
+      }),
+    );
+    expect(panel.hostMessages().at(-1)).toMatchObject({
+      type: "tableData",
+      payload: { fetchId: 2, rows: [{ name: "current" }] },
+    });
+  } finally {
+    release();
+    await oldRead;
+  }
+});
+
+it("redacts a confirmed delete's diagnostics without changing reconciliation evidence", async () => {
+  const password = "synthetic-delete-password-11";
+  const s = await setupPostgres(pgColumns, password);
+  const primaryKeys = { id: password };
+  const plan = {
+    ...deletePlan(),
+    rowIdentities: [primaryKeys],
+    verificationCriteriaList: [primaryKeys],
+  };
+  const evidence = {
+    success: false,
+    error: `Delete failed: ${password}`,
+    affectedRows: 0,
+    rowOutcomes: [
+      {
+        rowIndex: 0,
+        primaryKeys,
+        success: false,
+        status: "unknown" as const,
+        message: `Remote rejected ${password}`,
+      },
+    ],
+    changesPossible: true,
+    outcomeUnknown: true,
+  };
+  vi.spyOn(
+    TableDataService.prototype,
+    "prepareDeleteRowsPlan",
+  ).mockResolvedValue(plan);
+  vi.spyOn(
+    TableDataService.prototype,
+    "executePreparedDeletePlan",
+  ).mockRejectedValue(new DeleteExecutionError(evidence));
+
+  const operationId = "del-redaction";
+  await s.panel.dispatchMessage({
+    type: "deleteRows",
+    payload: { operationId, primaryKeysList: [primaryKeys] },
+  });
+  await vi.waitFor(() =>
+    expect(s.panel.hostMessages().at(-1)?.type).toBe("tableMutationPreview"),
+  );
+  const { previewToken } = s.panel.hostMessages().at(-1)?.payload as {
+    previewToken: string;
+  };
+  await s.panel.dispatchMessage({
+    type: "confirmMutationPreview",
+    payload: { operationId, previewToken },
+  });
+
+  await vi.waitFor(() =>
+    expect(s.panel.hostMessages().at(-1)?.type).toBe("deleteResult"),
+  );
+  expect(s.panel.hostMessages().at(-1)).toEqual({
+    type: "deleteResult",
+    payload: {
+      ...evidence,
+      operationId,
+      error: "Delete failed: [REDACTED]",
+      rowOutcomes: [
+        { ...evidence.rowOutcomes[0], message: "Remote rejected [REDACTED]" },
+      ],
+    },
+  });
+  expect(evidence.error).toContain(password);
+});
 
 describe("PNL-2 unsaved table edits survive disconnect", () => {
   it("closes a clean table panel on disconnect", async () => {
@@ -180,6 +432,191 @@ describe("PNL-2 unsaved table edits survive disconnect", () => {
     });
     s.disconnect();
     expect(s.onDispose).toHaveBeenCalledOnce();
+  });
+});
+
+describe("M4 clean table delete recovery", () => {
+  const operationId = "delete-without-edits";
+  const request = {
+    type: "deleteRows",
+    payload: { operationId, primaryKeysList: [{ id: 1 }] },
+  };
+  const resolveRecovery = {
+    type: "deleteRecoveryResolved",
+    payload: { operationId },
+  };
+  const knownFailure = {
+    success: false,
+    affectedRows: 0,
+    rowOutcomes: [],
+    changesPossible: false,
+    outcomeUnknown: false,
+  };
+  const unknownFailure = {
+    ...knownFailure,
+    changesPossible: true,
+    outcomeUnknown: true,
+    error: "Transport closed before acknowledgement",
+  };
+
+  function prepare() {
+    vi.spyOn(
+      TableDataService.prototype,
+      "prepareDeleteRowsPlan",
+    ).mockResolvedValue(deletePlan());
+  }
+
+  async function requestPreview(s: Awaited<ReturnType<typeof setupPostgres>>) {
+    await s.panel.dispatchMessage(request);
+    return vi.waitFor(() => {
+      const preview = s.panel.hostMessages().at(-1);
+      expect(preview?.type).toBe("tableMutationPreview");
+      return preview?.payload;
+    });
+  }
+
+  it.each([
+    false,
+    true,
+  ])("disposes clean unexecuted previews (cancelled=%s)", async (cancelled) => {
+    const s = await setupPostgres();
+    prepare();
+    const execute = vi.spyOn(
+      TableDataService.prototype,
+      "executePreparedDeletePlan",
+    );
+    const preview = await requestPreview(s);
+    if (cancelled) {
+      await s.panel.dispatchMessage({
+        type: "cancelMutationPreview",
+        payload: preview,
+      });
+    }
+    s.disconnect();
+    expect(s.onDispose).toHaveBeenCalledOnce();
+    expect(execute).not.toHaveBeenCalled();
+    expect(state.showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  const lateOutcomes = [
+    { outcome: "success", skipPreview: false },
+    { outcome: "not executed", skipPreview: true },
+    { outcome: "unknown", skipPreview: false },
+  ] as const;
+  it.each(lateOutcomes)("keeps clean viewer for late $outcome", async ({
+    outcome,
+    skipPreview,
+  }) => {
+    const s = await setupPostgres(pgColumns, undefined, skipPreview);
+    prepare();
+    let resolveDelete!: () => void;
+    let rejectDelete!: (error: Error) => void;
+    const settling = new Promise<void>((resolve, reject) => {
+      resolveDelete = resolve;
+      rejectDelete = reject;
+    });
+    const execute = vi
+      .spyOn(TableDataService.prototype, "executePreparedDeletePlan")
+      .mockImplementation(() => {
+        // Synchronous interruption at driver entry, with no UI dirty flag.
+        s.disconnect();
+        return settling;
+      });
+
+    const dispatch = skipPreview
+      ? s.panel.dispatchMessage(request)
+      : s.panel.dispatchMessage({
+          type: "confirmMutationPreview",
+          payload: await requestPreview(s),
+        });
+    await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+    expect(s.onDispose).not.toHaveBeenCalled();
+    expect(state.showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("awaiting verification"),
+    );
+    s.reconnect();
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)).toMatchObject({
+        type: "tableInit",
+        payload: { intent: "connectionRefresh" },
+      }),
+    );
+    await s.panel.dispatchMessage(resolveRecovery);
+    const read = vi.spyOn(TableDataService.prototype, "getPage");
+    await s.panel.dispatchMessage({
+      type: "fetchPage",
+      payload: { fetchId: 42, page: 1 },
+    });
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)).toMatchObject({
+        type: "tableError",
+        payload: { fetchId: 42, error: expect.stringContaining("in progress") },
+      }),
+    );
+    expect(read).not.toHaveBeenCalled();
+
+    if (outcome === "success") resolveDelete();
+    else {
+      rejectDelete(
+        new DeleteExecutionError(
+          outcome === "unknown" ? unknownFailure : knownFailure,
+        ),
+      );
+    }
+    await dispatch;
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)).toMatchObject({
+        type: "deleteResult",
+        payload: {
+          operationId,
+          success: outcome === "success",
+          changesPossible: outcome !== "not executed",
+          outcomeUnknown: outcome === "unknown",
+        },
+      }),
+    );
+    s.disconnect();
+    if (outcome === "not executed") {
+      expect(s.onDispose).toHaveBeenCalledOnce();
+    } else {
+      expect(s.onDispose).not.toHaveBeenCalled();
+      await s.panel.dispatchMessage({
+        type: "deleteRecoveryResolved",
+        payload: { operationId: "stale-operation" },
+      });
+      s.disconnect();
+      expect(s.onDispose).not.toHaveBeenCalled();
+      await s.panel.dispatchMessage(resolveRecovery);
+      s.disconnect();
+      expect(s.onDispose).toHaveBeenCalledOnce();
+    }
+  });
+
+  it.each([
+    false,
+    true,
+  ])("discards old recovery on target change (removed=%s)", async (removed) => {
+    const s = await setupPostgres();
+    prepare();
+    vi.spyOn(
+      TableDataService.prototype,
+      "executePreparedDeletePlan",
+    ).mockRejectedValue(new DeleteExecutionError(unknownFailure));
+    await s.panel.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: await requestPreview(s),
+    });
+    await vi.waitFor(() =>
+      expect(s.panel.hostMessages().at(-1)).toMatchObject({
+        type: "deleteResult",
+        payload: { operationId, outcomeUnknown: true },
+      }),
+    );
+    s.changeTarget(removed);
+    expect(s.onDispose).toHaveBeenCalledOnce();
+    expect(state.showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("verify it there"),
+    );
   });
 });
 

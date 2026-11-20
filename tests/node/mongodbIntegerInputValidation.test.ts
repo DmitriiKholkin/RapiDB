@@ -222,9 +222,9 @@ describe.each([
 
   it("preserves non-integer strings, null and original mixed-type values", () => {
     const s = setup(nativeType);
-    for (const input of ["plain text", "", null])
+    for (const input of ["plain text", "", null, NULL_SENTINEL]) {
       expect(s.driver.coerceInputValue(input, meta)).toBe(input);
-    expect(s.driver.coerceInputValue(NULL_SENTINEL, meta)).toBeNull();
-    expect(s.driver.coerceOriginalValue(NULL_SENTINEL, meta)).toBeNull();
+      expect(s.driver.coerceOriginalValue(input, meta)).toBe(input);
+    }
   });
 });

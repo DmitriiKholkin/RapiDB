@@ -1,6 +1,7 @@
 import oracledb from "oracledb";
 import { expect, it, vi } from "vitest";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
+import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 
 function cursor(size: number, fail = false, start = 0, columnCount = 2) {
   let fetched = 0;
@@ -91,6 +92,38 @@ it("maps Oracle NUMBER metadata on query results", async () => {
 
   expect(result.columnMeta).toEqual([{ category: "decimal" }]);
   expect(result.resultSets?.[0]?.columnMeta).toEqual([{ category: "decimal" }]);
+});
+
+it("preserves string and number elements in Oracle native JSON query arrays", async () => {
+  const { OsonEncoder, OsonDecoder } =
+    require("oracledb/lib/impl/datahandlers/oson.js") as {
+      OsonEncoder: new () => {
+        encode(value: unknown, maxFieldNameSize: number): Buffer;
+      };
+      OsonDecoder: new (value: Buffer) => { decode(): unknown };
+    };
+  const input = [["123", 123, "00123"]];
+  const bytes = new OsonEncoder().encode(input, 255);
+  const value = new OsonDecoder(bytes).decode();
+  const { driver } = harness([
+    {
+      resultSet: {
+        metaData: [{ name: "payload", dbType: oracledb.DB_TYPE_JSON }],
+        getRows: vi
+          .fn()
+          .mockResolvedValueOnce([[value]])
+          .mockResolvedValue([]),
+        close: vi.fn(async () => {}),
+      },
+    },
+  ]);
+
+  const result = await driver.query("SELECT payload FROM documents");
+  expect(result.columnMeta).toEqual([{ category: null }]);
+  expect(result.rows).toEqual([{ __col_0: input }]);
+  expect(formatQueryResult(result, 10).rows).toEqual([
+    { __col_0: '[["123",123,"00123"]]' },
+  ]);
 });
 
 it("returns completed SELECT results with a later statement error and recovers", async () => {

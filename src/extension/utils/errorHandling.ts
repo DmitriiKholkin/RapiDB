@@ -87,10 +87,14 @@ export function normalizeUnknownError(
   return new Error(formatUnknownErrorMessage(error));
 }
 
-export function logErrorWithContext(context: string, error: unknown): Error {
-  const normalized = normalizeUnknownError(error);
+export function logErrorWithContext(
+  context: string,
+  error: unknown,
+  secretContext?: unknown,
+): Error {
+  const normalized = normalizeUnknownError(error, secretContext);
   console.error(
-    `[RapiDB] ${redactDiagnosticText(context, error)}:`,
+    `[RapiDB] ${redactDiagnosticText(context, [secretContext, error])}:`,
     normalized.stack ?? normalized.message,
   );
   return normalized;

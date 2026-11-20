@@ -17,6 +17,7 @@ import {
   createMongoTlsCertificates,
   startMongoTlsFixture,
 } from "../support/mongoTlsFixture";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 vi.mock("vscode", async () => ({
   EventEmitter: (await import("../support/mockVscode")).MockEventEmitter,
@@ -80,8 +81,7 @@ async function connectThroughManager(
           remoteHost: request.remoteHost,
           remotePort: request.remotePort,
         },
-        verifiedFingerprintSha256:
-          "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         dispose,
       };
     },
@@ -106,7 +106,7 @@ async function connectThroughManager(
         authMethod: "password",
         password: "test",
         hostVerificationMode: "manual",
-        hostFingerprintSha256: "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
       ...fields,
     });

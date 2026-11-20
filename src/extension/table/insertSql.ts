@@ -28,6 +28,7 @@ export function buildInsertRowOperation(
   onPreviewColumns?: (columns: ColumnTypeMeta[]) => void,
 ): TransactionOperation {
   const qt = drv.qualifiedTableName(database, schema, table);
+  const insertInto = `${drv.buildTableMutationVerb?.("INSERT") ?? "INSERT"} INTO ${qt}`;
   const colMap = new Map(cols.map((column) => [column.name, column]));
   const entries = writableEntries(values, colMap);
 
@@ -39,7 +40,7 @@ export function buildInsertRowOperation(
         params: [],
       },
       returning,
-      (output) => `INSERT INTO ${qt} ${output} DEFAULT VALUES`,
+      (output) => `${insertInto} ${output} DEFAULT VALUES`,
       { database, schema, table },
     );
   }
@@ -96,12 +97,12 @@ export function buildInsertRowOperation(
   return withReturning(
     drv,
     {
-      sql: `INSERT INTO ${qt} (${columnNames.join(", ")}) VALUES (${valueExpressions.join(", ")})`,
+      sql: `${insertInto} (${columnNames.join(", ")}) VALUES (${valueExpressions.join(", ")})`,
       params,
     },
     returning,
     (output) =>
-      `INSERT INTO ${qt} (${columnNames.join(", ")}) ${output} VALUES (${valueExpressions.join(", ")})`,
+      `${insertInto} (${columnNames.join(", ")}) ${output} VALUES (${valueExpressions.join(", ")})`,
     { database, schema, table },
   );
 }
@@ -154,7 +155,7 @@ function withReturning(
     operation.sql += ` RETURNING ${expressions.join(", ")} INTO ${columns.map((_, index) => `:${start + index + 1}`).join(", ")}`;
     operation.captureIdentity.oracleOutTypes = types;
   } else {
-    operation.sql += ` RETURNING ${columns.map((column, index) => `${driver.quoteIdentifier(column.name)} AS ${aliases[index]}`).join(", ")}`;
+    operation.sql += ` RETURNING ${columns.map((column, index) => `${driver.buildTablePrimaryKeyExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${aliases[index]}`).join(", ")}`;
   }
   operation.expectedAffectedRows = 1;
   return operation;

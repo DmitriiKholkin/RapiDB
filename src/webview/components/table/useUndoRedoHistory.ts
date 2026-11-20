@@ -1,6 +1,10 @@
 import { useCallback, useMemo, useRef, useState } from "react";
 import type { MutationSnapshot } from "../../types";
 
+// Bound full snapshots in memory, not the current edits or persisted draft.
+// Undo/redo move one step between stacks, so only push needs to enforce the cap.
+const MAX_HISTORY_STEPS = 100;
+
 export interface UndoRedoHistory {
   push: (snapshot: MutationSnapshot) => void;
   undo: (currentState: MutationSnapshot) => MutationSnapshot | null;
@@ -19,8 +23,10 @@ export function useUndoRedoHistory(): UndoRedoHistory {
   const [canRedo, setCanRedo] = useState(false);
 
   const push = useCallback((snapshot: MutationSnapshot) => {
-    pastRef.current = [...pastRef.current, snapshot];
-    futureRef.current = [];
+    const past = pastRef.current;
+    past.push(snapshot);
+    if (past.length > MAX_HISTORY_STEPS) past.shift();
+    futureRef.current.length = 0;
     setCanUndo(true);
     setCanRedo(false);
   }, []);
@@ -28,13 +34,11 @@ export function useUndoRedoHistory(): UndoRedoHistory {
   const undo = useCallback(
     (currentState: MutationSnapshot): MutationSnapshot | null => {
       const past = pastRef.current;
-      if (past.length === 0) return null;
+      const snapshot = past.pop();
+      if (!snapshot) return null;
+      futureRef.current.push(currentState);
 
-      const snapshot = past[past.length - 1];
-      pastRef.current = past.slice(0, -1);
-      futureRef.current = [...futureRef.current, currentState];
-
-      setCanUndo(pastRef.current.length > 0);
+      setCanUndo(past.length > 0);
       setCanRedo(true);
 
       return snapshot;
@@ -45,13 +49,11 @@ export function useUndoRedoHistory(): UndoRedoHistory {
   const redo = useCallback(
     (currentState: MutationSnapshot): MutationSnapshot | null => {
       const future = futureRef.current;
-      if (future.length === 0) return null;
+      const snapshot = future.pop();
+      if (!snapshot) return null;
+      pastRef.current.push(currentState);
 
-      const snapshot = future[future.length - 1];
-      futureRef.current = future.slice(0, -1);
-      pastRef.current = [...pastRef.current, currentState];
-
-      setCanRedo(futureRef.current.length > 0);
+      setCanRedo(future.length > 0);
       setCanUndo(true);
 
       return snapshot;
@@ -60,8 +62,8 @@ export function useUndoRedoHistory(): UndoRedoHistory {
   );
 
   const clear = useCallback(() => {
-    pastRef.current = [];
-    futureRef.current = [];
+    pastRef.current.length = 0;
+    futureRef.current.length = 0;
     setCanUndo(false);
     setCanRedo(false);
   }, []);
@@ -74,13 +76,13 @@ export function useUndoRedoHistory(): UndoRedoHistory {
     [],
   );
 
-  const hasUnresolvedEdits = useCallback(
-    () =>
-      [...pastRef.current, ...futureRef.current].some(
-        (snapshot) => (snapshot.unresolvedPendingEdits?.length ?? 0) > 0,
-      ),
-    [],
-  );
+  const hasUnresolvedEdits = useCallback(() => {
+    const isUnresolved = (snapshot: MutationSnapshot) =>
+      (snapshot.unresolvedPendingEdits?.length ?? 0) > 0;
+    return (
+      pastRef.current.some(isUnresolved) || futureRef.current.some(isUnresolved)
+    );
+  }, []);
 
   return useMemo(
     () => ({

@@ -129,6 +129,34 @@ describe("Query Results exact numeric sorting", () => {
     expect(readRowValues(container)).toEqual(["10", "2"]);
   });
 
+  it("sorts malformed formatted values as text instead of tying them with numbers", () => {
+    const values = ["$1,234,", "$1,234.00", "1.2.", "12"];
+    const result: QueryResult = {
+      ...decimalResult,
+      rows: values.map((value) => ({ __col_0: value })),
+      rowCount: values.length,
+    };
+    const { container } = render(<QueryResultsGridHarness result={result} />);
+    const header = container.querySelector(
+      'th[data-column-id="__col_0"]',
+    ) as HTMLTableCellElement;
+
+    fireEvent.click(header);
+    expect(readRowValues(container)).toEqual([
+      "12",
+      "$1,234.00",
+      "$1,234,",
+      "1.2.",
+    ]);
+    fireEvent.click(header);
+    expect(readRowValues(container)).toEqual([
+      "1.2.",
+      "$1,234,",
+      "$1,234.00",
+      "12",
+    ]);
+  });
+
   it("keeps large exact integer digits and compares their numeric order", () => {
     const result: QueryResult = {
       ...decimalResult,

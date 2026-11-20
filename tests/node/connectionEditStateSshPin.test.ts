@@ -4,8 +4,7 @@ import {
   preserveTrustedSshFingerprint,
 } from "../../src/extension/connectionEditState";
 import type { ConnectionConfig } from "../../src/extension/connectionManagerModels";
-
-const PIN = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/";
+import { SSH_HOST_FINGERPRINT_SHA256 as PIN } from "../support/sshFingerprints";
 
 function profile(
   ssh: Partial<NonNullable<ConnectionConfig["ssh"]>>,

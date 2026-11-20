@@ -35,15 +35,16 @@ import {
   type UpdateItemCommandInput,
   type UpdateItemCommandOutput,
 } from "@aws-sdk/client-dynamodb";
-import { fromIni } from "@aws-sdk/credential-providers";
 import { marshall, NumberValueImpl, unmarshall } from "@aws-sdk/util-dynamodb";
 import { NodeHttpHandler } from "@smithy/node-http-handler";
 import {
   DYNAMODB_NATIVE_CELL_VALUE_PREFIX,
   getDynamoDbNativeCellValidationError,
-  hasDuplicateDynamoDbNumbers,
-  parseDynamoDbNumberSetJson,
-  parseDynamoDbSetLiteral,
+  parseDynamoDbBinarySetEntries,
+  parseDynamoDbBinarySetInput,
+  parseDynamoDbNumberSetEntries,
+  parseDynamoDbNumberSetInput,
+  parseDynamoDbStringSetInput,
 } from "../../shared/dynamodbCellInput";
 import {
   type DynamoDbNativeOperationName,
@@ -54,7 +55,9 @@ import { compareNumericTokens } from "../../shared/numericNormalization";
 import type { PrimaryKeyRole } from "../../shared/tableTypes";
 import type { ConnectionConfig } from "../connectionManager";
 import {
+  getRuntimeOverrides,
   getSshHttpAgentTransport,
+  getSshTcpForwardTransport,
   getTlsServername,
 } from "../driverRuntimeConfig";
 import {
@@ -63,6 +66,10 @@ import {
 } from "../utils/jsonCanonical";
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
+import {
+  buildDynamoDBClientConfig,
+  DynamoDBSshRequestHandler,
+} from "./dynamodbConnection";
 import { getMetadataContext } from "./metadataCancellation";
 import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
@@ -138,7 +145,7 @@ const DYNAMODB_CREATE_TABLE_REQUEST_FIELDS = [
   "WarmThroughput",
 ] as const;
 
-import { NULL_SENTINEL, resolveFilterOperators } from "./types";
+import { resolveFilterOperators } from "./types";
 
 const DYNAMODB_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table"],
@@ -553,35 +560,38 @@ export class DynamoDBDriver implements IDBDriver {
     this.assertConnectionEpoch(epoch);
 
     const sshAgentTransport = getSshHttpAgentTransport(this.config);
+    const sshTcpTransport = getSshTcpForwardTransport(this.config);
+    const sshEndpoint = getRuntimeOverrides(this.config)?.dynamoDBSshEndpoint;
     const tlsServername = getTlsServername(this.config);
+    if (Boolean(sshTcpTransport) !== Boolean(sshEndpoint)) {
+      throw new Error(
+        "[RapiDB] DynamoDB SSH requires a fixed TCP forward and endpoint.",
+      );
+    }
 
     const client = new DynamoDBClient({
-      maxAttempts: 1,
-      region: this.config.awsRegion || "us-east-1",
-      endpoint: this.config.endpoint ?? this.config.awsEndpoint,
-      requestHandler: sshAgentTransport
-        ? new NodeHttpHandler({
-            httpAgent: sshAgentTransport.httpAgent,
-            httpsAgent: sshAgentTransport.httpsAgent,
-          })
-        : tlsServername
-          ? new NodeHttpHandler({
-              httpsAgent: new https.Agent({
-                keepAlive: true,
-                servername: tlsServername,
-              }),
-            })
-          : undefined,
-      credentials:
-        this.config.awsAccessKeyId && this.config.awsSecretAccessKey
-          ? {
-              accessKeyId: this.config.awsAccessKeyId,
-              secretAccessKey: this.config.awsSecretAccessKey,
-              sessionToken: this.config.awsSessionToken,
-            }
-          : this.config.awsProfile
-            ? fromIni({ profile: this.config.awsProfile })
-            : undefined,
+      ...buildDynamoDBClientConfig(this.config),
+      ...sshEndpoint?.clientConfig,
+      requestHandler:
+        sshEndpoint && sshTcpTransport
+          ? new DynamoDBSshRequestHandler(
+              sshEndpoint,
+              sshTcpTransport,
+              tlsServername,
+            )
+          : sshAgentTransport
+            ? new NodeHttpHandler({
+                httpAgent: sshAgentTransport.httpAgent,
+                httpsAgent: sshAgentTransport.httpsAgent,
+              })
+            : tlsServername
+              ? new NodeHttpHandler({
+                  httpsAgent: new https.Agent({
+                    keepAlive: true,
+                    servername: tlsServername,
+                  }),
+                })
+              : undefined,
     });
 
     this.pendingClient = client;
@@ -649,6 +659,7 @@ export class DynamoDBDriver implements IDBDriver {
       tabularRead: "nosql" as const,
       queryMode: "text" as const,
       supportsMutations: true,
+      rejectsUnknownMutationColumn: () => true,
       isTableFilterError: (message: string) =>
         message.startsWith(DYNAMODB_TABLE_FILTER_ERROR_PREFIX) ||
         /^(?:ValidationException:\s*)?Invalid FilterExpression:/i.test(
@@ -969,14 +980,16 @@ export class DynamoDBDriver implements IDBDriver {
 
     const isMutation = !READ_ONLY_DYNAMODB_OPERATIONS.has(operation);
     const total = preparedInputs.length;
-    const appliedText = (count: number) =>
-      `${count} of ${total} request${total === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} applied`;
+    const completedText = (count: number) =>
+      operation === "BatchWriteItem"
+        ? `${count} of ${total} batch request${total === 1 ? "" : "s"} returned a response`
+        : `${count} of ${total} request${total === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} applied`;
     for (const [index, input] of preparedInputs.entries()) {
       try {
         throwIfQueryCancelled(options);
       } catch (error: unknown) {
         if (index === 0 || !isMutation) throw error;
-        partialError = `DynamoDB ${operation} script was cancelled after ${appliedText(index)}. The remaining requests were not sent.`;
+        partialError = `DynamoDB ${operation} script was cancelled after ${completedText(index)}. The remaining requests were not sent.`;
         break;
       }
       let result: QueryDispatchResult;
@@ -989,13 +1002,13 @@ export class DynamoDBDriver implements IDBDriver {
         const message = error instanceof Error ? error.message : String(error);
         const request = `request ${index + 1} of ${total}`;
         partialError = options?.signal?.aborted
-          ? `DynamoDB ${operation} script was cancelled during ${request} after ${appliedText(index)}. The outcome of ${request} is unknown and the remaining requests were not sent.`
+          ? `DynamoDB ${operation} script was cancelled during ${request} after ${completedText(index)}. The outcome of ${request} is unknown and the remaining requests were not sent.`
           : this.isConditionalCheckFailure(error) ||
               this.isValidationException(error) ||
               this.isTransactionCanceled(error) ||
               this.isWriteThrottled(error)
-            ? `DynamoDB ${operation} ${request} failed after ${appliedText(index)}. It was not applied and the remaining requests were not sent. ${message}`
-            : `DynamoDB ${operation} ${request} failed after ${appliedText(index)}. Its outcome is unknown and the remaining requests were not sent. ${message}`;
+            ? `DynamoDB ${operation} ${request} failed after ${completedText(index)}. It was not applied and the remaining requests were not sent. ${message}`
+            : `DynamoDB ${operation} ${request} failed after ${completedText(index)}. Its outcome is unknown and the remaining requests were not sent. ${message}`;
         break;
       }
       rawRows.push(...result.rows);
@@ -1012,7 +1025,7 @@ export class DynamoDBDriver implements IDBDriver {
         throwIfQueryCancelled(options);
       } catch (error: unknown) {
         if (!isMutation) throw error;
-        partialError = `DynamoDB ${operation} script was cancelled after ${appliedText(index + 1)}.${index + 1 < total ? " The remaining requests were not sent." : ""}`;
+        partialError = `DynamoDB ${operation} script was cancelled after ${completedText(index + 1)}.${index + 1 < total ? " The remaining requests were not sent." : ""}`;
         break;
       }
     }
@@ -1020,7 +1033,7 @@ export class DynamoDBDriver implements IDBDriver {
       typeof metadata.warning === "string" ? [metadata.warning] : [],
     );
     if (partialError !== undefined && unprocessedWarnings.length > 0) {
-      partialError = `${partialError} Applied requests also reported: ${unprocessedWarnings.join(" ")}`;
+      partialError = `${partialError} Completed responses also reported: ${unprocessedWarnings.join(" ")}`;
     }
 
     const columns = inferColumnsFromRows(rawRows, "id").map(
@@ -1050,8 +1063,18 @@ export class DynamoDBDriver implements IDBDriver {
       ...(responseMetadata.length > 0 ? { responseMetadata } : {}),
       ...(missingCells.length > 0 ? { missingCells } : {}),
       rowCount: rawRows.length,
-      affectedRows:
-        sawMutation && !affectedRowsUnknown ? affectedRows : undefined,
+      rowCountKind: "returned",
+      ...(affectedRowsUnknown
+        ? { affectedRowsUnknown: true }
+        : sawMutation
+          ? {
+              affectedRows,
+              ...(operation === "BatchWriteItem" ||
+              operation === "TransactWriteItems"
+                ? { affectedRowsKind: "processed-writes" as const }
+                : {}),
+            }
+          : {}),
       executionTimeMs: Date.now() - startedAt,
       ...(partialError !== undefined ? { error: partialError } : {}),
     };
@@ -1076,6 +1099,8 @@ export class DynamoDBDriver implements IDBDriver {
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
     throwIfReadCancelled(request);
+    if (request.conflictRefresh)
+      this.invalidateCursorCacheForTable(request.table);
     const schema = await this.getTableSchema(request.table, request);
     throwIfReadCancelled(request);
     const describedColumns = await this.describeColumns(
@@ -1246,11 +1271,23 @@ export class DynamoDBDriver implements IDBDriver {
         );
       } catch (error: unknown) {
         if (this.isConditionalCheckFailure(error)) {
+          const reasons = (
+            error as { CancellationReasons?: { Code?: string }[] }
+          ).CancellationReasons;
+          const conflictedRows = new Set(
+            inputs
+              .filter(
+                (_, index) =>
+                  reasons?.[index]?.Code === "ConditionalCheckFailed",
+              )
+              .map(({ rowIndex }) => rowIndex),
+          );
           return completeDriverUpdateRowsResult(
             0,
             request.updates.map((_, rowIndex) => ({
               rowIndex,
               status: "not_applied" as const,
+              ...(conflictedRows.has(rowIndex) && { conflict: true }),
             })),
           );
         }
@@ -1313,7 +1350,11 @@ export class DynamoDBDriver implements IDBDriver {
           }
         } catch (error: unknown) {
           if (this.isConditionalCheckFailure(error)) {
-            completedOutcomes.push({ rowIndex, status: "not_applied" });
+            completedOutcomes.push({
+              rowIndex,
+              status: "not_applied",
+              conflict: true,
+            });
             continue;
           }
           if (
@@ -1520,9 +1561,6 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   coerceInputValue(value: unknown, column: ColumnTypeMeta): unknown {
-    if (value === NULL_SENTINEL) {
-      return null;
-    }
     if (value === null || value === undefined) {
       return value;
     }
@@ -1580,25 +1618,19 @@ export class DynamoDBDriver implements IDBDriver {
         );
       }
       case "string set": {
-        const parsed = this.parseSetInput(trimmed, "string");
-        if (parsed !== null) return parsed;
+        const entries = parseDynamoDbStringSetInput(trimmed);
+        if (entries !== null) return new Set(entries);
         throw new Error(
-          `DynamoDB String Set value for "${column.name}" must be a <<'...'>> literal or a JSON array of strings.`,
+          `DynamoDB String Set value for "${column.name}" must be a <<'...'>> literal or a non-empty JSON array of strings.`,
         );
       }
       case "number set": {
-        const parsed = this.parseSetInput(trimmed, "number");
-        if (parsed !== null) return parsed;
-        throw new Error(
-          "Enter a valid DynamoDB number set containing at least one number.",
-        );
+        const entries = parseDynamoDbNumberSetInput(trimmed);
+        return new Set(entries.map((entry) => NumberValueImpl.from(entry)));
       }
       case "binary set": {
-        const parsed = this.parseSetInput(trimmed, "binary");
-        if (parsed !== null) return parsed;
-        throw new Error(
-          `DynamoDB Binary Set value for "${column.name}" must contain valid binary values (0x-prefixed hex or base64).`,
-        );
+        const entries = parseDynamoDbBinarySetInput(trimmed);
+        return new Set(entries.map((entry) => Buffer.from(entry, "base64")));
       }
       case "list": {
         const parsed = this.parseExactJsonValue(trimmed);
@@ -3785,18 +3817,19 @@ export class DynamoDBDriver implements IDBDriver {
           | PutItemCommandOutput
           | UpdateItemCommandOutput
           | DeleteItemCommandOutput;
+        const attributes = typedOutput.Attributes;
+        const returnedRows =
+          attributes && Object.keys(attributes).length > 0
+            ? [this.unmarshallItem(attributes)]
+            : [];
         const affectedRows =
-          operation !== "DeleteItem"
+          operation !== "DeleteItem" || returnedRows.length > 0
             ? 1
             : input?.ReturnValues === "ALL_OLD"
-              ? typedOutput.Attributes
-                ? 1
-                : 0
+              ? 0
               : undefined;
         return {
-          rows: typedOutput.Attributes
-            ? [this.unmarshallItem(typedOutput.Attributes)]
-            : [],
+          rows: returnedRows,
           ...(affectedRows !== undefined ? { affectedRows } : {}),
         };
       }
@@ -5020,105 +5053,6 @@ export class DynamoDBDriver implements IDBDriver {
     return null;
   }
 
-  private parseSetInput(
-    value: string,
-    subtype: "string" | "number" | "binary",
-  ): Set<unknown> | null {
-    if (value.trim().startsWith("<<")) {
-      let entries: string[];
-      try {
-        entries = parseDynamoDbSetLiteral(value, subtype);
-      } catch (error) {
-        if (subtype === "binary") return null;
-        throw error;
-      }
-      if (subtype === "binary") return this.parseBinarySetEntries(entries);
-      return new Set(
-        entries.map((entry) =>
-          subtype === "number" ? NumberValueImpl.from(entry) : entry,
-        ),
-      );
-    }
-    if (subtype === "number") {
-      if (value.trim().startsWith("["))
-        return new Set(
-          parseDynamoDbNumberSetJson(value).map((entry) =>
-            NumberValueImpl.from(entry),
-          ),
-        );
-
-      const numericBody = value
-        .trim()
-        .replace(/^<</, "")
-        .replace(/>>$/, "")
-        .replace(/^\[/, "")
-        .replace(/\]$/, "");
-      const tokens = numericBody
-        .split(",")
-        .map((entry) => entry.trim())
-        .filter(Boolean);
-      if (hasDuplicateDynamoDbNumbers(tokens))
-        throw new Error("DynamoDB number set values must be unique.");
-      return tokens.length > 0 &&
-        tokens.every((entry) =>
-          /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(entry),
-        )
-        ? new Set(tokens.map((entry) => NumberValueImpl.from(entry)))
-        : null;
-    }
-    const parsedJson = this.parseJsonValue(value);
-    if (Array.isArray(parsedJson)) {
-      if (subtype === "binary") {
-        return this.parseBinarySetEntries(parsedJson);
-      }
-      return new Set(
-        parsedJson.map((entry) => this.coerceSetEntryValue(entry, subtype)),
-      );
-    }
-
-    return null;
-  }
-
-  private parseBinarySetEntries(
-    entries: readonly unknown[],
-  ): Set<Buffer> | null {
-    if (entries.length === 0) return null;
-    const buffers = entries.map((entry) =>
-      typeof entry === "string" ? this.parseBinaryInput(entry.trim()) : null,
-    );
-    if (!buffers.every((entry): entry is Buffer => entry !== null)) {
-      return null;
-    }
-    const uniqueByBytes = new Map<string, Buffer>();
-    for (const buffer of buffers) {
-      const base64 = buffer.toString("base64");
-      if (!uniqueByBytes.has(base64)) {
-        uniqueByBytes.set(base64, buffer);
-      }
-    }
-    return new Set(uniqueByBytes.values());
-  }
-
-  private coerceSetEntryValue(
-    value: unknown,
-    subtype: "string" | "number" | "binary",
-  ): unknown {
-    if (subtype === "string") {
-      return typeof value === "string" ? value : String(value);
-    }
-    if (subtype === "number") {
-      if (value instanceof NumberValueImpl) return value;
-      const token = String(value).trim();
-      return /^-?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(token)
-        ? NumberValueImpl.from(token)
-        : value;
-    }
-    if (this.isBinaryValue(value)) {
-      return value;
-    }
-    return this.parseBinaryInput(String(value).trim()) ?? value;
-  }
-
   private parseJsonValue(value: string): unknown {
     try {
       return JSON.parse(value) as unknown;
@@ -5195,31 +5129,17 @@ export class DynamoDBDriver implements IDBDriver {
           break;
         return new Set(value);
       case "NS":
-        if (
-          !Array.isArray(value) ||
-          !value.every(
-            (entry) =>
-              typeof entry === "string" && DYNAMODB_NUMBER_RE.test(entry),
-          )
-        )
-          break;
-        if (value.length === 0 || hasDuplicateDynamoDbNumbers(value)) break;
-        return new Set(value.map((entry) => NumberValueImpl.from(entry)));
+        return new Set(
+          parseDynamoDbNumberSetEntries(value).map((entry) =>
+            NumberValueImpl.from(entry),
+          ),
+        );
       case "BS":
-        if (
-          !Array.isArray(value) ||
-          value.length === 0 ||
-          !value.every((entry) => typeof entry === "string")
-        )
-          break;
-        {
-          const binaries = value.map((entry) =>
-            this.parseCanonicalBase64(entry),
-          );
-          if (binaries.some((entry) => entry === null)) break;
-          if (new Set(value).size !== value.length) break;
-          return new Set(binaries as Buffer[]);
-        }
+        return new Set(
+          parseDynamoDbBinarySetEntries(value, "envelope").map((entry) =>
+            Buffer.from(entry, "base64"),
+          ),
+        );
       case "L":
         if (!Array.isArray(value)) break;
         return value.map((entry) =>

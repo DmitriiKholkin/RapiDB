@@ -139,7 +139,7 @@ describe("Oracle timezone-aware keyset export", () => {
             const condition = driver.buildCursorComparison(
               column,
               operator,
-              "2024-07-15 10:00:00.123456789",
+              " 2024-07-15 10:00:00.123456789",
               1,
             );
             const result = await driver.query(
@@ -151,7 +151,7 @@ describe("Oracle timezone-aware keyset export", () => {
           const condition = driver.buildCursorComparison(
             column,
             "eq",
-            "2024-07-15 10:00:01",
+            " 2024-07-15 10:00:01.000000000",
             1,
           );
           const result = await driver.query(

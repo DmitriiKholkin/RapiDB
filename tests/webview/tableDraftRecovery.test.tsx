@@ -6,6 +6,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { MssqlSqlVariantRowIdentity } from "../../src/shared/mssqlSqlVariantRowIdentity";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import type { Row } from "../../src/webview/types";
 
@@ -22,7 +23,21 @@ vi.mock("@tanstack/react-virtual", () => ({
   }),
 }));
 vi.mock("../../src/webview/components/MonacoEditor", () => ({
-  MonacoEditor: () => null,
+  MonacoEditor: ({
+    initialValue,
+    ariaLabel,
+    onChange,
+  }: {
+    initialValue?: string;
+    ariaLabel?: string;
+    onChange?: (value: string) => void;
+  }) => (
+    <textarea
+      defaultValue={initialValue}
+      aria-label={ariaLabel}
+      onChange={(event) => onChange?.(event.target.value)}
+    />
+  ),
 }));
 
 import { TableView } from "../../src/webview/components/TableView";
@@ -91,16 +106,20 @@ function lastPayload(type: string): Record<string, unknown> {
 function draft() {
   return parsePersistedTableDraft(state.tableDraft, tableKey);
 }
-function commitTableRows(rows: Row[]) {
+function commitTableRows(
+  rows: Row[],
+  mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[],
+) {
   act(() =>
     dispatchIncomingMessage("tableData", {
       fetchId: lastPayload("fetchPage").fetchId,
       rows,
+      mssqlSqlVariantRowIdentities,
       totalCount: rows.length,
     }),
   );
 }
-function mountTable(rows?: Row[]) {
+function mountTable(rows?: Row[], columnDefs = columns) {
   const view = render(
     <TableView
       connectionId="conn"
@@ -111,7 +130,7 @@ function mountTable(rows?: Row[]) {
   );
   act(() =>
     dispatchIncomingMessage("tableInit", {
-      columns,
+      columns: columnDefs,
       primaryKeyColumns: ["id"],
     }),
   );
@@ -152,7 +171,462 @@ function mountController(
   return { ...hook, refs, commit };
 }
 
+function editName(rowIndex: number, value: string) {
+  const cell = [...document.querySelectorAll(`td[data-row="${rowIndex}"]`)].at(
+    -1,
+  );
+  if (!cell) throw new Error(`Missing name cell for row ${rowIndex}`);
+  fireEvent.doubleClick(cell);
+  const inline = screen.queryByLabelText("Cell value");
+  const editor = inline ?? screen.getByLabelText("Cell data");
+  fireEvent.change(editor, { target: { value } });
+  if (inline) fireEvent.keyDown(editor, { key: "Enter" });
+  else clickButton("Apply");
+}
+
+function clickButton(name: string) {
+  const button = screen.getByRole<HTMLButtonElement>("button", { name });
+  fireEvent.click(button);
+  return button;
+}
+
+describe("confirmed Apply conflict refresh", () => {
+  it.each([
+    "changed",
+    "missing",
+    "same key and values",
+  ] as const)("preserves exact drafts and history when the conflict row is %s", (kind) => {
+    const original = [
+      { id: 1, name: "Original" },
+      { id: 2, name: "Other" },
+    ];
+    mountTable(original);
+    editName(1, "safe draft");
+    editName(0, "conflicting draft");
+    clickButton("Add Row");
+    editName(-1, "insert draft");
+    clickButton("Refresh");
+    expect(messages("fetchPage")).toHaveLength(1);
+    clickButton("Apply Changes");
+    const operationId = lastPayload("applyChanges").operationId;
+    const noWrite = {
+      success: false,
+      changesPossible: false,
+      outcomeUnknown: false,
+      conflictRows: [1],
+      rowOutcomes: [
+        { rowIndex: 0, success: false, status: "not_applied" },
+        { rowIndex: 1, success: false, status: "not_applied" },
+      ],
+    };
+    act(() =>
+      dispatchIncomingMessage("applyResult", {
+        ...noWrite,
+        operationId: "stale-operation",
+      }),
+    );
+    expect(draft()?.mutation).not.toHaveProperty("applyConflict");
+    act(() =>
+      dispatchIncomingMessage("applyResult", { ...noWrite, operationId }),
+    );
+    expect(draft()?.mutation).toMatchObject({
+      kind: "apply",
+      unknown: false,
+      applyConflict: true,
+    });
+    expect(clickButton("Apply Changes").disabled).toBe(true);
+    fireEvent.change(screen.getByLabelText("Rows per page"), {
+      target: { value: "100" },
+    });
+    expect(messages("fetchPage")).toHaveLength(1);
+    const obsoleteFetch = lastPayload("fetchPage").fetchId;
+    clickButton("Refresh");
+    const reviewFetch = lastPayload("fetchPage").fetchId;
+    expect(lastPayload("fetchPage")).toMatchObject({
+      conflictRefresh: true,
+      page: 1,
+      pageSize: 25,
+      filters: [],
+      sort: null,
+    });
+    expect(reviewFetch).not.toBe(obsoleteFetch);
+    act(() => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: obsoleteFetch,
+        rows: original,
+        totalCount: 2,
+      });
+      dispatchIncomingMessage("tableData", { rows: original, totalCount: 2 });
+      dispatchIncomingMessage("tableError", {
+        fetchId: reviewFetch,
+        error: "Temporary read failure",
+      });
+    });
+    expect(draft()?.mutation?.applyConflict).toBe(true);
+    expect(screen.getByText("Temporary read failure")).toBeTruthy();
+    clickButton("Refresh");
+    const refreshed = [
+      original[1],
+      ...(kind === "missing"
+        ? [{ id: 3, name: "Unrelated" }]
+        : [{ id: 1, name: kind === "changed" ? "Concurrent" : "Original" }]),
+    ];
+    commitTableRows(refreshed);
+    expect(screen.getByText("Review conflicting drafts")).toBeTruthy();
+    expect(screen.getByText('"conflicting draft"')).toBeTruthy();
+    expect(screen.getByText("safe draft")).toBeTruthy();
+    expect(screen.getByText("insert draft")).toBeTruthy();
+    expect(draft()?.mutation).toBeUndefined();
+    expect(
+      draft()?.restoreState.entries.find((entry) => entry.applyConflict),
+    ).toMatchObject({
+      originalValues: new Map([["name", "Original"]]),
+      changes: new Map([["name", "conflicting draft"]]),
+    });
+    expect(clickButton("Apply Changes").disabled).toBe(true);
+    expect(messages("applyChanges")).toHaveLength(1);
+    clickButton("Discard Unmatched");
+    expect(screen.queryByText("Review conflicting drafts")).toBeNull();
+    expect(screen.getByText("safe draft")).toBeTruthy();
+    expect(screen.getByText("insert draft")).toBeTruthy();
+    clickButton("Undo");
+    expect(screen.queryByText("insert draft")).toBeNull();
+    clickButton("Redo");
+    expect(screen.getByText("insert draft")).toBeTruthy();
+    clickButton("Apply Changes");
+    expect(lastPayload("applyChanges")).toMatchObject({
+      updates: [
+        {
+          primaryKeys: { id: 2 },
+          originalValues: { name: "Other" },
+          changes: { name: "safe draft" },
+        },
+      ],
+      insertValues: [{ name: "insert draft" }],
+    });
+  });
+
+  it("restores the committed page and requires an explicit read after reload", () => {
+    const conflictView = {
+      tableKey,
+      page: 2,
+      pageSize: 100,
+      sort: { column: "id", direction: "desc" as const },
+      filters: { name: { operator: "eq" as const, value: "Original" } },
+    };
+    state.tableView = { ...conflictView, page: 1, filters: {} };
+    state.tableDraft = serializeTableDraft(
+      tableKey,
+      {
+        entries: [
+          {
+            originalSignature: '[["id",1]]',
+            changes: new Map([["name", "draft"]]),
+            originalValues: new Map([["name", "Original"]]),
+            originalMissingFields: new Set(),
+            baselinePresenceVersion: 1,
+            applyConflict: true,
+          },
+        ],
+      },
+      [],
+      { kind: "apply", unknown: false, applyConflict: true, conflictView },
+    );
+    const original = [{ id: 1, name: "Original" }];
+    const view = mountTable(original);
+    expect(lastPayload("fetchPage")).toMatchObject({
+      page: 2,
+      pageSize: 100,
+      sort: conflictView.sort,
+      filters: [{ column: "name", operator: "eq", value: "Original" }],
+    });
+    expect(lastPayload("fetchPage")).not.toHaveProperty("conflictRefresh");
+    expect(clickButton("Apply Changes").disabled).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "Discard Unmatched" }),
+    ).toBeNull();
+    clickButton("Refresh");
+    expect(lastPayload("fetchPage")).toMatchObject({
+      page: 2,
+      pageSize: 100,
+      conflictRefresh: true,
+    });
+    commitTableRows(original);
+    expect(messages("fetchPage")).toHaveLength(2);
+    expect(draft()?.mutation).toBeUndefined();
+    view.unmount();
+
+    clearPostedMessages();
+    mountTable(original);
+    expect(lastPayload("fetchPage")).toMatchObject({ page: 2, pageSize: 100 });
+    expect(clickButton("Apply Changes").disabled).toBe(true);
+    expect(screen.getByText("Review conflicting drafts")).toBeTruthy();
+    expect(messages("applyChanges")).toHaveLength(0);
+  });
+
+  it("does not open recovery for an ordinary no-write error urging Refresh", () => {
+    mountTable([{ id: 1, name: "Original" }]);
+    editName(0, "draft");
+    clickButton("Apply Changes");
+    act(() =>
+      dispatchIncomingMessage("applyResult", {
+        operationId: lastPayload("applyChanges").operationId,
+        success: false,
+        changesPossible: false,
+        outcomeUnknown: false,
+        error: "Unexpected error. Refresh the table and retry.",
+      }),
+    );
+    expect(draft()?.mutation).toBeUndefined();
+    clickButton("Refresh");
+    expect(messages("fetchPage")).toHaveLength(1);
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Apply Changes" })
+        .disabled,
+    ).toBe(false);
+    clickButton("Apply Changes");
+    expect(messages("applyChanges")).toHaveLength(2);
+  });
+});
+
 describe("table draft recovery across remounts", () => {
+  const variantColumns: ColumnTypeMeta[] = [
+    {
+      ...columns[0],
+      type: "sql_variant",
+      nativeType: "sql_variant",
+      category: "other",
+      mssqlSqlVariantPrimaryKey: true,
+    },
+    {
+      ...columns[1],
+      name: "amount",
+      type: "int",
+      nativeType: "int",
+      category: "integer",
+    },
+  ];
+  const decimalKey = {
+    id: { $rapidbMssqlVariantKey: "v1:decimal:5:2:5::31002E0030003000" },
+  };
+  const stringKey = {
+    id: {
+      $rapidbMssqlVariantKey:
+        "v1:nvarchar:0:0:16:Latin1_General_100_BIN2:31002E0030003000",
+    },
+  };
+  const variantRows = [
+    { id: "1.00", amount: 3 },
+    { id: "1.00", amount: 3 },
+  ];
+
+  it("restores edits to the exact SQL Server variant key after row order changes", () => {
+    const first = mountTable(undefined, variantColumns);
+    commitTableRows(variantRows, [stringKey, decimalKey]);
+    fireEvent.doubleClick(screen.getAllByRole("cell", { name: "3" })[1]);
+    const editor = screen.getByLabelText("Cell value");
+    fireEvent.change(editor, { target: { value: "42" } });
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(draft()?.restoreState.entries[0].originalSignature).toContain(
+      decimalKey.id.$rapidbMssqlVariantKey,
+    );
+    first.unmount();
+    clearPostedMessages();
+
+    mountTable(undefined, variantColumns);
+    commitTableRows(
+      variantRows.map((row) => ({ ...row })),
+      [decimalKey, stringKey],
+    );
+    const pending = screen.getByRole("cell", { name: "42" }).closest("tr");
+    expect(pending).toBe(
+      screen.getByRole("checkbox", { name: "Select row 1" }).closest("tr"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(lastPayload("applyChanges").updates).toEqual([
+      {
+        primaryKeys: decimalKey,
+        changes: { amount: "42" },
+        originalValues: { amount: 3 },
+      },
+    ]);
+  });
+
+  it("does not attach a legacy display-only draft to the surviving variant row", () => {
+    state.tableDraft = serializeTableDraft(
+      tableKey,
+      {
+        entries: [
+          {
+            originalSignature: JSON.stringify([["id", "1.00"]]),
+            changes: new Map([["amount", "42"]]),
+            originalValues: new Map([["amount", 3]]),
+            originalMissingFields: new Set(),
+            baselinePresenceVersion: 1,
+          },
+        ],
+      },
+      [],
+    );
+    mountTable(undefined, variantColumns);
+    commitTableRows([{ ...variantRows[0] }], [stringKey]);
+    expect(screen.getByRole("cell", { name: "3" })).toBeTruthy();
+    expect(screen.queryByRole("cell", { name: "42" })).toBeNull();
+    expect(
+      screen.getByText(/edits are preserved but not attached/),
+    ).toBeTruthy();
+    const apply = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Apply Changes",
+    });
+    expect(apply.disabled).toBe(true);
+    fireEvent.click(apply);
+    expect(messages("applyChanges")).toHaveLength(0);
+  });
+
+  it.each([
+    undefined,
+    [{ id: null }],
+  ])("blocks row mutations when the exact variant identity is unavailable (%j)", (identity) => {
+    mountTable(undefined, variantColumns);
+    commitTableRows([{ ...variantRows[0] }], identity);
+    fireEvent.doubleClick(screen.getByRole("cell", { name: "3" }));
+    expect(screen.queryByLabelText("Cell value")).toBeNull();
+    expect(
+      screen.getByText(
+        /exact identity for SQL Server sql_variant primary key id is unavailable/,
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select row 1" }));
+    fireEvent.click(screen.getByRole("button", { name: /Delete \([01]\)/ }));
+    expect(messages("deleteRows")).toHaveLength(0);
+    expect(messages("applyChanges")).toHaveLength(0);
+  });
+  it.each([
+    ["tableData", { rows: [null], totalCount: 1 }],
+    ["tableError", { error: { message: "not a string" } }],
+  ] as const)("releases only the matching malformed %s without clearing the committed page", (type, reply) => {
+    mountTable([{ id: 1, name: "Alice" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const firstId = lastPayload("fetchPage").fetchId;
+    commitTableRows([{ id: 1, name: "Alice" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const fetchId = lastPayload("fetchPage").fetchId;
+    expect(fetchId).not.toBe(firstId);
+    act(() => {
+      dispatchIncomingMessage(type, { ...reply, fetchId: firstId });
+      dispatchIncomingMessage(type, reply);
+      dispatchIncomingMessage(type, null);
+    });
+    expect(
+      screen.getByRole("status", { name: "Loading data..." }),
+    ).toBeTruthy();
+    act(() => dispatchIncomingMessage(type, { ...reply, fetchId }));
+    expect(
+      screen.queryByRole("status", { name: "Loading data..." }),
+    ).toBeNull();
+    expect(screen.getByText(/invalid table read reply/)).toBeTruthy();
+    expect(screen.getByText("Alice")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    commitTableRows([{ id: 1, name: "Updated" }]);
+    expect(screen.getByText("Updated")).toBeTruthy();
+    expect(screen.queryByText(/invalid table read reply/)).toBeNull();
+  });
+
+  it.each([
+    "apply",
+    "delete",
+  ] as const)("treats a malformed %s acknowledgement as unknown without clearing edits or drafts", (kind) => {
+    const { result, refs, commit } = mountController();
+    const active = kind === "apply" ? "applying" : "deleting";
+    const request = kind === "apply" ? "applyChanges" : "deleteRows";
+    const reply = kind === "apply" ? "applyResult" : "deleteResult";
+    const otherReply = kind === "apply" ? "deleteResult" : "applyResult";
+    act(() => {
+      result.current.commitCellEdit(0, columns[1], "Edited", "Alice");
+      result.current.startInsertRow();
+    });
+    act(() =>
+      result.current[kind === "apply" ? "applyChanges" : "deleteSelected"](),
+    );
+    const { operationId } = lastPayload(request);
+    expect(result.current[active]).toBe(true);
+    const invalid = {
+      success: true,
+      affectedRows: 1,
+      changesPossible: true,
+      outcomeUnknown: false,
+      insertApplied: true,
+      rowOutcomes: [
+        {
+          rowIndex: 0,
+          status: kind === "apply" ? "applied" : "deleted",
+          success: true,
+        },
+        null,
+      ],
+    };
+    act(() => {
+      dispatchIncomingMessage(reply, { ...invalid, operationId: "old" });
+      dispatchIncomingMessage(reply, invalid);
+      dispatchIncomingMessage(otherReply, { ...invalid, operationId });
+    });
+    expect(result.current[active]).toBe(true);
+    act(() => dispatchIncomingMessage(reply, { ...invalid, operationId }));
+    expect(result.current[active]).toBe(false);
+    expect(result.current.reconciliationRequired).toBe(true);
+    expect(result.current.pendingEdits.get(0)?.get("name")).toBe("Edited");
+    expect(result.current.newRows).toHaveLength(1);
+    expect(
+      result.current.applyStatus?.message ?? result.current.mutErr,
+    ).toMatch(/write outcome is unknown/i);
+    expect(draft()?.mutation).toMatchObject({ kind, unknown: true });
+    expect(refs.fetchPageRef.current).not.toHaveBeenCalled();
+
+    commit([{ id: 1, name: "Alice" }]);
+    expect(result.current.reconciliationRequired).toBe(true);
+    act(() => result.current.retryReconciliation());
+    expect(refs.fetchPageRef.current).toHaveBeenCalledOnce();
+    commit([{ id: 1, name: "Alice" }]);
+    expect(result.current.reconciliationRequired).toBe(kind === "apply");
+    if (kind === "apply") {
+      act(() => result.current.applyChanges());
+      expect(messages(request)).toHaveLength(1);
+    }
+  });
+
+  it("requires a fresh read after a malformed verification page and never reapplies unknown inserts", () => {
+    mountTable([{ id: 1, name: "Alice" }]);
+    fireEvent.click(screen.getByRole("button", { name: "Add Row" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+    const { operationId } = lastPayload("applyChanges");
+    act(() =>
+      dispatchIncomingMessage("applyResult", {
+        operationId,
+        success: true,
+        rowOutcomes: {},
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    const { fetchId } = lastPayload("fetchPage");
+    act(() => dispatchIncomingMessage("tableData", { fetchId, totalCount: 1 }));
+    expect(screen.getByText(/invalid table read reply/)).toBeTruthy();
+    act(() =>
+      dispatchIncomingMessage("tableData", {
+        fetchId,
+        rows: [{ id: 1, name: "Alice" }],
+        totalCount: 1,
+      }),
+    );
+    expect(screen.getByText(/invalid table read reply/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    commitTableRows([{ id: 1, name: "Alice" }]);
+    expect(screen.queryByText(/invalid table read reply/)).toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Apply Changes" })
+        .disabled,
+    ).toBe(true);
+  });
+
   it.each([
     false,
     true,
@@ -376,13 +850,116 @@ describe("table draft recovery across remounts", () => {
     first.unmount();
     clearPostedMessages();
     const restored = mountController();
+    expect(lastPayload("unsavedChangesState")).toEqual({
+      hasUnsavedChanges: false,
+      hasDeleteRecovery: true,
+    });
     act(() => restored.result.current.deleteSelected());
     expect(messages("deleteRows")).toHaveLength(0);
     expect(restored.result.current.reconciliationRequired).toBe(true);
     act(() => restored.result.current.retryReconciliation());
     restored.commit([]);
     act(() => restored.result.current.revertChanges());
+    expect(messages("deleteRecoveryResolved")).toHaveLength(1);
     expect(state.tableDraft).toBeUndefined();
+  });
+
+  it.each([
+    false,
+    true,
+  ])("discards clean preview marker (cancelled=%s)", (cancelled) => {
+    const viewer = mountController();
+    act(() => viewer.result.current.deleteSelected());
+    const { operationId } = lastPayload("deleteRows");
+    const preview = {
+      operationId,
+      kind: "deleteRows",
+      previewToken: "preview",
+    };
+    act(() => dispatchIncomingMessage("tableMutationPreview", preview));
+    expect(state.tableDraft).toBeUndefined();
+    expect(lastPayload("unsavedChangesState")).toEqual({
+      hasUnsavedChanges: false,
+    });
+    if (cancelled) {
+      act(() => viewer.result.current.cancelMutationPreview());
+      expect(lastPayload("cancelMutationPreview")).toMatchObject({
+        operationId,
+      });
+      expect(state.tableDraft).toBeUndefined();
+    } else {
+      act(() => viewer.result.current.confirmMutationPreview());
+      expect(lastPayload("confirmMutationPreview")).toMatchObject({
+        operationId,
+      });
+      expect(draft()?.mutation).toEqual({
+        kind: "delete",
+        unknown: true,
+        operationId,
+      });
+    }
+  });
+
+  it("requires explicit verification of a late unknown DELETE on the reconnected viewer", () => {
+    const tableRows = [{ id: 1, name: "Alice" }];
+    mountTable(tableRows);
+    fireEvent.click(screen.getByLabelText("Select row 1"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete (1)" }));
+    const { operationId } = lastPayload("deleteRows");
+    act(() => dispatchIncomingMessage("tableConnectionInvalidated", {}));
+    act(() =>
+      dispatchIncomingMessage("deleteResult", {
+        operationId,
+        success: false,
+        affectedRows: 0,
+        rowOutcomes: [],
+        changesPossible: true,
+        outcomeUnknown: true,
+        error: "The transport closed before acknowledgement.",
+      }),
+    );
+    expect(draft()?.mutation).toEqual({
+      kind: "delete",
+      unknown: true,
+      operationId,
+    });
+    expect(lastPayload("unsavedChangesState")).toMatchObject({
+      hasDeleteRecovery: true,
+    });
+    clearPostedMessages();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(messages("fetchPage")).toHaveLength(0);
+
+    act(() =>
+      dispatchIncomingMessage("tableInit", {
+        intent: "connectionRefresh",
+        columns,
+        primaryKeyColumns: ["id"],
+      }),
+    );
+    expect(messages("fetchPage")).toHaveLength(1);
+    commitTableRows(tableRows);
+    expect(
+      screen.getByRole("button", { name: "Add Row" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      screen.queryByRole("button", { name: "Acknowledge delete warning" }),
+    ).toBeNull();
+    expect(messages("deleteRecoveryResolved")).toHaveLength(0);
+    expect(messages("deleteRows")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(messages("fetchPage")).toHaveLength(2);
+    commitTableRows([]);
+    fireEvent.click(
+      screen.getByRole("button", { name: "Acknowledge delete warning" }),
+    );
+    expect(lastPayload("deleteRecoveryResolved")).toEqual({ operationId });
+    expect(lastPayload("unsavedChangesState")).toEqual({
+      hasUnsavedChanges: false,
+    });
+    expect(state.tableDraft).toBeUndefined();
+    expect(messages("deleteRows")).toHaveLength(0);
   });
 
   it.each([

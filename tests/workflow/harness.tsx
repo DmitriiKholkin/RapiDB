@@ -11,7 +11,7 @@ const { workflowState, vscodeMockFactory } = vi.hoisted(() => {
     showOpenDialog: () => undefined,
     withProgress: () => undefined,
     writeClipboard: () => undefined,
-    readClipboard: () => undefined,
+    readClipboard: (): Promise<string> | undefined => undefined,
     createWebviewPanel: () => ({}),
     createTreeView: () => ({}),
     registerCommand: () => ({}),
@@ -155,6 +155,9 @@ const { workflowState, vscodeMockFactory } = vi.hoisted(() => {
       ProgressLocation: { Notification: 15, Window: 10 },
       ViewColumn: { One: 1, Two: 2 },
       ConfigurationTarget: { Global: 1 },
+      MarkdownString: class MarkdownString {
+        constructor(readonly value: string) {}
+      },
       FileType: { Unknown: 0, File: 1, Directory: 2 },
       TreeItemCollapsibleState: { None: 0, Collapsed: 1, Expanded: 2 },
       ThemeIcon: class ThemeIconImpl {},

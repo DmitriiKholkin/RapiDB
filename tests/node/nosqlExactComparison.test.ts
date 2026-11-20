@@ -62,6 +62,7 @@ describe("B08 exact typed client comparisons", () => {
     ["+001.e+3", "1000", 0],
     ["-001.e-3", "-.001", 0],
     ["$1,234.50", "1234.5", 0],
+    ["9\u202f007\u202f199\u202f254\u202f740\u202f993", "9007199254740993", 0],
     ["CHF 1'234.50", "1234.5", 0],
     ["($1,234.50)", "-1234.5", 0],
     ["-0e999999999999999999999", "+0", 0],
@@ -85,6 +86,11 @@ describe("B08 exact typed client comparisons", () => {
     "1.e+",
     "$1.2.",
     "1,234.5.e3",
+    "1 2",
+    "1\t2\n3",
+    "1 e3",
+    "1e+ 2",
+    "1 2.",
   ])("rejects malformed decimal %s without repairing it in range filters", (malformed) => {
     expect(compareNumericTokens(malformed, "0")).toBeNull();
     expect(compareNumericTokens("0", malformed)).toBeNull();
@@ -173,11 +179,12 @@ describe("B08 exact typed client comparisons", () => {
     "$",
     "€",
     "\u{1ECB0}",
-  ])("normalizes long %j affix runs with bounded Unicode scans, including filters/sorts", (affix) => {
+  ])("handles long %j runs with bounded Unicode scans, including filters/sorts", (affix) => {
     const run = affix.repeat(20_000);
     const interior = `1${run}1`;
     const suffix = `11${run}`;
     const rows = [{ value: interior }, { value: suffix }, { value: "11" }];
+    const whitespace = /\s/.test(affix);
     const originalReplace = String.prototype.replace;
     const originalCharCodeAt = String.prototype.charCodeAt;
     const budget = 20 * (interior.length + suffix.length);
@@ -222,9 +229,13 @@ describe("B08 exact typed client comparisons", () => {
       replace.mockRestore();
       charCodeAt.mockRestore();
     }
-    expect(results).toEqual([0, 0]);
-    expect(filtered).toEqual(rows);
-    expect(sorted).toEqual(rows);
+    expect(results).toEqual([whitespace ? null : 0, 0]);
+    expect(filtered).toEqual(whitespace ? rows.slice(1) : rows);
+    expect(sorted).toEqual(
+      whitespace
+        ? [...rows].sort((a, b) => a.value.localeCompare(b.value))
+        : rows,
+    );
     expect(inspections).toBeLessThanOrEqual(budget);
   });
 

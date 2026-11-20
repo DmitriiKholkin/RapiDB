@@ -9,7 +9,6 @@ import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutation
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { parseDynamoDbNativeQueryInputs } from "../../src/shared/dynamodbNative";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const emptyBinaryCellMarker = "0x (empty binary)";
 
@@ -2174,8 +2173,8 @@ describe("DynamoDBDriver native API", () => {
     });
   });
 
-  it("validates Binary Set edits and deduplicates entries by bytes", async () => {
-    const { driver, clientSend, queueResponses } = createDriver();
+  it("validates Binary Set edits and rejects repeated bytes", async () => {
+    const { driver, clientSend } = createDriver();
     const binarySetColumn: ColumnTypeMeta = {
       ...createColumns()[2],
       name: "binarySet",
@@ -2201,7 +2200,7 @@ describe("DynamoDBDriver native API", () => {
       '\\DynamoDB native value (nested sets/binary): {"BS":["AQID"]}',
     ]) {
       expect(() => driver.coerceInputValue(malformed, binarySetColumn)).toThrow(
-        'DynamoDB Binary Set value for "binarySet" must contain valid binary values (0x-prefixed hex or base64).',
+        /DynamoDB binary set/,
       );
     }
 
@@ -2222,30 +2221,19 @@ describe("DynamoDBDriver native API", () => {
         { tenant_id: "tenant-1", user_id: "user-1" },
         { binarySet: "<<0x01GG, 0x040506>>" },
       ),
-    ).rejects.toThrow(
-      'DynamoDB Binary Set value for "binarySet" must contain valid binary values (0x-prefixed hex or base64).',
-    );
-    expect(commandInputs(clientSend, "UpdateItemCommand")).toHaveLength(0);
+    ).rejects.toThrow(/DynamoDB binary set/);
 
-    queueResponses({
-      Attributes: marshall({
-        tenant_id: "tenant-1",
-        user_id: "user-1",
-        binarySet: new Set([Buffer.from([1, 2, 3])]),
-      }),
-    });
-    await mutationService.updateRow(
-      "conn-ddb",
-      "us-east-1",
-      "us-east-1",
-      "users",
-      { tenant_id: "tenant-1", user_id: "user-1" },
-      { binarySet: "<<0x010203, 0x010203>>" },
-    );
-    expect(
-      commandInputs(clientSend, "UpdateItemCommand")[0]
-        ?.ExpressionAttributeValues,
-    ).toEqual({ ":u0": { BS: [Buffer.from([1, 2, 3])] } });
+    await expect(
+      mutationService.updateRow(
+        "conn-ddb",
+        "us-east-1",
+        "us-east-1",
+        "users",
+        { tenant_id: "tenant-1", user_id: "user-1" },
+        { binarySet: "<<0x010203, AQID>>" },
+      ),
+    ).rejects.toThrow(/DynamoDB binary set values must be unique/);
+    expect(clientSend).not.toHaveBeenCalled();
   });
 
   it("uses each DynamoDB row's original type when preparing edit previews", () => {
@@ -2523,7 +2511,7 @@ describe("DynamoDBDriver native API", () => {
       "us-east-1",
       "users",
       keys,
-      { email: NULL_SENTINEL },
+      { email: null },
     );
 
     const updates = commandInputs(clientSend, "UpdateItemCommand");
@@ -2845,7 +2833,7 @@ describe("DynamoDBDriver native API", () => {
     ).resolves.toEqual({
       affectedRows: 0,
       updateRowOutcomes: [
-        { rowIndex: 0, status: "not_applied" },
+        { rowIndex: 0, status: "not_applied", conflict: true },
         { rowIndex: 1, status: "not_applied" },
       ],
     });
@@ -3922,7 +3910,7 @@ describe("DynamoDB driver review regressions", () => {
       new Set([Buffer.from("AAAA", "base64"), Buffer.from([0xaa, 0xaa])]),
     );
     expect(() => driver.coerceInputValue("<<abcd12>>", binarySet)).toThrow(
-      /Binary Set/,
+      /binary set/,
     );
     const original = Buffer.from([0, 0xaa, 0xff]);
     const displayed = driver.formatOutputValue(original, payload);
@@ -4069,7 +4057,7 @@ describe("DynamoDB driver review regressions", () => {
       }
       return { Items: [] };
     });
-    await driver.updateRows({
+    const update = await driver.updateRows({
       database: "us-east-1",
       schema: "us-east-1",
       table: "users",
@@ -4080,8 +4068,17 @@ describe("DynamoDB driver review regressions", () => {
         },
       ],
     });
+    expect(update.updateRowOutcomes).toEqual([
+      { rowIndex: 0, status: "not_applied", conflict: true },
+    ]);
     await driver.readTablePage({ ...pageRequest, filters: [] });
     expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(2);
+    await driver.readTablePage({
+      ...pageRequest,
+      filters: [],
+      conflictRefresh: true,
+    });
+    expect(commandInputs(clientSend, "ScanCommand")).toHaveLength(4);
   });
 
   it("still throws when the first write request fails", async () => {
@@ -4162,6 +4159,7 @@ describe("DynamoDB driver review regressions", () => {
     ["binary", "0xZZ", /Binary value for "field"/],
     ["map", '{"a":1', /JSON object/],
     ["string set", "abc", /String Set value for "field"/],
+    ["string set", '["tag", 9007199254740993]', /String Set value for "field"/],
   ])("rejects invalid %s cell input instead of storing a string", (nativeType, input, error) => {
     const { driver } = createDriver();
     const column: ColumnTypeMeta = {

@@ -74,14 +74,16 @@ describe("PostgreSQL query results through formatting and JSON export", () => {
         field("int_values", 1007),
         field("numeric_values", 1231),
         field("uuid_values", 2951),
+        field("bigint_values", 1016),
       ],
       [
         String.raw`{"{\"a\": 1}","{\"x\": 1, \"y\": 2}"}`,
         String.raw`{"{\"n\": 12345678901234567890}",NULL}`,
         String.raw`{a,123,"{\"a\":1}"}`,
         "{{1,2},{3,4}}",
-        "{1.50,-2}",
+        "{{1.50,12345678901234567890.1234567890}}",
         "{00000000-0000-4000-8000-000000000001}",
+        "{{9223372036854775807,NULL}}",
       ],
     );
 
@@ -92,6 +94,7 @@ describe("PostgreSQL query results through formatting and JSON export", () => {
       { category: "array", nativeType: "integer[]" },
       { category: "array", nativeType: "numeric[]" },
       { category: "array", nativeType: "uuid[]" },
+      { category: "array", nativeType: "bigint[]" },
     ]);
     expect(formatted.rows[0].__col_2).toBe(String.raw`["a","123","{\"a\":1}"]`);
     expect(JSON.parse(exported)).toEqual({
@@ -102,13 +105,29 @@ describe("PostgreSQL query results through formatting and JSON export", () => {
         [1, 2],
         [3, 4],
       ],
-      numeric_values: [1.5, -2],
+      numeric_values: [[1.5, expect.any(Number)]],
       uuid_values: ["00000000-0000-4000-8000-000000000001"],
+      bigint_values: [[expect.any(Number), null]],
     });
     expect(exported).toContain(
       '"json_values":[{"n": 12345678901234567890},null]',
     );
-    expect(exported).toContain('"numeric_values":[1.50,-2]');
+    expect(exported).toContain(
+      '"numeric_values":[[1.50,12345678901234567890.1234567890]]',
+    );
+    expect(exported).toContain('"bigint_values":[[9223372036854775807,null]]');
+  });
+
+  it("leaves an unregistered array OID as wire text", async () => {
+    const value = '{"123","00123"}';
+    const { formatted, exported } = await queryWireRow(
+      [field("custom_values", 65001)],
+      [value],
+    );
+
+    expect(formatted.columnMeta).toEqual([{ category: null }]);
+    expect(formatted.rows).toEqual([{ __col_0: value }]);
+    expect(JSON.parse(exported)).toEqual({ custom_values: value });
   });
 
   it("formats geometric and interval columns from their type metadata", async () => {

@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { QueryMissingCell } from "../../shared/tableTypes";
-import type { ColumnTypeMeta, QueryColumnMeta } from "../dbDrivers/types";
+import type {
+  ColumnTypeMeta,
+  QueryColumnMeta,
+  QueryJsonExportOverrides,
+  QueryResult,
+} from "../dbDrivers/types";
 import { csvCell } from "./csvUtils";
 import { normalizeUnknownError } from "./errorHandling";
 import {
@@ -20,6 +25,7 @@ import {
 const DOWNLOADS_DIRECTORY = "Downloads";
 const CSV_EXTENSION = "csv";
 const JSON_EXTENSION = "json";
+const UTF8_BOM = "\uFEFF";
 const LINE_BREAK = "\n";
 const LAST_EXPORT_DIRECTORY_STATE_KEY = "rapidb.lastExportDirectory";
 const NUMERIC_CSV_VALUE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
@@ -70,11 +76,12 @@ function formatCsvExportCell(
   return csvCell(formatted, trustedNumeric);
 }
 
-export interface QueryResultExport {
+export interface QueryResultExport extends QueryJsonExportOverrides {
   columns: readonly string[];
   columnMeta?: readonly QueryColumnMeta[];
   rows: readonly Record<string, unknown>[];
-  exportRows?: readonly Record<string, unknown>[];
+  exportRows?: readonly (Record<string, unknown> | undefined)[];
+  serializeJsonExportRow?: QueryResult["serializeJsonExportRow"];
   missingCells?: readonly QueryMissingCell[];
 }
 
@@ -93,11 +100,17 @@ interface ExportRequest {
   successLabel: string;
   errorLabel: string;
   context?: vscode.ExtensionContext;
+  secretContext?: unknown;
   write: (
-    filePath: string,
+    destination: ExportDestination,
     signal: AbortSignal,
     state: ExportOperationState,
   ) => Promise<void>;
+}
+
+interface ExportDestination {
+  readonly filePath: string;
+  readonly existing: fs.BigIntStats | undefined;
 }
 
 interface ExportOperationState {
@@ -131,8 +144,8 @@ export async function exportQueryResultsAsCsv(
     successLabel: "query results",
     errorLabel: "CSV export failed",
     context: options?.context,
-    write: async (filePath, signal, state) => {
-      await writeQueryResultsCsv(filePath, result, signal, state);
+    write: async (destination, signal, state) => {
+      await writeQueryResultsCsv(destination, result, signal, state);
     },
   });
 }
@@ -148,8 +161,8 @@ export async function exportQueryResultsAsJson(
     successLabel: "query results",
     errorLabel: "JSON export failed",
     context: options?.context,
-    write: async (filePath, signal, state) => {
-      await writeQueryResultsJson(filePath, result, signal, state);
+    write: async (destination, signal, state) => {
+      await writeQueryResultsJson(destination, result, signal, state);
     },
   });
 }
@@ -158,8 +171,9 @@ export async function exportTableDataAsCsv(options: {
   fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
   context?: vscode.ExtensionContext;
+  secretContext?: unknown;
 }): Promise<void> {
-  const { fileName, loadChunks, context } = options;
+  const { fileName, loadChunks, context, secretContext } = options;
   await runExport({
     defaultFileName: fileName,
     format: CSV_EXTENSION,
@@ -167,9 +181,10 @@ export async function exportTableDataAsCsv(options: {
     successLabel: fileName,
     errorLabel: "CSV export failed",
     context,
-    write: async (filePath, signal, state) => {
+    secretContext,
+    write: async (destination, signal, state) => {
       await writeChunkedCsv(
-        filePath,
+        destination,
         lazyChunks(loadChunks, signal),
         signal,
         state,
@@ -182,8 +197,9 @@ export async function exportTableDataAsJson(options: {
   fileName: string;
   loadChunks: (signal: AbortSignal) => AsyncIterable<ChunkedExportData>;
   context?: vscode.ExtensionContext;
+  secretContext?: unknown;
 }): Promise<void> {
-  const { fileName, loadChunks, context } = options;
+  const { fileName, loadChunks, context, secretContext } = options;
   await runExport({
     defaultFileName: fileName,
     format: JSON_EXTENSION,
@@ -191,9 +207,10 @@ export async function exportTableDataAsJson(options: {
     successLabel: fileName,
     errorLabel: "JSON export failed",
     context,
-    write: async (filePath, signal, state) => {
+    secretContext,
+    write: async (destination, signal, state) => {
       await writeChunkedJson(
-        filePath,
+        destination,
         lazyChunks(loadChunks, signal),
         signal,
         state,
@@ -231,10 +248,30 @@ async function runExport(request: ExportRequest): Promise<void> {
   }
 
   try {
-    assertNotDirectoryDestination(saveUri.fsPath);
-    assertWindowsDestinationIsNew(saveUri.fsPath);
+    const filePath = saveUri.fsPath;
+    const existing = lstatDestinationIfPresent(filePath);
+    const destination: ExportDestination = { filePath, existing };
+    if (existing?.isDirectory()) {
+      throw new Error("Cannot export to a directory.");
+    }
+    if (existing) {
+      if (process.platform === "win32") {
+        throw new Error(
+          "Cannot safely replace an existing export on Windows. Choose a new file name instead.",
+        );
+      }
+      // The save dialog returns only a URI, not whether replacement was confirmed.
+      const replace = "Replace File";
+      const selected = await vscode.window.showWarningMessage(
+        `Replace the existing export file "${path.basename(filePath)}"?`,
+        { modal: true, detail: filePath },
+        replace,
+      );
+      if (selected !== replace) return;
+      assertExportDestinationUnchanged(destination);
+    }
     if (request.context) {
-      await persistLastExportDirectory(request.context, saveUri.fsPath);
+      await persistLastExportDirectory(request.context, filePath);
     }
 
     await vscode.window.withProgress(
@@ -251,7 +288,7 @@ async function runExport(request: ExportRequest): Promise<void> {
 
         try {
           await request.write(
-            saveUri.fsPath,
+            destination,
             abortController.signal,
             operationState,
           );
@@ -271,7 +308,7 @@ async function runExport(request: ExportRequest): Promise<void> {
     );
 
     vscode.window.showInformationMessage(
-      `[RapiDB] Exported ${request.successLabel} → ${path.basename(saveUri.fsPath)}`,
+      `[RapiDB] Exported ${request.successLabel} → ${path.basename(filePath)}`,
     );
   } catch (error: unknown) {
     const normalized = normalizeUnknownError(error);
@@ -282,8 +319,12 @@ async function runExport(request: ExportRequest): Promise<void> {
       return;
     }
 
+    const message =
+      request.secretContext === undefined
+        ? normalized.message
+        : normalizeUnknownError(error, request.secretContext).message;
     vscode.window.showErrorMessage(
-      `[RapiDB] ${request.errorLabel}: ${normalized.message}`,
+      `[RapiDB] ${request.errorLabel}: ${message}`,
     );
   }
 }
@@ -373,8 +414,30 @@ function buildExportFilters(format: ExportFormat): Record<string, string[]> {
     : { "JSON files": [JSON_EXTENSION], "All files": ["*"] };
 }
 
+async function withCsvWriteStream(
+  destination: ExportDestination,
+  writer: (writeStream: fs.WriteStream) => Promise<void>,
+  signal: AbortSignal,
+  state: ExportOperationState,
+): Promise<void> {
+  await withWriteStream(
+    destination,
+    async (writeStream) => {
+      const includeBom = vscode.workspace
+        .getConfiguration("rapidb")
+        .get<boolean>("export.csvUtf8Bom", false);
+      if (includeBom === true) {
+        await writeStreamChunk(writeStream, UTF8_BOM, signal);
+      }
+      await writer(writeStream);
+    },
+    signal,
+    state,
+  );
+}
+
 async function writeQueryResultsCsv(
-  filePath: string,
+  destination: ExportDestination,
   result: QueryResultExport,
   signal: AbortSignal,
   state: ExportOperationState,
@@ -384,8 +447,8 @@ async function writeQueryResultsCsv(
     result.columnMeta,
   );
 
-  await withWriteStream(
-    filePath,
+  await withCsvWriteStream(
+    destination,
     async (writeStream) => {
       throwIfAborted(signal);
       await writeStreamChunk(
@@ -405,7 +468,9 @@ async function writeQueryResultsCsv(
       >();
       for (const [rowIndex, row] of result.rows.entries()) {
         throwIfAborted(signal);
-        const exportRow = result.exportRows?.[rowIndex];
+        const exportRow = result.serializeJsonExportRow
+          ? undefined
+          : result.exportRows?.[rowIndex];
         await writeStreamChunk(
           writeStream,
           exportColumns
@@ -440,7 +505,7 @@ async function writeQueryResultsCsv(
 }
 
 async function writeQueryResultsJson(
-  filePath: string,
+  destination: ExportDestination,
   result: QueryResultExport,
   signal: AbortSignal,
   state: ExportOperationState,
@@ -451,7 +516,7 @@ async function writeQueryResultsJson(
   );
 
   await withWriteStream(
-    filePath,
+    destination,
     async (writeStream) => {
       throwIfAborted(signal);
       await writeStreamChunk(writeStream, "[\n", signal);
@@ -465,21 +530,29 @@ async function writeQueryResultsJson(
         throwIfAborted(signal);
         const row = result.rows[index];
         const exportRow = result.exportRows?.[index];
+        // The serializer writes bigint values as exact, unquoted JSON numbers.
+        const jsonOverrides = result.jsonExportCellOverrides?.[index];
+        const entries = exportColumns.map((column, columnIndex) => ({
+          ...column,
+          value:
+            jsonOverrides?.[column.sourceKey] ??
+            (exportRow ? exportRow[column.sourceKey] : row[column.sourceKey]),
+          omit:
+            missingCells.has(`${index}:${columnIndex}`) ||
+            (exportRow !== undefined &&
+              !Object.hasOwn(exportRow, column.sourceKey)),
+        }));
+        const serialized =
+          exportRow && result.serializeJsonExportRow
+            ? result.serializeJsonExportRow(
+                entries
+                  .filter((entry) => !entry.omit)
+                  .map((entry) => [entry.key, entry.value]),
+              )
+            : serializeJsonExportRecord(entries);
         await writeStreamChunk(
           writeStream,
-          `${index === 0 ? "" : ",\n"}${serializeJsonExportRecord(
-            exportColumns.map((column, columnIndex) => ({
-              ...column,
-              value:
-                exportRow && Object.hasOwn(exportRow, column.sourceKey)
-                  ? exportRow[column.sourceKey]
-                  : row[column.sourceKey],
-              omit:
-                missingCells.has(`${index}:${columnIndex}`) ||
-                (exportRow !== undefined &&
-                  !Object.hasOwn(exportRow, column.sourceKey)),
-            })),
-          )}`,
+          `${index === 0 ? "" : ",\n"}${serialized}`,
           signal,
         );
       }
@@ -492,13 +565,13 @@ async function writeQueryResultsJson(
 }
 
 async function writeChunkedCsv(
-  filePath: string,
+  destination: ExportDestination,
   chunks: AsyncIterable<ChunkedExportData>,
   signal: AbortSignal,
   state: ExportOperationState,
 ): Promise<void> {
-  await withWriteStream(
-    filePath,
+  await withCsvWriteStream(
+    destination,
     async (writeStream) => {
       let headerColumns: ChunkedExportData["columns"] | undefined;
       let headerByName: ReturnType<typeof indexExportColumns> | undefined;
@@ -606,13 +679,13 @@ function assertExportRowColumns(
 }
 
 async function writeChunkedJson(
-  filePath: string,
+  destination: ExportDestination,
   chunks: AsyncIterable<ChunkedExportData>,
   signal: AbortSignal,
   state: ExportOperationState,
 ): Promise<void> {
   await withWriteStream(
-    filePath,
+    destination,
     async (writeStream) => {
       throwIfAborted(signal);
       await writeStreamChunk(writeStream, "[\n", signal);
@@ -726,13 +799,27 @@ async function writeStreamChunk(
   });
 }
 
+function exportSiblingPath(filePath: string, suffix: "tmp" | "probe"): string {
+  const fileName = path.basename(filePath);
+  // Keep the original directory prefix (including any symlink/.. traversal).
+  const directoryPrefix = filePath.slice(0, filePath.lastIndexOf(fileName));
+  const siblingName = `.rapidb-${randomUUID()}.${suffix}`;
+  // Do not use the destination itself, even on a case-insensitive filesystem.
+  if (siblingName === fileName.replace(/[. ]+$/, "").toLowerCase()) {
+    throw new Error("Could not choose a distinct temporary export file name.");
+  }
+  return `${directoryPrefix}${siblingName}`;
+}
+
 async function withWriteStream(
-  filePath: string,
+  destination: ExportDestination,
   writer: (writeStream: fs.WriteStream) => Promise<void>,
   signal: AbortSignal,
   state: ExportOperationState,
 ): Promise<void> {
-  const temporaryPath = `${filePath}.rapidb-${randomUUID()}.tmp`;
+  throwIfAborted(signal);
+  assertExportDestinationUnchanged(destination);
+  const temporaryPath = exportSiblingPath(destination.filePath, "tmp");
   const writeStream = fs.createWriteStream(temporaryPath, {
     encoding: "utf8",
     flags: "wx",
@@ -743,20 +830,15 @@ async function withWriteStream(
   try {
     await waitForWriteStreamOpen(writeStream);
     temporaryFileCreated = true;
-    const destinationExisted = !!lstatDestinationIfPresent(filePath);
-    if (destinationExisted) assertWindowsDestinationIsNew(filePath);
+    assertExportDestinationUnchanged(destination);
     const hardLinksSupported =
-      destinationExisted || probeHardLinkSupport(temporaryPath);
+      !!destination.existing ||
+      probeHardLinkSupport(temporaryPath, destination.filePath);
     await writer(writeStream);
     await closeWriteStream(writeStream);
     throwIfAborted(signal);
     state.replacementStarted = true;
-    replaceExportFile(
-      temporaryPath,
-      filePath,
-      destinationExisted,
-      hardLinksSupported,
-    );
+    publishExportFile(temporaryPath, destination, hardLinksSupported);
   } catch (error) {
     await destroyAndWaitForClose(writeStream);
     if (temporaryFileCreated) {
@@ -777,15 +859,13 @@ function waitForWriteStreamOpen(writeStream: fs.WriteStream): Promise<void> {
   });
 }
 
-function replaceExportFile(
+function publishExportFile(
   temporaryPath: string,
-  filePath: string,
-  destinationExisted: boolean,
+  destination: ExportDestination,
   hardLinksSupported: boolean,
 ): void {
-  assertNotDirectoryDestination(filePath);
-  const destination = lstatDestinationIfPresent(filePath);
-  if (!destinationExisted || !destination) {
+  const { filePath, existing } = destination;
+  if (!existing) {
     let linked = false;
     if (hardLinksSupported) {
       try {
@@ -805,17 +885,11 @@ function replaceExportFile(
     }
     return;
   }
-  assertWindowsDestinationIsNew(filePath);
-  preserveDestinationMode(temporaryPath, filePath);
+  assertExportDestinationUnchanged(destination);
+  preserveDestinationMode(temporaryPath, existing);
+  // Node has no conditional rename; recheck as close to replacement as possible.
+  assertExportDestinationUnchanged(destination);
   fs.renameSync(temporaryPath, filePath);
-}
-
-function assertWindowsDestinationIsNew(filePath: string): void {
-  if (process.platform === "win32" && lstatDestinationIfPresent(filePath)) {
-    throw new Error(
-      "Cannot safely replace an existing export on Windows. Choose a new file name instead.",
-    );
-  }
 }
 
 function hardLinkError(error: unknown): Error {
@@ -842,26 +916,12 @@ function isHardLinkUnsupportedError(error: unknown): boolean {
   return typeof code === "string" && HARD_LINK_UNSUPPORTED_CODES.has(code);
 }
 
-const COPY_NOT_CREATED_CODES = new Set([
-  "EEXIST",
-  "EACCES",
-  "EPERM",
-  "ENOENT",
-  "ENOTDIR",
-  "EISDIR",
-  "EROFS",
-]);
-
 function copyNewExportFile(temporaryPath: string, filePath: string): void {
   try {
     fs.copyFileSync(temporaryPath, filePath, fs.constants.COPYFILE_EXCL);
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (!code || !COPY_NOT_CREATED_CODES.has(code)) {
-      try {
-        fs.rmSync(filePath, { force: true });
-      } catch {}
-    }
+    // Node attempts to clean up a failed partial copy. We do not own whatever
+    // entry is now at filePath, so do not perform a second cleanup by name.
     throw new Error(
       `Cannot publish a new export: ${normalizeUnknownError(error).message}. The destination may already exist. Choose a new name and retry.`,
       { cause: error },
@@ -869,13 +929,19 @@ function copyNewExportFile(temporaryPath: string, filePath: string): void {
   }
 }
 
-function probeHardLinkSupport(temporaryPath: string): boolean {
-  const probePath = `${temporaryPath}.${randomUUID()}.probe`;
+function probeHardLinkSupport(
+  temporaryPath: string,
+  filePath: string,
+): boolean {
+  const probePath = exportSiblingPath(filePath, "probe");
   try {
     fs.linkSync(temporaryPath, probePath);
   } catch (error) {
     if (isHardLinkUnsupportedError(error)) return false;
-    throw hardLinkError(error);
+    throw new Error(
+      `Cannot check hard-link support in the export directory: ${normalizeUnknownError(error).message}.`,
+      { cause: error },
+    );
   }
   try {
     fs.unlinkSync(probePath);
@@ -898,14 +964,13 @@ async function destroyAndWaitForClose(stream: fs.WriteStream): Promise<void> {
 
 function preserveDestinationMode(
   temporaryPath: string,
-  filePath: string,
+  destinationStats: fs.BigIntStats,
 ): void {
-  const destinationStats = lstatDestinationIfPresent(filePath);
-  if (!destinationStats?.isFile()) {
+  if (!destinationStats.isFile()) {
     return;
   }
   try {
-    fs.chmodSync(temporaryPath, destinationStats.mode & 0o777);
+    fs.chmodSync(temporaryPath, Number(destinationStats.mode & 0o777n));
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EINVAL") {
@@ -914,15 +979,36 @@ function preserveDestinationMode(
   }
 }
 
-function assertNotDirectoryDestination(filePath: string): void {
-  if (lstatDestinationIfPresent(filePath)?.isDirectory()) {
-    throw new Error("Cannot export to a directory.");
+function assertExportDestinationUnchanged({
+  filePath,
+  existing,
+}: ExportDestination): void {
+  const current = lstatDestinationIfPresent(filePath);
+  if (!existing && !current) return;
+  if (
+    existing &&
+    current &&
+    current.dev === existing.dev &&
+    current.ino === existing.ino &&
+    current.birthtimeNs === existing.birthtimeNs &&
+    current.ctimeNs === existing.ctimeNs &&
+    current.mtimeNs === existing.mtimeNs &&
+    current.size === existing.size &&
+    current.mode === existing.mode
+  ) {
+    return;
   }
+  throw new Error(
+    "The export destination changed after it was selected. Choose the destination again and retry.",
+  );
 }
 
-function lstatDestinationIfPresent(filePath: string): fs.Stats | undefined {
+function lstatDestinationIfPresent(
+  filePath: string,
+): fs.BigIntStats | undefined {
   try {
-    return fs.lstatSync(filePath);
+    // Observe the directory entry, not the target of a symbolic link.
+    return fs.lstatSync(filePath, { bigint: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return undefined;

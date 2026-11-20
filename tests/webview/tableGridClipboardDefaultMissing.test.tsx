@@ -2,7 +2,6 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { createRef } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 import { TableGrid } from "../../src/webview/components/table/TableGrid";
 import { INSERT_DEFAULT_SENTINEL } from "../../src/webview/components/table/tableViewHelpers";
 import {
@@ -54,7 +53,7 @@ function setup() {
     newRows: [
       {
         a: { value: INSERT_DEFAULT_SENTINEL },
-        b: { value: NULL_SENTINEL },
+        b: { value: null },
         c: { value: "" },
       },
     ],

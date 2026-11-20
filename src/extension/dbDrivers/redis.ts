@@ -81,8 +81,9 @@ import type {
   TransactionContext,
   TransactionOperation,
   TriggerMeta,
+  TypeCategory,
 } from "./types";
-import { NULL_SENTINEL, resolveFilterOperators } from "./types";
+import { resolveFilterOperators } from "./types";
 import {
   completeDriverUpdateRowsResult,
   failedDriverUpdateRows,
@@ -456,7 +457,9 @@ function redisComparisonRow(
 function formatRedisReplyValue(value: unknown): unknown {
   if (Buffer.isBuffer(value)) return formatRedisBlobString(value);
   if (value instanceof ErrorReply) return `(error) ${value.message}`;
-  if (typeof value === "string" && /^-?\d+$/.test(value)) {
+  // Wire strings arrive as buffers; raw numeric tokens arrive as strings.
+  // Only promote canonical safe integers, never padded text.
+  if (typeof value === "string" && /^-?(?:0|[1-9]\d*)$/.test(value)) {
     const integer = Number(value);
     return Number.isSafeInteger(integer) ? integer : value;
   }
@@ -529,6 +532,39 @@ function formatRedisValueTypeLabel(
     return valueTypes[0];
   }
   return `mixed(${valueTypes.join(", ")})`;
+}
+
+function redisKeyspaceColumn(
+  name: string,
+  type: string,
+  nativeType: string,
+  category: TypeCategory,
+  {
+    nullable = false,
+    filterable = true,
+    isReadOnly = false,
+    isPrimaryKey = false,
+  }: {
+    nullable?: boolean;
+    filterable?: boolean;
+    isReadOnly?: boolean;
+    isPrimaryKey?: boolean;
+  } = {},
+): ColumnTypeMeta {
+  return {
+    name,
+    type,
+    nativeType,
+    category,
+    nullable,
+    isPrimaryKey,
+    ...(isPrimaryKey ? { primaryKeyOrdinal: 1 } : {}),
+    ...(isReadOnly ? { isReadOnly: true } : {}),
+    isForeignKey: false,
+    filterable,
+    filterOperators: resolveFilterOperators(category, { filterable, nullable }),
+    valueSemantics: "plain",
+  };
 }
 
 function splitRedisStatements(input: string): string[] {
@@ -630,6 +666,20 @@ function describeClosedTransaction({
     default:
       return undefined;
   }
+}
+
+function describeRedisTransactionWarning(
+  transaction: RedisClosedTransaction,
+): string | undefined {
+  const { multiIndex, closeIndex, outcome } = transaction;
+  if (outcome === "partial") {
+    return `EXEC at statement ${closeIndex + 1} returned errors for one or more commands queued after MULTI at statement ${multiIndex + 1}. Redis does not roll back successful sibling commands.`;
+  }
+  if (outcome === "watchAborted") {
+    const description = describeClosedTransaction(transaction);
+    if (description) return `${capitalize(description)}.`;
+  }
+  return undefined;
 }
 
 function describeRedisScriptProgress(
@@ -1380,6 +1430,7 @@ export class RedisDriver implements IDBDriver {
                   [RESP_TYPES.BLOB_STRING]: Buffer,
                   [RESP_TYPES.VERBATIM_STRING]: Buffer,
                   [RESP_TYPES.DOUBLE]: String,
+                  // node-redis supports String, but not BigInt, for RESP NUMBER.
                   [RESP_TYPES.NUMBER]: String,
                   [RESP_TYPES.BIG_NUMBER]: String,
                   [RESP_TYPES.MAP]: Map,
@@ -1446,6 +1497,13 @@ export class RedisDriver implements IDBDriver {
           : { results: queryValue },
       );
       const columns = Object.keys(row);
+      // If execution stopped early, partialError already includes the
+      // completed transaction outcomes. Otherwise all replies are available.
+      const warnings = partialError
+        ? []
+        : closedTransactions.flatMap(
+            (transaction) => describeRedisTransactionWarning(transaction) ?? [],
+          );
       return {
         columns,
         columnMeta: [
@@ -1460,6 +1518,7 @@ export class RedisDriver implements IDBDriver {
         rowCount: 1,
         executionTimeMs: Date.now() - startedAt,
         ...(partialError ? { error: partialError } : {}),
+        ...(warnings.length > 0 ? { warnings } : {}),
       };
     } finally {
       if (onAbort) querySignal.removeEventListener("abort", onAbort);
@@ -1814,10 +1873,20 @@ export class RedisDriver implements IDBDriver {
         }
         if (result === -2) {
           writeMayHaveApplied = false;
+          updateRowOutcomes.push({
+            rowIndex,
+            status: "not_applied",
+            conflict: true,
+          });
           throw new Error("Redis key type changed after the row was loaded.");
         }
         if (result === -3) {
           writeMayHaveApplied = false;
+          updateRowOutcomes.push({
+            rowIndex,
+            status: "not_applied",
+            conflict: true,
+          });
           throw new Error("Redis value changed after the row was loaded.");
         }
         if (result === 1) {
@@ -1826,7 +1895,11 @@ export class RedisDriver implements IDBDriver {
           updateRowOutcomes.push({ rowIndex, status: "applied" });
         } else if (result === 0) {
           writeMayHaveApplied = false;
-          updateRowOutcomes.push({ rowIndex, status: "not_applied" });
+          updateRowOutcomes.push({
+            rowIndex,
+            status: "not_applied",
+            conflict: true,
+          });
         } else {
           updateRowOutcomes.push({ rowIndex, status: "unknown" });
         }
@@ -2052,7 +2125,7 @@ export class RedisDriver implements IDBDriver {
   }
 
   coerceInputValue(value: unknown, _column: ColumnTypeMeta): unknown {
-    return value === NULL_SENTINEL ? null : value;
+    return value;
   }
 
   coerceOriginalValue(value: unknown, _column: ColumnTypeMeta): unknown {
@@ -2519,66 +2592,39 @@ export class RedisDriver implements IDBDriver {
   }
 
   private inferRedisColumns(rows: readonly RedisSampleRow[]): ColumnTypeMeta[] {
-    const columns = inferColumnsFromRows(
-      rows.map((entry) =>
-        isRedisOversizedValueSnapshot(entry.row.value)
-          ? { ...entry.row, value: null }
-          : redisComparisonRow(entry.row),
-      ),
-      "key",
-      {
-        nullableMode: "schemaLess",
-        consistentCategories: true,
-      },
-    );
+    // The grid schema exists even without keys. Only value comparisons and
+    // the native value label are inferred from samples; inserts still use SET.
     const valueTypeLabel = formatRedisValueTypeLabel(rows);
-    return columns.map((column) =>
-      column.name === "key"
-        ? {
-            ...column,
-            type: "string",
-            nativeType: "string",
-            category: "text",
-            filterOperators: resolveFilterOperators("text", {
-              filterable: true,
-              nullable: false,
-            }),
-          }
-        : column.name === "value" && valueTypeLabel
-          ? {
-              ...column,
-              type: valueTypeLabel,
-              nativeType: valueTypeLabel,
-            }
-          : column.name === "type"
-            ? {
-                ...column,
-                type: "string",
-                nativeType: "redis_type",
-                category: "text",
-                isReadOnly: true,
-                filterable: true,
-                filterOperators: resolveFilterOperators("text", {
-                  filterable: true,
-                  nullable: false,
-                }),
-                valueSemantics: "plain",
-              }
-            : column.name === "ttl"
-              ? {
-                  ...column,
-                  type: "integer",
-                  nativeType: "ttl_seconds",
-                  category: "integer",
-                  filterable: true,
-                  filterOperators: resolveFilterOperators("integer", {
-                    filterable: true,
-                    nullable: true,
-                  }),
-                  valueSemantics: "plain",
-                }
-              : column,
+    const [sampledValue] = inferColumnsFromRows(
+      rows.map(({ row }) => ({
+        value: isRedisOversizedValueSnapshot(row.value)
+          ? null
+          : redisComparisonRow(row).value,
+      })),
+      "key",
+      { nullableMode: "schemaLess", consistentCategories: true },
     );
+    const valueType = valueTypeLabel ?? sampledValue?.nativeType ?? "string";
+    return [
+      redisKeyspaceColumn("key", "string", "string", "text", {
+        isPrimaryKey: true,
+      }),
+      {
+        ...(sampledValue ??
+          redisKeyspaceColumn("value", "string", "string", "text", {
+            nullable: true,
+          })),
+        type: valueType,
+        nativeType: valueType,
+        redisValue: true,
+      },
+      redisKeyspaceColumn("ttl", "integer", "ttl_seconds", "integer", {
+        nullable: true,
+      }),
+      redisKeyspaceColumn("type", "string", "redis_type", "text", {
+        isReadOnly: true,
+      }),
+    ];
   }
 
   private parseRedisTtlInput(

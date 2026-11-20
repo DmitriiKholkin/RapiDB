@@ -2,7 +2,6 @@ import { act, renderHook } from "@testing-library/react";
 import type React from "react";
 import { describe, expect, it } from "vitest";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 import { useCellSelection } from "../../src/webview/components/table/useCellSelection";
 import {
   formatNormalizedPasteValue,
@@ -130,9 +129,7 @@ describe("copying MISSING / DEFAULT cells", () => {
       parsed.quoted?.[0]?.[0],
     );
     expect(pasted).toEqual({ valid: true, coercedValue: null });
-    expect(formatNormalizedPasteValue(missing, pasted.coercedValue)).toBe(
-      NULL_SENTINEL,
-    );
+    expect(formatNormalizedPasteValue(missing, pasted.coercedValue)).toBeNull();
   });
 });
 

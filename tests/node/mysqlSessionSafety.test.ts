@@ -319,6 +319,7 @@ describe("MySQL table page cancellation", () => {
 describe("MySQL session initialization", () => {
   const mysqlIdentitySql =
     "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_uuid, @@hostname, @@port) AS server_identity";
+  const mysqlSessionProbeSql = `${mysqlIdentitySql}, @@SESSION.sql_mode AS sql_mode`;
 
   function nativeConnection(statusFlags?: number) {
     return {
@@ -353,7 +354,7 @@ describe("MySQL session initialization", () => {
       getConnection: vi.fn(async () => {
         onConnection?.(probeNative);
         const identity = probeNative.query.mock.calls.find(
-          (call) => call[0] === mysqlIdentitySql,
+          (call) => call[0] === mysqlSessionProbeSql,
         )?.[1] as (error: Error | null, rows?: unknown) => void;
         identity(null, [probeIdentity]);
         return probe;
@@ -384,7 +385,7 @@ describe("MySQL session initialization", () => {
   it("needs a single identity round trip when the handshake reports autocommit", async () => {
     const { driver, probe, probeNative, killTargets } = await connectedPool();
     expect(probeNative.query.mock.calls.map((call) => call[0])).toEqual([
-      mysqlIdentitySql,
+      mysqlSessionProbeSql,
     ]);
     expect(probe.release).toHaveBeenCalledOnce();
     expect(killTargets.get(probeNative)).toEqual({
@@ -395,12 +396,60 @@ describe("MySQL session initialization", () => {
     await driver.disconnect();
   });
 
+  it.each([
+    { status: 0x0202, sql_mode: undefined },
+    { status: 2, sql_mode: "STRICT_TRANS_TABLES, NO_BACKSLASH_ESCAPES" },
+  ])("uses the handshake or actual session sql_mode for previews ($sql_mode)", async ({
+    status,
+    sql_mode,
+  }) => {
+    const { driver } = await connectedPool(status, {
+      connection_id: "42",
+      autocommit: 1,
+      server_identity: "uuid-1:db-1:3306",
+      sql_mode,
+    });
+    const literal = String.raw`'today''s folder ?\'`;
+    const sql = `SELECT ${literal}, ?, ?`;
+    expect(driver.materializePreviewSql(sql, [7, 8])).toBe(
+      `SELECT ${literal}, 7, 8`,
+    );
+    expect(() => driver.materializePreviewSql(sql, [7])).toThrow(
+      "Preview parameter mismatch: SQL has 2 placeholder(s)",
+    );
+    await driver.disconnect();
+  });
+
+  it("uses actual session mode over the handshake and does not guess when live sessions disagree", async () => {
+    const { driver, open } = await connectedPool(0x0202, {
+      connection_id: "42",
+      autocommit: 1,
+      server_identity: "uuid-1:db-1:3306",
+      sql_mode: "STRICT_TRANS_TABLES",
+    });
+    const escapedLiteral = String.raw`'today\'s folder ?'`;
+    expect(
+      driver.materializePreviewSql(`SELECT ${escapedLiteral}, ?`, [7]),
+    ).toBe(`SELECT ${escapedLiteral}, 7`);
+
+    const { callbacks } = open(2);
+    callbacks[0](null, [{ sql_mode: "NO_BACKSLASH_ESCAPES" }]);
+    expect(() =>
+      driver.materializePreviewSql(`SELECT ${escapedLiteral}, ?`, [7]),
+    ).toThrow("Preview parameter mismatch");
+    const identifier = driver.quoteIdentifier("notes\\");
+    expect(driver.materializePreviewSql(`SELECT ${identifier}, ?`, [7])).toBe(
+      `SELECT ${identifier}, 7`,
+    );
+    await driver.disconnect();
+  });
+
   it("sets autocommit before any user query when the handshake does not report it", async () => {
     const { driver, open } = await connectedPool();
     const { native, callbacks } = open(0);
     expect(native.query.mock.calls.map((call) => call[0])).toEqual([
       "SET SESSION autocommit = 1",
-      mysqlIdentitySql,
+      mysqlSessionProbeSql,
     ]);
     callbacks[0](null);
     expect(native.destroy).not.toHaveBeenCalled();

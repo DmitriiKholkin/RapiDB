@@ -18,17 +18,26 @@ import {
   parseQueryPanelMessage,
   type QueryBookmarkPayload,
   type QueryEditorSqlDialect,
+  type QueryOperationIdentity,
   type QueryResultExportPayload,
   type QuerySchemaPayload,
+  type QueryTargetBinding,
 } from "../../shared/webviewContracts";
 import type { ConnectionManager } from "../connectionManager";
 import type { SchemaObjectEntry } from "../connectionManagerModels";
-import { colKey, type QueryColumnMeta } from "../dbDrivers/types";
+import { connectionSessionKey } from "../connectionManagerStore";
+import {
+  colKey,
+  type QueryColumnMeta,
+  type QueryJsonExportOverrides,
+} from "../dbDrivers/types";
 import { readClipboardTextSafe, writeClipboardText } from "../utils/clipboard";
+import { redactDiagnosticText } from "../utils/diagnosticRedaction";
 import { normalizeUnknownError } from "../utils/errorHandling";
 import {
   exportQueryResultsAsCsv,
   exportQueryResultsAsJson,
+  type QueryResultExport,
 } from "../utils/exportService";
 import { logger } from "../utils/logger";
 import {
@@ -49,6 +58,14 @@ const MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE =
   "[RapiDB] Read-only MSSQL queries require database-enforced read permissions; client-side SQL classification is not sufficient.";
 const MYSQL_EXECUTABLE_COMMENT_MESSAGE =
   "[RapiDB] MySQL/MariaDB executable comments are blocked because the server executes their contents. Remove the `/*!...*/` or `/*M!...*/` wrapper and run the intended statement explicitly.";
+const PINNED_QUERY_TARGET_MESSAGE =
+  "[RapiDB] This tab is pinned to its original PostgreSQL connection and database. Open a new query to use another target.";
+const PINNED_QUERY_UNAVAILABLE_MESSAGE =
+  "[RapiDB] The PostgreSQL connection pinned to this tab is unavailable.";
+const QUERY_TARGET_CHANGED_MESSAGE =
+  "[RapiDB] The query target changed or could not be verified. Review and confirm the target before running again.";
+const QUERY_SESSION_ENDED_MESSAGE =
+  "[RapiDB] The connection attempt was interrupted. Run the query again after reconnecting.";
 const CONNECTION_TYPE_TO_SCHEMA_DIALECT: Record<
   ConnectionType,
   QueryEditorSqlDialect
@@ -65,11 +82,24 @@ const CONNECTION_TYPE_TO_SCHEMA_DIALECT: Record<
 };
 let nextQueryRequestToken = 0;
 
-export interface QueryPanelCachedResult {
+export function currentQueryTargetSessionKey(
+  manager: ConnectionManager,
+  connectionId: string,
+): string | null {
+  return (
+    connectionSessionKey(
+      manager.getConnection(connectionId),
+      manager.getConnectionSessionNonce?.(connectionId),
+    ) ?? null
+  );
+}
+
+export interface QueryPanelCachedResult extends QueryJsonExportOverrides {
   columns: string[];
   columnMeta?: QueryColumnMeta[];
   rows: Record<string, unknown>[];
-  exportRows?: Record<string, unknown>[];
+  exportRows?: QueryResultExport["exportRows"];
+  serializeJsonExportRow?: QueryResultExport["serializeJsonExportRow"];
   partial?: boolean;
   resultSets?: FormattedQueryResultSet[];
   resultSetsTruncated?: boolean;
@@ -89,12 +119,18 @@ interface QueryPanelView {
 }
 
 interface ActiveQueryExecution extends QueryExecutionCancellationHandle {
+  secretContext?: unknown;
+  targetSessionKey?: string;
   operationId?: string;
   cancelRequested?: boolean;
   cancellationPending?: Promise<void>;
   queryStarted: boolean;
   completion?: Promise<void>;
   finish?: () => void;
+}
+
+interface QueryResultIdentity extends QueryOperationIdentity {
+  requestToken: number;
 }
 
 export class QueryPanelController {
@@ -115,15 +151,80 @@ export class QueryPanelController {
     private readonly connectionManager: ConnectionManager,
     private readonly view: QueryPanelView,
     private readonly context?: vscode.ExtensionContext,
+    private readonly postgresDatabase?: string,
+    private targetBinding?: QueryTargetBinding,
   ) {}
 
   private resolveConnectionId(connectionIdOverride?: string): string {
+    if (this.postgresDatabase !== undefined) {
+      return this.view.getInitialConnectionId();
+    }
+    if (this.targetBinding) {
+      return connectionIdOverride ?? this.targetBinding.connectionId;
+    }
     return (
       connectionIdOverride ||
       this.requestedConnectionId ||
       this.view.getActiveConnectionId() ||
       this.view.getInitialConnectionId()
     );
+  }
+
+  private rejectsTarget(connectionIdOverride?: string): boolean {
+    return (
+      this.postgresDatabase !== undefined &&
+      !!connectionIdOverride &&
+      connectionIdOverride !== this.view.getInitialConnectionId()
+    );
+  }
+
+  private isValidTarget(
+    connectionId: string,
+    sessionKey?: string | null,
+  ): boolean {
+    if (!this.targetBinding) return true;
+    return (
+      !!sessionKey &&
+      this.targetBinding.connectionId === connectionId &&
+      this.targetBinding.sessionKey === sessionKey &&
+      currentQueryTargetSessionKey(this.connectionManager, connectionId) ===
+        sessionKey
+    );
+  }
+
+  private rejectUnverifiedTarget(
+    connectionId: string,
+    sessionKey: string | undefined,
+    resultIdentity: QueryResultIdentity | undefined,
+  ): boolean {
+    if (this.isValidTarget(connectionId, sessionKey)) return false;
+    this.pushConnections();
+    const unavailablePinnedProfile =
+      this.postgresDatabase !== undefined &&
+      this.connectionManager.getConnection(connectionId)?.type !== "pg";
+    this.postQueryError(
+      unavailablePinnedProfile
+        ? PINNED_QUERY_UNAVAILABLE_MESSAGE
+        : QUERY_TARGET_CHANGED_MESSAGE,
+      undefined,
+      resultIdentity,
+    );
+    return true;
+  }
+
+  private publishTargetChange(): void {
+    const binding = this.targetBinding;
+    if (!binding) return;
+    this.view.postMessage({ type: "queryTargetBinding", payload: binding });
+  }
+
+  private removeExecution(connectionId: string, requestToken: number): void {
+    if (
+      this.activeQueryExecutions.get(connectionId)?.requestToken ===
+      requestToken
+    ) {
+      this.activeQueryExecutions.delete(connectionId);
+    }
   }
 
   async handleMessage(message: unknown): Promise<void> {
@@ -135,7 +236,10 @@ export class QueryPanelController {
     switch (parsed.type) {
       case "activeConnectionChanged":
         if (parsed.payload) {
-          await this.handleActiveConnectionChanged(parsed.payload.connectionId);
+          await this.handleActiveConnectionChanged(
+            parsed.payload.connectionId,
+            parsed.payload.targetSessionKey,
+          );
         }
         break;
       case "executeQuery":
@@ -144,17 +248,37 @@ export class QueryPanelController {
             parsed.payload.queryText,
             parsed.payload.connectionId,
             parsed.payload.operationId,
+            parsed.payload.targetSessionKey,
           );
         }
         break;
       case "cancelQuery":
         if (parsed.payload) {
-          await this.handleCancelQuery(parsed.payload.operationId);
+          await this.handleCancelQuery(parsed.payload);
         }
         break;
-      case "getConnections":
+      case "getConnections": {
+        if (this.targetBinding) {
+          const initializing = this.connectionManager
+            .getConnections()
+            .filter(
+              ({ id }) =>
+                this.postgresDatabase === undefined ||
+                id === this.view.getInitialConnectionId(),
+            )
+            .flatMap(({ id }) => {
+              const pending =
+                this.connectionManager.initializeConnectionCredentialRevision?.(
+                  id,
+                );
+              return pending ? [pending] : [];
+            });
+          if (initializing.length > 0) await Promise.all(initializing);
+        }
+        this.publishTargetChange();
         this.pushConnections();
         break;
+      }
       case "getSchema":
         await this.pushSchema(parsed.payload?.connectionId);
         break;
@@ -197,6 +321,11 @@ export class QueryPanelController {
   }
 
   async handleSchemaLoaded(connectionId: string): Promise<void> {
+    // A pinned panel loads and awaits its own database scope. An aggregate
+    // Explorer event may be for any database under this connection.
+    if (this.postgresDatabase !== undefined) return;
+    if (!this.isValidTarget(connectionId, this.targetBinding?.sessionKey))
+      return;
     const activeConnectionId = this.view.getActiveConnectionId();
     const initialConnectionId = this.view.getInitialConnectionId();
     if (
@@ -215,7 +344,42 @@ export class QueryPanelController {
 
   private async handleActiveConnectionChanged(
     connectionId: string,
+    sessionKey?: string,
   ): Promise<void> {
+    if (this.targetBinding) {
+      const initializing =
+        this.connectionManager.initializeConnectionCredentialRevision?.(
+          connectionId,
+        );
+      if (
+        (initializing && !(await initializing)) ||
+        this.rejectsTarget(connectionId) ||
+        (this.postgresDatabase !== undefined &&
+          this.connectionManager.getConnection(connectionId)?.type !== "pg") ||
+        !sessionKey ||
+        currentQueryTargetSessionKey(this.connectionManager, connectionId) !==
+          sessionKey
+      ) {
+        this.pushConnections();
+        return;
+      }
+      if (this.isValidTarget(connectionId, sessionKey)) return;
+      // Install the explicitly selected revision before awaiting cancellation.
+      // A queued Run cannot implicitly select a different profile or revision.
+      this.targetBinding = { connectionId, sessionKey };
+      ++this.schemaRequestToken;
+      this.queryRequestToken = 0;
+      this.acceptedQueryRequestToken = 0;
+      this.view.setActiveConnectionId(connectionId);
+      this.view.setLastQueryResult(null);
+      this.view.syncTitle();
+      this.publishTargetChange();
+      this.pushConnections();
+      void this.pushSchema(connectionId);
+      await this.cancelOwnedQueryExecutions("superseded");
+      return;
+    }
+    if (this.postgresDatabase !== undefined) return;
     if (
       connectionId ===
       (this.requestedConnectionId ?? this.view.getActiveConnectionId())
@@ -240,21 +404,45 @@ export class QueryPanelController {
     queryText: string,
     connectionIdOverride?: string,
     operationId?: string,
+    targetSessionKey?: string,
   ): Promise<void> {
     if (!queryText.trim()) {
       return;
     }
 
     const connectionId = this.resolveConnectionId(connectionIdOverride);
+    if (this.rejectsTarget(connectionIdOverride)) {
+      this.postQueryError(
+        PINNED_QUERY_TARGET_MESSAGE,
+        undefined,
+        operationId
+          ? {
+              connectionId: connectionIdOverride || connectionId,
+              operationId,
+              requestToken: ++nextQueryRequestToken,
+            }
+          : undefined,
+      );
+      return;
+    }
     const requestToken = ++nextQueryRequestToken;
-    this.queryRequestToken = requestToken;
     const resultIdentity = operationId
       ? { connectionId, operationId, requestToken }
       : undefined;
+    const rejectIfTargetChanged = () =>
+      this.rejectUnverifiedTarget(
+        connectionId,
+        targetSessionKey,
+        resultIdentity,
+      );
+    if (rejectIfTargetChanged()) return;
+    this.queryRequestToken = requestToken;
     const canProceed = await this.cancelSupersededQueryExecution(
       connectionId,
       requestToken,
     );
+    if (!this.isCurrentQueryRequest(requestToken)) return;
+    if (rejectIfTargetChanged()) return;
     if (!canProceed) {
       this.postQueryError(
         SUPERSEDED_QUERY_REJECTED_MESSAGE,
@@ -275,6 +463,14 @@ export class QueryPanelController {
       return;
     }
     const connection = this.connectionManager.getConnection(connectionId);
+    if (this.postgresDatabase !== undefined && connection?.type !== "pg") {
+      this.postQueryError(
+        PINNED_QUERY_UNAVAILABLE_MESSAGE,
+        requestToken,
+        resultIdentity,
+      );
+      return;
+    }
     if (connection?.type === "mysql" && hasExecutableMysqlComment(queryText)) {
       this.postQueryError(
         MYSQL_EXECUTABLE_COMMENT_MESSAGE,
@@ -332,47 +528,63 @@ export class QueryPanelController {
       connectionId,
       operationName: "query",
       operationId,
+      targetSessionKey,
       supportsCancellation: false,
       queryStarted: false,
       cancel: async () => undefined,
     };
     this.activeQueryExecutions.set(connectionId, pendingExecution);
 
-    if (!this.connectionManager.isConnected(connectionId)) {
-      try {
-        await this.connectionManager.connectTo(connectionId, "automatic");
-      } catch (error: unknown) {
-        const active = this.activeQueryExecutions.get(connectionId);
-        if (active?.requestToken === requestToken) {
-          this.activeQueryExecutions.delete(connectionId);
-        }
-        if (!this.isCurrentQueryRequest(requestToken)) return;
-        const normalized = normalizeUnknownError(error, connection);
-        this.postQueryError(
-          `Cannot connect: ${normalized.message}`,
-          requestToken,
-          resultIdentity,
+    let driver: ReturnType<ConnectionManager["getDriver"]>;
+    try {
+      if (this.targetBinding && targetSessionKey) {
+        driver = await this.connectionManager.getDriverForQuery(
+          connectionId,
+          targetSessionKey,
         );
-        return;
+      } else {
+        if (!this.connectionManager.isConnected(connectionId)) {
+          await this.connectionManager.connectTo(connectionId, "automatic");
+        }
+        driver = this.connectionManager.getDriver(connectionId);
       }
-    }
-
-    if (!this.isCurrentQueryRequest(requestToken)) {
-      const active = this.activeQueryExecutions.get(connectionId);
-      if (active?.requestToken === requestToken) {
-        this.activeQueryExecutions.delete(connectionId);
-      }
+    } catch (error: unknown) {
+      this.removeExecution(connectionId, requestToken);
+      if (!this.isCurrentQueryRequest(requestToken)) return;
+      if (rejectIfTargetChanged()) return;
+      const normalized = normalizeUnknownError(
+        error,
+        this.connectionManager.getConnectionDiagnosticContext?.(connectionId) ??
+          connection,
+      );
+      this.postQueryError(
+        `Cannot connect: ${normalized.message}`,
+        requestToken,
+        resultIdentity,
+      );
       return;
     }
 
-    const driver = this.connectionManager.getDriver(connectionId);
-    if (!driver) {
-      const active = this.activeQueryExecutions.get(connectionId);
-      if (active?.requestToken === requestToken) {
-        this.activeQueryExecutions.delete(connectionId);
-      }
+    if (!this.isCurrentQueryRequest(requestToken)) {
+      this.removeExecution(connectionId, requestToken);
+      return;
+    }
+
+    if (rejectIfTargetChanged()) {
+      this.removeExecution(connectionId, requestToken);
+      return;
+    }
+
+    if (
+      !driver ||
+      (this.targetBinding &&
+        this.connectionManager.getDriver(connectionId) !== driver)
+    ) {
+      this.removeExecution(connectionId, requestToken);
       this.postQueryError(
-        `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
+        this.targetBinding
+          ? QUERY_SESSION_ENDED_MESSAGE
+          : `[RapiDB] Cannot execute query: driver is unavailable for ${connectionId}.`,
         requestToken,
         resultIdentity,
       );
@@ -381,6 +593,11 @@ export class QueryPanelController {
 
     const executionConnection =
       this.connectionManager.getConnection(connectionId);
+    const secretContext =
+      this.connectionManager.getConnectionDiagnosticContext?.(
+        connectionId,
+        driver,
+      ) ?? executionConnection;
     const executionDecision = decideReadOnlyQueryExecution(
       this.connectionManager,
       connectionId,
@@ -399,34 +616,35 @@ export class QueryPanelController {
               ? MSSQL_READ_ONLY_ENFORCEMENT_MESSAGE
               : undefined));
     if (executionBlock) {
-      const active = this.activeQueryExecutions.get(connectionId);
-      if (active?.requestToken === requestToken) {
-        this.activeQueryExecutions.delete(connectionId);
-      }
+      this.removeExecution(connectionId, requestToken);
       this.postQueryError(executionBlock, requestToken, resultIdentity);
       return;
     }
 
-    this.activeQueryExecutions.set(
+    const execution = this.createQueryExecutionHandle(
       connectionId,
-      this.createQueryExecutionHandle(
-        connectionId,
-        requestToken,
-        driver,
-        operationId,
-      ),
+      requestToken,
+      driver,
+      operationId,
+      secretContext,
+      targetSessionKey,
     );
+    this.activeQueryExecutions.set(connectionId, execution);
 
     if (!this.isCurrentQueryRequest(requestToken)) {
-      const active = this.activeQueryExecutions.get(connectionId);
-      if (active?.requestToken === requestToken) {
-        this.activeQueryExecutions.delete(connectionId);
-      }
+      execution.finish?.();
+      this.removeExecution(connectionId, requestToken);
       return;
     }
 
     void this.connectionManager
-      .addToHistory(connectionId, queryText)
+      .addToHistory(
+        connectionId,
+        queryText,
+        ...(this.postgresDatabase !== undefined
+          ? ([this.postgresDatabase] as const)
+          : []),
+      )
       .catch((error) => {
         logger.error("Failed to save query history", error);
       });
@@ -447,6 +665,9 @@ export class QueryPanelController {
       queryStarted = true;
       const result = await driver.query(cappedQueryText, undefined, {
         requestToken,
+        ...(this.postgresDatabase !== undefined
+          ? { database: this.postgresDatabase }
+          : {}),
         ...(driverBounded ? { hardCap: hardCapProbeLimit } : {}),
         ...(executionConnection?.readOnly === true ? { readOnly: true } : {}),
       });
@@ -457,6 +678,7 @@ export class QueryPanelController {
       if (!this.isCurrentQueryRequest(requestToken)) {
         return;
       }
+      if (rejectIfTargetChanged()) return;
       const formattedResult = formatQueryResult(result, effectiveRowLimit);
 
       this.view.setLastQueryResult({
@@ -465,6 +687,12 @@ export class QueryPanelController {
         rows: formattedResult.rows,
         ...(formattedResult.exportRows
           ? { exportRows: formattedResult.exportRows }
+          : {}),
+        ...(formattedResult.jsonExportCellOverrides
+          ? { jsonExportCellOverrides: formattedResult.jsonExportCellOverrides }
+          : {}),
+        ...(formattedResult.serializeJsonExportRow
+          ? { serializeJsonExportRow: formattedResult.serializeJsonExportRow }
           : {}),
         ...(formattedResult.resultSets
           ? { resultSets: formattedResult.resultSets }
@@ -479,23 +707,46 @@ export class QueryPanelController {
       });
       const webviewResult = { ...formattedResult };
       delete webviewResult.exportRows;
+      delete webviewResult.serializeJsonExportRow;
+      delete webviewResult.jsonExportCellOverrides;
+      webviewResult.resultSets = webviewResult.resultSets?.map((resultSet) => {
+        if (!resultSet.jsonExportCellOverrides) return resultSet;
+        const displayResultSet = { ...resultSet };
+        delete displayResultSet.jsonExportCellOverrides;
+        return displayResultSet;
+      });
       this.view.postMessage({
         type: "queryResult",
-        payload: { ...webviewResult, ...resultIdentity },
+        payload: {
+          ...webviewResult,
+          ...(webviewResult.error !== undefined && {
+            error: redactDiagnosticText(webviewResult.error, secretContext),
+          }),
+          ...(webviewResult.warnings !== undefined && {
+            warnings: webviewResult.warnings.map((warning) =>
+              redactDiagnosticText(warning, secretContext),
+            ),
+          }),
+          ...resultIdentity,
+        },
       });
     } catch (error: unknown) {
       const activeExecution = this.activeQueryExecutions.get(connectionId);
       if (activeExecution?.requestToken === requestToken) {
         await activeExecution.cancellationPending;
       }
-      const normalized = normalizeUnknownError(error, connection);
+      if (!this.isCurrentQueryRequest(requestToken)) return;
+      if (rejectIfTargetChanged()) return;
+      const normalized = normalizeUnknownError(error, secretContext);
       if (
         activeExecution?.requestToken === requestToken &&
         activeExecution.cancelRequested
       ) {
         const isRedisClientDisconnect =
           connection?.type === "redis" &&
-          /^disconnects client\.?$/i.test(normalized.message.trim());
+          /^disconnects client\.?$/i.test(
+            normalizeUnknownError(error, connection).message.trim(),
+          );
         const cancellationMessage = isRedisClientDisconnect
           ? "[RapiDB] Query cancellation was requested. The Redis query client was disconnected to stop the active request. The operation outcome may be unknown; cancellation does not confirm rollback."
           : `[RapiDB] Query failed after a cancellation request. ${normalized.message} The operation outcome may be unknown; cancellation does not confirm rollback.`;
@@ -513,17 +764,27 @@ export class QueryPanelController {
         try {
           await this.connectionManager.disconnectFrom(connectionId);
         } catch (error) {
-          logger.error("Failed to retire a lost database session", error);
+          logger.error(
+            "Failed to retire a lost database session",
+            error,
+            secretContext,
+          );
         }
       }
-      if (queryStarted && changesDiscoverableSchema) {
+      if (
+        queryStarted &&
+        changesDiscoverableSchema &&
+        (!this.targetBinding ||
+          (currentQueryTargetSessionKey(
+            this.connectionManager,
+            connectionId,
+          ) === targetSessionKey &&
+            this.connectionManager.getDriver(connectionId) === driver))
+      ) {
         this.connectionManager.refreshSchemaCache(connectionId);
       }
-      const active = this.activeQueryExecutions.get(connectionId);
-      if (active?.requestToken === requestToken) {
-        active.finish?.();
-        this.activeQueryExecutions.delete(connectionId);
-      }
+      execution.finish?.();
+      this.removeExecution(connectionId, requestToken);
     }
   }
 
@@ -537,6 +798,8 @@ export class QueryPanelController {
       ) => void | Promise<void>;
     },
     operationId?: string,
+    secretContext?: unknown,
+    targetSessionKey?: string,
   ): ActiveQueryExecution {
     const supportsCancellation =
       typeof driver.cancelCurrentOperation === "function";
@@ -550,6 +813,8 @@ export class QueryPanelController {
       connectionId,
       operationName: "query",
       operationId,
+      secretContext,
+      targetSessionKey,
       queryStarted: true,
       completion,
       finish,
@@ -569,16 +834,23 @@ export class QueryPanelController {
     };
   }
 
-  private async handleCancelQuery(operationId: string): Promise<void> {
-    const execution = [...this.activeQueryExecutions.values()].find(
-      (candidate) => candidate.operationId === operationId,
-    );
-    if (!execution) return;
+  private async handleCancelQuery(
+    identity: QueryOperationIdentity,
+  ): Promise<void> {
+    const { connectionId, operationId } = identity;
+    const execution = this.activeQueryExecutions.get(connectionId);
+    if (
+      !execution ||
+      execution.operationId !== operationId ||
+      !this.isCurrentQueryRequest(execution.requestToken) ||
+      !this.isValidTarget(connectionId, execution.targetSessionKey)
+    ) {
+      return;
+    }
     if (!execution.queryStarted) {
       execution.cancelRequested = true;
       this.postQueryError("[RapiDB] Query cancelled.", execution.requestToken, {
-        connectionId: execution.connectionId,
-        operationId: execution.operationId,
+        ...identity,
         requestToken: execution.requestToken,
       });
       if (this.queryRequestToken === execution.requestToken) {
@@ -633,7 +905,11 @@ export class QueryPanelController {
       }
     } catch (error: unknown) {
       execution.cancelRequested = false;
-      logger.error("Failed to cancel query execution", error);
+      logger.error(
+        "Failed to cancel query execution",
+        error,
+        execution.secretContext,
+      );
       void vscode.window.showWarningMessage(
         "[RapiDB] Query cancellation failed; the query may still be running.",
       );
@@ -701,7 +977,11 @@ export class QueryPanelController {
       }
       return true;
     } catch (error: unknown) {
-      logger.error("Failed to cancel superseded query execution", error);
+      logger.error(
+        "Failed to cancel superseded query execution",
+        error,
+        previous.secretContext,
+      );
       return false;
     } finally {
       if (timeoutHandle) {
@@ -744,7 +1024,11 @@ export class QueryPanelController {
             }),
           ]);
         } catch (error: unknown) {
-          logger.error("Failed to cancel owned query execution", error);
+          logger.error(
+            "Failed to cancel owned query execution",
+            error,
+            execution.secretContext,
+          );
         } finally {
           if (timeoutHandle) {
             clearTimeout(timeoutHandle);
@@ -764,22 +1048,67 @@ export class QueryPanelController {
   private pushConnections(): void {
     const connections = this.connectionManager
       .getConnections()
+      .filter(
+        (connection) =>
+          this.postgresDatabase === undefined ||
+          (connection.id === this.view.getInitialConnectionId() &&
+            connection.type === "pg"),
+      )
       .map((connection) => ({
         id: connection.id,
         name: connection.name,
         type: connection.type,
+        ...(this.targetBinding
+          ? {
+              targetSessionKey: currentQueryTargetSessionKey(
+                this.connectionManager,
+                connection.id,
+              ),
+            }
+          : {}),
         editorPresentation: this.connectionManager.getQueryEditorPresentation(
           connection.id,
         ),
       }));
+    if (this.targetBinding) {
+      // Retire operations for replaced targets without making the new target
+      // wait for the old driver. Any late callback still has its own token.
+      for (const [id, execution] of this.activeQueryExecutions) {
+        if (
+          currentQueryTargetSessionKey(this.connectionManager, id) !==
+          execution.targetSessionKey
+        ) {
+          this.activeQueryExecutions.delete(id);
+        }
+      }
+      if (
+        !this.isValidTarget(
+          this.targetBinding.connectionId,
+          this.targetBinding.sessionKey,
+        )
+      ) {
+        this.view.setLastQueryResult(null);
+      }
+    }
     this.view.postMessage({ type: "connections", payload: connections });
   }
 
   private async pushSchema(connectionIdOverride?: string): Promise<void> {
+    if (this.rejectsTarget(connectionIdOverride)) return;
     const requestToken = ++this.schemaRequestToken;
     const connectionId = this.resolveConnectionId(connectionIdOverride);
+    const targetSessionKey = this.targetBinding?.sessionKey;
 
-    if (!this.connectionManager.isConnected(connectionId)) {
+    const unavailable =
+      this.postgresDatabase !== undefined &&
+      this.connectionManager.getConnection(connectionId)?.type !== "pg"
+        ? PINNED_QUERY_UNAVAILABLE_MESSAGE
+        : !this.isValidTarget(connectionId, targetSessionKey)
+          ? QUERY_TARGET_CHANGED_MESSAGE
+          : !this.connectionManager.isConnected(connectionId)
+            ? "Not connected."
+            : undefined;
+    if (unavailable) {
       if (!this.isCurrentSchemaRequest(requestToken)) {
         return;
       }
@@ -788,15 +1117,26 @@ export class QueryPanelController {
         payload: {
           connectionId,
           schema: [],
-          error: "Not connected.",
+          error: unavailable,
         } satisfies QuerySchemaPayload<SchemaObjectEntry>,
       });
       return;
     }
 
+    const secretContext =
+      this.connectionManager.getConnectionDiagnosticContext?.(connectionId);
     try {
-      const schema = await this.connectionManager.getSchemaAsync(connectionId);
-      if (!this.isCurrentSchemaRequest(requestToken)) {
+      const schema =
+        this.postgresDatabase === undefined
+          ? await this.connectionManager.getSchemaAsync(connectionId)
+          : await this.connectionManager.getSchemaAsync(
+              connectionId,
+              this.postgresDatabase,
+            );
+      if (
+        !this.isCurrentSchemaRequest(requestToken) ||
+        !this.isValidTarget(connectionId, targetSessionKey)
+      ) {
         return;
       }
       this.view.postMessage({
@@ -804,16 +1144,23 @@ export class QueryPanelController {
         payload: this.buildSchemaPayload(connectionId, schema),
       });
     } catch (error: unknown) {
-      if (!this.isCurrentSchemaRequest(requestToken)) {
+      if (
+        !this.isCurrentSchemaRequest(requestToken) ||
+        !this.isValidTarget(connectionId, targetSessionKey)
+      ) {
         return;
       }
-      logger.error("Failed to load schema", error);
+      const normalized = logger.error(
+        "Failed to load schema",
+        error,
+        secretContext,
+      );
       this.view.postMessage({
         type: "schema",
         payload: {
           connectionId,
           schema: [],
-          error: normalizeUnknownError(error).message,
+          error: normalized.message,
         } satisfies QuerySchemaPayload<SchemaObjectEntry>,
       });
     }
@@ -824,12 +1171,24 @@ export class QueryPanelController {
     schema: SchemaObjectEntry[],
   ): QuerySchemaPayload<SchemaObjectEntry> {
     const schemaState =
-      this.connectionManager.getSchemaSnapshotState(connectionId);
+      this.postgresDatabase === undefined
+        ? this.connectionManager.getSchemaSnapshotState(connectionId)
+        : this.connectionManager.getSchemaSnapshotState(connectionId, {
+            kind: "database",
+            database: this.postgresDatabase,
+          });
     return {
       connectionId,
       schema,
       ...(schemaState.status === "error"
-        ? { error: schemaState.error ?? "Schema loading failed." }
+        ? {
+            error: redactDiagnosticText(
+              schemaState.error ?? "Schema loading failed.",
+              this.connectionManager.getConnectionDiagnosticContext?.(
+                connectionId,
+              ),
+            ),
+          }
         : {}),
     };
   }
@@ -845,11 +1204,7 @@ export class QueryPanelController {
   private postQueryError(
     error: string,
     requestToken?: number,
-    identity?: {
-      connectionId: string;
-      operationId?: string;
-      requestToken: number;
-    },
+    identity?: QueryResultIdentity,
   ): void {
     if (
       requestToken !== undefined &&
@@ -877,6 +1232,13 @@ export class QueryPanelController {
     sort?: QueryResultExportPayload["sort"],
     resultSetIndex?: number,
   ): Promise<void> {
+    const binding = this.targetBinding;
+    if (
+      binding &&
+      !this.isValidTarget(binding.connectionId, binding.sessionKey)
+    )
+      return;
+    const originalCache = this.view.getLastQueryResult();
     const cached = this.getCachedResultForExport(resultSetIndex);
     if (!cached) {
       return;
@@ -912,6 +1274,14 @@ export class QueryPanelController {
         exportLabel,
       );
       if (confirmation !== exportLabel) return;
+      if (
+        binding &&
+        (this.targetBinding !== binding ||
+          !this.isValidTarget(binding.connectionId, binding.sessionKey) ||
+          this.view.getLastQueryResult() !== originalCache)
+      ) {
+        return;
+      }
     }
 
     const columnIds = new Set(cached.columns.map((_, i) => colKey(i)));
@@ -976,16 +1346,24 @@ export class QueryPanelController {
       }
       return newRow;
     });
-    const reorderedExportRows = result.exportRows?.map((row) => {
-      const newRow: Record<string, unknown> = {};
-      for (let index = 0; index < indices.length; index++) {
-        const sourceKey = colKey(indices[index]);
-        if (Object.hasOwn(row, sourceKey)) {
-          newRow[colKey(index)] = row[sourceKey];
+    const reorderExportRows = <T>(
+      rows?: readonly (Readonly<Record<string, T>> | undefined)[],
+    ) =>
+      rows?.map((row) => {
+        if (row === undefined) return undefined;
+        const newRow: Record<string, T> = {};
+        for (let index = 0; index < indices.length; index++) {
+          const sourceKey = colKey(indices[index]);
+          if (Object.hasOwn(row, sourceKey)) {
+            newRow[colKey(index)] = row[sourceKey];
+          }
         }
-      }
-      return newRow;
-    });
+        return newRow;
+      });
+    const reorderedExportRows = reorderExportRows(result.exportRows);
+    const reorderedJsonOverrides = reorderExportRows(
+      result.jsonExportCellOverrides,
+    );
     const reorderedMissingCells = result.missingCells?.flatMap(
       ({ rowIndex, columnIndex }) => {
         const nextColumnIndex = indices.indexOf(columnIndex);
@@ -1001,6 +1379,9 @@ export class QueryPanelController {
       ...(columnMeta ? { columnMeta: indices.map((i) => columnMeta[i]) } : {}),
       rows: reorderedRows,
       ...(reorderedExportRows ? { exportRows: reorderedExportRows } : {}),
+      ...(reorderedJsonOverrides
+        ? { jsonExportCellOverrides: reorderedJsonOverrides }
+        : {}),
       ...(reorderedMissingCells ? { missingCells: reorderedMissingCells } : {}),
     };
   }
@@ -1056,7 +1437,14 @@ export class QueryPanelController {
       ...(result.exportRows
         ? {
             exportRows: sortedRows.map(
-              ({ rowIndex }) => result.exportRows?.[rowIndex] ?? {},
+              ({ rowIndex }) => result.exportRows?.[rowIndex],
+            ),
+          }
+        : {}),
+      ...(result.jsonExportCellOverrides
+        ? {
+            jsonExportCellOverrides: sortedRows.map(
+              ({ rowIndex }) => result.jsonExportCellOverrides?.[rowIndex],
             ),
           }
         : {}),
@@ -1096,6 +1484,7 @@ export class QueryPanelController {
   private async handleAddBookmark({
     queryText,
     connectionId: connectionIdOverride,
+    targetSessionKey,
     requestId,
   }: QueryBookmarkPayload): Promise<void> {
     if (!queryText?.trim()) {
@@ -1105,7 +1494,26 @@ export class QueryPanelController {
     const connectionId = this.resolveConnectionId(connectionIdOverride);
 
     try {
-      await this.connectionManager.addBookmark(connectionId, queryText);
+      if (this.rejectsTarget(connectionIdOverride)) {
+        throw new Error(PINNED_QUERY_TARGET_MESSAGE);
+      }
+      if (
+        this.postgresDatabase !== undefined &&
+        this.connectionManager.getConnection(connectionId)?.type !== "pg"
+      ) {
+        throw new Error(PINNED_QUERY_UNAVAILABLE_MESSAGE);
+      }
+      if (!this.isValidTarget(connectionId, targetSessionKey)) {
+        this.pushConnections();
+        throw new Error(QUERY_TARGET_CHANGED_MESSAGE);
+      }
+      await this.connectionManager.addBookmark(
+        connectionId,
+        queryText,
+        ...(this.postgresDatabase !== undefined
+          ? ([this.postgresDatabase] as const)
+          : []),
+      );
       this.view.postMessage({
         type: "bookmarkSaved",
         payload: {

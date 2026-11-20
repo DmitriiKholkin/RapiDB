@@ -42,6 +42,9 @@ async function exportedDocument(
       sort: () => cursor,
       skip: () => cursor,
       limit: () => cursor,
+      map: (decode: (raw: Uint8Array) => unknown) => ({
+        toArray: async () => [decode(bytes)],
+      }),
       toArray: async () => [BSON.deserialize(bytes, options)],
     };
     return cursor;
@@ -104,6 +107,9 @@ describe("MongoDB native export distinguishes document keys from BSON instances"
     { $oid: "507f1f77bcf86cd799439011" },
     { $date: "2024-01-01T00:00:00Z" },
     { $numberLong: "42" },
+    {
+      $dbPointer: { $ref: "items", $id: { $oid: "507f1f77bcf86cd799439011" } },
+    },
   ])("rejects ambiguous literal EJSON document %j", async (payload) => {
     await expect(exportedDocument({ _id: "literal", payload })).rejects.toThrow(
       /cannot preserve the literal document key/,

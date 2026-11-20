@@ -1,7 +1,15 @@
+import type { MssqlSqlVariantRowIdentity } from "../../shared/mssqlSqlVariantRowIdentity";
+import type { MySQLTimestampRowIdentity } from "../../shared/mysqlTimestampRowIdentity";
+import type { OracleTemporalRowIdentity } from "../../shared/oracleTemporalRowIdentity";
+import type { PostgresArrayRowIdentity } from "../../shared/postgresArrayRowIdentity";
+import type { SqlDeleteObservation } from "../../shared/sqlDeleteObservation";
+import type { SQLiteRowIdentity } from "../../shared/sqliteRowIdentity";
 import type { ApplyResultPayload } from "../../shared/webviewContracts";
+import type { SQLiteAttachmentTarget } from "../dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
   MongoValueTypeHint,
+  MutationSqlExpression,
   TransactionOperation,
   TransactionVerification,
 } from "../dbDrivers/types";
@@ -17,6 +25,12 @@ export interface TablePage {
   mongoIdTypes?: Array<"objectId" | "string" | null>;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
+  sqliteRowIdentities?: SQLiteRowIdentity[];
+  postgresArrayRowIdentities?: PostgresArrayRowIdentity[];
+  mysqlTimestampRowIdentities?: MySQLTimestampRowIdentity[];
+  mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[];
+  oracleTemporalRowIdentities?: OracleTemporalRowIdentity[];
+  sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -35,6 +49,7 @@ export interface PreparedInsertPlan {
   database: string;
   schema: string;
   table: string;
+  sqliteAttachmentTarget?: SQLiteAttachmentTarget;
   mode?: "sql" | "driver";
   values?: Record<string, unknown>;
   operation: TransactionOperation;
@@ -48,6 +63,7 @@ export interface PreparedDeletePlan {
   database: string;
   schema: string;
   table: string;
+  sqliteAttachmentTarget?: SQLiteAttachmentTarget;
   mode?: "sql" | "driver";
   executionMode: "sequential" | "transaction";
   primaryKeyValuesList?: Record<string, unknown>[];
@@ -60,6 +76,14 @@ export interface PreparedDeletePlan {
 export interface VerificationTarget {
   rowIndex: number;
   primaryKeys: Record<string, unknown>;
+  writtenKeyComparisons?: Record<string, MutationSqlExpression>;
+  capturedIdentity?: {
+    columns: ColumnTypeMeta[];
+    operationIndex: number;
+    sqlite: boolean;
+    sqliteNullKeyColumns?: string[];
+    oracle?: boolean;
+  };
   values: Array<{
     column: ColumnTypeMeta;
     expectedValue: unknown;
@@ -72,6 +96,7 @@ export interface PreparedApplyPlan {
   database: string;
   schema: string;
   table: string;
+  sqliteAttachmentTarget?: SQLiteAttachmentTarget;
   mode?: "sql" | "driver";
   cols: ColumnTypeMeta[];
   updates: RowUpdate[];

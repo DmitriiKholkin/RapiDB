@@ -32,6 +32,38 @@ describe("diagnostic credential redaction", () => {
     });
   });
 
+  it.each([
+    ["x-aMz-%53ignature", "X-Amz-Credential", "X-Amz-Security-Token"],
+    ["%58-gOoG-Signature", "X-Goog-Credential", "X-Goog-Security-Token"],
+  ])("redacts signed URL and diagnostic fields with %s", (signature, credential, token) => {
+    const base = "https://service.example.test/api";
+    const endpoint = `${base}?${signature}=fake%2bsignature&${credential}=fake%2Fcredential&mode=read#${token}=fake%3Dtoken`;
+    const safe = `${base}?${signature}=[REDACTED]&${credential}=[REDACTED]&mode=read#${token}=[REDACTED]`;
+    expect(redactDiagnosticText(`Request failed: "${endpoint}"`)).toBe(
+      `Request failed: "${safe}"`,
+    );
+    expect(redactDiagnosticText(endpoint)).toBe(safe);
+    expect(
+      redactDiagnosticText(
+        "Rejected fake+signature, fake%2bsignature, fake%2Bsignature, fake/credential and fake=token",
+        { endpoint },
+      ),
+    ).toBe(
+      "Rejected [REDACTED], [REDACTED], [REDACTED], [REDACTED] and [REDACTED]",
+    );
+    expect(
+      redactDiagnosticValue({ [credential]: "fake-credential", mode: "read" }),
+    ).toEqual({
+      [credential]: "[REDACTED]",
+      mode: "read",
+    });
+    expect(
+      redactDiagnosticText(
+        JSON.stringify({ [token]: "fake-token", mode: "read" }),
+      ),
+    ).toBe(JSON.stringify({ [token]: "[REDACTED]", mode: "read" }));
+  });
+
   it("preserves and redacts inherited DOMException messages without mutating the original", () => {
     const upstream = new DOMException(
       "Credential inherited-secret rejected",
@@ -42,6 +74,27 @@ describe("diagnostic credential redaction", () => {
     });
     expect(safe.message).toBe("Credential [REDACTED] rejected");
     expect(upstream.message).toBe("Credential inherited-secret rejected");
+  });
+
+  it.each([
+    "",
+    '"',
+  ])("redacts multiple signed URLs in one diagnostic (quote=%j)", (quote) => {
+    const aws = `${quote}https://aws.example.test/?X-Amz-Signature=fake-aws&mode=read${quote}`;
+    const gcs = `${quote}https://gcs.example.test/?X-Goog-Signature=fake-gcs${quote}`;
+    expect(redactDiagnosticText(`Failed ${aws} and ${gcs} with EACCES`)).toBe(
+      `Failed ${aws.replace("fake-aws", "[REDACTED]")} and ${gcs.replace("fake-gcs", "[REDACTED]")} with EACCES`,
+    );
+  });
+
+  it("does not redact unrelated uses of common signing metadata values", () => {
+    const endpoint =
+      "https://service.example.test/?X-Amz-SignedHeaders=host&mode=host&X-Amz-Signature=fake-signature";
+    expect(
+      redactDiagnosticText(`Rejected ${endpoint} at host`, { endpoint }),
+    ).toBe(
+      "Rejected https://service.example.test/?X-Amz-SignedHeaders=[REDACTED]&mode=host&X-Amz-Signature=[REDACTED] at host",
+    );
   });
 
   it.each(

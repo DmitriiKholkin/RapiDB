@@ -837,7 +837,7 @@ describe("QueryPanelController", () => {
 
     await controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "panel:run:1" },
+      payload: { connectionId: "active", operationId: "panel:run:1" },
     });
 
     expect(cancelCurrentOperation).toHaveBeenCalledWith(
@@ -949,7 +949,7 @@ describe("QueryPanelController", () => {
     try {
       const cancelling = controller.handleMessage({
         type: "cancelQuery",
-        payload: { operationId: "manual:1" },
+        payload: { connectionId: "active", operationId: "manual:1" },
       });
       if (cancellation === "unavailable") finishQuery();
       if (cancellation === "times out") {
@@ -993,7 +993,7 @@ describe("QueryPanelController", () => {
         await Promise.resolve();
         await controller.handleMessage({
           type: "cancelQuery",
-          payload: { operationId: "manual:1" },
+          payload: { connectionId: "active", operationId: "manual:1" },
         });
         expect(cancelCurrentOperation).toHaveBeenCalledOnce();
         expect(view.postMessage).toHaveBeenCalledOnce();
@@ -1063,7 +1063,7 @@ describe("QueryPanelController", () => {
     await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
     await controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "redis:cancel" },
+      payload: { connectionId: "redis", operationId: "redis:cancel" },
     });
     await running;
 
@@ -1140,7 +1140,7 @@ describe("QueryPanelController", () => {
     await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
     const cancelling = controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "sqlite:write" },
+      payload: { connectionId: "sqlite", operationId: "sqlite:write" },
     });
     await vi.waitFor(() =>
       expect(driver.cancelCurrentOperation).toHaveBeenCalledOnce(),
@@ -1221,7 +1221,7 @@ describe("QueryPanelController", () => {
     await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
     const cancellingOld = controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "old" },
+      payload: { connectionId: "active", operationId: "old" },
     });
     const newRun = controller.handleMessage({
       type: "executeQuery",
@@ -1235,12 +1235,12 @@ describe("QueryPanelController", () => {
     expect(view.postMessage).not.toHaveBeenCalled();
     await controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "old" },
+      payload: { connectionId: "active", operationId: "old" },
     });
     expect(driver.cancelCurrentOperation).toHaveBeenCalledTimes(2);
     await controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "new" },
+      payload: { connectionId: "active", operationId: "new" },
     });
     expect(driver.cancelCurrentOperation).toHaveBeenCalledTimes(3);
     expect(driver.cancelCurrentOperation).toHaveBeenLastCalledWith(
@@ -1310,7 +1310,7 @@ describe("QueryPanelController", () => {
 
     await controller.handleMessage({
       type: "cancelQuery",
-      payload: { operationId: "panel:connect:1" },
+      payload: { connectionId: "active", operationId: "panel:connect:1" },
     });
 
     expect(view.postMessage).toHaveBeenCalledWith(
@@ -3366,10 +3366,11 @@ describe("QueryPanelController", () => {
   });
 
   it("rejects superseded execution when cancellation throws", async () => {
+    const password = "synthetic-cancel-password-11";
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     let resolveFirstQuery: ((value: unknown) => void) | undefined;
     const cancelCurrentOperation = vi.fn(async () => {
-      throw new Error("cancel failed");
+      throw new Error(`cancel failed for ${password}`);
     });
     const query = vi
       .fn()
@@ -3394,6 +3395,7 @@ describe("QueryPanelController", () => {
         type: "pg",
         readOnly: false,
       })),
+      getConnectionDiagnosticContext: () => ({ password }),
       getDriverCapabilities: vi.fn(() => ({})),
       isConnected: vi.fn(() => true),
       connectTo: vi.fn(async () => undefined),
@@ -3447,8 +3449,12 @@ describe("QueryPanelController", () => {
     });
     expect(errorSpy).toHaveBeenCalledWith(
       "[RapiDB] Failed to cancel superseded query execution:",
-      expect.any(Error),
+      expect.objectContaining({
+        message: "cancel failed for [REDACTED]",
+        stack: expect.stringContaining("cancel failed for [REDACTED]"),
+      }),
     );
+    expect(errorSpy.mock.calls[0]?.[1].stack).not.toContain(password);
 
     resolveFirstQuery?.({
       columns: ["q"],
@@ -3463,13 +3469,15 @@ describe("QueryPanelController", () => {
   });
 
   it("flags schema load failures recorded by the shared schema cache", async () => {
+    const apiKey = "synthetic-schema-api-key-11";
     const partialSchema = [{ object: "users" }];
     const connectionManager = {
       isConnected: vi.fn(() => true),
+      getConnectionDiagnosticContext: () => ({ apiKey }),
       getSchemaAsync: vi.fn(async () => partialSchema),
       getSchemaSnapshotState: vi.fn(() => ({
         status: "error",
-        error: "permission denied for schema audit",
+        error: `permission denied for schema audit: ${apiKey}`,
       })),
     };
     const view = {
@@ -3502,16 +3510,18 @@ describe("QueryPanelController", () => {
       payload: {
         connectionId: "conn-1",
         schema: partialSchema,
-        error: "permission denied for schema audit",
+        error: "permission denied for schema audit: [REDACTED]",
       },
     });
   });
 
-  it("handles schema load rejection and posts safe empty schema", async () => {
-    const schemaError = new Error("schema failed");
+  it("redacts a bare secret in schema load rejection logs and the webview error", async () => {
+    const password = "synthetic-schema-password-11";
+    const schemaError = new Error(`schema failed for ${password}`);
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const connectionManager = {
       isConnected: vi.fn(() => true),
+      getConnectionDiagnosticContext: () => ({ password }),
       getSchemaAsync: vi.fn(async () => {
         throw schemaError;
       }),
@@ -3544,10 +3554,90 @@ describe("QueryPanelController", () => {
 
     expect(view.postMessage).toHaveBeenCalledWith({
       type: "schema",
-      payload: { connectionId: "conn-1", schema: [], error: "schema failed" },
+      payload: {
+        connectionId: "conn-1",
+        schema: [],
+        error: "schema failed for [REDACTED]",
+      },
     });
+    expect(errorSpy).toHaveBeenCalledExactlyOnceWith(
+      "[RapiDB] Failed to load schema:",
+      expect.objectContaining({
+        message: "schema failed for [REDACTED]",
+        stack: expect.stringContaining("schema failed for [REDACTED]"),
+      }),
+    );
+    expect(errorSpy.mock.calls[0]?.[1].stack).not.toContain(password);
+    expect(schemaError.message).toContain(password);
 
     errorSpy.mockRestore();
+  });
+
+  it.each([
+    "thrown",
+    "partial",
+  ])("redacts bare query diagnostics without redacting data (%s)", async (mode) => {
+    const password = "synthetic-query-password-11";
+    const message = `Query failed near ${password}`;
+    const driverResult = {
+      columns: ["example"],
+      columnMeta: [],
+      rows: [{ __col_0: password }],
+      rowCount: 1,
+      executionTimeMs: 1,
+      error: message,
+    };
+    const driver = {
+      query: vi.fn(async () => {
+        if (mode === "thrown") throw new Error(message);
+        return driverResult;
+      }),
+    };
+    formatQueryResult.mockImplementationOnce((result) => result);
+    const getConnectionDiagnosticContext = vi.fn(() => ({ password }));
+    const manager = {
+      getConnectionDiagnosticContext,
+      getConnection: () => ({ type: "pg" }),
+      getQueryRowLimit: () => 100,
+      isConnected: () => true,
+      getDriver: () => driver,
+      addToHistory: vi.fn(async () => undefined),
+    };
+    const view = {
+      getActiveConnectionId: () => "other-conn",
+      getInitialConnectionId: () => "other-conn",
+      getLastQueryResult: () => null,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: vi.fn(),
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(manager as never, view);
+
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "select 1", connectionId: "conn-1" },
+    });
+
+    expect(getConnectionDiagnosticContext).toHaveBeenCalledWith(
+      "conn-1",
+      driver,
+    );
+    expect(view.postMessage).toHaveBeenCalledExactlyOnceWith({
+      type: "queryResult",
+      payload: expect.objectContaining({
+        error: "Query failed near [REDACTED]",
+        rows: mode === "partial" ? driverResult.rows : [],
+      }),
+    });
+    if (mode === "partial") {
+      expect(view.setLastQueryResult).toHaveBeenCalledWith(
+        expect.objectContaining({ partial: true, rows: driverResult.rows }),
+      );
+    }
   });
 
   it("clears per-connection execution handle when a request turns stale after handle registration", async () => {

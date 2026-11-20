@@ -7,10 +7,12 @@ import type {
 } from "../../shared/tableTypes";
 import type {
   QueryEditorPresentation,
+  QueryOperationIdentity,
+  QueryResultCounts,
   QueryResultSet,
 } from "../../shared/webviewContracts";
 
-export interface QueryResult {
+export interface QueryResult extends QueryResultCounts {
   operationId?: string;
   connectionId?: string;
   requestToken?: number;
@@ -21,9 +23,8 @@ export interface QueryResult {
   resultSetsTruncated?: boolean;
   responseMetadata?: Record<string, unknown>[];
   missingCells?: QueryMissingCell[];
-  rowCount: number;
-  affectedRowsUnknown?: boolean;
   executionTimeMs: number;
+  warnings?: string[];
   error?: string;
 
   truncated?: boolean;
@@ -31,20 +32,24 @@ export interface QueryResult {
   truncatedAt?: number;
 }
 
-export type QueryStatus = "idle" | "running" | "success" | "error";
-
-export interface QueryOperation {
-  operationId: string;
-  connectionId: string;
+export function hasQueryResultDetails(result: QueryResult): boolean {
+  return (
+    result.columns.length > 0 ||
+    (result.resultSets?.length ?? 0) > 0 ||
+    (result.rowCountKind === "returned" &&
+      (result.affectedRows !== undefined ||
+        result.affectedRowsUnknown === true ||
+        (result.responseMetadata?.length ?? 0) > 0))
+  );
 }
+
+export type QueryStatus = "idle" | "running" | "success" | "error";
 
 export interface QueryState {
   status: QueryStatus;
   result: QueryResult | null;
-  activeOperation: QueryOperation | null;
-  operationSequence: number;
-  nextOperationId: (panelId: string) => string;
-  setRunning: (operation: QueryOperation) => void;
+  activeOperation: QueryOperationIdentity | null;
+  setRunning: (operation: QueryOperationIdentity) => void;
   setResult: (result: QueryResult) => void;
   setError: (error: string) => void;
   reset: () => void;
@@ -114,6 +119,7 @@ export interface ConnectionEntry {
   id: string;
   name: string;
   type: string;
+  targetSessionKey?: string | null;
   editorPresentation?: QueryEditorPresentation;
 }
 
@@ -143,16 +149,10 @@ export interface SchemaState {
   getSchema: (connectionId: string) => SchemaObject[];
 }
 
-export const useQueryStore = create<QueryState>((set, get) => ({
+export const useQueryStore = create<QueryState>((set) => ({
   status: "idle",
   result: null,
   activeOperation: null,
-  operationSequence: 0,
-  nextOperationId: (panelId) => {
-    const operationSequence = get().operationSequence + 1;
-    set({ operationSequence });
-    return `${panelId}:${operationSequence}`;
-  },
   setRunning: (operation) =>
     set({ status: "running", result: null, activeOperation: operation }),
   setResult: (result) =>

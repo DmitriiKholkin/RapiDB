@@ -2,8 +2,15 @@ import type React from "react";
 import type { RefObject } from "react";
 import type { QueryEditorSqlDialect } from "../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus, SchemaObject } from "../../store";
+import { ErrorBoundary } from "../ErrorBoundary";
 import { MonacoEditor, type MonacoEditorHandle } from "../MonacoEditor";
 import { TableGrid } from "../table/TableGrid";
+
+const hideCrashedResults = {
+  label: "Hide results",
+  message:
+    "Results hidden. No query was rerun. If the query could have changed data, verify the outcome before running it again.",
+};
 
 interface QueryEditorPanelsProps {
   allowFormatting: boolean;
@@ -80,8 +87,20 @@ export function QueryEditorPanels({
         title="Drag to resize"
       />
 
-      <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
-        <TableGrid mode="query" status={status} result={result} />
+      <div style={{ flex: 1, overflow: "auto", minHeight: 0 }}>
+        {/* Reset the results fallback for a new operation without remounting
+            the editor or changing what the query controller is tracking. */}
+        <ErrorBoundary
+          key={`${status}:${result?.operationId ?? ""}`}
+          context="Query results"
+          hideOnError={
+            result && (status === "success" || status === "error")
+              ? hideCrashedResults
+              : undefined
+          }
+        >
+          <TableGrid mode="query" status={status} result={result} />
+        </ErrorBoundary>
       </div>
     </>
   );

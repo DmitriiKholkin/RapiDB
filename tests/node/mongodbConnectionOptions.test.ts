@@ -71,6 +71,65 @@ describe("MongoDBDriver — connect()", () => {
     ]);
   });
 
+  it("uses authorized names only for connection and catalog discovery", async () => {
+    const visible = [
+      { name: "items", type: "collection" },
+      { name: "items_view", type: "view" },
+    ];
+    const close = vi.fn().mockResolvedValue(undefined);
+    const listCollections = vi.fn(
+      (
+        _filter: unknown,
+        options: { nameOnly?: boolean; authorizedCollections?: boolean },
+      ) => {
+        const checkPermission = () => {
+          if (!options.nameOnly || !options.authorizedCollections) {
+            throw Object.assign(new Error("not authorized"), { code: 13 });
+          }
+        };
+        return {
+          hasNext: async () => {
+            checkPermission();
+            return true;
+          },
+          toArray: async () => {
+            checkPermission();
+            return visible;
+          },
+          close,
+        };
+      },
+    );
+    mongoClientMocks.db.mockReturnValue({ listCollections });
+    const driver = new MongoDBDriver({
+      id: "scoped",
+      name: "Scoped MongoDB",
+      type: "mongodb",
+      connectionUri: "mongodb://localhost/app",
+    });
+
+    try {
+      await driver.connect();
+      expect(mongoClientMocks.db).toHaveBeenCalledWith("app");
+      expect(listCollections).toHaveBeenCalledWith(
+        {},
+        {
+          nameOnly: true,
+          authorizedCollections: true,
+          batchSize: 1,
+          signal: expect.any(AbortSignal),
+        },
+      );
+      expect(close).toHaveBeenCalledOnce();
+      expect(await driver.listObjects("")).toEqual([
+        { schema: "app", name: "items", type: "table" },
+        { schema: "app", name: "items_view", type: "view" },
+      ]);
+    } finally {
+      await driver.disconnect();
+    }
+  });
+
   it.each([
     ["", 900, 900],
     ["?serverSelectionTimeoutMS=600&connectTimeoutMS=500", 600, 500],

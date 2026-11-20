@@ -102,6 +102,37 @@ export function coercePrimaryKeyValues(
   return coerced;
 }
 
+/** Build a predicate from already-coerced identity values (not edit input). */
+export function appendPrimaryKeyComparison(
+  driver: IDBDriver,
+  column: ColumnTypeMeta | string,
+  value: unknown,
+  params: unknown[],
+  previewColumns?: Array<ColumnTypeMeta | undefined>,
+): string {
+  if (typeof column === "string") {
+    if (driver.buildPrimaryKeyComparison)
+      throw new Error("Unknown primary key column.");
+    params.push(value);
+    previewColumns?.push(undefined);
+    return `${driver.quoteIdentifier(column)} = ?`;
+  }
+  const paramIndex = params.length + 1;
+  const expression = driver.buildPrimaryKeyComparison?.(
+    column,
+    value,
+    paramIndex,
+  ) ?? {
+    sql: `${driver.quoteIdentifier(column.name)} = ${driver.buildInsertValueExpr(column, paramIndex)}`,
+    params: [value],
+  };
+  params.push(...expression.params);
+  previewColumns?.push(
+    ...(expression.previewColumns ?? expression.params.map(() => column)),
+  );
+  return expression.sql;
+}
+
 export function buildUpdateRowSql(
   drv: IDBDriver,
   database: string,
@@ -132,17 +163,24 @@ export function buildUpdateRowSql(
   const canUseSqlOriginalCoercion =
     drv.getCapabilities?.().tabularRead === "sql";
   const coercedOriginalValues = Object.fromEntries(
-    writableEntries(originalValues, colMap).map(([columnName, value]) => {
-      const column = colMap.get(columnName);
-      return [
-        columnName,
-        column && canUseSqlOriginalCoercion && drv.coerceOriginalValue
-          ? drv.coerceOriginalValue(value, column)
-          : column
-            ? drv.coerceInputValue(value, column)
-            : value,
-      ];
-    }),
+    writableEntries(originalValues, colMap)
+      .filter(([name]) => {
+        // The exact key already provides the old-value guard. A second
+        // predicate derived from display text can reject a valid key edit.
+        const column = colMap.get(name);
+        return !column?.isPrimaryKey || !drv.buildTablePrimaryKeyExpr?.(column);
+      })
+      .map(([columnName, value]) => {
+        const column = colMap.get(columnName);
+        return [
+          columnName,
+          column && canUseSqlOriginalCoercion && drv.coerceOriginalValue
+            ? drv.coerceOriginalValue(value, column)
+            : column
+              ? drv.coerceInputValue(value, column)
+              : value,
+        ];
+      }),
   );
 
   const setCols = Object.keys(coercedChanges);
@@ -181,15 +219,15 @@ export function buildUpdateRowSql(
       : `${drv.quoteIdentifier(c)} = ?`;
   });
 
-  const whereParts = pkCols.map((c) => {
-    params.push(coercedPk[c]);
-    const meta = colMap.get(c);
-    previewColumns.push(meta);
-    const placeholder = meta
-      ? drv.buildInsertValueExpr(meta, params.length)
-      : "?";
-    return `${drv.quoteIdentifier(c)} = ${placeholder}`;
-  });
+  const whereParts = pkCols.map((c) =>
+    appendPrimaryKeyComparison(
+      drv,
+      colMap.get(c) ?? c,
+      coercedPk[c],
+      params,
+      previewColumns,
+    ),
+  );
   for (const [columnName, value] of Object.entries(coercedOriginalValues)) {
     const identifier = drv.quoteIdentifier(columnName);
     if (value === null) {
@@ -225,8 +263,9 @@ export function buildUpdateRowSql(
   }
 
   onPreviewColumns?.(previewColumns);
+  const update = drv.buildTableMutationVerb?.("UPDATE") ?? "UPDATE";
   return {
-    sql: `UPDATE ${updateTarget} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,
+    sql: `${update} ${updateTarget} SET ${setParts.join(", ")} WHERE ${whereParts.join(" AND ")}`,
     params,
   };
 }

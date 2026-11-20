@@ -5,6 +5,7 @@ import {
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
 import { MockEventEmitter } from "../support/mockVscode";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 vi.mock("vscode", () => ({
   EventEmitter: MockEventEmitter,
@@ -63,11 +64,14 @@ describe("SSH trust defaults", () => {
     expect(
       buildSettings({
         ...config,
-        ssh: { ...config.ssh, hostFingerprintSha256: " SHA256:pinned " },
+        ssh: {
+          ...config.ssh,
+          hostFingerprintSha256: ` ${SSH_HOST_FINGERPRINT_SHA256} `,
+        },
       }),
     ).toMatchObject({
       hostVerificationMode: "manual",
-      fingerprintSha256: "SHA256:pinned",
+      fingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
     });
   });
 
@@ -90,12 +94,12 @@ describe("SSH trust defaults", () => {
         ssh: {
           ...config.ssh,
           hostVerificationMode: "trustOnFirstUse",
-          hostFingerprintSha256: " SHA256:pinned ",
+          hostFingerprintSha256: ` ${SSH_HOST_FINGERPRINT_SHA256} `,
         },
       }),
     ).toMatchObject({
       hostVerificationMode: "trustOnFirstUse",
-      fingerprintSha256: "SHA256:pinned",
+      fingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
     });
   });
 });

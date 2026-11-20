@@ -1,14 +1,18 @@
+import { createHash } from "node:crypto";
 import type { QueryColumnMeta } from "../../shared/tableTypes";
 import {
   ensureSQLiteRuntimeInstalled,
   probeInstalledBetterSqlite3Runtime,
-  resolveInstalledBetterSqlite3PackagePath,
+  repairSQLiteManagedRuntime,
   type SQLiteInstalledRuntimeProbe,
+  snapshotSQLiteManagedRuntime,
+  sqliteNativeBindingPath,
 } from "../utils/sqliteInstaller";
 
 interface BetterSqlite3OpenOptions {
   readonly?: boolean;
   fileMustExist?: boolean;
+  nativeBinding?: string;
 }
 
 interface BetterSqlite3Statement {
@@ -49,29 +53,26 @@ type BetterSqlite3Module =
       default?: BetterSqlite3Constructor;
     };
 
+interface SQLiteQueryRows {
+  columns: string[];
+  columnMeta: QueryColumnMeta[];
+  rows: unknown[][];
+  exactIntegerRows?: ([columnIndex: number, value: bigint][] | undefined)[];
+}
+
 export interface SQLiteDatabase {
   readonly isOpen: boolean;
   readonly inTransaction: boolean;
   close(): void;
   exec(sql: string): void;
   all(sql: string, params?: readonly unknown[]): unknown[];
-  allRaw(
-    sql: string,
-    params?: readonly unknown[],
-  ): {
-    columns: string[];
-    columnMeta: QueryColumnMeta[];
-    rows: unknown[][];
-  };
+  allRaw(sql: string, params?: readonly unknown[]): SQLiteQueryRows;
   queryBounded(
     sql: string,
     params: readonly unknown[],
     limit: number,
     onResultSet?: () => void,
-  ): {
-    columns: string[];
-    columnMeta: QueryColumnMeta[];
-    rows: unknown[][];
+  ): SQLiteQueryRows & {
     rowCount: number;
     changes?: number;
     truncated: boolean;
@@ -97,8 +98,6 @@ export type SQLiteRuntimeTargetId =
   | "linux-arm64"
   | "darwin-x64"
   | "darwin-arm64";
-
-let cachedBetterSqlite3: BetterSqlite3Constructor | null = null;
 
 export function resolveSQLiteRuntimeTarget(
   platform = process.platform,
@@ -234,18 +233,11 @@ function sqliteDateTimeSortKey(value: unknown): string | null {
 }
 
 export function resolveBetterSqlite3LoadTargets(
-  baseDir = __dirname,
-  preferManagedRuntime = true,
+  validatedManagedPackage: string | null,
 ): string[] {
-  const targets: string[] = [];
-  if (preferManagedRuntime) {
-    const installedPackage = resolveInstalledBetterSqlite3PackagePath(baseDir);
-    if (installedPackage) {
-      targets.push(installedPackage);
-    }
-  }
-  targets.push("better-sqlite3");
-  return targets;
+  return validatedManagedPackage
+    ? [validatedManagedPackage, "better-sqlite3"]
+    : ["better-sqlite3"];
 }
 
 function errorMessage(error: unknown): string {
@@ -294,8 +286,7 @@ export function formatSQLiteRuntimeLoadErrorMessage(
 
   const versionHint = isModuleVersionError
     ? " The SQLite binary was compiled for a different Node.js version. " +
-      "RapiDB re-downloads a host-compatible binary automatically when the cached runtime metadata does not match this host, but the cached copy still failed to load. " +
-      "Delete the cached SQLite runtime directory (installedPackage below) and retry the SQLite connection to force a fresh download."
+      "Reconnect to check for a host-compatible SQLite runtime."
     : "";
 
   const managedHint =
@@ -312,15 +303,18 @@ export function formatSQLiteRuntimeLoadErrorMessage(
   return `[RapiDB] SQLite runtime is unavailable because better-sqlite3 could not be loaded for ${sqliteRuntimeTarget()}.${versionHint}${managedHint}${attemptHint}${probeHint} Runtime: ${runtimeHint}. Error: ${errorMsg}`.trim();
 }
 
-function sqliteRuntimeLoadError(
-  error: unknown,
-  attemptedTargets: readonly string[],
-  probe: SQLiteInstalledRuntimeProbe | null,
-): Error {
-  return withCause(
-    formatSQLiteRuntimeLoadErrorMessage(error, attemptedTargets, probe),
-    error,
-  );
+export class SQLiteRuntimeLoadError extends Error {
+  constructor(
+    cause: unknown,
+    attemptedTargets: readonly string[],
+    probe: SQLiteInstalledRuntimeProbe | null,
+    readonly managedNativeFailure: boolean,
+  ) {
+    super(formatSQLiteRuntimeLoadErrorMessage(cause, attemptedTargets, probe), {
+      cause,
+    });
+    this.name = "SQLiteRuntimeLoadError";
+  }
 }
 
 function sqliteOpenError(
@@ -334,56 +328,114 @@ function sqliteOpenError(
   );
 }
 
-async function loadBetterSqlite3(
-  loadTargets?: readonly string[],
-): Promise<BetterSqlite3Constructor> {
-  if (cachedBetterSqlite3) {
-    return cachedBetterSqlite3;
+interface LoadedSQLiteRuntime {
+  Database: BetterSqlite3Constructor;
+  nativeBinding?: string;
+}
+
+function loadBetterSqlite3(
+  attemptedTargets: readonly string[],
+  managedPackage: string | null,
+  installError?: unknown,
+  probe: SQLiteInstalledRuntimeProbe | null = null,
+): LoadedSQLiteRuntime {
+  let lastError: unknown;
+  let managedNativeError: unknown;
+  for (const [index, target] of attemptedTargets.entries()) {
+    const nativeBinding =
+      index === 0 && managedPackage
+        ? sqliteNativeBindingPath(managedPackage)
+        : undefined;
+    try {
+      const loaded = require(target) as BetterSqlite3Module | null;
+      const Database = typeof loaded === "function" ? loaded : loaded?.default;
+      if (typeof Database !== "function") {
+        throw new Error(
+          `better-sqlite3 load target ${target} did not export a database constructor.`,
+        );
+      }
+
+      // require() only loads the JS wrapper. Force the addon to initialize
+      // before touching a user path, and pin managed loads to the exact binary
+      // selected by the installer rather than bindings' ambient search paths.
+      let smoke: BetterSqlite3Database;
+      try {
+        smoke = new Database(":memory:", { nativeBinding });
+      } catch (error) {
+        if (
+          nativeBinding &&
+          (error as NodeJS.ErrnoException)?.code === "ERR_DLOPEN_FAILED"
+        ) {
+          managedNativeError = error;
+        }
+        throw error;
+      }
+      try {
+        const row = smoke.prepare("SELECT 1 AS ok").get() as { ok?: number };
+        if (row?.ok !== 1)
+          throw new Error("Unexpected SQLite smoke test result");
+      } finally {
+        smoke.close();
+      }
+      return { Database, nativeBinding };
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  let installError: unknown = null;
+  throw new SQLiteRuntimeLoadError(
+    installError ??
+      managedNativeError ??
+      lastError ??
+      new Error("No better-sqlite3 load target is available."),
+    attemptedTargets,
+    probe,
+    managedNativeError !== undefined,
+  );
+}
+
+async function selectSQLiteRuntime(): Promise<LoadedSQLiteRuntime> {
+  const snapshot = snapshotSQLiteManagedRuntime(__dirname);
+  let managedPackage: string | null = null;
+  let installError: unknown;
+  let probe: SQLiteInstalledRuntimeProbe | null = null;
   try {
-    if (!loadTargets) await ensureSQLiteRuntimeInstalled(__dirname);
+    managedPackage = await ensureSQLiteRuntimeInstalled(__dirname);
   } catch (error) {
     installError = error;
   }
-
-  const attemptedTargets =
-    loadTargets ?? resolveBetterSqlite3LoadTargets(__dirname, true);
-  const probe = loadTargets
-    ? null
-    : probeInstalledBetterSqlite3Runtime(__dirname);
-
-  let lastError: unknown = null;
-  for (const target of attemptedTargets) {
-    let loaded: BetterSqlite3Module;
-    try {
-      loaded = require(target) as BetterSqlite3Module;
-    } catch (error) {
-      lastError = error;
-      continue;
-    }
-    const candidate =
-      typeof loaded === "function" ? loaded : (loaded.default ?? null);
-
-    if (typeof candidate !== "function") {
-      lastError = new Error(
-        `better-sqlite3 load target ${target} did not export a database constructor.`,
-      );
-      continue;
-    }
-
-    cachedBetterSqlite3 = candidate;
-    return candidate;
+  try {
+    probe = probeInstalledBetterSqlite3Runtime(__dirname);
+  } catch {
+    // Probe data is diagnostic only.
   }
-
-  throw sqliteRuntimeLoadError(
-    lastError ??
-      installError ??
-      new Error("better-sqlite3 did not export a database constructor."),
-    attemptedTargets,
-    probe,
-  );
+  try {
+    return loadBetterSqlite3(
+      resolveBetterSqlite3LoadTargets(managedPackage),
+      managedPackage,
+      installError,
+      probe,
+    );
+  } catch (error) {
+    if (
+      !(error instanceof SQLiteRuntimeLoadError) ||
+      !error.managedNativeFailure ||
+      !snapshot ||
+      snapshot.packagePath !== managedPackage
+    )
+      throw error;
+    try {
+      const repaired = await repairSQLiteManagedRuntime(__dirname, snapshot);
+      if (repaired)
+        return loadBetterSqlite3([repaired], repaired, undefined, probe);
+    } catch (repairError) {
+      throw withCause(
+        `${error.message} SQLite runtime repair failed: ${errorMessage(repairError)}`,
+        repairError,
+      );
+    }
+    throw error;
+  }
 }
 
 function executeStatement<T>(
@@ -459,6 +511,34 @@ function inferSqliteQueryColumnMeta(
   });
 }
 
+function formatSqliteQueryRows(
+  columns: string[],
+  rawRows: unknown[][],
+): SQLiteQueryRows {
+  const exactIntegerRows: NonNullable<SQLiteQueryRows["exactIntegerRows"]> = [];
+  const rows = rawRows.map((rawRow) => {
+    let exactIntegers: (typeof exactIntegerRows)[number];
+    const row = rawRow.map((value, index) => {
+      if (typeof value !== "bigint") return value;
+      const display = normalizeSqliteIntegers(value);
+      if (typeof display === "string") {
+        // safeIntegers(true) distinguishes SQLite INTEGER from identical TEXT.
+        exactIntegers ??= [];
+        exactIntegers.push([index, value]);
+      }
+      return display;
+    });
+    exactIntegerRows.push(exactIntegers);
+    return row;
+  });
+  return {
+    columns,
+    columnMeta: inferSqliteQueryColumnMeta(rawRows, columns.length),
+    rows,
+    ...(exactIntegerRows.some(Boolean) ? { exactIntegerRows } : {}),
+  };
+}
+
 class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
   constructor(private readonly database: BetterSqlite3Database) {}
 
@@ -488,14 +568,7 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     );
   }
 
-  allRaw(
-    sql: string,
-    params: readonly unknown[] = [],
-  ): {
-    columns: string[];
-    columnMeta: QueryColumnMeta[];
-    rows: unknown[][];
-  } {
+  allRaw(sql: string, params: readonly unknown[] = []): SQLiteQueryRows {
     const statement = this.database.prepare(sql);
     if (!statement.reader)
       throw new TypeError(
@@ -506,11 +579,7 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     const rawRows = params.length
       ? (exactStatement.all(params) as unknown[][])
       : (exactStatement.all() as unknown[][]);
-    return {
-      columns,
-      columnMeta: inferSqliteQueryColumnMeta(rawRows, columns.length),
-      rows: normalizeSqliteIntegers(rawRows) as unknown[][],
-    };
+    return formatSqliteQueryRows(columns, rawRows);
   }
 
   queryBounded(
@@ -518,7 +587,7 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     params: readonly unknown[],
     limit: number,
     onResultSet?: () => void,
-  ) {
+  ): ReturnType<SQLiteDatabase["queryBounded"]> {
     const statement = this.database.prepare(sql);
     if (!statement.reader) {
       const info = executeStatement<{ changes: number }>(
@@ -538,23 +607,19 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
     onResultSet?.();
     const exact = statement.raw().safeIntegers(true);
     const iterator = params.length ? exact.iterate(params) : exact.iterate();
-    const rows: unknown[][] = [];
     const rawRows: unknown[][] = [];
     let rowCount = 0;
     for (const row of iterator) {
       rowCount++;
-      if (rows.length < limit) {
+      if (rawRows.length < limit) {
         rawRows.push(row);
-        rows.push(normalizeSqliteIntegers(row) as unknown[]);
       }
     }
     const columns = statement.columns().map((column) => column.name);
     return {
-      columns,
-      columnMeta: inferSqliteQueryColumnMeta(rawRows, columns.length),
-      rows,
+      ...formatSqliteQueryRows(columns, rawRows),
       rowCount,
-      truncated: rowCount > rows.length,
+      truncated: rowCount > rawRows.length,
     };
   }
 
@@ -579,14 +644,20 @@ class BetterSqlite3DatabaseAdapter implements SQLiteDatabase {
 export async function openSQLiteDatabase(
   config: SQLiteRuntimeOpenConfig,
   loadTargets?: readonly string[],
+  managedPackage: string | null = null,
+  beforeOpen?: () => void,
 ): Promise<SQLiteDatabase> {
-  const Database = await loadBetterSqlite3(loadTargets);
+  const { Database, nativeBinding } = loadTargets
+    ? loadBetterSqlite3(loadTargets, managedPackage)
+    : await selectSQLiteRuntime();
   const readOnly = config.readOnly === true;
   let database: BetterSqlite3Database;
+  beforeOpen?.();
   try {
     database = new Database(config.filePath, {
       readonly: readOnly,
       fileMustExist: readOnly,
+      nativeBinding,
     });
   } catch (error) {
     throw sqliteOpenError(config, error);
@@ -604,6 +675,22 @@ export async function openSQLiteDatabase(
       "RAPIDB_TIME_KEY",
       { deterministic: true },
       sqliteTimeSortKey,
+    );
+    database.function("RAPIDB_REAL_KEY", { deterministic: true }, (value) =>
+      typeof value === "number" ? String(value) : null,
+    );
+    database.function(
+      "RAPIDB_DELETE_HASH",
+      { deterministic: true },
+      (value) => {
+        const hash = createHash("sha256");
+        if (typeof value === "string") return hash.update(value).digest("hex");
+        if (typeof value !== "number") return null;
+        // SQLite REAL values bypass text formatting (including signed zero).
+        const bytes = Buffer.alloc(8);
+        bytes.writeDoubleBE(value);
+        return hash.update("r:").update(bytes).digest("hex");
+      },
     );
 
     return new BetterSqlite3DatabaseAdapter(database);

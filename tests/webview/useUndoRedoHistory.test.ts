@@ -337,6 +337,89 @@ describe("useUndoRedoHistory", () => {
     expect(r).toBeNull();
   });
 
+  it("keeps only the 100 newest history steps and redoes them back to the latest state", () => {
+    const { result } = renderHook(() => useUndoRedoHistory());
+    const snapshots = Array.from({ length: 103 }, (_, value) =>
+      makeSnapshot({ pendingEdits: pendingEditsFrom([[0, { value }]]) }),
+    );
+    const latest = makeSnapshot({
+      newRows: [{ a: { value: "latest draft" } }],
+    });
+    let current = latest;
+
+    act(() => {
+      for (const snapshot of snapshots) result.current.push(snapshot);
+    });
+    expect(result.current.canUndo).toBe(true);
+    expect(result.current.canRedo).toBe(false);
+
+    act(() => {
+      for (const expected of snapshots.slice(3).reverse()) {
+        expect(result.current.undo(current)).toBe(expected);
+        current = expected;
+      }
+      expect(result.current.undo(current)).toBeNull();
+    });
+    expect(result.current.canUndo).toBe(false);
+    expect(result.current.canRedo).toBe(true);
+
+    act(() => {
+      for (const expected of [...snapshots.slice(4), latest]) {
+        expect(result.current.redo(current)).toBe(expected);
+        current = expected;
+      }
+      expect(result.current.redo(current)).toBeNull();
+    });
+    expect(result.current.canUndo).toBe(true);
+    expect(result.current.canRedo).toBe(false);
+  });
+
+  it("drops the redo branch after an over-cap history while keeping earlier retained edits", () => {
+    const { result } = renderHook(() => useUndoRedoHistory());
+    const evicted = makeSnapshot({
+      unresolvedPendingEdits: [
+        {
+          originalSignature: "evicted",
+          changes: new Map([["name", "old edit"]]),
+        },
+      ],
+    });
+    const earlier = makeSnapshot({
+      pendingEdits: pendingEditsFrom([[0, { a: 1 }]]),
+    });
+    const branchPoint = makeSnapshot({
+      pendingEdits: pendingEditsFrom([[0, { a: 2 }]]),
+    });
+    const abandoned = makeSnapshot({
+      pendingEdits: pendingEditsFrom([[0, { a: 3 }]]),
+    });
+    const newBranch = makeSnapshot({
+      pendingEdits: pendingEditsFrom([[0, { a: 4 }]]),
+    });
+
+    act(() => {
+      result.current.push(evicted);
+      for (let i = 0; i < 98; i++) result.current.push(makeSnapshot());
+      result.current.push(earlier);
+      result.current.push(branchPoint);
+    });
+    expect(result.current.hasUnresolvedEdits()).toBe(false);
+
+    act(() => {
+      expect(result.current.undo(abandoned)).toBe(branchPoint);
+    });
+    expect(result.current.canRedo).toBe(true);
+
+    act(() => result.current.push(branchPoint));
+    expect(result.current.canRedo).toBe(false);
+
+    act(() => {
+      expect(result.current.redo(newBranch)).toBeNull();
+      expect(result.current.undo(newBranch)).toBe(branchPoint);
+      expect(result.current.undo(branchPoint)).toBe(earlier);
+    });
+  });
+
   it("stores snapshots by reference: caller must clone before pushing", () => {
     const { result } = renderHook(() => useUndoRedoHistory());
 

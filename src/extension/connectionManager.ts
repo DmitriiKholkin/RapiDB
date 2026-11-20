@@ -50,6 +50,7 @@ import {
   type ConnectionManagerStore,
   canonicalizeOracleServiceName,
   connectionIdsMatch,
+  connectionSessionKey,
   connectionSessionSettings,
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
@@ -65,8 +66,13 @@ import {
   shouldForceSecretStorage,
   shouldKeepHandWrittenSecretsInSettings,
 } from "./connectionSecrets";
-import { parseStoredConnectionSecrets } from "./connectionSecretsData";
+import {
+  parseStoredConnectionSecrets,
+  readConnectionCredentialRevision,
+  withConnectionCredentialRevision,
+} from "./connectionSecretsData";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
+import { resolveDynamoDBSshEndpoint } from "./dbDrivers/dynamodbConnection";
 import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
 import { MongoDBDriver } from "./dbDrivers/mongodb";
 import { MSSQLDriver } from "./dbDrivers/mssql";
@@ -94,6 +100,7 @@ import {
   PartialSchemaLoadError,
 } from "./schema/schemaLoaders";
 import { ConnectionValidationService } from "./services/connectionValidationService";
+import { resolvePostgresPort } from "./services/postgresPort";
 import {
   type ConnectionSshSettings,
   createSshRuntime,
@@ -102,6 +109,7 @@ import {
   type SshRuntimeRequest,
 } from "./services/sshRuntime";
 import { runAbortableFilesystemOperation } from "./utils/abortableFilesystem";
+import { redactDiagnosticValue } from "./utils/diagnosticRedaction";
 import { normalizeUnknownError } from "./utils/errorHandling";
 import { logger } from "./utils/logger";
 
@@ -165,6 +173,25 @@ function connectionSessionChanged(
   } catch {
     return true;
   }
+}
+
+function usesStoredCredentials(config: ConnectionConfig | undefined): boolean {
+  return (
+    config !== undefined &&
+    config.type !== "sqlite" &&
+    config.useSecretStorage !== false &&
+    !shouldKeepHandWrittenSecretsInSettings(config)
+  );
+}
+
+function samePersistedConnection(
+  previous: ConnectionConfig,
+  next: ConnectionConfig,
+): boolean {
+  return isDeepStrictEqual(
+    JSON.parse(JSON.stringify(previous)),
+    JSON.parse(JSON.stringify(next)),
+  );
 }
 
 export function createConnectionRootSchemaScope(): ExplorerSchemaScope {
@@ -729,6 +756,7 @@ const ORPHANED_SECRET_CLEANUP_DELAY_MS = 5 * 60_000;
 async function awaitBoundedCleanup(
   label: string,
   cleanup: () => void | Promise<void>,
+  secretContext?: unknown,
 ): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const completed = await Promise.race([
@@ -737,7 +765,7 @@ async function awaitBoundedCleanup(
       .then(
         () => true,
         (error: unknown) => {
-          logger.error(`${label} failed during cleanup`, error);
+          logger.error(`${label} failed during cleanup`, error, secretContext);
           return true;
         },
       ),
@@ -769,6 +797,16 @@ export class ConnectionManager
   private readonly validationService = new ConnectionValidationService();
   private readonly store: ConnectionManagerStore;
   private driverMap = new Map<string, IDBDriver>();
+  // Reuse the config already hydrated for this exact driver, including for
+  // in-flight failures after the connection ID is rebound to another driver.
+  private readonly driverDiagnosticConfigs = new WeakMap<
+    IDBDriver,
+    readonly ConnectionConfig[]
+  >();
+  private readonly driverTargetSessions = new WeakMap<
+    IDBDriver,
+    { key: string | null; generation: number }
+  >();
   private readonly automaticReconnectBlocks = new Map<string, string>();
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly disposedSshRuntimes = new WeakSet<SshRuntime>();
@@ -811,6 +849,14 @@ export class ConnectionManager
   private readonly _onDidChangeConnectionSession =
     new vscode.EventEmitter<string>();
   private readonly _connectionSessionGenerations = new Map<string, number>();
+  private readonly unpersistedSessionNonces = new Map<string, string>();
+  // Only opaque revisions are cached, never the SecretStorage documents.
+  private readonly credentialRevisions = new Map<string, string | undefined>();
+  private readonly credentialRevisionReads = new Map<
+    string,
+    Promise<boolean>
+  >();
+  private readonly credentialChangeSubscription: vscode.Disposable | undefined;
   private _connectionsCache: ConnectionConfig[] | null = null;
   private readonly _driverStaticMetadataCache = new Map<
     string,
@@ -871,6 +917,9 @@ export class ConnectionManager
         this.reconcileOrphanedSecretCleanup(false);
         for (const before of previous) {
           const next = current.get(before.id);
+          if (!usesStoredCredentials(next)) {
+            this.credentialRevisions.delete(before.id);
+          }
           const expected = this.pendingTrustedFingerprintWrites.get(before.id);
           if (
             next &&
@@ -902,6 +951,24 @@ export class ConnectionManager
         await this._trimHistoryToLimit();
       }
     }, context.subscriptions);
+    this.credentialChangeSubscription = this.store.onDidChangeSecret?.((id) => {
+      // Application-scoped delivery also reaches windows that don't use this
+      // key. Cold profiles read their initial revision before binding a session.
+      if (
+        !this._disposed &&
+        (this.credentialRevisions.has(id) ||
+          this.credentialRevisionReads.has(id) ||
+          this.driverMap.has(id) ||
+          this.isConnecting(id))
+      ) {
+        void this.refreshConnectionCredentialRevision(id).catch((error) => {
+          logger.error(
+            "Could not reconcile a changed credential revision",
+            error,
+          );
+        });
+      }
+    });
     void this.store.clearLegacyOrphanedSecretIds?.().catch((error) => {
       logger.error("Could not clear legacy orphaned secret ids", error);
     });
@@ -913,23 +980,155 @@ export class ConnectionManager
   }
 
   getConnectionSessionNonce(id: string): string | undefined {
+    let localNonce = this.unpersistedSessionNonces.get(id);
     try {
-      return this.store.readConnectionSessionNonce?.(id);
-    } catch {
-      return undefined;
-    }
+      localNonce ??= this.store.readConnectionSessionNonce?.(id);
+    } catch {}
+    const revision = this.credentialRevisions.get(id);
+    return revision === undefined
+      ? localNonce
+      : JSON.stringify([localNonce ?? null, revision]);
   }
 
-  private markConnectionSessionChanged(id: string): void {
+  getQueryTargetSessionKey(id: string): string | null {
+    return (
+      connectionSessionKey(
+        this.getConnection(id),
+        this.getConnectionSessionNonce(id),
+      ) ?? null
+    );
+  }
+
+  // Return no promise on the hot path. A panel restored in a different host
+  // must load the same committed revision before it trusts a saved target key.
+  initializeConnectionCredentialRevision(
+    id: string,
+  ): Promise<boolean> | undefined {
+    if (this._disposed || !this.credentialChangeSubscription) return;
+    const pending =
+      this.credentialRevisionReads.get(id) ??
+      (!this.credentialRevisions.has(id) &&
+      usesStoredCredentials(this.getConnection(id))
+        ? this.refreshConnectionCredentialRevision(id)
+        : undefined);
+    if (pending) return this.awaitCredentialRevisionReads(id, pending);
+  }
+
+  private async awaitCredentialRevisionReads(
+    id: string,
+    pending: Promise<boolean>,
+  ): Promise<boolean> {
+    let verified = await pending;
+    let latest = this.credentialRevisionReads.get(id);
+    while (latest && latest !== pending) {
+      pending = latest;
+      verified = await pending;
+      latest = this.credentialRevisionReads.get(id);
+    }
+    return verified;
+  }
+
+  private refreshConnectionCredentialRevision(id: string): Promise<boolean> {
+    const pending = this.credentialRevisionReads.get(id) ?? Promise.resolve();
+    const read = pending
+      .then(async () => {
+        if (this._disposed) return true;
+        const config = this.getConnection(id);
+        if (!usesStoredCredentials(config)) return true;
+        const previous = this.credentialRevisions.get(id);
+        const hadRevision = this.credentialRevisions.has(id);
+        let revision: string | undefined;
+        try {
+          revision = readConnectionCredentialRevision(
+            await this.store.getSecret(id),
+          );
+        } catch {
+          // An unreadable event cannot verify that a live session is still safe.
+          // A cold read failure alone doesn't change the session key.
+          if (
+            hadRevision &&
+            !this._disposed &&
+            previous === this.credentialRevisions.get(id) &&
+            this.credentialRevisions.delete(id)
+          ) {
+            await this.invalidateCredentialSession(id, true);
+          }
+          // Preserve the existing fallback for legacy profiles without an
+          // explicit Secret Storage opt-in or an observed credential revision.
+          return !hadRevision && config?.useSecretStorage !== true;
+        }
+        if (
+          this._disposed ||
+          previous !== this.credentialRevisions.get(id) ||
+          hadRevision !== this.credentialRevisions.has(id) ||
+          !usesStoredCredentials(this.getConnection(id))
+        ) {
+          return true;
+        }
+        // Unstamped events include migration and transactional writes/rollbacks.
+        // Only the first load or a committed revision can change the baseline.
+        if (revision !== undefined || !this.credentialRevisions.has(id)) {
+          await this.applyConnectionCredentialRevision(id, revision);
+        }
+        return true;
+      })
+      .finally(() => {
+        if (this.credentialRevisionReads.get(id) === read) {
+          this.credentialRevisionReads.delete(id);
+        }
+      });
+    this.credentialRevisionReads.set(id, read);
+    return read;
+  }
+
+  private async applyConnectionCredentialRevision(
+    id: string,
+    revision: string | undefined,
+    committedHere = false,
+  ): Promise<void> {
+    if (this._disposed) return;
+    const hadRevision = this.credentialRevisions.has(id);
+    if (hadRevision && this.credentialRevisions.get(id) === revision) return;
+    this.credentialRevisions.set(id, revision);
+    if (!hadRevision && !committedHere && !this.driverMap.has(id)) return;
+    await this.invalidateCredentialSession(id, false);
+  }
+
+  private async invalidateCredentialSession(
+    id: string,
+    persistLocalNonce: boolean,
+  ): Promise<void> {
+    this.invalidateDriverStaticMetadata(id);
+    const disconnect =
+      this.driverMap.has(id) || this.isConnecting(id)
+        ? this.disconnectFrom(id)
+        : undefined;
+    this.markConnectionSessionChanged(id, persistLocalNonce);
+    if (disconnect) await disconnect;
+  }
+
+  private markConnectionSessionChanged(
+    id: string,
+    persistLocalNonce = true,
+  ): void {
     this._connectionSessionGenerations.set(
       id,
       this.getConnectionSessionGeneration(id) + 1,
     );
-    void this.store
-      .writeConnectionSessionNonce?.(id, randomUUID())
-      .catch((error) => {
-        logger.error("Could not record connection session change", error);
-      });
+    if (persistLocalNonce) {
+      const nonce = randomUUID();
+      this.unpersistedSessionNonces.set(id, nonce);
+      void this.store.writeConnectionSessionNonce?.(id, nonce).then(
+        () => {
+          if (this.unpersistedSessionNonces.get(id) === nonce) {
+            this.unpersistedSessionNonces.delete(id);
+          }
+        },
+        (error) => {
+          logger.error("Could not record connection session change", error);
+        },
+      );
+    }
     this._onDidChangeConnectionSession.fire(id);
   }
 
@@ -1236,19 +1435,36 @@ export class ConnectionManager
       return undefined;
     }
 
+    return this._stageConnectionSecret(
+      config.id,
+      previousSecretSnapshot,
+      nextSecretSnapshot,
+    );
+  }
+
+  private async _stageConnectionSecret(
+    id: string,
+    previousSecret: string | undefined,
+    stagedSecret: string | undefined,
+  ): Promise<() => Promise<void>> {
     const restore = async (): Promise<void> => {
-      if (previousSecretSnapshot === undefined) {
-        await this.store.deleteSecret(config.id);
+      // A different window may have committed a credential-only revision while
+      // this settings write was pending. Do not undo its committed secret.
+      if ((await this.store.getSecret(id)) !== stagedSecret) {
+        return;
+      }
+      if (previousSecret === undefined) {
+        await this.store.deleteSecret(id);
       } else {
-        await this.store.storeSecret(config.id, previousSecretSnapshot);
+        await this.store.storeSecret(id, previousSecret);
       }
     };
 
     try {
-      if (nextSecretSnapshot === undefined) {
-        await this.store.deleteSecret(config.id);
+      if (stagedSecret === undefined) {
+        await this.store.deleteSecret(id);
       } else {
-        await this.store.storeSecret(config.id, nextSecretSnapshot);
+        await this.store.storeSecret(id, stagedSecret);
       }
     } catch (writeError) {
       try {
@@ -1256,7 +1472,7 @@ export class ConnectionManager
       } catch (rollbackError) {
         throw new AggregateError(
           [writeError, rollbackError],
-          `Secret update and rollback both failed for connection "${config.id}".`,
+          `Secret update and rollback both failed for connection "${id}".`,
         );
       }
       throw writeError;
@@ -1457,6 +1673,9 @@ export class ConnectionManager
 
     let persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
     let replacesSecretProfileWithSqlite = false;
+    let credentialCommit: { revision: string; generation: number } | undefined;
+    let credentialCommitError: Error | undefined;
+    let credentialRollbackFailed = false;
     const sessionChanged = await this.store.mutateConnections(
       async (connections) => {
         const idx = connections.findIndex((c) => c.id === canonicalConfig.id);
@@ -1466,6 +1685,7 @@ export class ConnectionManager
           previous !== undefined &&
           previous.type !== "sqlite" &&
           previous.useSecretStorage !== false;
+        let editSecretSnapshot: string | undefined;
         if (precondition?.kind === "create" && previous) {
           throw new Error(
             "A connection with this ID already exists. Reopen the form to create a new connection.",
@@ -1483,16 +1703,17 @@ export class ConnectionManager
             );
           }
           if (
+            previous.useSecretStorage !== false &&
+            previous.type !== "sqlite"
+          ) {
+            editSecretSnapshot = await this.store.getSecret(previous.id);
+          }
+          if (
             !connectionEditStatesMatch(
               precondition.state,
               connectionEditState(
                 previous,
-                previous.useSecretStorage === false ||
-                  previous.type === "sqlite"
-                  ? {}
-                  : parseStoredConnectionSecrets(
-                      await this.store.getSecret(previous.id),
-                    ),
+                parseStoredConnectionSecrets(editSecretSnapshot),
               ),
             )
           ) {
@@ -1507,9 +1728,15 @@ export class ConnectionManager
           );
         }
         let sessionChanged = false;
+        let previousSecret: string | undefined;
         if (previous) {
           const safePrevious = omitAmbiguousCredentialBearingUris(previous);
-          const hydratedPrevious = await this._hydratePassword(safePrevious);
+          const hydratedPrevious = await this._hydratePassword(
+            safePrevious,
+            (stored) => {
+              previousSecret = stored;
+            },
+          );
           const previousSecrets =
             serializeConnectionSecretsForConfig(hydratedPrevious);
           const nextSecrets = shouldForceSecretStorage(canonicalConfig)
@@ -1528,6 +1755,121 @@ export class ConnectionManager
               parseStoredConnectionSecrets(previousSecrets),
               parseStoredConnectionSecrets(nextSecrets),
             );
+        }
+        if (
+          sessionChanged &&
+          this.credentialChangeSubscription &&
+          previous &&
+          usesStoredCredentials(previous) &&
+          canonicalConfig.type !== "sqlite" &&
+          persistedConfig.useSecretStorage === true &&
+          isDeepStrictEqual(
+            connectionSessionSettings(previous),
+            connectionSessionSettings(persistedConfig),
+          )
+        ) {
+          const id = canonicalConfig.id;
+          const settingsChanged = !samePersistedConnection(
+            previous,
+            persistedConfig,
+          );
+          const nextSecret = serializeConnectionSecretsForStoredConfig(
+            canonicalConfig,
+            previousSecret,
+            clearOptions,
+          );
+          const assertCredentialsCurrent = async (
+            expected: string | undefined,
+          ) => {
+            if (
+              (precondition?.kind === "edit" &&
+                editSecretSnapshot !== previousSecret) ||
+              (await this.store.getSecret(id)) !== expected
+            ) {
+              throw new Error(
+                "Saved credentials changed during the operation. Please retry.",
+              );
+            }
+          };
+          await assertCredentialsCurrent(previousSecret);
+          if (nextSecret !== previousSecret) {
+            const revision = randomUUID();
+            const committedSecret = withConnectionCredentialRevision(
+              nextSecret,
+              revision,
+            );
+            const commit = async (expected: string | undefined) => {
+              // The queue serializes this host. SecretStorage has no CAS, so
+              // across hosts this check cannot cover the gap before store().
+              await assertCredentialsCurrent(expected);
+              const generation = this.getConnectionSessionGeneration(id);
+              try {
+                await this.store.storeSecret(id, committedSecret);
+              } catch (error) {
+                if (
+                  !settingsChanged ||
+                  (await this.store.getSecret(id).catch(() => undefined)) !==
+                    committedSecret
+                ) {
+                  throw error;
+                }
+              }
+              credentialCommit = { revision, generation };
+            };
+            if (!settingsChanged) {
+              return {
+                result: true,
+                commitSecretOnly: () => commit(previousSecret),
+              };
+            }
+            const rollback = await this._stageConnectionSecret(
+              id,
+              previousSecret,
+              nextSecret,
+            );
+            const next = [...connections];
+            next[idx] = persistedConfig;
+            return {
+              connections: next,
+              result: true,
+              rollback,
+              afterSettingsWrite: async () => {
+                // Presentation settings don't fence sessions on other hosts.
+                // The staged write retained the old revision; publish one only
+                // after settings succeed and only for our own staged value.
+                try {
+                  const current = this.store
+                    .getConnections()
+                    .find((connection) => connection.id === id);
+                  if (
+                    !current ||
+                    !samePersistedConnection(current, persistedConfig)
+                  ) {
+                    throw new Error("The saved connection was changed again.");
+                  }
+                  await commit(nextSecret);
+                } catch (error) {
+                  let cause = error;
+                  try {
+                    await rollback();
+                  } catch (rollbackError) {
+                    credentialRollbackFailed = true;
+                    cause = new AggregateError([error, rollbackError]);
+                  }
+                  // Settings already applied. Never roll back the whole array.
+                  // A crash or failed rollback can leave an unstamped secret;
+                  // that cannot be treated as a peer commit notification.
+                  credentialCommitError = new Error(
+                    credentialRollbackFailed
+                      ? "The connection settings write completed, but the credential update could not be confirmed and rollback failed. Verify the saved credentials before reconnecting or retrying."
+                      : "The connection settings write completed, but the credential update could not be confirmed. Reopen Edit Connection before retrying.",
+                    { cause },
+                  );
+                }
+              },
+            };
+          }
+          if (!settingsChanged) return { result: false };
         }
         const rollback =
           canonicalConfig.type !== "sqlite" &&
@@ -1553,11 +1895,49 @@ export class ConnectionManager
       },
     );
     this._connectionsCache = null;
+    if (credentialCommitError) {
+      const id = canonicalConfig.id;
+      try {
+        // A peer may have won the save, or the write acknowledgement was
+        // inconclusive. Reconcile only what SecretStorage actually exposes.
+        const generation = this.getConnectionSessionGeneration(id);
+        await this.refreshConnectionCredentialRevision(id);
+        if (
+          credentialRollbackFailed &&
+          !this._disposed &&
+          this.getConnectionSessionGeneration(id) === generation
+        ) {
+          await this.invalidateCredentialSession(id, true);
+        }
+      } catch (error) {
+        logger.error(
+          "Could not reconcile a changed credential revision",
+          error,
+        );
+      }
+      this._onDidChangeConnections.fire();
+      throw credentialCommitError;
+    }
+    if (credentialCommit !== undefined) {
+      const { revision, generation } = credentialCommit;
+      const id = canonicalConfig.id;
+      if (!this._disposed && usesStoredCredentials(this.getConnection(id))) {
+        if (this.getConnectionSessionGeneration(id) === generation) {
+          await this.applyConnectionCredentialRevision(id, revision, true);
+        } else if (this.credentialRevisions.get(id) !== revision) {
+          // Don't install an older acknowledgement over a newer observed commit.
+          await this.refreshConnectionCredentialRevision(id);
+        }
+      }
+      this._onDidChangeConnections.fire();
+      return sanitizeConnectionConfigForResponse(persistedConfig);
+    }
     if (sessionChanged) this.markConnectionSessionChanged(canonicalConfig.id);
     if (
       persistedConfig.useSecretStorage === false ||
       replacesSecretProfileWithSqlite
     ) {
+      this.credentialRevisions.delete(canonicalConfig.id);
       await this._removeUnusedConnectionSecrets(canonicalConfig.id);
     }
     this.invalidateDriverStaticMetadata(canonicalConfig.id);
@@ -1614,6 +1994,12 @@ export class ConnectionManager
       return false;
     }
     this._connectionsCache = null;
+    this.credentialRevisions.delete(id);
+    this.markConnectionSessionChanged(id);
+    // A query may have begun reconnecting while the removal was being saved.
+    if (this.driverMap.has(id) || this.isConnecting(id)) {
+      await this.disconnectFrom(id);
+    }
     this.automaticReconnectBlocks.delete(id);
     this.invalidateDriverStaticMetadata(id);
     await this._purgeHistoryForConnection(id);
@@ -1703,7 +2089,10 @@ export class ConnectionManager
     return updatedCount;
   }
 
-  async _hydratePassword(config: ConnectionConfig): Promise<ConnectionConfig> {
+  async _hydratePassword(
+    config: ConnectionConfig,
+    onSecretRead?: (stored: string | undefined) => void,
+  ): Promise<ConnectionConfig> {
     if (
       config.useSecretStorage === false ||
       config.type === "sqlite" ||
@@ -1724,6 +2113,7 @@ export class ConnectionManager
       );
       return config;
     }
+    onSecretRead?.(stored);
     if (config.useSecretStorage !== true && stored === undefined) {
       return config;
     }
@@ -1943,34 +2333,6 @@ export class ConnectionManager
     );
   }
 
-  private resolveDynamoEndpoint(config: ConnectionConfig): string {
-    if (config.endpoint) {
-      return config.endpoint;
-    }
-
-    if (config.awsEndpoint) {
-      return config.awsEndpoint;
-    }
-
-    const region = config.awsRegion?.trim() || "us-east-1";
-    return `https://dynamodb.${region}.amazonaws.com`;
-  }
-
-  private resolveDynamoRemoteTarget(config: ConnectionConfig): {
-    host: string;
-    port: number;
-  } {
-    return (
-      this.resolveUrlRemoteTarget(
-        config.endpoint ?? config.awsEndpoint,
-        443,
-      ) ?? {
-        host: `dynamodb.${config.awsRegion?.trim() || "us-east-1"}.amazonaws.com`,
-        port: 443,
-      }
-    );
-  }
-
   private resolveTcpRemoteTarget(config: ConnectionConfig): {
     host: string;
     port: number;
@@ -1979,7 +2341,7 @@ export class ConnectionManager
       case "pg":
         return {
           host: config.host?.trim() || "localhost",
-          port: config.port ?? 5432,
+          port: resolvePostgresPort(config.port),
         };
       case "mysql":
         return {
@@ -2010,8 +2372,6 @@ export class ConnectionManager
           "[RapiDB] Elasticsearch over SSH requires a fixed host, endpoint, or connection URI when Cloud ID is not used.",
         );
       }
-      case "dynamodb":
-        return this.resolveDynamoRemoteTarget(config);
       default: {
         const unsupported = config.type;
         throw new Error(
@@ -2043,14 +2403,6 @@ export class ConnectionManager
           return { kind: "httpAgent" };
         }
 
-        const remoteTarget = this.resolveTcpRemoteTarget(config);
-        return {
-          kind: "tcpForward",
-          remoteHost: remoteTarget.host,
-          remotePort: remoteTarget.port,
-        };
-      }
-      case "dynamodb": {
         const remoteTarget = this.resolveTcpRemoteTarget(config);
         return {
           kind: "tcpForward",
@@ -2095,7 +2447,10 @@ export class ConnectionManager
       } as DriverConnectionConfig;
     }
 
-    const remoteTarget = this.resolveTcpRemoteTarget(config);
+    const remoteTarget =
+      config.type === "pg"
+        ? { host: runtime.transport.remoteHost }
+        : this.resolveTcpRemoteTarget(config);
     const baseConfig: DriverConnectionConfig = {
       ...config,
       host: runtime.transport.localHost,
@@ -2174,24 +2529,6 @@ export class ConnectionManager
             runtime.transport.localPort,
           ),
         };
-      case "dynamodb":
-        return {
-          ...baseConfig,
-          runtimeOverrides: {
-            ...baseConfig.runtimeOverrides,
-            tlsServername: remoteTarget.host,
-          },
-          endpoint: this.rewriteUriHostPort(
-            config.endpoint ?? this.resolveDynamoEndpoint(config),
-            runtime.transport.localHost,
-            runtime.transport.localPort,
-          ),
-          awsEndpoint: this.rewriteUriHostPort(
-            config.awsEndpoint,
-            runtime.transport.localHost,
-            runtime.transport.localPort,
-          ),
-        };
       default:
         break;
     }
@@ -2213,7 +2550,13 @@ export class ConnectionManager
       };
     }
 
-    const request = this.resolveSshRuntimeRequest(config);
+    const dynamoDBSshEndpoint =
+      config.type === "dynamodb"
+        ? await resolveDynamoDBSshEndpoint(config, signal)
+        : undefined;
+    signal?.throwIfAborted();
+    const request =
+      dynamoDBSshEndpoint?.request ?? this.resolveSshRuntimeRequest(config);
     const runtime = signal
       ? await this.createSshRuntimeForConnection(sshSettings, request, {
           signal,
@@ -2222,7 +2565,15 @@ export class ConnectionManager
 
     try {
       return {
-        config: this.applySshRuntimeToConfig(config, runtime),
+        config: dynamoDBSshEndpoint
+          ? {
+              ...config,
+              runtimeOverrides: {
+                transport: runtime.transport,
+                dynamoDBSshEndpoint,
+              },
+            }
+          : this.applySshRuntimeToConfig(config, runtime),
         runtime,
       };
     } catch (error) {
@@ -2304,7 +2655,29 @@ export class ConnectionManager
     }
 
     const liveConfig = this.getConnection(id) ?? fallbackConfig;
-    const fullConfig = await this._hydratePassword(liveConfig);
+    const fullConfig = await this._hydratePassword(liveConfig, (stored) => {
+      if (
+        !this.credentialChangeSubscription ||
+        this._isStaleConnectEpoch(id, connectEpoch)
+      )
+        return;
+      const revision = readConnectionCredentialRevision(stored);
+      if (!this.credentialRevisions.has(id)) {
+        this.credentialRevisions.set(id, revision);
+        return;
+      }
+      if (revision === this.credentialRevisions.get(id)) return;
+      // A reconnect must never attach newly read credentials to an old query
+      // or table binding, even if the storage event hasn't arrived yet.
+      void this.applyConnectionCredentialRevision(id, revision).catch(
+        (error) => {
+          logger.error(
+            "Failed to disconnect changed connection credentials",
+            error,
+          );
+        },
+      );
+    });
     const validation = this.validationService.validate(fullConfig);
     if (!validation.valid) {
       throw new Error(validation.message ?? "Connection settings are invalid.");
@@ -2321,7 +2694,11 @@ export class ConnectionManager
     driver: IDBDriver;
     runtime?: SshRuntime;
   }> {
-    const prepared = await this.prepareDriverConfig(config, signal);
+    const prepared = await this.prepareDriverConfig(config, signal).catch(
+      (error: unknown) => {
+        throw redactDiagnosticValue(error, config);
+      },
+    );
     let driver: IDBDriver | undefined;
     let rejectAbort: ((reason: Error) => void) | undefined;
     let tunnelClosedError: Error | undefined;
@@ -2349,6 +2726,7 @@ export class ConnectionManager
       }
       if (tunnelClosedError) throw tunnelClosedError;
       driver = this.createDriver(prepared.config);
+      this.driverDiagnosticConfigs.set(driver, [config, prepared.config]);
       signal.addEventListener("abort", onAbort, { once: true });
       if (signal.aborted) {
         throw new DOMException("Aborted", "AbortError");
@@ -2370,7 +2748,7 @@ export class ConnectionManager
       return { driver, runtime: prepared.runtime };
     } catch (err) {
       await this.disposeUnboundConnectionResources(driver, prepared.runtime);
-      throw normalizeUnknownError(err, config);
+      throw normalizeUnknownError(err, [config, prepared.config]);
     } finally {
       signal.removeEventListener("abort", onAbort);
       tunnelCloseSubscription?.dispose();
@@ -2382,8 +2760,10 @@ export class ConnectionManager
     runtime?: SshRuntime,
   ): Promise<void> {
     if (driver) {
-      await awaitBoundedCleanup("Unbound database driver disconnect", () =>
-        driver.disconnect(),
+      await awaitBoundedCleanup(
+        "Unbound database driver disconnect",
+        () => driver.disconnect(),
+        this.driverDiagnosticConfigs.get(driver),
       );
     }
 
@@ -2448,8 +2828,10 @@ export class ConnectionManager
       runtime: this.sshRuntimeMap.get(id),
     };
     if (driver) {
-      await awaitBoundedCleanup(`Driver disconnect for ${id}`, () =>
-        driver.disconnect(),
+      await awaitBoundedCleanup(
+        `Driver disconnect for ${id}`,
+        () => driver.disconnect(),
+        this.getConnectionDiagnosticContext(id, driver),
       );
     }
 
@@ -2465,6 +2847,13 @@ export class ConnectionManager
     id: string,
     intent: ConnectionConnectIntent = "automatic",
   ): ConnectAttempt {
+    return this.beginConnectWithOwner(id, intent);
+  }
+
+  private beginConnectWithOwner(
+    id: string,
+    intent: ConnectionConnectIntent,
+  ): ConnectAttempt & { epoch?: number } {
     this._assertNotDisposed();
 
     if (this._disconnectingMap.has(id)) {
@@ -2487,7 +2876,7 @@ export class ConnectionManager
 
     const pending = this._connectingMap.get(id);
     if (pending) {
-      return { promise: pending.promise, isNew: false };
+      return { promise: pending.promise, isNew: false, epoch: pending.epoch };
     }
     if (this.isConnected(id)) {
       return { promise: Promise.resolve(), isNew: false };
@@ -2510,6 +2899,12 @@ export class ConnectionManager
     void (async () => {
       this._secretReadFailures.delete(id);
       try {
+        const initializing = this.initializeConnectionCredentialRevision(id);
+        if (initializing) await initializing;
+        const targetSession = {
+          key: this.getQueryTargetSessionKey(id),
+          generation: this.getConnectionSessionGeneration(id),
+        };
         if (this.driverMap.has(id)) {
           await this.disconnectRegisteredDriver(id, true);
         }
@@ -2527,7 +2922,16 @@ export class ConnectionManager
           config,
           connectEpoch,
         );
-        if (!fullConfig) {
+        if (
+          !fullConfig ||
+          this._isStaleConnectEpoch(id, connectEpoch) ||
+          targetSession.key !==
+            (connectionSessionKey(
+              fullConfig,
+              this.getConnectionSessionNonce(id),
+            ) ?? null) ||
+          targetSession.generation !== this.getConnectionSessionGeneration(id)
+        ) {
           resolveAttempt();
           return;
         }
@@ -2536,13 +2940,24 @@ export class ConnectionManager
           fullConfig,
           ac.signal,
         );
+        const checkingRevision = this.credentialRevisionReads.get(id);
+        const verified =
+          !checkingRevision ||
+          (await this.awaitCredentialRevisionReads(id, checkingRevision));
 
-        if (this._isStaleConnectEpoch(id, connectEpoch)) {
+        if (
+          !verified ||
+          this._isStaleConnectEpoch(id, connectEpoch) ||
+          targetSession.generation !==
+            this.getConnectionSessionGeneration(id) ||
+          targetSession.key !== this.getQueryTargetSessionKey(id)
+        ) {
           await this.disposeUnboundConnectionResources(driver, runtime);
           resolveAttempt();
           return;
         }
 
+        this.driverTargetSessions.set(driver, targetSession);
         this.driverMap.set(id, driver);
         if (intent === "explicit") this.automaticReconnectBlocks.delete(id);
         if (runtime) {
@@ -2566,7 +2981,37 @@ export class ConnectionManager
         this.finalizeConnectAttempt(id, connectEpoch);
       }
     })();
-    return { promise: attempt, isNew: true };
+    return { promise: attempt, isNew: true, epoch: connectEpoch };
+  }
+
+  // Some cancelled connect attempts resolve normally. Only the attempt this
+  // query joined may supply its driver, even after a same-target reconnect.
+  async getDriverForQuery(
+    id: string,
+    expectedKey: string,
+  ): Promise<IDBDriver | undefined> {
+    const initializing = this.initializeConnectionCredentialRevision(id);
+    if (initializing && !(await initializing)) return undefined;
+    if (this.getQueryTargetSessionKey(id) !== expectedKey) return undefined;
+    const generation = this.getConnectionSessionGeneration(id);
+    if (!this.isConnected(id)) {
+      const attempt = this.beginConnectWithOwner(id, "automatic");
+      await attempt.promise;
+      if (
+        attempt.epoch === undefined ||
+        this._isStaleConnectEpoch(id, attempt.epoch)
+      ) {
+        return undefined;
+      }
+    }
+    const driver = this.getDriver(id);
+    const owner = driver && this.driverTargetSessions.get(driver);
+    return owner?.key === expectedKey &&
+      owner.generation === generation &&
+      generation === this.getConnectionSessionGeneration(id) &&
+      this.getQueryTargetSessionKey(id) === expectedKey
+      ? driver
+      : undefined;
   }
   async connectTo(
     id: string,
@@ -2619,6 +3064,38 @@ export class ConnectionManager
   }
   getDriver(id: string): IDBDriver | undefined {
     return this._disconnectingMap.has(id) ? undefined : this.driverMap.get(id);
+  }
+
+  getConnectedDriverSessionKey(
+    id: string,
+    driver: IDBDriver,
+  ): string | undefined {
+    if (
+      this._disposed ||
+      this.getDriver(id) !== driver ||
+      !driver.isConnected()
+    ) {
+      return;
+    }
+    const owner = this.driverTargetSessions.get(driver);
+    if (
+      owner?.key &&
+      owner.generation === this.getConnectionSessionGeneration(id) &&
+      owner.key === this.getQueryTargetSessionKey(id)
+    ) {
+      return owner.key;
+    }
+  }
+
+  getConnectionDiagnosticContext(
+    id: string,
+    driver = this.driverMap.get(id),
+  ): unknown {
+    // Do not call getConnections(): warming its cache can schedule migration.
+    return (
+      (driver && this.driverDiagnosticConfigs.get(driver)) ??
+      this._connectionsCache?.find((config) => config.id === id)
+    );
   }
   getAutomaticReconnectBlockReason(id: string): string | undefined {
     const reason = this.driverMap.get(id)?.getAutomaticReconnectBlockReason?.();
@@ -3062,7 +3539,33 @@ export class ConnectionManager
     this._onDidRefreshSchemas.fire(connectionId);
   }
 
-  async getSchemaAsync(connectionId: string): Promise<SchemaObjectEntry[]> {
+  async getSchemaAsync(
+    connectionId: string,
+    database?: string,
+  ): Promise<SchemaObjectEntry[]> {
+    if (database !== undefined) {
+      const scope = { kind: "database", database } as const;
+      const scopeKey = getExplorerSchemaScopeKey(scope);
+      const getScope = () =>
+        this._schemaCacheMap.get(connectionId)?.scopes.get(scopeKey);
+      const inFlight = getScope()?.loading;
+      if (inFlight) await inFlight;
+      // Query completion needs objects in the whole target database, not just
+      // the first schema preloaded for a lazily expanded Explorer database.
+      if (!inFlight || getScope()?.status !== "error") {
+        this._startDatabaseScopeLoad(
+          connectionId,
+          database,
+          true,
+          false,
+          "baseline",
+        );
+        await getScope()?.loading;
+      }
+      return flattenSchemaSnapshot(
+        this.getSchemaSnapshotState(connectionId, scope).snapshot,
+      );
+    }
     const snapshot = await this.getSchemaSnapshotAsync(connectionId);
     return flattenSchemaSnapshot(snapshot);
   }
@@ -3307,7 +3810,10 @@ export class ConnectionManager
       );
       this._replaceSchemaScopeFragment(scopeEntry, schema);
     }
-    const error = normalizeUnknownError(err);
+    const error = normalizeUnknownError(
+      err,
+      this.getConnectionDiagnosticContext(connectionId),
+    );
     scopeEntry.status = "error";
     scopeEntry.fullyLoaded = false;
     scopeEntry.isPartial = scopeEntry.snapshot.databases.length > 0;
@@ -3480,7 +3986,10 @@ export class ConnectionManager
           return;
         }
 
-        const error = normalizeUnknownError(err);
+        const error = normalizeUnknownError(
+          err,
+          this.getConnectionDiagnosticContext(connectionId, driver),
+        );
         rootEntry.status = "error";
         rootEntry.isPartial = rootEntry.snapshot.databases.length > 0;
         rootEntry.error = error.message;
@@ -3968,6 +4477,9 @@ export class ConnectionManager
     }
 
     this._disposed = true;
+    this.credentialChangeSubscription?.dispose();
+    this.credentialRevisionReads.clear();
+    this.credentialRevisions.clear();
     for (const timer of this.orphanedSecretTimers.values()) clearTimeout(timer);
     this.orphanedSecretTimers.clear();
 
@@ -4009,6 +4521,7 @@ export class ConnectionManager
     this._onDidChangeSchemaState.dispose();
     this._onDidRefreshSchemas.dispose();
     this._onDidChangeConnectionSession.dispose();
+    this.unpersistedSessionNonces.clear();
   }
   getHistory(connectionId?: string): HistoryEntry[] {
     const all = this.store.readHistory();
@@ -4017,7 +4530,11 @@ export class ConnectionManager
     }
     return all;
   }
-  async addToHistory(connectionId: string, sql: string): Promise<void> {
+  async addToHistory(
+    connectionId: string,
+    sql: string,
+    postgresDatabase?: string,
+  ): Promise<void> {
     const trimmed = sql.trim();
     if (!trimmed) {
       return;
@@ -4028,12 +4545,17 @@ export class ConnectionManager
     await this._enqueueHistoryMutation(async () => {
       const all = this.store.readHistory();
       const latest = all[0];
-      if (latest?.sql === trimmed && latest.connectionId === connectionId)
+      if (
+        latest?.sql === trimmed &&
+        latest.connectionId === connectionId &&
+        latest.postgresDatabase === postgresDatabase
+      )
         return;
       const entry: HistoryEntry = {
         id: randomUUID(),
         sql: trimmed,
         connectionId,
+        ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
         executedAt: new Date().toISOString(),
       };
       const updated = [entry, ...all].slice(0, this.getHistoryLimit());
@@ -4057,12 +4579,17 @@ export class ConnectionManager
   getBookmark(id: string): BookmarkEntry | undefined {
     return this.store.readBookmarks().find((bookmark) => bookmark.id === id);
   }
-  async addBookmark(connectionId: string, sql: string): Promise<BookmarkEntry> {
+  async addBookmark(
+    connectionId: string,
+    sql: string,
+    postgresDatabase?: string,
+  ): Promise<BookmarkEntry> {
     const trimmed = sql.trim();
     const entry: BookmarkEntry = {
       id: randomUUID(),
       sql: trimmed,
       connectionId,
+      ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
       savedAt: new Date().toISOString(),
     };
     return await this._enqueueBookmarkMutation(async () => {

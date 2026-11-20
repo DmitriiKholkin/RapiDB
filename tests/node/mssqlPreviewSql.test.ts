@@ -36,6 +36,56 @@ function column(
   };
 }
 
+describe("MSSQL decimal value casts", () => {
+  it.each([
+    ["decimal(1,0)", "decimal(1,0)"],
+    [" NUMERIC ( 38 , 38 ) ", "numeric(38,38)"],
+    ["Decimal(12)", "decimal(12)"],
+    ["numeric", "numeric"],
+    ["Money", "money"],
+    ["smallmoney", "smallmoney"],
+  ])("uses a canonical cast for %s", (nativeType, castType) => {
+    const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
+    const amount = column("amount", nativeType, "decimal");
+    const operation = buildInsertRowOperation(
+      driver,
+      "db",
+      "dbo",
+      "t",
+      { amount: "0" },
+      [amount],
+    );
+
+    expect(operation.sql).toBe(
+      `INSERT INTO [db].[dbo].[t] ([amount]) VALUES (CAST(? AS ${castType}))`,
+    );
+    expect(operation.params).toEqual(["0"]);
+    expect(driver.buildSetExpr(amount, 1)).toBe(
+      `[amount] = CAST(? AS ${castType})`,
+    );
+  });
+
+  it.each([
+    "",
+    "varchar(12)",
+    "decimal(0,0)",
+    "numeric(39,0)",
+    "decimal(6,7)",
+    "numeric(10,-1)",
+    "decimal(10,)",
+    "numeric(10.5,2)",
+    "money(4)",
+    "decimal(10,2) extra",
+  ])("rejects invalid decimal type metadata: %j", (nativeType) => {
+    const driver = new MSSQLDriver(baseConfig as ConnectionConfig);
+    const amount = column("amount", nativeType, "decimal");
+
+    expect(() => driver.buildInsertValueExpr(amount, 1)).toThrow(
+      'Invalid SQL Server decimal type metadata for column "amount".',
+    );
+  });
+});
+
 describe("MSSQL preview SQL literals", () => {
   function encodeNumericN(value: string, scale: number): Buffer {
     const negative = value.startsWith("-");

@@ -7,7 +7,6 @@ import {
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const binaryColumn: ColumnTypeMeta = {
   name: "payload",
@@ -275,11 +274,11 @@ describe("R10 Mongo binary input versus tolerant output", () => {
     expect(s.updateOne).not.toHaveBeenCalled();
   });
 
-  it.each<[string, string | null]>([
+  it.each<[string | null, string | null]>([
     ...unprefixedText.map((value): [string, string] => [`"${value}"`, value]),
     ['"0xA"', "0xA"],
     ["", ""],
-    [NULL_SENTINEL, null],
+    [null, null],
   ])("still permits explicit type editing %j", async (value, saved) => {
     const s = setup();
     const result = await applyChangesTransactional(

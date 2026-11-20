@@ -32,7 +32,7 @@ import { postMessage } from "../../../utils/messaging";
 import { formatScalarValueForDisplay } from "../../../utils/valueFormatting";
 import { Icon } from "../../Icon";
 import { CellDisplay } from "../CellDisplay";
-import { EditInput, valueToEditString } from "../EditInput";
+import { EditInput, toEditValue } from "../EditInput";
 import { GridContextMenu } from "../GridContextMenu";
 import {
   BottomSpacerRow,
@@ -760,7 +760,7 @@ export const QueryTableRow = React.memo(function QueryTableRow({
           >
             {!isCollapsed && isEditing ? (
               <EditInput
-                initial={valueToEditString(raw)}
+                initial={toEditValue(raw)}
                 category={category}
                 nullable
                 readOnly

@@ -34,6 +34,7 @@ import {
 
 type VscodeMockShape = {
   showSaveDialog: ReturnType<typeof vi.fn>;
+  showWarningMessage: ReturnType<typeof vi.fn>;
   withProgress: ReturnType<typeof vi.fn>;
   showInformationMessage: ReturnType<typeof vi.fn>;
   showErrorMessage: ReturnType<typeof vi.fn>;
@@ -109,14 +110,24 @@ describe("exportService", () => {
   let tempDir: string;
   let outputPath: string;
   let vscodeMock: VscodeMockShape;
+  let getSetting: ReturnType<typeof vi.fn>;
+
+  async function* loadOneChunk(): AsyncIterable<ChunkedExportData> {
+    yield {
+      columns: [{ name: "id", category: "integer", nativeType: "int" }],
+      rows: [{ id: 1 }],
+    };
+  }
 
   beforeEach(() => {
     vi.resetModules();
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "rapidb-export-"));
     outputPath = path.join(tempDir, "export.out");
+    getSetting = vi.fn((_key: string, fallback: unknown) => fallback);
 
     vscodeMock = {
       showSaveDialog: vi.fn(async () => ({ fsPath: outputPath })),
+      showWarningMessage: vi.fn(async () => "Replace File"),
       withProgress: vi.fn(async (_options, task) =>
         task(
           {},
@@ -136,12 +147,133 @@ describe("exportService", () => {
       ProgressLocation: {
         Notification: 15,
       },
+      workspace: { getConfiguration: () => ({ get: getSetting }) },
       window: vscodeMock,
     }));
   });
 
   afterEach(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it.each([
+    // At 165 bytes the old staging name fit, but the old link probe did not.
+    { kind: "165-byte ASCII", basename: `${"a".repeat(161)}.csv` },
+    { kind: "255-byte ASCII", basename: `${"a".repeat(251)}.csv` },
+    {
+      kind: "255-byte UTF-8",
+      basename: `${"表".repeat(12)}${"a".repeat(215)}.csv`,
+    },
+  ])("publishes a new export with a $kind destination basename", async ({
+    basename,
+  }) => {
+    outputPath = path.join(tempDir, basename);
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    await exportTableDataAsCsv({
+      fileName: "long_export",
+      loadChunks: loadOneChunk,
+    });
+
+    expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showWarningMessage).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
+    expect(fs.readdirSync(tempDir)).toEqual([basename]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "replaces a confirmed export with a 255-byte destination basename",
+    async () => {
+      const basename = `${"a".repeat(251)}.csv`;
+      outputPath = path.join(tempDir, basename);
+      fs.writeFileSync(outputPath, "previous export\n");
+      fs.chmodSync(outputPath, 0o644);
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({
+        fileName: "long_export",
+        loadChunks: loadOneChunk,
+      });
+
+      expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showWarningMessage).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining(basename),
+        { modal: true, detail: outputPath },
+        "Replace File",
+      );
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
+      expect(fs.statSync(outputPath).mode & 0o777).toBe(0o644);
+      expect(fs.readdirSync(tempDir)).toEqual([basename]);
+    },
+  );
+
+  describe.each(["query", "table"] as const)("%s export encoding", (source) => {
+    const column = {
+      name: "Имя",
+      category: "text",
+      nativeType: "text",
+    } as const;
+    const values = ["Привет, мир", '你好 "世界" 😀'];
+    const csv = 'Имя\n"Привет, мир"\n"你好 ""世界"" 😀"\n';
+    const bom = Buffer.from([0xef, 0xbb, 0xbf]);
+
+    async function exportFile(format: "csv" | "json"): Promise<void> {
+      const exporters = await import("../../src/extension/utils/exportService");
+      if (source === "query") {
+        const exportQuery =
+          format === "csv"
+            ? exporters.exportQueryResultsAsCsv
+            : exporters.exportQueryResultsAsJson;
+        await exportQuery({
+          columns: [column.name],
+          rows: values.map((value) => ({ __col_0: value })),
+        });
+      } else {
+        const exportTable =
+          format === "csv"
+            ? exporters.exportTableDataAsCsv
+            : exporters.exportTableDataAsJson;
+        await exportTable({
+          fileName: "unicode",
+          loadChunks: async function* () {
+            for (const value of values) {
+              yield { columns: [column], rows: [{ [column.name]: value }] };
+            }
+          },
+        });
+      }
+      expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+    }
+
+    it("writes plain UTF-8 CSV by default", async () => {
+      await exportFile("csv");
+      expect(fs.readFileSync(outputPath)).toEqual(Buffer.from(csv, "utf8"));
+    });
+
+    it("adds exactly one leading UTF-8 BOM to CSV when enabled", async () => {
+      getSetting.mockReturnValue(true);
+      await exportFile("csv");
+      expect(getSetting).toHaveBeenCalledExactlyOnceWith(
+        "export.csvUtf8Bom",
+        false,
+      );
+      const bytes = fs.readFileSync(outputPath);
+      expect(bytes).toEqual(Buffer.concat([bom, Buffer.from(csv, "utf8")]));
+      expect(new TextDecoder("utf-8", { fatal: true }).decode(bytes)).toBe(csv);
+    });
+
+    it("keeps JSON BOM-free even when the CSV BOM is enabled", async () => {
+      getSetting.mockReturnValue(true);
+      await exportFile("json");
+      expect(getSetting).not.toHaveBeenCalled();
+      const bytes = fs.readFileSync(outputPath);
+      expect(bytes.subarray(0, bom.length)).not.toEqual(bom);
+      expect(JSON.parse(bytes.toString("utf8"))).toEqual(
+        values.map((value) => ({ [column.name]: value })),
+      );
+    });
   });
 
   it.each(
@@ -811,6 +943,25 @@ describe("exportService", () => {
     expect(fs.readFileSync(outputPath, "utf8")).toBe(
       'payload\n"{""n"":{""$numberInt"":""1""}}"\n" { ""n"" : 1 } "\n',
     );
+  });
+
+  it("redacts configured credentials in errors from table export chunks", async () => {
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    const apiKey = "synthetic-export-api-key-11";
+    await exportTableDataAsCsv({
+      fileName: "redacted",
+      secretContext: { apiKey },
+      loadChunks: async function* () {
+        yield createMongoExportChunk();
+        throw new Error(`Export access denied for ${apiKey}`);
+      },
+    });
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledExactlyOnceWith(
+      "[RapiDB] CSV export failed: Export access denied for [REDACTED]",
+    );
+    expect(fs.existsSync(outputPath)).toBe(false);
   });
 
   it("exports MongoDB table CSV without leading apostrophes", async () => {
@@ -1772,7 +1923,7 @@ describe("exportService", () => {
   });
 
   it.skipIf(process.platform === "win32")(
-    "keeps the permissions of an exported file it replaces",
+    "replaces a confirmed export, preserves its permissions, and cleans up staging",
     async () => {
       fs.writeFileSync(outputPath, "previous export\n");
       fs.chmodSync(outputPath, 0o644);
@@ -1791,8 +1942,14 @@ describe("exportService", () => {
       });
 
       expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showWarningMessage).toHaveBeenCalledWith(
+        expect.stringContaining("export.out"),
+        { modal: true, detail: outputPath },
+        "Replace File",
+      );
       expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
       expect(fs.statSync(outputPath).mode & 0o777).toBe(0o644);
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
     },
   );
 
@@ -1967,7 +2124,7 @@ describe("exportService", () => {
     "does not follow or remove a colliding temporary-path symlink",
     async () => {
       const targetPath = path.join(tempDir, "symlink-target.txt");
-      const temporaryPath = `${outputPath}.rapidb-known.tmp`;
+      const temporaryPath = path.join(tempDir, ".rapidb-known.tmp");
       fs.writeFileSync(targetPath, "do not overwrite");
       fs.symlinkSync(targetPath, temporaryPath);
       vi.doMock("node:crypto", async () => {
@@ -1995,11 +2152,69 @@ describe("exportService", () => {
 
       expect(fs.readFileSync(targetPath, "utf8")).toBe("do not overwrite");
       expect(fs.lstatSync(temporaryPath).isSymbolicLink()).toBe(true);
+      expect(fs.existsSync(outputPath)).toBe(false);
       expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
         expect.stringContaining("CSV export failed"),
       );
     },
   );
+
+  it("does not overwrite or remove a colliding hard-link probe path", async () => {
+    const probePath = path.join(tempDir, ".rapidb-known.probe");
+    fs.writeFileSync(probePath, "do not overwrite");
+    vi.doMock("node:crypto", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:crypto")>("node:crypto");
+      return { ...actual, randomUUID: () => "known" };
+    });
+
+    try {
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({
+        fileName: "probe_collision",
+        loadChunks: loadOneChunk,
+      });
+    } finally {
+      vi.doUnmock("node:crypto");
+    }
+
+    expect(fs.readFileSync(probePath, "utf8")).toBe("do not overwrite");
+    expect(fs.readdirSync(tempDir)).toEqual([".rapidb-known.probe"]);
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("Cannot check hard-link support"),
+    );
+  });
+
+  it.each([
+    "tmp",
+    "probe",
+  ])("does not use the chosen destination as the %s sibling", async (suffix) => {
+    outputPath = path.join(tempDir, `.RAPIDB-known.${suffix}`);
+    vi.doMock("node:crypto", async () => {
+      const actual =
+        await vi.importActual<typeof import("node:crypto")>("node:crypto");
+      return { ...actual, randomUUID: () => "known" };
+    });
+
+    try {
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({
+        fileName: "destination_collision",
+        loadChunks: loadOneChunk,
+      });
+    } finally {
+      vi.doUnmock("node:crypto");
+    }
+
+    expect(fs.readdirSync(tempDir)).toEqual([]);
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("distinct temporary export file name"),
+    );
+  });
 
   it.each([
     "csv",
@@ -2076,7 +2291,11 @@ describe("exportService", () => {
     }
   });
 
-  it("cancels while the staging stream closes without replacing the old export", async () => {
+  it.each([
+    false,
+    true,
+  ])("cancels while the staging stream closes without replacing the old export (BOM: %s)", async (includeBom) => {
+    getSetting.mockReturnValue(includeBom);
     const previousOutput = "previous export\n";
     fs.writeFileSync(outputPath, previousOutput);
     let cancel: (() => void) | undefined;
@@ -2376,7 +2595,9 @@ describe("exportService", () => {
         rows: [{ id: 1 }],
       };
     });
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const platform = required(
+      Object.getOwnPropertyDescriptor(process, "platform"),
+    );
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
       const { exportTableDataAsCsv } = await import(
@@ -2391,6 +2612,7 @@ describe("exportService", () => {
     }
     expect(fs.readFileSync(outputPath, "utf8")).toBe("previous export\n");
     expect(loadChunks).not.toHaveBeenCalled();
+    expect(vscodeMock.showWarningMessage).not.toHaveBeenCalled();
     expect(vscodeMock.withProgress).not.toHaveBeenCalled();
     expect(vscodeMock.showSaveDialog).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -2404,7 +2626,9 @@ describe("exportService", () => {
   });
 
   it("publishes a new file on Windows without replacing another file", async () => {
-    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const platform = required(
+      Object.getOwnPropertyDescriptor(process, "platform"),
+    );
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     try {
       const { exportTableDataAsCsv } = await import(
@@ -2424,43 +2648,213 @@ describe("exportService", () => {
     }
     expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n1\n");
     expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(vscodeMock.showWarningMessage).not.toHaveBeenCalled();
     expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
   });
 
-  it("fails without publishing if the filesystem does not support hard links", async () => {
-    const loadChunks = vi.fn(async function* () {
-      yield {
-        columns: [
-          { name: "id", category: "integer" as const, nativeType: "int" },
-        ],
-        rows: [{ id: 1 }],
-      };
+  it("keeps a file created while saving the last-export directory", async () => {
+    const { exportTableDataAsCsv } = await import(
+      "../../src/extension/utils/exportService"
+    );
+    const update = vi.fn(async () => {
+      await Promise.resolve();
+      fs.writeFileSync(outputPath, "saved by another application", {
+        flag: "wx",
+      });
     });
+    const loadChunks = vi.fn(loadOneChunk);
+
+    await exportTableDataAsCsv({
+      fileName: "new_export",
+      context: { globalState: { get: vi.fn(), update } } as never,
+      loadChunks,
+    });
+
+    expect(update).toHaveBeenCalledWith("rapidb.lastExportDirectory", tempDir);
+    expect(loadChunks).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outputPath, "utf8")).toBe(
+      "saved by another application",
+    );
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(vscodeMock.showWarningMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("destination changed"),
+    );
+  });
+
+  it("keeps a file created while opening the staging stream and cleans up staging", async () => {
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
       return {
         ...actual,
-        linkSync: vi.fn(() => {
-          throw new Error("hard links unsupported");
-        }),
+        createWriteStream: (
+          ...args: Parameters<typeof fs.createWriteStream>
+        ) => {
+          const stream = actual.createWriteStream(...args);
+          stream.once("open", () => {
+            actual.writeFileSync(outputPath, "saved during staging", {
+              flag: "wx",
+            });
+          });
+          return stream;
+        },
       };
+    });
+    const loadChunks = vi.fn(loadOneChunk);
+    try {
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({ fileName: "new_export", loadChunks });
+    } finally {
+      vi.doUnmock("node:fs");
+    }
+    expect(loadChunks).not.toHaveBeenCalled();
+    expect(fs.readFileSync(outputPath, "utf8")).toBe("saved during staging");
+    expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+    expect(vscodeMock.showWarningMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+    expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+      expect.stringContaining("destination changed"),
+    );
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "does not start exporting if a file exists when the chooser returns and replacement is declined",
+    async () => {
+      vscodeMock.showSaveDialog.mockImplementationOnce(async () => {
+        fs.writeFileSync(outputPath, "unconfirmed file\n");
+        return { fsPath: outputPath };
+      });
+      vscodeMock.showWarningMessage.mockResolvedValueOnce(undefined);
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      const loadChunks = vi.fn(loadOneChunk);
+
+      await exportTableDataAsCsv({ fileName: "existing_export", loadChunks });
+
+      expect(vscodeMock.showWarningMessage).toHaveBeenCalledOnce();
+      expect(vscodeMock.withProgress).not.toHaveBeenCalled();
+      expect(loadChunks).not.toHaveBeenCalled();
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("unconfirmed file\n");
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not authorize a different file that appears during replacement confirmation",
+    async () => {
+      fs.writeFileSync(outputPath, "previous export\n");
+      const nextPath = path.join(tempDir, "other-file");
+      fs.writeFileSync(nextPath, "new file at the selected path");
+      vscodeMock.showWarningMessage.mockImplementationOnce(async () => {
+        fs.renameSync(nextPath, outputPath);
+        return "Replace File";
+      });
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      const loadChunks = vi.fn(loadOneChunk);
+
+      await exportTableDataAsCsv({ fileName: "existing_export", loadChunks });
+
+      expect(vscodeMock.withProgress).not.toHaveBeenCalled();
+      expect(loadChunks).not.toHaveBeenCalled();
+      expect(fs.readFileSync(outputPath, "utf8")).toBe(
+        "new file at the selected path",
+      );
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining("destination changed"),
+      );
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "does not replace a new destination entry swapped in during the export",
+    async () => {
+      fs.writeFileSync(outputPath, "previous export\n");
+      const nextPath = path.join(tempDir, "other-file");
+      fs.writeFileSync(nextPath, "replacement from another application");
+      const { exportTableDataAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportTableDataAsCsv({
+        fileName: "existing_export",
+        loadChunks: async function* () {
+          yield* loadOneChunk();
+          fs.renameSync(nextPath, outputPath);
+        },
+      });
+
+      expect(fs.readFileSync(outputPath, "utf8")).toBe(
+        "replacement from another application",
+      );
+      expect(fs.readdirSync(tempDir)).toEqual(["export.out"]);
+      expect(vscodeMock.showInformationMessage).not.toHaveBeenCalled();
+      expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining("destination changed"),
+      );
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "replaces a confirmed symbolic link without modifying its target",
+    async () => {
+      const target = path.join(tempDir, "target");
+      fs.writeFileSync(target, "keep this file");
+      fs.symlinkSync(target, outputPath);
+      const { exportQueryResultsAsCsv } = await import(
+        "../../src/extension/utils/exportService"
+      );
+      await exportQueryResultsAsCsv({ columns: ["id"], rows: [] });
+
+      expect(fs.readFileSync(target, "utf8")).toBe("keep this file");
+      expect(fs.lstatSync(outputPath).isFile()).toBe(true);
+      expect(fs.readFileSync(outputPath, "utf8")).toBe("id\n");
+      expect(fs.readdirSync(tempDir).sort()).toEqual(["export.out", "target"]);
+      expect(vscodeMock.showErrorMessage).not.toHaveBeenCalled();
+    },
+  );
+
+  it("aborts before loading rows or copying on an unexpected hard-link probe EIO", async () => {
+    const loadChunks = vi.fn(loadOneChunk);
+    const linkSync = vi.fn<typeof fs.linkSync>(() => {
+      throw Object.assign(new Error("EIO: i/o error, link"), { code: "EIO" });
+    });
+    const copyFileSync = vi.fn(fs.copyFileSync);
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return { ...actual, linkSync, copyFileSync };
     });
     try {
       const { exportTableDataAsCsv } = await import(
         "../../src/extension/utils/exportService"
       );
       await exportTableDataAsCsv({
-        fileName: "unsupported_link",
+        fileName: "probe_io_error",
         loadChunks,
       });
     } finally {
       vi.doUnmock("node:fs");
     }
     expect(fs.existsSync(outputPath)).toBe(false);
+    expect(linkSync).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/\.tmp$/),
+      expect.stringMatching(/\.probe$/),
+    );
     expect(loadChunks).not.toHaveBeenCalled();
+    expect(copyFileSync).not.toHaveBeenCalled();
     expect(fs.readdirSync(tempDir)).toEqual([]);
     expect(vscodeMock.showErrorMessage).toHaveBeenCalledWith(
-      expect.stringContaining("hard links unsupported"),
+      expect.stringContaining(
+        "Cannot check hard-link support in the export directory: EIO",
+      ),
     );
   });
 

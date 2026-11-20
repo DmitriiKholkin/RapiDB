@@ -3,7 +3,10 @@ import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { formatQueryResult } from "../../src/extension/utils/queryResultFormatting";
 import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchIndexSettings,
+  elasticsearchKeys,
+} from "../support/elasticsearchIdentity";
 
 const elasticDatetimeColumn: ColumnTypeMeta = {
   name: "created_at",
@@ -30,7 +33,10 @@ function createDriver() {
 
   const search = vi.fn();
   const getMapping = vi.fn();
-  const getSettings = vi.fn().mockResolvedValue({});
+  const getSettings = vi.fn(
+    async (request: { index: string }): Promise<unknown> =>
+      elasticsearchIndexSettings(request.index),
+  );
   const openPointInTime = vi.fn().mockResolvedValue({ id: "page-pit" });
   const closePointInTime = vi.fn().mockResolvedValue({ succeeded: true });
   const resolveIndex = vi.fn();
@@ -980,7 +986,9 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       }),
     ).resolves.toEqual({
       affectedRows: 0,
-      updateRowOutcomes: [{ rowIndex: 0, status: "not_applied" }],
+      updateRowOutcomes: [
+        { rowIndex: 0, status: "not_applied", conflict: true },
+      ],
     });
   });
 

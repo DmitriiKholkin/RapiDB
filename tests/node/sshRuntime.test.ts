@@ -9,6 +9,7 @@ import {
   type ConnectionSshSettings,
   createSshRuntime,
 } from "../../src/extension/services/sshRuntime";
+import { OTHER_SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 type ConnectOptions = {
   hostVerifier: (hostKey: Buffer | string) => boolean;
@@ -392,10 +393,19 @@ describe("sshRuntime", () => {
     expect(createdClients[0].ended).toBe(true);
   });
 
-  it("verifies the exact SHA256 host fingerprint and forwards auth settings", async () => {
-    const runtime = await createRuntime();
+  it.each([
+    ["OpenSSH", sshSettings.fingerprintSha256],
+    [
+      "padded and surrounded by whitespace",
+      `  ${sshSettings.fingerprintSha256}=  `,
+    ],
+  ])("verifies an exact %s SHA256 host fingerprint and forwards auth settings", async (_format, fingerprintSha256) => {
+    const runtime = await createRuntime({ ...sshSettings, fingerprintSha256 });
     const client = createdClients[0];
 
+    expect(runtime.verifiedFingerprintSha256).toBe(
+      sshSettings.fingerprintSha256,
+    );
     expect(client?.connectOptions).toMatchObject({
       host: "bastion.internal",
       port: 22,
@@ -437,7 +447,7 @@ describe("sshRuntime", () => {
       createRuntime({
         ...sshSettings,
         hostVerificationMode,
-        fingerprintSha256: "SHA256:wrong",
+        fingerprintSha256: OTHER_SSH_HOST_FINGERPRINT_SHA256,
       }),
     ).rejects.toThrow("Host verification failed");
     expect(createdClients[0]?.ended).toBe(true);

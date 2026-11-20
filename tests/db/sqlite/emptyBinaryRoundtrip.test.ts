@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SQLiteCoreDriver } from "../../../src/extension/dbDrivers/sqliteCore";
 import { TableMutationService } from "../../../src/extension/table/tableMutationService";
 import { TableReadService } from "../../../src/extension/table/tableReadService";
-import { NULL_SENTINEL } from "../../../src/shared/tableTypes";
 
 describe("SQLite empty binary table edits", () => {
   let driver: SQLiteCoreDriver | undefined;
@@ -71,7 +70,7 @@ describe("SQLite empty binary table edits", () => {
       "main",
       "items",
       { id: 3 },
-      { payload: NULL_SENTINEL },
+      { payload: null },
     );
 
     const updatedPage = await readPage();

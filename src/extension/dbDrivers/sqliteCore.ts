@@ -1,11 +1,17 @@
+import { randomUUID } from "node:crypto";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import { normalizeNumericToken } from "../../shared/numericNormalization";
-import type { QueryResultSet } from "../../shared/webviewContracts";
+import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
 import type { ConnectionConfig } from "../connectionManager";
 import { BaseDBDriver } from "./BaseDBDriver";
 import { queryCollectionLimit } from "./boundedQueryRows";
 import { literalContainsPattern } from "./literalContains";
 import { MutationNotExecutedError } from "./mutationExecutionState";
+import {
+  SQLITE_ATTACHMENT_CHANGED,
+  type SQLiteAttachmentTarget,
+  sqliteTableSchema,
+} from "./sqliteAttachmentTarget";
 import { openSQLiteDatabase, type SQLiteDatabase } from "./sqliteRuntime";
 import {
   type DriverTimeoutSettingsProvider,
@@ -21,6 +27,7 @@ import type {
   ColumnTypeMeta,
   DatabaseInfo,
   DriverEntityManifest,
+  DriverQueryResultSet,
   FilterConditionResult,
   FilterOperator,
   GeneratedKind,
@@ -30,10 +37,11 @@ import type {
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TransactionVerification,
   TypeCategory,
   ValueSemantics,
 } from "./types";
-import { assertTransactionAffectedRows } from "./types";
+import { assertTransactionAffectedRows, colKey } from "./types";
 
 const SQLITE_ENTITY_MANIFEST: DriverEntityManifest = {
   dbObjectKinds: ["table", "view"],
@@ -52,6 +60,36 @@ const SQLITE_ENTITY_MANIFEST: DriverEntityManifest = {
 };
 
 type SqlStatementKind = "select" | "dml";
+
+function mapSqliteQueryRows({
+  columns,
+  columnMeta,
+  rows,
+  exactIntegerRows,
+}: ReturnType<SQLiteDatabase["allRaw"]>): Pick<
+  QueryResult,
+  "columns" | "columnMeta" | "rows" | "jsonExportCellOverrides"
+> {
+  return {
+    columns,
+    columnMeta,
+    rows: rows.map((row) =>
+      Object.fromEntries(row.map((value, index) => [colKey(index), value])),
+    ),
+    ...(exactIntegerRows
+      ? {
+          jsonExportCellOverrides: exactIntegerRows.map((row) =>
+            row
+              ? Object.fromEntries(
+                  row.map(([index, value]) => [colKey(index), value]),
+                )
+              : undefined,
+          ),
+        }
+      : {}),
+  };
+}
+
 interface SQLiteTableXInfoRow {
   name: string;
   type: string;
@@ -59,6 +97,10 @@ interface SQLiteTableXInfoRow {
   dflt_value: string | null;
   pk: number;
   hidden: number;
+}
+interface SQLiteTableListRow {
+  type: string;
+  wr: number;
 }
 interface SQLiteGeneratedColumnDetail {
   expression?: string;
@@ -70,6 +112,7 @@ interface SQLiteDatabaseListRow {
   file: string | null;
 }
 interface SQLiteTableMetadata {
+  schema: string;
   rows: SQLiteTableXInfoRow[];
   foreignKeyColumns: Set<string>;
   autoIncrementColumns: Set<string>;
@@ -656,6 +699,23 @@ function sqliteColumnDefinitionName(definition: string): string | null {
 function sqliteAsciiLower(value: string): string {
   return value.replace(/[A-Z]/g, (char) => char.toLowerCase());
 }
+
+function isSqliteRowidTable(table?: SQLiteTableListRow): boolean {
+  return table?.type === "table" && table.wr === 0;
+}
+
+function sqliteRowidPrimaryKey(
+  keys: readonly SQLiteTableXInfoRow[],
+  readIndexes: () => Array<{ origin: string }>,
+): SQLiteTableXInfoRow | undefined {
+  if (keys.length !== 1 || sqliteAsciiLower(keys[0].type) !== "integer") {
+    return undefined;
+  }
+  // The column-level INTEGER PRIMARY KEY DESC exception has a real PK index.
+  return readIndexes().some(({ origin }) => origin === "pk")
+    ? undefined
+    : keys[0];
+}
 function stripSqliteComments(sql: string): string {
   let stripped = "";
   let index = 0;
@@ -976,17 +1036,26 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     return "sqlite" as const;
   }
 
+  protected override getQuestionMarkPlaceholderOptions() {
+    return { backslashEscapes: false };
+  }
+
   private db: SQLiteDatabase | null = null;
+  private readonly attachmentGenerations = new Map<
+    string,
+    { generation: string; file: string | null }
+  >();
   private readonly config: ConnectionConfig;
   constructor(
     config: ConnectionConfig,
     timeoutSettingsProvider?: DriverTimeoutSettingsProvider,
     private readonly runtimeTargets?: readonly string[],
+    private readonly managedRuntimePackage?: string,
   ) {
     super(timeoutSettingsProvider);
     this.config = config;
   }
-  async connect(): Promise<void> {
+  async connect(beforeOpen?: () => void): Promise<void> {
     if (!this.config.filePath) {
       throw new Error("[RapiDB] SQLite requires a filePath");
     }
@@ -996,12 +1065,15 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       } catch {}
       this.db = null;
     }
+    this.attachmentGenerations.clear();
     this.db = await openSQLiteDatabase(
       {
         filePath: this.config.filePath,
         readOnly: this.config.readOnly,
       },
       this.runtimeTargets,
+      this.managedRuntimePackage,
+      beforeOpen,
     );
   }
   private requireDb(): SQLiteDatabase {
@@ -1014,6 +1086,62 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     return this.requireDb().all(
       "PRAGMA database_list",
     ) as SQLiteDatabaseListRow[];
+  }
+  private trackAttachmentChanges<T>(sql: string, execute: () => T): T {
+    // Observe each statement, not just each script: DETACH followed by ATTACH
+    // can restore the same alias, path (including an empty path) and slot.
+    let start = skipSqlTrivia(sql, 0);
+    while (sql[start] === ";") start = skipSqlTrivia(sql, start + 1);
+    const keyword = readSqlKeyword(sql, start)?.keyword;
+    if (
+      keyword !== "ATTACH" &&
+      keyword !== "DETACH" &&
+      keyword !== "PRAGMA" &&
+      keyword !== "EXPLAIN"
+    )
+      return execute();
+    try {
+      return execute();
+    } finally {
+      // Some PRAGMAs (e.g. temp_store) can reset the built-in temp database.
+      this.syncAttachmentGenerations();
+    }
+  }
+  private syncAttachmentGenerations(): void {
+    const current = new Set<string>();
+    for (const { name, file } of this.listAttachedDatabases()) {
+      const key = sqliteAsciiLower(name);
+      if (key === "main") continue;
+      current.add(key);
+      // Ignore the PRAGMA sequence number; unrelated DETACHes can change it.
+      const existing = this.attachmentGenerations.get(key);
+      if (!existing || existing.file !== file) {
+        this.attachmentGenerations.set(key, { file, generation: randomUUID() });
+      }
+    }
+    for (const key of this.attachmentGenerations.keys()) {
+      if (!current.has(key)) this.attachmentGenerations.delete(key);
+    }
+  }
+  async getSQLiteAttachmentTarget(
+    schema: string,
+  ): Promise<SQLiteAttachmentTarget> {
+    this.syncAttachmentGenerations();
+    const key = sqliteAsciiLower(schema);
+    const attachment = this.attachmentGenerations.get(key);
+    if (!attachment)
+      throw new MutationNotExecutedError(SQLITE_ATTACHMENT_CHANGED);
+    return { schema: key, generation: attachment.generation };
+  }
+  private assertSQLiteAttachmentTarget(target?: SQLiteAttachmentTarget): void {
+    if (!target) return;
+    this.syncAttachmentGenerations();
+    if (
+      this.attachmentGenerations.get(target.schema)?.generation !==
+      target.generation
+    ) {
+      throw new MutationNotExecutedError(SQLITE_ATTACHMENT_CHANGED);
+    }
   }
   private resolveSqliteSchema(database: string, schema: string): string {
     const available = new Map(
@@ -1028,14 +1156,14 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     const lookup = (name: string) =>
       available.get(sqliteAsciiLower(name)) ??
       available.get(sqliteAsciiLower(name.trim()));
-    if (schema?.trim()) {
+    if (schema) {
       const resolved = lookup(schema);
-      if (!resolved) {
+      if (resolved) return resolved;
+      if (schema.trim()) {
         throw new Error(
           `[RapiDB] SQLite schema "${schema}" is not attached to this connection`,
         );
       }
-      return resolved;
     }
     return (database?.trim() && lookup(database)) || "main";
   }
@@ -1095,6 +1223,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       });
     }
     return {
+      schema: sqliteSchema,
       rows,
       foreignKeyColumns: new Set(
         fkRows.map((row) => sqliteAsciiLower(row.from)),
@@ -1139,6 +1268,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
   async disconnect(): Promise<void> {
     this.db?.close();
     this.db = null;
+    this.attachmentGenerations.clear();
   }
   isConnected(): boolean {
     return this.db?.isOpen ?? false;
@@ -1187,19 +1317,40 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     table: string,
   ): Promise<ColumnTypeMeta[]> {
     const metadata = this.readTableMetadata(database, schema, table);
-    return metadata.rows.map((row) =>
-      this.enrichColumn(this.toColumnMeta(row, metadata)),
+    const pragma = (name: string) =>
+      this.requireDb().all(
+        `PRAGMA ${quoteSqliteIdentifier(metadata.schema)}.${name}(${quoteSqliteIdentifier(table)})`,
+      );
+    const candidate = sqliteRowidPrimaryKey(
+      metadata.rows.filter(({ pk }) => pk > 0),
+      () => pragma("index_list") as Array<{ origin: string }>,
     );
+    const rowidAlias =
+      candidate &&
+      isSqliteRowidTable((pragma("table_list") as SQLiteTableListRow[])[0])
+        ? candidate
+        : undefined;
+    return metadata.rows.map((row) => {
+      const column = this.enrichColumn(this.toColumnMeta(row, metadata));
+      return row === rowidAlias
+        ? { ...column, sqliteRowidAlias: true }
+        : column;
+    });
+  }
+  async describeSQLiteAttachmentColumns(
+    target: SQLiteAttachmentTarget,
+    table: string,
+  ): Promise<ColumnTypeMeta[]> {
+    this.assertSQLiteAttachmentTarget(target);
+    return this.describeColumns(target.schema, target.schema, table);
   }
   async getTableRowIdentityOrderExpressions(
-    _database: string,
+    database: string,
     schema: string,
     table: string,
     columns: readonly ColumnTypeMeta[],
   ): Promise<string[]> {
-    const master = schema
-      ? `${quoteSqliteIdentifier(schema)}.sqlite_master`
-      : "sqlite_master";
+    const master = `${this.quoteIdentifier(sqliteTableSchema(database, schema))}.sqlite_master`;
     const result = await this.query(
       `SELECT type FROM ${master} WHERE type IN ('table','view') AND name = ?`,
       [table],
@@ -1215,6 +1366,19 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     );
     return alias ? [alias] : [];
   }
+  override qualifiedTableName(
+    database: string,
+    schema: string,
+    table: string,
+  ): string {
+    // A viewer must not resolve an unqualified name to a temp shadow table,
+    // or fall through to another attachment if its intended alias is gone.
+    return super.qualifiedTableName(
+      database,
+      sqliteTableSchema(database, schema),
+      table,
+    );
+  }
   async query(
     sql: string,
     params?: unknown[],
@@ -1229,6 +1393,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         "SQLite query deadline exceeded before execution. The query was NOT_EXECUTED (not executed).",
       );
     }
+    this.assertSQLiteAttachmentTarget(operationContext?.sqliteAttachmentTarget);
     const statements = splitSQLiteScript(sql);
     const transactional =
       statements.length > 0 &&
@@ -1301,6 +1466,17 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     hardCap?: number,
     onResultSet?: () => void,
   ): QueryResult {
+    return this.trackAttachmentChanges(sql, () =>
+      this.executeSingleStatement(sql, params, start, hardCap, onResultSet),
+    );
+  }
+  private executeSingleStatement(
+    sql: string,
+    params: unknown[],
+    start: number,
+    hardCap?: number,
+    onResultSet?: () => void,
+  ): QueryResult {
     const kind = classifySql(sql);
     const isDml = isSQLiteDmlStatement(sql);
     const db = this.requireDb();
@@ -1317,11 +1493,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
             )
           : undefined);
       return {
-        columns: result.columns,
-        columnMeta: result.columnMeta,
-        rows: result.rows.map((row) =>
-          Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
-        ),
+        ...mapSqliteQueryRows(result),
         rowCount: changes ?? result.rowCount,
         ...(affectedRows !== undefined ? { affectedRows } : {}),
         truncated: result.truncated,
@@ -1330,15 +1502,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     }
     if (kind === "select") {
       try {
-        const { columns, columnMeta, rows: rawRows } = db.allRaw(sql, params);
-        const rows = rawRows.map((row) =>
-          Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
-        );
+        const result = db.allRaw(sql, params);
         return {
-          columns,
-          columnMeta,
-          rows,
-          rowCount: rows.length,
+          ...mapSqliteQueryRows(result),
+          rowCount: result.rows.length,
           executionTimeMs: Date.now() - start,
         };
       } catch (error) {
@@ -1349,17 +1516,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       }
     }
     if (canSQLiteStatementReturnRows(sql)) {
-      const { columns, columnMeta, rows: rawRows } = db.allRaw(sql, params);
-      const rows = rawRows.map((row) =>
-        Object.fromEntries(
-          row.map((value, index) => [`__col_${index}`, value]),
-        ),
-      );
+      const result = db.allRaw(sql, params);
       return {
-        columns,
-        columnMeta,
-        rows,
-        rowCount: rows.length,
+        ...mapSqliteQueryRows(result),
+        rowCount: result.rows.length,
         executionTimeMs: Date.now() - start,
       };
     }
@@ -1378,7 +1538,7 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     start: number,
     hardCap?: number,
   ): QueryResult {
-    const resultSets: QueryResultSet[] = [];
+    const resultSets: DriverQueryResultSet[] = [];
     let retainedRows = 0;
     let retainedColumns = 0;
     let resultSetsTruncated = false;
@@ -1408,6 +1568,14 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         columns: r.columns,
         columnMeta: r.columnMeta ?? [],
         rows,
+        ...(r.jsonExportCellOverrides
+          ? {
+              jsonExportCellOverrides: r.jsonExportCellOverrides.slice(
+                0,
+                rows.length,
+              ),
+            }
+          : {}),
         rowCount: r.rowCount,
         truncated,
       });
@@ -1420,6 +1588,9 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       columns: firstResultSet?.columns ?? [],
       columnMeta: firstResultSet?.columnMeta ?? [],
       rows: firstResultSet?.rows ?? [],
+      ...(firstResultSet?.jsonExportCellOverrides
+        ? { jsonExportCellOverrides: firstResultSet.jsonExportCellOverrides }
+        : {}),
       rowCount:
         resultSets.length > 0
           ? resultSets.reduce(
@@ -1689,61 +1860,260 @@ export class SQLiteCoreDriver extends BaseDBDriver {
     context?: import("./types").TransactionContext,
     scope?: import("./types").TransactionOptions,
   ): Promise<void> {
-    throwIfTransactionCancelled(context);
-    const db = this.requireDb();
-    db.exec("BEGIN TRANSACTION");
+    let db: SQLiteDatabase;
+    try {
+      throwIfTransactionCancelled(context);
+      db = this.requireDb();
+      this.assertSQLiteAttachmentTarget(scope?.sqliteAttachmentTarget);
+      db.exec("BEGIN TRANSACTION");
+    } catch (error) {
+      // A failed BEGIN may leave an outer transaction active; we don't own it.
+      throw new MutationNotExecutedError(
+        `SQLite transaction did not start: ${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
+    }
+    let onlyTransactionSafeStatements = true;
+    let commitAttempted = false;
+    const runStatement = <T>(sql: string, execute: () => T): T => {
+      if (onlyTransactionSafeStatements) {
+        const statements = splitSQLiteScript(sql);
+        // Raw transaction control can end (and later replace) our transaction.
+        // Only single reads and DML can prove it did not commit along the way.
+        onlyTransactionSafeStatements =
+          statements.length === 1 &&
+          /^(?:SELECT|WITH|VALUES|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(
+            statements[0],
+          );
+      }
+      return execute();
+    };
+    const readStatement = (sql: string, params: unknown[]) =>
+      runStatement(sql, () => this._executeSingle(sql, params, Date.now(), 2));
     try {
       const identities = new TransactionIdentityStore();
+      const nullableKeyUpdates = new Map<
+        number,
+        { alias: string; verification: TransactionVerification }
+      >();
+      // Resolve aliases on the same connection and transaction snapshot as
+      // UPDATE, before even the first INSERT/UPDATE in a mixed Apply.
+      for (const verification of scope?.verifications ?? []) {
+        const target = verification.sqliteNullableKeyUpdate;
+        if (!target) continue;
+        const operationIndex = verification.identity?.operationIndex;
+        if (
+          operationIndex === undefined ||
+          !operations[operationIndex]?.captureIdentity
+        ) {
+          throw new Error(
+            "SQLite NULL key verification requires a captured rowid.",
+          );
+        }
+        const alias = this.resolveNullableKeyUpdateRowid(db, target);
+        nullableKeyUpdates.set(operationIndex, { alias, verification });
+      }
+      const totalChanges = () =>
+        BigInt(
+          (
+            db.get("SELECT CAST(total_changes() AS TEXT) AS count") as {
+              count: string;
+            }
+          ).count,
+        );
+      let lastChanges: bigint | undefined;
+      let guardedUpdate: TransactionVerification | undefined;
       for (const [index, op] of operations.entries()) {
         throwIfTransactionCancelled(context);
+        const nullableKeyUpdate = nullableKeyUpdates.get(index);
+        if (nullableKeyUpdate) {
+          guardedUpdate = nullableKeyUpdate.verification;
+          lastChanges ??= totalChanges();
+        }
+        const sql = nullableKeyUpdate
+          ? `${op.sql} RETURNING CAST(${this.quoteIdentifier(nullableKeyUpdate.alias)} AS TEXT)`
+          : op.sql;
         const returning =
           op.captureIdentity && !op.captureIdentity.sql
-            ? this._executeSingle(op.sql, op.params ?? [], Date.now(), 2)
+            ? readStatement(sql, op.params ?? [])
             : undefined;
         const affected = returning
           ? (returning.affectedRows ?? returning.rowCount)
-          : db.run(op.sql, op.params ?? []).changes;
+          : runStatement(op.sql, () =>
+              this.trackAttachmentChanges(
+                op.sql,
+                () => db.run(op.sql, op.params ?? []).changes,
+              ),
+            );
         assertTransactionAffectedRows(op, affected);
+        if (guardedUpdate && lastChanges !== undefined) {
+          // RETURNING precedes AFTER-trigger changes. A trigger could replace
+          // a row at the captured rowid, even with identical values. Reject
+          // extra writes (including FK actions) here and in later operations.
+          const currentChanges = totalChanges();
+          if (currentChanges - lastChanges !== BigInt(affected)) {
+            throw new TransactionVerificationError({
+              rowIndex: guardedUpdate.rowIndex,
+              columns: guardedUpdate.sqliteNullableKeyUpdate?.columns ?? [],
+              message:
+                "A trigger or cascading action made additional changes, so the row with a NULL primary key cannot be verified safely.",
+            });
+          }
+          lastChanges = currentChanges;
+        }
         await identities.capture(
           index,
           op,
           returning?.rows ?? [],
-          async (sql, params) =>
-            this._executeSingle(sql, params, Date.now(), 2).rows,
+          async (sql, params) => readStatement(sql, params).rows,
         );
       }
       await verifyTransaction(
         this,
         identities.resolve(scope?.verifications),
-        async (verification) =>
-          this._executeSingle(
-            verification.sql,
-            verification.params,
-            Date.now(),
-            2,
-          ).rows,
+        async (verification) => {
+          const alias = nullableKeyUpdates.get(
+            verification.identity?.operationIndex ?? -1,
+          )?.alias;
+          const read = this.buildVerificationRead(verification, alias);
+          return readStatement(read.sql, read.params).rows;
+        },
         context,
       );
       throwIfTransactionCancelled(context);
+      commitAttempted = true;
       db.exec("COMMIT");
     } catch (error) {
-      if (db.inTransaction) {
-        try {
-          db.exec("ROLLBACK");
-        } catch (rollbackError) {
-          throw new SQLiteRollbackFailure(error, rollbackError);
-        }
-        if (error instanceof TransactionVerificationError) {
-          error.rollbackConfirmed = true;
-          throw error;
-        }
-        throw new MutationNotExecutedError(
-          error instanceof Error ? error.message : String(error),
-          error,
-        );
+      let inTransaction: boolean;
+      try {
+        if (!db.isOpen) throw new Error("SQLite connection is not open");
+        inTransaction = db.inTransaction;
+        if (inTransaction) db.exec("ROLLBACK");
+      } catch (rollbackError) {
+        throw new SQLiteRollbackFailure(error, rollbackError);
       }
-      throw error;
+      // On this same open connection, SQLite returning to autocommit before
+      // any possible COMMIT proves it already rolled back the owned transaction.
+      if (!onlyTransactionSafeStatements || (!inTransaction && commitAttempted))
+        throw error;
+      if (error instanceof TransactionVerificationError) {
+        error.rollbackConfirmed = true;
+        throw error;
+      }
+      throw new MutationNotExecutedError(
+        error instanceof Error ? error.message : String(error),
+        error,
+      );
     }
+  }
+  private resolveNullableKeyUpdateRowid(
+    db: SQLiteDatabase,
+    {
+      schema,
+      table,
+      columns,
+    }: NonNullable<TransactionVerification["sqliteNullableKeyUpdate"]>,
+  ): string {
+    const pragma = (name: string) =>
+      db.all(
+        `PRAGMA ${this.quoteIdentifier(schema)}.${name}(${this.quoteIdentifier(table)})`,
+      );
+    const [target] = pragma("table_list") as SQLiteTableListRow[];
+    const columnList = columns
+      .map((name) => this.quoteIdentifier(name))
+      .join(", ");
+    if (target?.wr === 1) {
+      throw new Error(
+        `SQLite primary key ${columnList} cannot be set to NULL in a WITHOUT ROWID table.`,
+      );
+    }
+    if (!isSqliteRowidTable(target)) {
+      throw new Error(
+        `Setting SQLite primary key ${columnList} to NULL requires an ordinary rowid table.`,
+      );
+    }
+    const tableColumns = pragma("table_xinfo") as SQLiteTableXInfoRow[];
+    const keys = tableColumns.filter(({ pk }) => pk > 0);
+    const rowidPrimaryKey = sqliteRowidPrimaryKey(
+      keys,
+      () => pragma("index_list") as Array<{ origin: string }>,
+    );
+    if (
+      rowidPrimaryKey ||
+      !columns.every((name) =>
+        keys.some((key) => key.name === name && key.notnull === 0),
+      )
+    ) {
+      throw new Error(
+        `SQLite primary key ${columnList} cannot be set to NULL.`,
+      );
+    }
+    const columnNames = new Set(
+      tableColumns.map(({ name }) => sqliteAsciiLower(name)),
+    );
+    const alias = ["rowid", "_rowid_", "oid"].find(
+      (name) => !columnNames.has(name),
+    );
+    if (!alias) {
+      throw new Error(
+        `Setting SQLite primary key ${columnList} to NULL cannot be verified safely: all rowid aliases are shadowed by table columns.`,
+      );
+    }
+    return alias;
+  }
+  private buildVerificationRead(
+    verification: TransactionVerification,
+    rowidAlias?: string,
+  ): {
+    sql: string;
+    params: unknown[];
+  } {
+    if (verification.sqliteNullableKeyUpdate) {
+      const rowid = verification.params[0];
+      if (
+        !rowidAlias ||
+        typeof rowid !== "string" ||
+        !/^(?:0|-?[1-9]\d{0,18})$/.test(rowid)
+      ) {
+        throw new Error("SQLite could not capture the updated rowid.");
+      }
+      const nullKeys = verification.sqliteNullableKeyUpdate.columns.map(
+        (name) => `${this.quoteIdentifier(name)} IS NULL`,
+      );
+      return {
+        sql: `${verification.sql} WHERE ${this.quoteIdentifier(rowidAlias)} = ? AND ${nullKeys.join(" AND ")}`,
+        params: [BigInt(rowid)],
+      };
+    }
+    const columns = verification.sqlitePrimaryKeyColumns;
+    if (!columns) return verification;
+    if (!columns.length || columns.length !== verification.params.length) {
+      throw new Error("SQLite verification has an incomplete primary key.");
+    }
+    const params: unknown[] = [];
+    const predicates = columns.map((name, index) => {
+      const token = verification.params[index];
+      if (token === null) return `${this.quoteIdentifier(name)} IS NULL`;
+      const key = { $rapidbSqliteKey: token };
+      if (!isSQLitePrimaryKeyValue(key)) {
+        throw new Error("SQLite could not read back the row's primary key.");
+      }
+      const predicate = this.buildPrimaryKeyComparison({ name }, key);
+      params.push(...predicate.params);
+      return predicate.sql;
+    });
+    return {
+      sql: `${verification.sql} WHERE ${predicates.join(" AND ")}`,
+      params,
+    };
+  }
+  buildTableMutationVerb(verb: "INSERT" | "UPDATE"): string {
+    // A schema-level ON CONFLICT REPLACE can otherwise delete a different
+    // row without counting it in the mutation's affected rows.
+    return `${verb} OR ABORT`;
+  }
+  override buildInsertDefaultValuesSql(qualifiedTableName: string): string {
+    return `${this.buildTableMutationVerb("INSERT")} INTO ${qualifiedTableName} DEFAULT VALUES`;
   }
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toUpperCase().trim();
@@ -1809,6 +2179,100 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       }
     }
     return super.coerceInputValue(value, column);
+  }
+  buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string {
+    const key = this.quoteIdentifier(column.name);
+    // TEXT bytes bypass JS decoding, and INTEGER never passes through a double.
+    return `(CASE typeof(${key}) WHEN 'text' THEN 't:' || hex(CAST(${key} AS BLOB)) WHEN 'blob' THEN 'b:' || hex(${key}) WHEN 'integer' THEN 'i:' || CAST(${key} AS TEXT) WHEN 'real' THEN 'r:' || RAPIDB_REAL_KEY(${key}) END)`;
+  }
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (isSQLitePrimaryKeyValue(value)) return value;
+    // Non-panel callers may pass native values. Never guess a storage class
+    // from a string (e.g. "true", "0xAB", or a decimal integer spelling).
+    if (typeof value === "boolean" && this.hasBooleanSemantics(column)) {
+      return value ? 1 : 0;
+    }
+    if (
+      typeof value === "string" ||
+      value instanceof Uint8Array ||
+      (typeof value === "bigint" &&
+        value >= SQLITE_INT64_MIN &&
+        value <= SQLITE_INT64_MAX) ||
+      (typeof value === "number" &&
+        Number.isFinite(value) &&
+        (!Number.isInteger(value) || Number.isSafeInteger(value)))
+    ) {
+      return value;
+    }
+    throw new Error(
+      `Invalid SQLite primary key for ${column.name}. Refresh the table and retry.`,
+    );
+  }
+  buildPrimaryKeyComparison(
+    column: Pick<ColumnTypeMeta, "name">,
+    value: unknown,
+  ) {
+    const key = this.quoteIdentifier(column.name);
+    if (isSQLitePrimaryKeyValue(value)) {
+      const token = value.$rapidbSqliteKey;
+      const body = token.slice(2);
+      switch (token.slice(0, 2)) {
+        case "t:": {
+          // Keep the indexed lookup, but require byte equality regardless
+          // of the column's collation or database text encoding.
+          const bytes = Buffer.from(body, "hex");
+          return {
+            sql: `(${key} = CAST(? AS TEXT) AND typeof(${key}) = 'text' AND CAST(${key} AS BLOB) = ?)`,
+            params: [bytes, bytes],
+          };
+        }
+        case "b:":
+          return {
+            sql: `(${key} = ? AND typeof(${key}) = 'blob')`,
+            params: [Buffer.from(body, "hex")],
+          };
+        case "i:": {
+          const integer = BigInt(body);
+          if (integer < SQLITE_INT64_MIN || integer > SQLITE_INT64_MAX)
+            throw new Error(
+              `Invalid SQLite integer primary key for ${column.name}.`,
+            );
+          return {
+            sql: `(${key} = ? AND typeof(${key}) = 'integer')`,
+            params: [integer],
+          };
+        }
+        case "r:": {
+          const real = Number(body);
+          if (!Number.isFinite(real)) {
+            return {
+              sql: `(${key} = ${real < 0 ? "-" : ""}1e999 AND typeof(${key}) = 'real')`,
+              params: [],
+            };
+          }
+          return {
+            sql: `(${key} = ? AND typeof(${key}) = 'real')`,
+            params: [real],
+          };
+        }
+      }
+    }
+    if (typeof value === "string") {
+      return {
+        sql: `(${key} = ? COLLATE BINARY AND typeof(${key}) = 'text')`,
+        params: [value],
+      };
+    }
+    if (value instanceof Uint8Array) {
+      return {
+        sql: `(${key} = ? AND typeof(${key}) = 'blob')`,
+        params: [Buffer.from(value)],
+      };
+    }
+    return {
+      sql: `(${key} = ? AND typeof(${key}) IN ('integer', 'real'))`,
+      params: [value],
+    };
   }
   override formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
     if (this.hasBooleanSemantics(column)) {

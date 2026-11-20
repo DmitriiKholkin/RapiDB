@@ -12,6 +12,7 @@ import {
   getMongoFormHost,
   getMongoFormUri,
   normalizeMongoConnectionConfig,
+  stripMongoUriTlsOptions,
 } from "../../src/shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../../src/shared/mongoDatabase";
 import { parseConnectionFormSubmission } from "../../src/shared/webviewContracts/connection";
@@ -145,6 +146,51 @@ describe("MongoDB connection modes", () => {
       { a: "b" },
       { c: "d" },
     ]);
+  });
+
+  it("does not rewrite a malformed option name in a URI edit", () => {
+    const connectionUri = "mongodb://host/app?bad%=private-option-value";
+    expect(getMongoFormUri({ connectionUri, authSource: "admin" })).toBe(
+      connectionUri,
+    );
+    expect(
+      restoreMongoUriCredentials(
+        connectionUri,
+        "mongodb://host/app?tlsCertificateKeyFilePassword=stored-password",
+        true,
+      ),
+    ).toBe(connectionUri);
+    expect(() => stripMongoUriTlsOptions(connectionUri)).toThrow(
+      new Error(
+        "MongoDB URI option name has invalid percent-encoding. Use %25 for a literal percent sign.",
+      ),
+    );
+  });
+
+  it("strips escaped TLS options without rewriting other escapes", () => {
+    const uri =
+      "mongodb+srv://u%40:p%2523@cluster.example/a%25zz?%74ls=true&appName=a%2526b";
+    expect(stripMongoUriTlsOptions(uri)).toBe(
+      "mongodb+srv://u%40:p%2523@cluster.example/a%25zz?appName=a%2526b",
+    );
+    expect(
+      stripMongoUriTlsOptions("mongodb://host/app?%2574ls=value&%74ls=true"),
+    ).toBe("mongodb://host/app?%2574ls=value");
+    expect(
+      validateConnectionConfig({
+        ...fields,
+        mongoConnectionMode: "uri",
+        connectionUri: uri,
+      }).valid,
+    ).toBe(true);
+    const client = new MongoClient(stripMongoUriTlsOptions(uri));
+    expect(client.options.dbName).toBe("a%zz");
+    expect(client.options.appName).toBe("a%26b");
+    expect(client.options.credentials).toMatchObject({
+      username: "u@",
+      password: "p%23",
+      source: "a%zz",
+    });
   });
 
   it.each([

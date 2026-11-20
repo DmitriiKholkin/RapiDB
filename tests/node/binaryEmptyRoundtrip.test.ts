@@ -15,7 +15,6 @@ import type {
 } from "../../src/extension/dbDrivers/types";
 import type { TableColumnsProvider } from "../../src/extension/table/tableDataContracts";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 
 const binaryColumn: ColumnTypeMeta = {
   name: "payload",
@@ -74,7 +73,7 @@ function createTableCellSaver(
   driver: IDBDriver,
   column: ColumnTypeMeta,
   driverType: ConnectionConfig["type"],
-): (value: string) => Promise<unknown> {
+): (value: string | null) => Promise<unknown> {
   const connection = config(driverType);
   let persistedValue: unknown;
 
@@ -159,7 +158,7 @@ describe.each(cases)("$name zero-length binary round trip", ({
     expect(emptyText).toBe("");
     expect(driver.formatOutputValue(emptyText, column)).toBe("");
 
-    const nullValue = await saveCell(NULL_SENTINEL);
+    const nullValue = await saveCell(null);
     expect(nullValue).toBeNull();
     expect(driver.formatOutputValue(nullValue, column)).toBeNull();
   });

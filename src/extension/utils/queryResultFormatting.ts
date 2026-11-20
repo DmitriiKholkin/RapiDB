@@ -1,5 +1,4 @@
 import type { QueryColumnMeta } from "../../shared/tableTypes";
-import type { QueryResultSet } from "../../shared/webviewContracts";
 import {
   formatDatetimeForDisplay,
   hexFromBuffer,
@@ -7,7 +6,11 @@ import {
   normalizeNumericDisplayValue,
   parseHexToBuffer,
 } from "../dbDrivers/BaseDBDriver";
-import { colKey, type QueryResult } from "../dbDrivers/types";
+import {
+  colKey,
+  type DriverQueryResultSet,
+  type QueryResult,
+} from "../dbDrivers/types";
 import { serializeArrayPreservingRawTokens } from "./arraySerialization";
 
 export interface FormattedQueryResult extends QueryResult {
@@ -18,7 +21,7 @@ export interface FormattedQueryResult extends QueryResult {
   resultSets?: FormattedQueryResultSet[];
 }
 
-export interface FormattedQueryResultSet extends QueryResultSet {
+export interface FormattedQueryResultSet extends DriverQueryResultSet {
   columnMeta: QueryColumnMeta[];
   rows: Record<string, unknown>[];
   truncated: boolean;
@@ -44,6 +47,14 @@ export function formatQueryResult(
     ...(result.exportRows
       ? { exportRows: result.exportRows.slice(0, sampledRows.length) }
       : {}),
+    ...(result.jsonExportCellOverrides
+      ? {
+          jsonExportCellOverrides: result.jsonExportCellOverrides.slice(
+            0,
+            sampledRows.length,
+          ),
+        }
+      : {}),
     ...(result.missingCells
       ? {
           missingCells: result.missingCells.filter(
@@ -60,7 +71,7 @@ export function formatQueryResult(
 }
 
 function formatQueryResultSet(
-  result: QueryResultSet,
+  result: DriverQueryResultSet,
   rowLimit: number,
 ): FormattedQueryResultSet {
   const truncated = result.truncated === true || result.rows.length > rowLimit;
@@ -68,6 +79,14 @@ function formatQueryResultSet(
   const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta);
   return {
     ...result,
+    ...(result.jsonExportCellOverrides
+      ? {
+          jsonExportCellOverrides: result.jsonExportCellOverrides.slice(
+            0,
+            sampledRows.length,
+          ),
+        }
+      : {}),
     columnMeta,
     rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
     truncated,
@@ -129,8 +148,27 @@ const INTERVAL_FIELDS = [
 
 const INTERVAL_KEY_SET: ReadonlySet<string> = new Set(INTERVAL_FIELDS);
 
-const NUMERIC_ARRAY_NATIVE_TYPE_RE =
-  /^(?:pg_catalog\.)?(?:smallint|integer|bigint|int[248]|numeric|decimal|real|double precision|float[48]|oid)(?:\[\])+$/i;
+const NUMERIC_ARRAY_ELEMENT_TYPE_RE =
+  /^(?:smallint|integer|bigint|int[248]?|numeric|decimal|real|double precision|float[48]|oid)$/;
+
+function isNumericArrayNativeType(nativeType: string | undefined): boolean {
+  if (nativeType === undefined) return false;
+  const type = nativeType
+    .trim()
+    .toLowerCase()
+    .replace(/^pg_catalog\./, "");
+  if (type.startsWith("_")) {
+    return /^_(?:int[248]|numeric|float[48]|oid)$/.test(type);
+  }
+
+  const elementType = type.replace(/(?:\s*\[\])+$/, "");
+  return (
+    elementType !== type &&
+    NUMERIC_ARRAY_ELEMENT_TYPE_RE.test(
+      elementType.replace(/\s*\(\s*\d+(?:\s*,\s*-?\d+)?\s*\)$/, ""),
+    )
+  );
+}
 
 type IntervalFieldValues = Record<(typeof INTERVAL_FIELDS)[number], number>;
 
@@ -272,11 +310,10 @@ function normalizeQueryRows(
         }
 
         if (Array.isArray(value)) {
-          const nativeType = columnMeta[index]?.nativeType;
+          // Some numeric array parsers return strings to avoid precision loss.
           normalized[normalizedKey] = serializeArrayPreservingRawTokens(
             value,
-            nativeType === undefined ||
-              NUMERIC_ARRAY_NATIVE_TYPE_RE.test(nativeType.trim()),
+            isNumericArrayNativeType(columnMeta[index]?.nativeType),
           );
           continue;
         }

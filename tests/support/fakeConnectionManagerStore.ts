@@ -116,6 +116,9 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
         this.connections = mutation.connections.map((connection) => ({
           ...connection,
         }));
+        await mutation.afterSettingsWrite?.();
+      } else {
+        await mutation.commitSecretOnly?.();
       }
       return mutation.result;
     };

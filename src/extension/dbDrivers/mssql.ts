@@ -1,6 +1,11 @@
 import * as mssql from "mssql";
 import { normalizeConnectionTlsConfig } from "../../shared/connectionConfig";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
+import {
+  isMssqlSqlVariantPrimaryKeyColumn,
+  isMssqlSqlVariantPrimaryKeyValue,
+  mssqlSqlVariantKeyChangeMessage,
+} from "../../shared/mssqlSqlVariantRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -37,6 +42,10 @@ import {
 } from "./mssqlCompletionMetadata";
 import { mssqlInsertGuard } from "./mssqlInsertGuard";
 import { MssqlQuerySession } from "./mssqlQuerySession";
+import {
+  mssqlSqlVariantDisplayExpression,
+  mssqlSqlVariantPrimaryKeyExpression,
+} from "./mssqlSqlVariantIdentity";
 import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   type QuestionMarkPlaceholderOptions,
@@ -64,6 +73,7 @@ import type {
   DriverEntityManifest,
   FilterConditionResult,
   FilterOperator,
+  MutationSqlExpression,
   PaginationResult,
   PersistedEditCheckOptions,
   PersistedEditCheckResult,
@@ -80,7 +90,6 @@ import {
   DATE_ONLY_RE,
   DATETIME_SQL_RE,
   ISO_DATETIME_RE,
-  NULL_SENTINEL,
 } from "./types";
 
 const MSSQL_TEDIOUS_EXACT_NUMERIC_PATCH_KEY = Symbol.for(
@@ -369,23 +378,6 @@ function mssqlSqlVariantInputExpression(
   return `CAST(? COLLATE ${snapshot.collation} AS ${type})`;
 }
 
-function mssqlSqlVariantDisplayExpression(name: string): string {
-  return `CASE CONVERT(nvarchar(128), SQL_VARIANT_PROPERTY(${name}, 'BaseType'))
-    WHEN 'binary' THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), ${name}), 1)
-    WHEN 'varbinary' THEN CONVERT(nvarchar(max), CONVERT(varbinary(8000), ${name}), 1)
-    WHEN 'float' THEN CONVERT(nvarchar(max), CONVERT(float, ${name}), 3)
-    WHEN 'real' THEN CONVERT(nvarchar(max), CONVERT(real, ${name}), 3)
-    WHEN 'money' THEN CONVERT(nvarchar(max), CONVERT(decimal(19,4), ${name}))
-    WHEN 'smallmoney' THEN CONVERT(nvarchar(max), CONVERT(decimal(10,4), ${name}))
-    WHEN 'datetimeoffset' THEN CONVERT(nvarchar(max), CONVERT(datetimeoffset(7), ${name}), 127)
-    WHEN 'datetime2' THEN CONVERT(nvarchar(max), CONVERT(datetime2(7), ${name}), 126)
-    WHEN 'datetime' THEN CONVERT(nvarchar(max), CONVERT(datetime, ${name}), 121)
-    WHEN 'smalldatetime' THEN CONVERT(nvarchar(max), CONVERT(smalldatetime, ${name}), 120)
-    WHEN 'date' THEN CONVERT(nvarchar(max), CONVERT(date, ${name}), 23)
-    WHEN 'time' THEN CONVERT(nvarchar(max), CONVERT(time(7), ${name}))
-    ELSE CONVERT(nvarchar(max), ${name}) END`;
-}
-
 interface NamedRow {
   name: string;
 }
@@ -518,7 +510,7 @@ interface MssqlTableTypeCheckConstraintRow {
 function canonicalizeMssqlBitPersistedEditValue(value: unknown): {
   canonical: string;
 } | null {
-  if (value === NULL_SENTINEL || value === null) {
+  if (value === null) {
     return { canonical: "__rapidb_null__" };
   }
   if (value === true || value === 1) {
@@ -800,9 +792,6 @@ function canonicalizeMssqlTemporalPersistedEditValue(
   value: unknown,
   baseType: string,
 ): string | null {
-  if (value === NULL_SENTINEL || value === null) {
-    return String(NULL_SENTINEL);
-  }
   if (typeof value === "string") {
     if (baseType === "date") {
       return normalizeDateLiteral(value);
@@ -919,17 +908,10 @@ function normalizeMssqlTemporalFraction(value: string): string {
 function readTediousDateTimeOffsetValue(
   buf: Buffer,
   offset: number,
-  metadata: { scale?: number },
+  dataLength: number,
+  scale: number,
   helpers: TediousHelpersModule,
 ): TediousReadValueResult {
-  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
-  const dataLength = dataLengthResult.value as number;
-  offset = dataLengthResult.offset;
-  if (dataLength === 0) {
-    return new helpers.Result(null, offset);
-  }
-
-  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
   const timeByteLength = dataLength - 5;
   if (timeByteLength < 3 || timeByteLength > 5) {
     throw new Error(
@@ -1002,14 +984,9 @@ function readTediousDateTimeOffsetValue(
 function readTediousDateValue(
   buf: Buffer,
   offset: number,
+  dataLength: number,
   helpers: TediousHelpersModule,
 ): TediousReadValueResult {
-  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
-  const dataLength = dataLengthResult.value as number;
-  offset = dataLengthResult.offset;
-  if (dataLength === 0) {
-    return new helpers.Result(null, offset);
-  }
   if (dataLength !== 3) {
     throw new Error(`Unsupported Date dataLength ${String(dataLength)}`);
   }
@@ -1067,19 +1044,13 @@ function formatTicksAsTimeString(ticks: bigint, scale: number): string {
 function readTediousTimeValue(
   buf: Buffer,
   offset: number,
-  metadata: { scale?: number },
+  dataLength: number,
+  scale: number,
   helpers: TediousHelpersModule,
 ): TediousReadValueResult {
-  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
-  const dataLength = dataLengthResult.value as number;
-  offset = dataLengthResult.offset;
-  if (dataLength === 0) {
-    return new helpers.Result(null, offset);
-  }
   if (dataLength < 3 || dataLength > 5) {
     throw new Error(`Unsupported Time dataLength ${String(dataLength)}`);
   }
-  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
   const parsed = readTediousTimeCore(buf, offset, dataLength, scale, helpers);
   return new helpers.Result(
     formatTicksAsTimeString(parsed.ticks, scale),
@@ -1090,16 +1061,10 @@ function readTediousTimeValue(
 function readTediousDateTime2Value(
   buf: Buffer,
   offset: number,
-  metadata: { scale?: number },
+  dataLength: number,
+  scale: number,
   helpers: TediousHelpersModule,
 ): TediousReadValueResult {
-  const dataLengthResult = readTediousUInt8(buf, offset, helpers);
-  const dataLength = dataLengthResult.value as number;
-  offset = dataLengthResult.offset;
-  if (dataLength === 0) {
-    return new helpers.Result(null, offset);
-  }
-  const scale = Math.max(0, Math.min(7, metadata.scale ?? 7));
   const timeByteLength = dataLength - 3;
   if (timeByteLength < 3 || timeByteLength > 5) {
     throw new Error(
@@ -1131,6 +1096,38 @@ function readTediousDateTime2Value(
     )} ${formatTicksAsTimeString(timeParsed.ticks, scale)}`,
     offset,
   );
+}
+
+type TediousModernTemporalType =
+  | "Date"
+  | "Time"
+  | "DateTime2"
+  | "DateTimeOffset";
+
+function readTediousModernTemporalValue(
+  buf: Buffer,
+  offset: number,
+  dataLength: number,
+  type: TediousModernTemporalType,
+  scale: number,
+  helpers: TediousHelpersModule,
+): TediousReadValueResult {
+  switch (type) {
+    case "Date":
+      return readTediousDateValue(buf, offset, dataLength, helpers);
+    case "Time":
+      return readTediousTimeValue(buf, offset, dataLength, scale, helpers);
+    case "DateTime2":
+      return readTediousDateTime2Value(buf, offset, dataLength, scale, helpers);
+    case "DateTimeOffset":
+      return readTediousDateTimeOffsetValue(
+        buf,
+        offset,
+        dataLength,
+        scale,
+        helpers,
+      );
+  }
 }
 
 function readTediousLegacyDateTimeValue(
@@ -1275,6 +1272,17 @@ const TEDIOUS_VARIANT_MONEY = 0x3c;
 const TEDIOUS_VARIANT_SMALL_MONEY = 0x7a;
 const TEDIOUS_VARIANT_DECIMAL_N = 0x6a;
 const TEDIOUS_VARIANT_NUMERIC_N = 0x6c;
+const TEDIOUS_VARIANT_SMALL_DATETIME = 0x3a;
+const TEDIOUS_VARIANT_DATETIME = 0x3d;
+const TEDIOUS_VARIANT_MODERN_TEMPORAL_TYPES = new Map<
+  number,
+  TediousModernTemporalType
+>([
+  [0x28, "Date"],
+  [0x29, "Time"],
+  [0x2a, "DateTime2"],
+  [0x2b, "DateTimeOffset"],
+]);
 
 function readTediousExactVariantValue(
   buf: Buffer,
@@ -1290,7 +1298,43 @@ function readTediousExactVariantValue(
   const baseType = buf.readUInt8(offset + 4);
   const propBytes = buf.readUInt8(offset + 5);
   const valueOffset = offset + 6;
+  // Tedious's Variant reader bypasses the top-level temporal readers. Decode
+  // here, while the base type, scale and (for datetimeoffset) offset still exist.
+  const temporalType = TEDIOUS_VARIANT_MODERN_TEMPORAL_TYPES.get(baseType);
+  if (temporalType !== undefined) {
+    const hasScale = temporalType !== "Date";
+    if (propBytes !== (hasScale ? 1 : 0) || dataLength <= propBytes + 2) {
+      throw new Error(`Invalid sql_variant ${temporalType} header`);
+    }
+    const scale = hasScale
+      ? (readTediousUInt8(buf, valueOffset, helpers).value as number)
+      : 0;
+    if (scale > 7) {
+      throw new Error(`Invalid sql_variant ${temporalType} scale`);
+    }
+    return readTediousModernTemporalValue(
+      buf,
+      valueOffset + propBytes,
+      dataLength - propBytes - 2,
+      temporalType,
+      scale,
+      helpers,
+    );
+  }
   switch (baseType) {
+    case TEDIOUS_VARIANT_SMALL_DATETIME:
+    case TEDIOUS_VARIANT_DATETIME: {
+      const valueLength = baseType === TEDIOUS_VARIANT_SMALL_DATETIME ? 4 : 8;
+      if (propBytes !== 0 || dataLength !== valueLength + 2) {
+        throw new Error("Invalid sql_variant legacy datetime header");
+      }
+      return readTediousLegacyDateTimeValue(
+        buf,
+        valueOffset,
+        valueLength,
+        helpers,
+      );
+    }
     case TEDIOUS_VARIANT_SMALL_MONEY:
       return readTediousSmallMoneyValue(buf, valueOffset, helpers);
     case TEDIOUS_VARIANT_MONEY:
@@ -1356,18 +1400,22 @@ function patchMssqlTediousExactNumericParsing(): void {
       case "DateTimeN":
         return readTediousDateTimeNValue(buf, offset, tediousHelpers);
       case "Date":
-        return readTediousDateValue(buf, offset, tediousHelpers);
       case "Time":
-        return readTediousTimeValue(buf, offset, metadata, tediousHelpers);
       case "DateTime2":
-        return readTediousDateTime2Value(buf, offset, metadata, tediousHelpers);
-      case "DateTimeOffset":
-        return readTediousDateTimeOffsetValue(
+      case "DateTimeOffset": {
+        const length = readTediousUInt8(buf, offset, tediousHelpers);
+        if (length.value === 0) {
+          return new tediousHelpers.Result(null, length.offset);
+        }
+        return readTediousModernTemporalValue(
           buf,
-          offset,
-          metadata,
+          length.offset,
+          length.value as number,
+          metadata.type.name,
+          Math.max(0, Math.min(7, metadata.scale ?? 7)),
           tediousHelpers,
         );
+      }
       default:
         return originalReadValue(buf, offset, metadata, options);
     }
@@ -1436,6 +1484,31 @@ function mssqlNumericFilterParam(
   }
   return Number(rawValue);
 }
+function mssqlDecimalCastType(column: ColumnTypeMeta): string {
+  const type =
+    typeof column.nativeType === "string"
+      ? column.nativeType.trim().toLowerCase()
+      : "";
+  if (type === "money" || type === "smallmoney") return type;
+
+  const match =
+    /^(decimal|numeric)(?:\s*\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?$/.exec(type);
+  if (match) {
+    const [, baseType, precisionText, scaleText] = match;
+    if (precisionText === undefined) return baseType;
+    const precision = Number(precisionText);
+    const scale = Number(scaleText ?? "0");
+    if (precision >= 1 && precision <= 38 && scale <= precision) {
+      return scaleText === undefined
+        ? `${baseType}(${precision})`
+        : `${baseType}(${precision},${scale})`;
+    }
+  }
+
+  throw new TypeError(
+    `Invalid SQL Server decimal type metadata for column "${column.name}". Expected decimal or numeric (precision 1–38, scale 0–precision), money, or smallmoney.`,
+  );
+}
 function mssqlNumericParamExpr(
   column: ColumnTypeMeta,
   rawValue?: string,
@@ -1457,7 +1530,7 @@ function mssqlNumericParamExpr(
     return `CAST(? AS decimal(38,${scale}))`;
   }
   return column.category === "decimal"
-    ? `CAST(? AS ${column.nativeType})`
+    ? `CAST(? AS ${mssqlDecimalCastType(column)})`
     : "?";
 }
 function mssqlDisplayedTemporalDiffUpperBound(rawValue: string): number | null {
@@ -1622,7 +1695,7 @@ function mssqlSqlVariantInputParam(
   value: unknown,
   nativeType: string,
 ): unknown {
-  if (typeof value !== "string" || value === NULL_SENTINEL) return value;
+  if (typeof value !== "string") return value;
   const baseType = baseTypeName(nativeType);
   if (baseType === "float" || baseType === "real") {
     const trimmed = value.trim();
@@ -1805,7 +1878,6 @@ export class MSSQLDriver extends BaseDBDriver {
     value: unknown,
     column?: ColumnTypeMeta,
   ): unknown {
-    if (value === NULL_SENTINEL) return null;
     if (value === null || value === undefined || value === "") return value;
     if (typeof value !== "string") return value;
     if (column?.category === "text") return value;
@@ -1895,8 +1967,7 @@ export class MSSQLDriver extends BaseDBDriver {
     name: string,
     rawValue: unknown,
   ): void {
-    const value =
-      rawValue === NULL_SENTINEL || rawValue === undefined ? null : rawValue;
+    const value = rawValue === undefined ? null : rawValue;
     request.input(name, this.typeForValue(value), value);
   }
   private bindPositionalParameters(
@@ -2307,6 +2378,10 @@ export class MSSQLDriver extends BaseDBDriver {
           : undefined,
         isPersisted,
         isPrimaryKey: row.IS_PK === 1,
+        ...(row.IS_PK === 1 &&
+        baseTypeName(row.BASE_TYPE ?? row.DATA_TYPE) === "sql_variant"
+          ? { mssqlSqlVariantPrimaryKey: true }
+          : {}),
         primaryKeyOrdinal: row.PK_ORDINAL ?? undefined,
         isForeignKey: row.IS_FK === 1,
       };
@@ -3926,7 +4001,7 @@ export class MSSQLDriver extends BaseDBDriver {
     _paramIndex: number,
   ): string {
     if (column.category === "decimal") {
-      return `CAST(? AS ${column.nativeType})`;
+      return `CAST(? AS ${mssqlDecimalCastType(column)})`;
     }
     return "?";
   }
@@ -3936,6 +4011,9 @@ export class MSSQLDriver extends BaseDBDriver {
     operation: "insert" | "update",
     originalValue?: unknown,
   ): { sql: string; params: unknown[] } | null {
+    if (operation === "update" && isMssqlSqlVariantPrimaryKeyColumn(column)) {
+      throw new TypeError(mssqlSqlVariantKeyChangeMessage(column.name));
+    }
     const type = baseTypeName(column.nativeType);
     if (type === "sql_variant") {
       if (operation !== "update" || originalValue == null) return null;
@@ -3957,7 +4035,6 @@ export class MSSQLDriver extends BaseDBDriver {
         );
       if (
         typeof value === "string" &&
-        value !== NULL_SENTINEL &&
         ["nvarchar", "nchar"].includes(originalValue.baseType.toLowerCase()) &&
         Buffer.byteLength(value, "utf16le") > (originalValue.maxLength ?? 0)
       ) {
@@ -3971,7 +4048,7 @@ export class MSSQLDriver extends BaseDBDriver {
       };
     }
     if (type !== "geometry" && type !== "geography") return null;
-    if (value === null || value === NULL_SENTINEL) {
+    if (value === null) {
       return { sql: "NULL", params: [] };
     }
     if (typeof value !== "string") {
@@ -4013,6 +4090,35 @@ export class MSSQLDriver extends BaseDBDriver {
   ): string {
     return `${tableReference}.${this.quoteIdentifier(columnName)}`;
   }
+  buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string | null {
+    return isMssqlSqlVariantPrimaryKeyColumn(column)
+      ? mssqlSqlVariantPrimaryKeyExpression(this.quoteIdentifier(column.name))
+      : null;
+  }
+  coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (!isMssqlSqlVariantPrimaryKeyColumn(column)) {
+      return this.coerceInputValue(value, column);
+    }
+    if (!isMssqlSqlVariantPrimaryKeyValue(value)) {
+      throw new TypeError(
+        `Refresh the table to load the exact stored identity for SQL Server sql_variant primary key "${column.name}". If the key subtype is unsupported, use the Query Editor with an explicitly typed key.`,
+      );
+    }
+    return { $rapidbMssqlVariantKey: value.$rapidbMssqlVariantKey };
+  }
+  buildPrimaryKeyComparison(
+    column: ColumnTypeMeta,
+    value: unknown,
+  ): MutationSqlExpression | null {
+    const expression = this.buildTablePrimaryKeyExpr(column);
+    if (!expression) return null;
+    if (!isMssqlSqlVariantPrimaryKeyValue(value)) {
+      throw new TypeError(
+        `Missing exact stored identity for SQL Server sql_variant primary key "${column.name}". Refresh the table and try again.`,
+      );
+    }
+    return { sql: `${expression} = ?`, params: [value.$rapidbMssqlVariantKey] };
+  }
   buildTableDataProjection(columns: readonly ColumnTypeMeta[]): string {
     if (columns.length === 0) return "*";
     const projection: string[] = [];
@@ -4033,6 +4139,8 @@ export class MSSQLDriver extends BaseDBDriver {
           `${mssqlSqlVariantDisplayExpression(quoted)} AS ${quoted}`,
         );
       } else {
+        // Variant primary keys keep their usual cell display; the exact typed
+        // identity is projected separately by buildTablePrimaryKeyExpr.
         projection.push(`${quoted} AS ${quoted}`);
       }
       if (
@@ -4066,7 +4174,11 @@ export class MSSQLDriver extends BaseDBDriver {
   }
   buildVerificationValueExpr(column: ColumnTypeMeta): string {
     const name = this.quoteIdentifier(column.name);
-    if (baseTypeName(column.nativeType) !== "sql_variant") return name;
+    if (
+      baseTypeName(column.nativeType) !== "sql_variant" &&
+      !isMssqlSqlVariantPrimaryKeyColumn(column)
+    )
+      return name;
     const properties = [
       "BaseType",
       "Precision",
@@ -4413,9 +4525,12 @@ export class MSSQLDriver extends BaseDBDriver {
     expectedValue: unknown,
     options?: PersistedEditCheckOptions,
   ): PersistedEditCheckResult | null {
-    if (baseTypeName(column.nativeType) === "sql_variant") {
+    if (
+      baseTypeName(column.nativeType) === "sql_variant" ||
+      isMssqlSqlVariantPrimaryKeyColumn(column)
+    ) {
       if (options === undefined) return { ok: true, shouldVerify: true };
-      if (expectedValue === null || expectedValue === NULL_SENTINEL) {
+      if (expectedValue === null) {
         return {
           ok: options.persistedValue === null,
           shouldVerify: true,
@@ -4454,7 +4569,12 @@ export class MSSQLDriver extends BaseDBDriver {
       const nativeType = mssqlSqlVariantNativeType(persisted);
       return (
         this.checkPersistedEdit(
-          { ...column, nativeType, category: this.mapTypeCategory(nativeType) },
+          {
+            ...column,
+            nativeType,
+            baseType: undefined,
+            category: this.mapTypeCategory(nativeType),
+          },
           expectedValue,
           { persistedValue: persisted.displayValue },
         ) ?? {
@@ -4512,7 +4632,6 @@ export class MSSQLDriver extends BaseDBDriver {
     if (column.category === "float") {
       if (
         typeof expectedValue === "string" &&
-        expectedValue !== NULL_SENTINEL &&
         !APPROXIMATE_NUMERIC_RE.test(expectedValue.trim())
       ) {
         return {
@@ -4567,6 +4686,7 @@ export class MSSQLDriver extends BaseDBDriver {
         expectedValue,
         options,
         (value) => {
+          if (value === null) return { canonical: null };
           const canonical = canonicalizeMssqlTemporalPersistedEditValue(
             value,
             baseType,
@@ -4593,6 +4713,22 @@ export class MSSQLDriver extends BaseDBDriver {
     value: string | [string, string] | undefined,
     _paramIndex: number,
   ): FilterConditionResult | null {
+    const isNumeric = this.isNumericCategory(column.category);
+    if (
+      operator === "between" &&
+      column.filterable &&
+      isNumeric &&
+      (!Array.isArray(value) ||
+        value.length !== 2 ||
+        typeof value[0] !== "string" ||
+        typeof value[1] !== "string" ||
+        value[0].trim() === "" ||
+        value[1].trim() === "")
+    ) {
+      throw new TypeError(
+        `[RapiDB Filter] Column ${column.name} expects two nonempty string values for between filters.`,
+      );
+    }
     const preamble = this.createFilterConditionPreamble(
       column,
       operator,
@@ -4665,7 +4801,7 @@ export class MSSQLDriver extends BaseDBDriver {
         params: [wkt],
       };
     }
-    if (this.isNumericCategory(column.category) && Array.isArray(val)) {
+    if (isNumeric && Array.isArray(val)) {
       return {
         sql: `${col} BETWEEN ${mssqlNumericParamExpr(column, val[0])} AND ${mssqlNumericParamExpr(column, val[1])}`,
         params: [
@@ -4674,7 +4810,7 @@ export class MSSQLDriver extends BaseDBDriver {
         ],
       };
     }
-    if (this.isNumericCategory(column.category) && typeof val === "string") {
+    if (isNumeric && typeof val === "string") {
       if (operator === "in") {
         const tokens = val.split(",").map((part) => part.trim());
         const parts = tokens.map((part) =>

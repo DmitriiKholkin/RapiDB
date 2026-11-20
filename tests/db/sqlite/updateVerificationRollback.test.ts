@@ -121,12 +121,16 @@ describe("UPDATE verification transaction rollback", () => {
     expect(queueAtRead.applySettled).toBe(false);
     expect(queueAtRead.active?.method).toBe("runTransaction");
     expect(queueAtRead.queuedMethods).toEqual(["query"]);
+    expect(queueAtRead.active?.args[0]).toMatchObject([
+      { sql: expect.stringContaining(" RETURNING "), captureIdentity: {} },
+    ]);
     expect(queueAtRead.active?.args[2]).toMatchObject({
       verifications: [
         {
           rowIndex: 0,
-          sql: expect.stringContaining('WHERE "id" = ?'),
-          params: ["2"],
+          sqlitePrimaryKeyColumns: ["id"],
+          params: [null],
+          identity: { operationIndex: 0, parameterIndexes: [0] },
           values: [
             { column: { name: "id" }, expectedValue: "2" },
             { column: { name: "amount" }, expectedValue: "9" },

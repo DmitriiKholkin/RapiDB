@@ -347,6 +347,107 @@ afterEach(async () => {
   vi.useRealTimers();
 });
 
+describe("Redis keyspace schema", () => {
+  it("describes and filters an empty keyspace, then refines its sampled value", async () => {
+    const driver = driverWith();
+    await driver.connect();
+    const database = "db2"; // Other logical databases have keys.
+    const table = REDIS_ALL_KEYS_TABLE;
+    const request = page(database, table);
+    expect(await driver.listObjects(database)).toEqual([
+      { name: table, schema: "", type: "table" },
+    ]);
+    const columns = await driver.describeColumns(database, "", table);
+    expect(columns.map(({ name }) => name)).toEqual([
+      "key",
+      "value",
+      "ttl",
+      "type",
+    ]);
+    const [key, value, ttl, type] = columns;
+    expect(key).toMatchObject({
+      category: "text",
+      nullable: false,
+      isPrimaryKey: true,
+      primaryKeyOrdinal: 1,
+      filterOperators: ["like"],
+    });
+    expect(value).toMatchObject({
+      category: "text",
+      nullable: true,
+      redisValue: true,
+    });
+    expect(ttl).toMatchObject({ category: "integer", nullable: true });
+    expect(type).toMatchObject({
+      nativeType: "redis_type",
+      isReadOnly: true,
+      filterOperators: ["like"],
+    });
+    expect(
+      columns.filter((column) => !column.isReadOnly).map((c) => c.name),
+    ).toEqual(["key", "value", "ttl"]);
+    expect(await driver.describeTable(database, "", table)).toMatchObject([
+      { name: "key", type: "string", isPrimaryKey: true },
+      { name: "value", type: "string" },
+      { name: "ttl", type: "ttl_seconds" },
+      { name: "type", type: "redis_type", isReadOnly: true },
+    ]);
+    expect(await driver.readTablePage(request)).toMatchObject({
+      columns,
+      rows: [],
+      totalCount: 0,
+    });
+    const chunks = [];
+    for await (const chunk of driver.readTablePageChunks(request))
+      chunks.push(chunk);
+    expect(chunks).toEqual([{ columns, rows: [] }]);
+
+    const service = new TableReadService({
+      getConnection: () => config,
+      getDriver: () => driver,
+    } as unknown as ConnectionManager);
+    for (const filters of [
+      [
+        { column: "key", operator: "like", value: "first" },
+        { column: "type", operator: "like", value: "string" },
+        { column: "ttl", operator: "is_null" },
+      ],
+      [{ column: "value", operator: "like", value: "needle" }],
+    ] as const) {
+      expect(
+        await service.getPage(config.id, database, "", table, 1, 10, [
+          ...filters,
+        ]),
+      ).toMatchObject({ columns, rows: [], totalCount: 0 });
+    }
+
+    harness.databases.set(
+      2,
+      new Map([["first", { type: "list", value: ["member"], ttl: -1 }]]),
+    );
+    const populated = await driver.readTablePage(request);
+    expect(populated.columns).toEqual([
+      key,
+      expect.objectContaining({
+        name: "value",
+        category: "array",
+        nativeType: "list",
+        redisValue: true,
+      }),
+      ttl,
+      type,
+    ]);
+    expect(populated.rows).toEqual([
+      { key: "first", value: '["member"]', ttl: null, type: "list" },
+    ]);
+    expect(await driver.readTablePage({ ...request, page: 2 })).toMatchObject({
+      columns,
+      rows: [],
+      totalCount: 1,
+    });
+  });
+});
+
 describe("B09 Redis reserved default prefix", () => {
   it("rejects truncated unprefixed filter reads instead of returning false zero matches", async () => {
     const store = new Map<string, Value>();

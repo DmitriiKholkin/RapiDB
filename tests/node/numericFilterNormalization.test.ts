@@ -5,8 +5,10 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { SQLiteDriver } from "../../src/extension/dbDrivers/sqlite";
 import type {
   ColumnTypeMeta,
+  FilterExpression,
   FilterOperator,
 } from "../../src/extension/dbDrivers/types";
+import { buildWhere } from "../../src/extension/table/filterSql";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const postgresDriver = new PostgresDriver({
@@ -215,6 +217,9 @@ describe("SQLite decimal filter bindings", () => {
     "0x10",
     "1.",
     "abc123",
+    "1 2",
+    "1\t2\n3",
+    "1e+ 2",
     "1 OR 1=1",
     "1); DROP TABLE items; --",
     "",
@@ -239,6 +244,29 @@ describe("SQLite decimal filter bindings", () => {
         ),
       ).toThrow(/RapiDB Filter/);
     }
+  });
+});
+
+describe("whitespace in SQLite mixed-storage numeric filters", () => {
+  it.each([
+    "integer",
+    "float",
+  ] as const)("keeps malformed numeric text literal in %s equality and IN fallbacks", (category) => {
+    const column = { ...sqliteDecimalColumn, category };
+    expect(
+      buildWhere(
+        sqliteDriver,
+        [{ column: column.name, operator: "eq", value: "1 2" }],
+        [column],
+      ).params,
+    ).toEqual(["1 2"]);
+    expect(
+      buildWhere(
+        sqliteDriver,
+        [{ column: column.name, operator: "in", value: "1\u202f234, 1\t2\n3" }],
+        [column],
+      ).params,
+    ).toEqual(["1234", "1\t2\n3"]);
   });
 });
 
@@ -269,6 +297,9 @@ describe("numeric filter normalization", () => {
     "mis500",
     "Infinity",
     "1e999",
+    "1 2",
+    "1\t2\n3",
+    "1 e2",
   ])("rejects invalid numeric filter input %s", (value) => {
     for (const driver of [postgresDriver, mssqlDriver]) {
       expect(() =>
@@ -327,6 +358,25 @@ describe("numeric filter normalization", () => {
     );
 
     expect(normalized).toBe("1234.56, 2345.67, 3456.78");
+  });
+
+  it("preserves exact numeric bindings with space grouping and a currency affix", () => {
+    expect(
+      buildWhere(
+        postgresDriver,
+        [
+          {
+            column: moneyColumn.name,
+            operator: "eq",
+            value: "$\u00a09\u202f007\u202f199\u202f254\u202f740\u202f993.125",
+          },
+        ],
+        [moneyColumn],
+      ),
+    ).toEqual({
+      clause: 'WHERE "col_money" = $1',
+      params: ["9007199254740993.125"],
+    });
   });
 
   it("keeps rejecting invalid grouped numeric input", () => {
@@ -400,6 +450,86 @@ describe("numeric filter normalization", () => {
     expect(condition).toEqual({
       sql: "[col_numeric] = CAST(? AS decimal(16,6))",
       params: ["9999999999.123455"],
+    });
+  });
+});
+
+describe("SQL Server numeric filters", () => {
+  it.each([
+    { label: "an omitted range", value: undefined },
+    { label: "a scalar", value: "1" },
+    { label: "a missing upper bound", value: ["1"] },
+    { label: "a sparse range", value: Array<string>(2) },
+    { label: "a blank bound", value: ["1", " "] },
+    { label: "an extra bound", value: ["1", "2", "3"] },
+  ])("rejects $label for BETWEEN in both builders", ({ value }) => {
+    const filter = {
+      column: moneyColumn.name,
+      operator: "between",
+      value,
+    } as FilterExpression;
+    expect(() => buildWhere(mssqlDriver, [filter], [moneyColumn])).toThrow(
+      "[RapiDB Filter] Column col_money",
+    );
+    expect(() =>
+      mssqlDriver.buildFilterCondition(
+        moneyColumn,
+        "between",
+        value as string | [string, string] | undefined,
+        1,
+      ),
+    ).toThrow(
+      "[RapiDB Filter] Column col_money expects two nonempty string values for between filters.",
+    );
+  });
+
+  it("preserves exact decimal bounds with independent cast precision", () => {
+    expect(
+      buildWhere(
+        mssqlDriver,
+        [
+          {
+            column: moneyColumn.name,
+            operator: "between",
+            value: ["9007199254740993.125", "9007199254740994.5"],
+          },
+        ],
+        [moneyColumn],
+      ),
+    ).toEqual({
+      clause:
+        "WHERE [col_money] BETWEEN CAST(? AS decimal(19,3)) AND CAST(? AS decimal(17,1))",
+      params: ["9007199254740993.125", "9007199254740994.5"],
+    });
+  });
+
+  it("preserves bigint and fractional integer bound typing", () => {
+    const bigintColumn: ColumnTypeMeta = {
+      ...moneyColumn,
+      name: "quantity",
+      type: "bigint",
+      nativeType: "bigint",
+      category: "integer",
+    };
+    expect(
+      mssqlDriver.buildFilterCondition(
+        bigintColumn,
+        "between",
+        ["9007199254740993", "9007199254740994.5"],
+        1,
+      ),
+    ).toEqual({
+      sql: "[quantity] BETWEEN ? AND CAST(? AS decimal(38,1))",
+      params: [9007199254740993n, "9007199254740994.5"],
+    });
+  });
+
+  it("preserves independent casts in exact numeric IN filters", () => {
+    expect(
+      mssqlDriver.buildFilterCondition(moneyColumn, "in", "1.25, 20", 1),
+    ).toEqual({
+      sql: "[col_money] IN (CAST(? AS decimal(3,2)), CAST(? AS decimal(2,0)))",
+      params: ["1.25", "20"],
     });
   });
 });

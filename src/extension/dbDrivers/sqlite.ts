@@ -68,6 +68,11 @@ export class SQLiteDriver extends SQLiteCoreDriver {
   override listObjects(...args: Parameters<SQLiteCoreDriver["listObjects"]>) {
     return this.call("listObjects", args);
   }
+  override getSQLiteAttachmentTarget(
+    ...args: Parameters<SQLiteCoreDriver["getSQLiteAttachmentTarget"]>
+  ) {
+    return this.call("getSQLiteAttachmentTarget", args);
+  }
   override describeTable(
     ...args: Parameters<SQLiteCoreDriver["describeTable"]>
   ) {
@@ -77,6 +82,11 @@ export class SQLiteDriver extends SQLiteCoreDriver {
     ...args: Parameters<SQLiteCoreDriver["describeColumns"]>
   ) {
     return this.call("describeColumns", args);
+  }
+  override describeSQLiteAttachmentColumns(
+    ...args: Parameters<SQLiteCoreDriver["describeSQLiteAttachmentColumns"]>
+  ) {
+    return this.call("describeSQLiteAttachmentColumns", args);
   }
   override getIndexes(...args: Parameters<SQLiteCoreDriver["getIndexes"]>) {
     return this.call("getIndexes", args);

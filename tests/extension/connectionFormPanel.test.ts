@@ -6,6 +6,7 @@ import {
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import { createWebviewShell } from "../../src/extension/panels/webviewShell";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 const vscodeMock = vi.hoisted(() => {
   const createWebviewPanel = vi.fn(() => {
@@ -1139,8 +1140,7 @@ describe("ConnectionFormPanel", () => {
           privateKey:
             "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
           passphrase: "inline-passphrase",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         useSecretStorage: true,
       },
@@ -1686,7 +1686,7 @@ describe("ConnectionFormPanel", () => {
         type: "elasticsearch",
         endpoint: "https://elastic-user:elastic-pass@cluster.example.com",
         apiKey: "base64-api-key",
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
         useSecretStorage: false,
       },
     });
@@ -1696,7 +1696,7 @@ describe("ConnectionFormPanel", () => {
         id: "conn-es",
         type: "elasticsearch",
         endpoint: "https://cluster.example.com",
-        cloudId: "deployment:ZXM=",
+        cloudId: "deployment:ZXhhbXBsZS50ZXN0JGVz",
         useSecretStorage: false,
       }),
     );
@@ -1740,8 +1740,7 @@ describe("ConnectionFormPanel", () => {
           port: 22,
           username: "tunnel",
           authMethod: "privateKey",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         useSecretStorage: true,
       })),
@@ -1763,8 +1762,7 @@ describe("ConnectionFormPanel", () => {
           port: 22,
           username: "tunnel",
           authMethod: "privateKey",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
         useSecretStorage: true,
       },
@@ -1791,8 +1789,7 @@ describe("ConnectionFormPanel", () => {
           port: 22,
           username: "tunnel",
           authMethod: "privateKey",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
           privateKey: "",
           passphrase: "new-passphrase",
         },
@@ -2919,8 +2916,7 @@ describe("uniform secret storage choice", () => {
           authMethod: "password",
           password: "ssh-secret",
           hostVerificationMode: "manual",
-          hostFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
         },
       },
     },

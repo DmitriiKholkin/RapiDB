@@ -4,7 +4,10 @@ import { describe, expect, it } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { ElasticsearchSerializer } from "../../src/extension/dbDrivers/elasticsearchSerializer";
 import { canonicalizeJsonNumericValues } from "../../src/extension/utils/jsonCanonical";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchKeys,
+  elasticsearchTestIndexUuid,
+} from "../support/elasticsearchIdentity";
 
 const exportRequest = {
   database: "default",
@@ -27,7 +30,7 @@ async function fixture(source: string, mutationResponse?: string) {
     if (request.method === "HEAD") response.end();
     else if (path.includes("/_settings/"))
       response.end(
-        '{"records":{"settings":{"index":{"max_result_window":"100"}}}}',
+        `{"records":{"settings":{"index":{"max_result_window":"100","uuid":"${elasticsearchTestIndexUuid}"}}}}`,
       );
     else if (request.method === "POST" && path.startsWith("/records/_pit"))
       response.end('{"id":"precision-pit"}');

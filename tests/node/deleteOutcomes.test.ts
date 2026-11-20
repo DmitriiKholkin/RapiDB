@@ -11,17 +11,34 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { createTimeoutAwareDriver } from "../../src/extension/dbDrivers/timeout";
 import type {
+  ColumnTypeMeta,
   DriverDeleteRowsRequest,
   IDBDriver,
 } from "../../src/extension/dbDrivers/types";
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import type { PreparedDeletePlan } from "../../src/extension/table/tableDataContracts";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchIndexSettings,
+  elasticsearchKeys,
+} from "../support/elasticsearchIdentity";
 
 const engines = ["redis", "dynamodb", "elasticsearch", "mongodb"] as const;
 type Engine = (typeof engines)[number];
 const config = { id: "delete", name: "delete" };
+const postgresIdColumn: ColumnTypeMeta = {
+  name: "id",
+  type: "integer",
+  nativeType: "integer",
+  category: "integer",
+  nullable: false,
+  isPrimaryKey: true,
+  primaryKeyOrdinal: 1,
+  isForeignKey: false,
+  filterable: true,
+  filterOperators: ["eq", "neq", "gt", "gte", "lt", "lte", "between", "in"],
+  valueSemantics: "plain",
+};
 const timeoutSettings = () => ({
   connectionTimeoutMs: 1000,
   connectionTimeoutSeconds: 1,
@@ -62,6 +79,7 @@ function harness(engine: Engine, write: (index: number) => Promise<boolean>) {
     delete: call,
     deleteOne: call,
     withAbortSignal: vi.fn(() => client),
+    indices: { getSettings: async () => elasticsearchIndexSettings("items") },
   };
   Object.assign(driver, {
     getDatabaseClient: async () => client,
@@ -69,6 +87,8 @@ function harness(engine: Engine, write: (index: number) => Promise<boolean>) {
     getTableSchema: async () => ({ keys: ["id"] }),
     requireDb: () => ({ collection: () => client }),
   });
+  if (driver instanceof ElasticsearchDriver)
+    Object.assign(driver, { connected: true, client });
   const identities = ["a", "b", "c"].map((id) =>
     engine === "redis"
       ? { key: id }
@@ -554,7 +574,7 @@ describe("B12 service and preview results", () => {
       getQueryEditorPresentation: () => undefined,
     };
     const tableMutationService = new TableMutationService(manager as never, {
-      getColumns: async () => [],
+      getColumns: async () => [postgresIdColumn],
     });
     const controller = new TableMutationPreviewController({
       connectionId: config.id,
@@ -590,6 +610,12 @@ describe("B12 service and preview results", () => {
     });
     expect(runTransaction).toHaveBeenCalledOnce();
     expect(query).toHaveBeenCalledTimes(identities.length);
+    const existenceSql = `SELECT 1 FROM ${driver.qualifiedTableName("db", "", "items")} WHERE "id" = $1`;
+    for (const { id } of identities) {
+      expect(query).toHaveBeenCalledWith(existenceSql, [id], {
+        database: "db",
+      });
+    }
   });
 
   it("preserves SQL expected-count guards and treats a transaction error as unknown", async () => {
@@ -648,7 +674,7 @@ describe("B12 service and preview results", () => {
       if (failedRead === "metadata") {
         throw new Error("metadata read failed after commit");
       }
-      return [];
+      return [postgresIdColumn];
     });
     const manager = {
       getDriver: () => driver,
@@ -682,6 +708,11 @@ describe("B12 service and preview results", () => {
     });
     expect((error as DeleteExecutionError).deleteResult.error).toMatch(
       /Delete committed, but verification failed/,
+    );
+    expect((error as DeleteExecutionError).deleteResult.error).toContain(
+      failedRead === "verification"
+        ? queuedRead.message
+        : "metadata read failed after commit",
     );
     expect((error as DeleteExecutionError).deleteResult.error).not.toMatch(
       /late write|in-flight write/i,

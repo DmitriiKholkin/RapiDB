@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { gunzipSync } from "node:zlib";
 
 const require = createRequire(import.meta.url);
@@ -245,23 +246,28 @@ export async function collectSQLitePins() {
   return pins;
 }
 
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+export async function runSQLitePinMaintenance(
+  args,
+  collect = collectSQLitePins,
 ) {
-  const outputFlag = process.argv.indexOf("--output");
-  const checkFlag = process.argv.indexOf("--check");
-  if (outputFlag < 0 && checkFlag < 0)
+  const [mode, path] = args;
+  if (
+    args.length !== 2 ||
+    (mode !== "--output" && mode !== "--check") ||
+    !path?.trim() ||
+    path.startsWith("-")
+  )
     throw new Error(
-      "Use --output <candidate.json> or --check <committed-manifest.json>. No remote writes are performed.",
+      "Usage: node scripts/refresh-sqlite-artifact-pins.mjs --output <candidate.json> or --check <committed-manifest.json>. No remote writes are performed.",
     );
-  const pins = await collectSQLitePins();
+
+  const expected =
+    mode === "--check" ? JSON.parse(readFileSync(path, "utf8")) : undefined;
+  const pins = await collect();
   const serialized = `${JSON.stringify(pins, null, 2)}\n`;
-  if (checkFlag >= 0) {
-    const expected = JSON.parse(
-      readFileSync(process.argv[checkFlag + 1], "utf8"),
-    );
-    if (JSON.stringify(expected) !== JSON.stringify(pins))
+  if (mode === "--check") {
+    // Compare the JSON representation, not collector-only fields such as assets: undefined.
+    if (!isDeepStrictEqual(expected, JSON.parse(serialized)))
       throw new Error(
         "Upstream pins changed: review a --output candidate; do not silently accept it.",
       );
@@ -269,9 +275,21 @@ if (
       "All committed SQLite pins agree with upstream metadata and independently downloaded bytes.",
     );
   } else {
-    writeFileSync(process.argv[outputFlag + 1], serialized);
+    writeFileSync(path, serialized);
     console.log(
       "Candidate written. A separate reviewer must verify IDs/digests/bytes before shipping.",
     );
+  }
+}
+
+if (
+  process.argv[1] &&
+  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  try {
+    await runSQLitePinMaintenance(process.argv.slice(2));
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
   }
 }

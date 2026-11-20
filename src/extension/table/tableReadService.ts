@@ -1,8 +1,20 @@
+import { isMssqlSqlVariantPrimaryKeyValue } from "../../shared/mssqlSqlVariantRowIdentity";
+import { isOracleTemporalPrimaryKeyValue } from "../../shared/oracleTemporalRowIdentity";
+import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
 import type { QueryMissingCell } from "../../shared/tableTypes";
 import type { ConnectionManager } from "../connectionManager";
+import {
+  buildSqlDeleteSnapshot,
+  readSqlDeleteObservations,
+} from "../dbDrivers/sqlDeleteSnapshot";
+import {
+  SQLITE_ATTACHMENT_CHANGED,
+  type SQLiteAttachmentTarget,
+} from "../dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
   DriverTableExportChunk,
+  DriverTableExportFormat,
   FilterExpression,
   QueryResult,
 } from "../dbDrivers/types";
@@ -21,12 +33,24 @@ export class TableReadService {
   private readonly columnCache = new Map<string, ColumnTypeMeta[]>();
   private readonly columnCacheGenerations = new Map<string, number>();
   private readonly rowIdentityOrderCache = new Map<string, string[]>();
+  private sqliteAttachmentTarget?: SQLiteAttachmentTarget;
 
   private encodeKeyPart(value: string): string {
     return `${value.length}:${value}`;
   }
 
   constructor(private readonly connectionManager: ConnectionManager) {}
+
+  /** Set before the first metadata read on a Table Viewer-scoped service. */
+  bindSQLiteAttachmentTarget(target: SQLiteAttachmentTarget): void {
+    this.sqliteAttachmentTarget ??= target;
+  }
+
+  private getSQLiteAttachmentScope() {
+    return this.sqliteAttachmentTarget
+      ? { sqliteAttachmentTarget: this.sqliteAttachmentTarget }
+      : {};
+  }
 
   clearForConnection(connectionId: string): void {
     this.columnCacheGenerations.set(
@@ -60,7 +84,11 @@ export class TableReadService {
 
     const generation = this.columnCacheGenerations.get(connectionId) ?? 0;
     const { driver } = this.getConnectionDriver(connectionId);
-    const columns = await driver.describeColumns(database, schema, table);
+    const target = this.sqliteAttachmentTarget;
+    const columns = target
+      ? await driver.describeSQLiteAttachmentColumns?.(target, table)
+      : await driver.describeColumns(database, schema, table);
+    if (!columns) throw new Error(SQLITE_ATTACHMENT_CHANGED);
     if ((this.columnCacheGenerations.get(connectionId) ?? 0) === generation) {
       this.columnCache.set(cacheKey, columns);
     }
@@ -99,7 +127,13 @@ export class TableReadService {
     } catch (error: unknown) {
       console.error(
         "[RapiDB] Row identity lookup failed, reading without a row tie-breaker:",
-        normalizeUnknownError(error).message,
+        normalizeUnknownError(
+          error,
+          this.connectionManager.getConnectionDiagnosticContext?.(
+            connectionId,
+            driver,
+          ),
+        ).message,
       );
       return [];
     }
@@ -121,9 +155,13 @@ export class TableReadService {
     skipCount = false,
     signal?: AbortSignal,
     assertExportSession?: () => void,
+    observeSqlDelete = false,
+    conflictRefresh = false,
+    browsingSnapshot?: AbortSignal,
   ): Promise<TablePage> {
     assertExportSession?.();
     signal?.throwIfAborted();
+    browsingSnapshot?.throwIfAborted();
     if (!Array.isArray(filters)) {
       throw new Error("[RapiDB Filter] Filters must be an array.");
     }
@@ -135,6 +173,7 @@ export class TableReadService {
         : undefined;
     assertExportSession?.();
     signal?.throwIfAborted();
+    browsingSnapshot?.throwIfAborted();
     if (columns) {
       validateFilterExpressions(filters, columns);
     }
@@ -149,6 +188,10 @@ export class TableReadService {
         filters,
         sort,
         skipCount,
+        ...(assertExportSession ? { omitRowIdentity: true } : {}),
+        ...(observeSqlDelete ? { observeSqlDelete: true } : {}),
+        ...(conflictRefresh ? { conflictRefresh: true } : {}),
+        ...(browsingSnapshot ? { browsingSnapshot } : {}),
         ...(signal ? { signal } : {}),
       });
     }
@@ -166,6 +209,7 @@ export class TableReadService {
       columns,
       assertExportSession,
       signal,
+      observeSqlDelete,
     );
   }
 
@@ -243,6 +287,7 @@ export class TableReadService {
     knownColumns?: ColumnTypeMeta[],
     assertExportSession?: () => void,
     signal?: AbortSignal,
+    observeSqlDelete = false,
   ): Promise<TablePage> {
     assertExportSession?.();
     signal?.throwIfAborted();
@@ -282,6 +327,7 @@ export class TableReadService {
     assertExportSession?.();
     signal?.throwIfAborted();
     const count = await this.readFallbackTotalCount(
+      connectionId,
       driver,
       database,
       qualifiedTableName,
@@ -306,30 +352,168 @@ export class TableReadService {
       );
     const baseParams = [...whereParams, ...pagination.params];
     const projection = driver.buildTableDataProjection?.(columns) ?? "*";
-    const dataSql = `SELECT ${projection} FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
-    const fallbackSql =
-      projection === "*"
-        ? undefined
-        : `SELECT * FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
-    const dataResult = await this.readFallbackDataResult(
-      driver,
-      database,
-      dataSql,
-      baseParams,
-      columns,
-      fallbackSql,
-      assertExportSession,
-      signal,
+    const identityColumns = columns.flatMap((column) => {
+      const expression =
+        column.isPrimaryKey &&
+        !(
+          assertExportSession &&
+          (column.mssqlSqlVariantPrimaryKey || column.oracleTemporalPrimaryKey)
+        ) &&
+        driver.buildTablePrimaryKeyExpr?.(column);
+      return expression ? [{ column, expression }] : [];
+    });
+    const displayNames = new Set(columns.map(({ name }) => name));
+    let identityAliasIndex = 0;
+    const identityProjection = identityColumns
+      .map(({ column, expression }) => {
+        if (!column.postgresArrayPrimaryKey && !column.oracleTemporalPrimaryKey)
+          return `, ${expression}`;
+        // Do not shadow any real column in the result or ORDER BY.
+        const prefix = column.postgresArrayPrimaryKey
+          ? "pg_array"
+          : "oracle_temporal";
+        let alias: string;
+        do {
+          alias = `__rapidb_${prefix}_key_${identityAliasIndex++}`;
+        } while (displayNames.has(alias));
+        return `, ${expression} AS ${driver.quoteIdentifier(alias)}`;
+      })
+      .join("");
+    const deleteSnapshot = observeSqlDelete
+      ? buildSqlDeleteSnapshot(
+          this.connectionManager.getConnection(connectionId)?.type,
+          driver,
+          columns,
+        )
+      : undefined;
+    const displayNamesFolded = new Set(
+      columns.map(({ name }) => name.toLowerCase()),
     );
+    let deleteAliasIndex = 0;
+    const deleteProjectionColumns = deleteSnapshot?.expressions.map(
+      (expression) => {
+        let alias: string;
+        do {
+          alias = `__rapidb_delete_${deleteAliasIndex++}`;
+        } while (displayNamesFolded.has(alias));
+        return { alias, expression };
+      },
+    );
+    const deleteProjection = deleteProjectionColumns
+      ?.map(
+        ({ alias, expression }) =>
+          `, ${expression} AS ${driver.quoteIdentifier(alias)}`,
+      )
+      .join("");
+    const pageQuery = (base: string, snapshot = "") =>
+      `SELECT ${base}${identityProjection}${snapshot} FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
+    const read = (snapshot?: string) =>
+      this.readFallbackDataResult(
+        driver,
+        database,
+        pageQuery(projection, snapshot),
+        baseParams,
+        columns,
+        projection === "*" ? undefined : pageQuery("*", snapshot),
+        assertExportSession,
+        signal,
+      );
+    // E.g. a foreign relation cannot expose PostgreSQL heap system columns,
+    // or an older server does not implement the snapshot function. Keep reads
+    // and edits available, but never turn the fallback into key-only delete.
+    let hasDeleteProjection = Boolean(deleteProjection);
+    const dataResult = await read(deleteProjection).catch((error: unknown) => {
+      if (!deleteProjection) throw error;
+      signal?.throwIfAborted();
+      hasDeleteProjection = false;
+      return read();
+    });
     signal?.throwIfAborted();
-    const fetchedRows = this.formatQueryRows(driver, columns, dataResult);
+    const deleteColumnCount =
+      hasDeleteProjection &&
+      deleteProjectionColumns?.length &&
+      deleteProjectionColumns.every(
+        ({ alias }, index) =>
+          dataResult.columns.at(index - deleteProjectionColumns.length) ===
+          alias,
+      )
+        ? deleteProjectionColumns.length
+        : 0;
+    // Identity expressions are positional, not aliases that a table column
+    // might shadow. Never include these values in displayed/exported rows.
+    const displayColumnCount =
+      dataResult.columns.length - identityColumns.length - deleteColumnCount;
+    const fetchedRows = this.formatQueryRows(driver, columns, {
+      ...dataResult,
+      columns: dataResult.columns.slice(0, displayColumnCount),
+    });
     const hasMoreRows = count.countFailed && fetchedRows.length > pageSize;
     const rows = hasMoreRows ? fetchedRows.slice(0, pageSize) : fetchedRows;
+    const readIdentities = <T>(
+      encode: (value: unknown) => T,
+    ): Record<string, T>[] =>
+      dataResult.rows
+        .slice(0, rows.length)
+        .map((row) =>
+          Object.fromEntries(
+            identityColumns.map(({ column }, index) => [
+              column.name,
+              encode(row[`__col_${displayColumnCount + index}`]),
+            ]),
+          ),
+        );
+    const hasMssqlSqlVariantIdentities = identityColumns.some(
+      ({ column }) => column.mssqlSqlVariantPrimaryKey,
+    );
+    const hasPostgresArrayIdentities = identityColumns.some(
+      ({ column }) => column.postgresArrayPrimaryKey,
+    );
+    const hasOracleTemporalIdentities = identityColumns.some(
+      ({ column }) => column.oracleTemporalPrimaryKey,
+    );
+    const identities = hasMssqlSqlVariantIdentities
+      ? {
+          mssqlSqlVariantRowIdentities: readIdentities((value) => {
+            const key = { $rapidbMssqlVariantKey: value };
+            return isMssqlSqlVariantPrimaryKeyValue(key) ? key : null;
+          }),
+        }
+      : hasPostgresArrayIdentities
+        ? {
+            postgresArrayRowIdentities: readIdentities((value) =>
+              typeof value === "string" ? { $rapidbPgArrayKey: value } : null,
+            ),
+          }
+        : hasOracleTemporalIdentities
+          ? {
+              oracleTemporalRowIdentities: readIdentities((value) => {
+                const key = { $rapidbOracleTemporalKey: value };
+                return isOracleTemporalPrimaryKeyValue(key) ? key : null;
+              }),
+            }
+          : identityColumns.length > 0
+            ? {
+                sqliteRowIdentities: readIdentities((value) => {
+                  const key = { $rapidbSqliteKey: value };
+                  return isSQLitePrimaryKeyValue(key) ? key : null;
+                }),
+              }
+            : {};
     const executionTimeMs = Math.round(performance.now() - startTime);
 
     return {
       columns,
       rows,
+      ...identities,
+      ...(deleteSnapshot && deleteColumnCount > 0
+        ? {
+            sqlDeleteObservations: readSqlDeleteObservations(
+              deleteSnapshot,
+              dataResult.rows.slice(0, rows.length),
+              dataResult.columns.length - deleteColumnCount,
+            ),
+          }
+        : {}),
       totalCount: count.countFailed
         ? offset + rows.length + (hasMoreRows ? 1 : 0)
         : count.totalCount,
@@ -351,6 +535,7 @@ export class TableReadService {
     filters: FilterExpression[] = [],
     signal?: AbortSignal,
     selectedColumns?: readonly string[],
+    format?: DriverTableExportFormat,
   ): AsyncGenerator<{
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
@@ -386,6 +571,7 @@ export class TableReadService {
         signal,
         selectedColumns,
         assertSession,
+        format,
       )) {
         assertSession();
         yield chunk;
@@ -408,6 +594,7 @@ export class TableReadService {
     signal?: AbortSignal,
     selectedColumns?: readonly string[],
     assertSession?: () => void,
+    format?: DriverTableExportFormat,
   ): AsyncGenerator<{
     columns: ColumnTypeMeta[];
     rows: Record<string, unknown>[];
@@ -488,7 +675,8 @@ export class TableReadService {
           continue;
         }
         rowCount += chunk.rows.length;
-        yield driver.formatTableExportChunk?.(chunk, selectedColumns) ?? chunk;
+        yield driver.formatTableExportChunk?.(chunk, selectedColumns, format) ??
+          chunk;
       }
 
       if (rowCount === 0) {
@@ -544,6 +732,7 @@ export class TableReadService {
   }
 
   private async readFallbackTotalCount(
+    connectionId: string,
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
     database: string,
     qualifiedTableName: string,
@@ -560,6 +749,7 @@ export class TableReadService {
       const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
       const countResult = await driver.query(countSql, whereParams, {
         database,
+        ...this.getSQLiteAttachmentScope(),
         ...(signal ? { signal } : {}),
       });
       signal?.throwIfAborted();
@@ -572,9 +762,17 @@ export class TableReadService {
       };
     } catch (error: unknown) {
       signal?.throwIfAborted();
+      if (error instanceof Error && error.message === SQLITE_ATTACHMENT_CHANGED)
+        throw error;
       console.error(
         "[RapiDB] COUNT query failed, falling back to a lower-bound totalCount:",
-        normalizeUnknownError(error).message,
+        normalizeUnknownError(
+          error,
+          this.connectionManager.getConnectionDiagnosticContext?.(
+            connectionId,
+            driver,
+          ),
+        ).message,
       );
       return { totalCount: 0, countFailed: true };
     }
@@ -606,6 +804,7 @@ export class TableReadService {
       signal?.throwIfAborted();
       const result = await driver.query(dataSql, params, {
         database,
+        ...this.getSQLiteAttachmentScope(),
         ...(signal ? { signal } : {}),
       });
       signal?.throwIfAborted();
@@ -628,6 +827,7 @@ export class TableReadService {
             params,
             {
               database,
+              ...this.getSQLiteAttachmentScope(),
               ...(signal ? { signal } : {}),
             },
           );
@@ -732,6 +932,21 @@ export class TableReadService {
       order,
       qualifiedTableName,
     );
+    const cursorExpressions = order.flatMap(({ column }) => {
+      const expression = driver.buildCursorValueExpr?.(column);
+      return expression ? [{ column, expression }] : [];
+    });
+    const displayNames = new Set(columns.map(({ name }) => name));
+    let cursorAliasIndex = 0;
+    const cursorProjection = cursorExpressions
+      .map(({ expression }) => {
+        let alias: string;
+        do {
+          alias = `__rapidb_cursor_${cursorAliasIndex++}`;
+        } while (displayNames.has(alias));
+        return `, ${expression} AS ${driver.quoteIdentifier(alias)}`;
+      })
+      .join("");
     let cursor: ExportCursor | null = null;
 
     while (true) {
@@ -763,11 +978,11 @@ export class TableReadService {
         baseWhereParams.length + (cursorCondition?.params.length ?? 0) + 1,
       );
       const projection = driver.buildTableDataProjection?.(columns) ?? "*";
-      const sql = `SELECT ${projection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+      const sql = `SELECT ${projection}${cursorProjection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
       const fallbackSql =
         projection === "*"
           ? undefined
-          : `SELECT * FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+          : `SELECT *${cursorProjection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
       const params = [
         ...baseWhereParams,
         ...(cursorCondition?.params ?? []),
@@ -783,7 +998,12 @@ export class TableReadService {
         assertSession,
         signal,
       );
-      const rows = this.formatQueryRows(driver, columns, dataResult);
+      const displayCount = dataResult.columns.length - cursorExpressions.length;
+      const displayColumns = dataResult.columns.slice(0, displayCount);
+      const rows = this.formatQueryRows(driver, columns, {
+        ...dataResult,
+        columns: displayColumns,
+      });
 
       if (rows.length === 0) {
         if (cursor === null) {
@@ -794,12 +1014,16 @@ export class TableReadService {
 
       const lastRawRow = dataResult.rows[dataResult.rows.length - 1];
       const nextCursor = this.createCursorFromRow(
-        Object.fromEntries(
-          dataResult.columns.map((name, index) => [
+        Object.fromEntries([
+          ...displayColumns.map((name, index) => [
             name,
             lastRawRow[`__col_${index}`],
           ]),
-        ),
+          ...cursorExpressions.map(({ column }, index) => [
+            column.name,
+            lastRawRow[`__col_${displayCount + index}`],
+          ]),
+        ]),
         order,
       );
       const previousCursor = cursor;

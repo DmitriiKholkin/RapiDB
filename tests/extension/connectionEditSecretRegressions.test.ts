@@ -1,10 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/extension/connectionManager";
 import { VSCodeConnectionManagerStore } from "../../src/extension/connectionManagerStore";
+import { parseStoredConnectionSecrets } from "../../src/extension/connectionSecretsData";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import type { ConnectionFormExistingState } from "../../src/shared/webviewContracts";
 import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
 import type { MockWebviewPanel } from "../support/mockVscode";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 vi.mock("vscode", async () => {
   const { createMockVscodeModule } = await import("../support/mockVscode");
@@ -170,11 +173,11 @@ describe("edit precondition ignores extension-managed background writes", () => 
       }
     ).persistTrustedSshFingerprintIfNeeded(
       config,
-      "SHA256:trusted",
+      SSH_HOST_FINGERPRINT_SHA256,
       new AbortController().signal,
     );
     expect(f.connections()[0].ssh?.hostFingerprintSha256).toBe(
-      "SHA256:trusted",
+      SSH_HOST_FINGERPRINT_SHA256,
     );
     const payload = {
       ...config,
@@ -196,7 +199,7 @@ describe("edit precondition ignores extension-managed background writes", () => 
     expect(saveResults(edit.panel)).toEqual([]);
     expect(f.connections()[0]).toMatchObject({
       name: "Renamed",
-      ssh: { ...tofuSsh, hostFingerprintSha256: "SHA256:trusted" },
+      ssh: { ...tofuSsh, hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256 },
     });
     expect(JSON.parse((await f.context.secrets.get("a")) ?? "null")).toEqual({
       password: "db-secret",
@@ -227,7 +230,7 @@ describe("edit precondition ignores extension-managed background writes", () => 
       host: tofuSsh.host,
       port: tofuSsh.port,
       username: "other",
-      hostFingerprintSha256: "SHA256:trusted",
+      hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
     });
   });
 
@@ -241,7 +244,7 @@ describe("edit precondition ignores extension-managed background writes", () => 
       ssh: {
         ...tofuSsh,
         password: "ssh-secret",
-        hostFingerprintSha256: "SHA256:trusted",
+        hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
       },
       ...change,
     });
@@ -337,6 +340,59 @@ describe("legacy DynamoDB awsEndpoint", () => {
   });
 });
 
+describe("signed Elasticsearch endpoint", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("keeps the original signed URL in Secret Storage through a rename-only edit", async () => {
+    const base = "https://es.example.test/api";
+    const endpoint = `${base}?x-aMz-%53ignature=fake%2bsignature&tag=a%20b&X-Amz-Security-Token=fake%2Ftoken&tag=%7e&X-Amz-Credential=fake%2Fcredential`;
+    const safeEndpoint = `${base}?tag=a%20b&tag=%7e`;
+    const config: ConnectionConfig = {
+      id: "signed",
+      name: "Elastic",
+      type: "elasticsearch",
+      endpoint,
+      useSecretStorage: true,
+    };
+    const f = fixture([]);
+    const testConnection = vi
+      .spyOn(f.manager, "testConnection")
+      .mockResolvedValue({ success: true });
+    await f.manager.saveConnection(config);
+    const [persisted] = f.connections();
+    expect(persisted.endpoint).toBe(safeEndpoint);
+    expect(
+      JSON.parse((await f.context.secrets.get(config.id)) ?? "null"),
+    ).toEqual({
+      endpoint,
+    });
+    const edit = await f.open(persisted);
+    const initial = vi.mocked(createWebviewShell).mock.calls.at(-1)?.[0]
+      .initialState as { existing: ConnectionConfig };
+    expect(initial.existing.endpoint).toBe(safeEndpoint);
+    expect(JSON.stringify(initial)).not.toContain("fake");
+    const payload = {
+      ...persisted,
+      name: "Renamed",
+      keepConnectionUriCredentials: true,
+    };
+
+    await edit.panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: { ...payload, requestId: "r1" },
+    });
+    expect(testConnection.mock.calls[0]?.[0].endpoint).toBe(endpoint);
+    await edit.panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload,
+    });
+    await edit.result;
+    const [saved] = f.connections();
+    expect(saved).toMatchObject({ name: "Renamed", endpoint: safeEndpoint });
+    expect((await f.manager._hydratePassword(saved)).endpoint).toBe(endpoint);
+  });
+});
+
 describe("SQLite never touches Secret Storage", () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -428,6 +484,102 @@ describe("type switches through SQLite", () => {
     expect(
       (await f.manager._hydratePassword(f.connections()[0])).password,
     ).toBe("");
+  });
+});
+
+describe("password resolution for the submitted engine", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const legacyPassword = "synthetic-legacy-pg";
+  const mysqlPassword = "synthetic-mysql";
+  const replacement = "synthetic-replacement-pg";
+
+  it.each([
+    ["create MySQL with a blank draft", "create", "mysql", "", false, ""],
+    [
+      "create MySQL with a typed draft",
+      "create",
+      "mysql",
+      mysqlPassword,
+      false,
+      mysqlPassword,
+    ],
+    ["switch from a keychain profile", "keychain", "mysql", "", false, ""],
+    ["switch from a plaintext profile", "plaintext", "mysql", "", false, ""],
+    [
+      "switch and supply a new MySQL password",
+      "keychain",
+      "mysql",
+      mysqlPassword,
+      false,
+      mysqlPassword,
+    ],
+    [
+      "keep the hidden password on the original engine",
+      "keychain",
+      "pg",
+      "",
+      false,
+      legacyPassword,
+    ],
+    ["remove the original password", "keychain", "pg", "", true, ""],
+    [
+      "replace the original password",
+      "keychain",
+      "pg",
+      replacement,
+      false,
+      replacement,
+    ],
+  ] as const)("uses the same password for Test and Save: %s", async (_label, source, type, password, clearPassword, expected) => {
+    const original =
+      source === "create"
+        ? undefined
+        : {
+            ...pg,
+            useSecretStorage: source === "keychain",
+            password: source === "plaintext" ? legacyPassword : undefined,
+          };
+    const f = fixture(original ? [original] : []);
+    if (source === "keychain") {
+      await f.context.secrets.store(pg.id, legacyPassword);
+    }
+    const testConnection = vi
+      .spyOn(f.manager, "testConnection")
+      .mockResolvedValue({ success: true });
+    const { panel, result } = await f.open(original);
+    const initial = vi.mocked(createWebviewShell).mock.calls.at(-1)?.[0]
+      .initialState as { existing?: ConnectionFormExistingState };
+    expect(initial.existing?.hasStoredSecret).toBe(original ? true : undefined);
+    expect(JSON.stringify(initial)).not.toContain(legacyPassword);
+
+    const payload = {
+      ...pg,
+      type,
+      password,
+      useSecretStorage: source !== "plaintext",
+      hasStoredSecret: type === original?.type || undefined,
+      clearPassword: type === original?.type ? clearPassword : undefined,
+    };
+    await panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: { ...payload, requestId: "r1" },
+    });
+    expect(testConnection).toHaveBeenCalledOnce();
+    expect(testConnection.mock.calls[0]?.[0]).toMatchObject({
+      type,
+      password: expected,
+    });
+
+    await panel.webview.dispatchMessage({ type: "saveConnection", payload });
+    expect(saveResults(panel)).toEqual([]);
+    await expect(result).resolves.toMatchObject({ id: pg.id, type });
+    const [saved] = f.connections();
+    expect(saved.password).toBe(source === "plaintext" ? "" : undefined);
+    expect(
+      parseStoredConnectionSecrets(await f.context.secrets.get(pg.id)).password,
+    ).toBe(expected || undefined);
+    expect((await f.manager._hydratePassword(saved)).password).toBe(expected);
   });
 });
 

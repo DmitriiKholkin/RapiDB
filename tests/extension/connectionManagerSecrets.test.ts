@@ -1,12 +1,23 @@
 import { describe, expect, it, vi } from "vitest";
+import * as vscode from "vscode";
+import { connectionEditState } from "../../src/extension/connectionEditState";
 import { ConnectionManager } from "../../src/extension/connectionManager";
+import {
+  readConnectionCredentialRevision,
+  withConnectionCredentialRevision,
+} from "../../src/extension/connectionSecretsData";
 import type { IDBDriver } from "../../src/extension/dbDrivers/types";
+import { QueryPanel } from "../../src/extension/panels/queryPanel";
+import { TablePanel } from "../../src/extension/panels/tablePanel";
+import { normalizeUnknownError } from "../../src/extension/utils/errorHandling";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
 
 const configuration = vi.hoisted(() => ({
   connections: [] as ConnectionConfig[],
+  afterApply: undefined as (() => void) | undefined,
   rejectAfterApply: false,
+  rejectBeforeApply: false,
   writes: 0,
 }));
 
@@ -19,8 +30,11 @@ vi.mock("vscode", async () => {
     ),
     inspect: () => ({ globalValue: configuration.connections }),
     update: vi.fn(async (_key: string, value: ConnectionConfig[]) => {
+      if (configuration.rejectBeforeApply)
+        throw new Error("settings write failed");
       configuration.connections = JSON.parse(JSON.stringify(value));
       configuration.writes += 1;
+      configuration.afterApply?.();
       if (configuration.rejectAfterApply)
         throw new Error("acknowledgement failed");
     }),
@@ -28,7 +42,788 @@ vi.mock("vscode", async () => {
   return mock.module;
 });
 
+function fireConnectionsConfigurationChange() {
+  const event = {
+    affectsConfiguration: (section: string) => section === "rapidb.connections",
+  };
+  for (const [listener] of vi.mocked(vscode.workspace.onDidChangeConfiguration)
+    .mock.calls) {
+    listener(event);
+  }
+}
+
+vi.mock("../../src/extension/panels/webviewShell", () => ({
+  APP_WEBVIEW_SHELL_LAYOUT: {},
+  MONACO_SCROLLBAR_STYLES: "",
+  WEBVIEW_SCROLLBAR_STYLES: "",
+  createWebviewShell: () => "<html></html>",
+}));
+
+function sharedSecretStorage() {
+  const listeners = new Set<(event: { key: string }) => void>();
+  const entries = new Map<string, string>();
+  const emit = (key: string) => {
+    for (const listener of listeners) listener({ key });
+  };
+  let notify = true;
+  const store = vi.fn(async (key: string, value: string) => {
+    entries.set(key, value);
+    if (notify) emit(key);
+  });
+  const get = vi.fn(async (key: string) => entries.get(key));
+  return {
+    emit,
+    entries,
+    listeners,
+    muteEvents: () => {
+      notify = false;
+    },
+    context: () => ({
+      ...createExtensionContextStub(),
+      secrets: {
+        onDidChange(listener: (event: { key: string }) => void) {
+          listeners.add(listener);
+          return { dispose: () => listeners.delete(listener) };
+        },
+        get,
+        store,
+        async delete(key: string) {
+          if (entries.delete(key) && notify) emit(key);
+        },
+      },
+    }),
+    get,
+    store,
+  };
+}
+
+function credentialDriverFactory(manager: ConnectionManager) {
+  return vi.spyOn(
+    manager as unknown as { createDriver(config: ConnectionConfig): IDBDriver },
+    "createDriver",
+  );
+}
+
+function credentialDriver(hold?: () => Promise<void>) {
+  let connected = false;
+  return {
+    connect: vi.fn(async () => {
+      await hold?.();
+      connected = true;
+    }),
+    disconnect: vi.fn(async () => {
+      connected = false;
+    }),
+    isConnected: () => connected,
+    query: vi.fn(async () => ({
+      columns: [],
+      rows: [],
+      rowCount: 0,
+      executionTimeMs: 0,
+    })),
+  };
+}
+
+const sharedCredentialProfile = {
+  id: "shared-static-credentials",
+  name: "DynamoDB",
+  type: "dynamodb",
+  useSecretStorage: true,
+  awsRegion: "us-east-1",
+} satisfies ConnectionConfig;
+
+const originalCredentials = {
+  awsAccessKeyId: "synthetic-access-key-A",
+  awsSecretAccessKey: "synthetic-secret-key-A",
+};
+const replacementCredentials = {
+  awsAccessKeyId: "synthetic-access-key-B",
+  awsSecretAccessKey: "synthetic-secret-key-B",
+};
+const originalRevision = "00000000-0000-4000-8000-000000000001";
+
+describe("credential revisions across VS Code windows", () => {
+  it("disconnects both live sessions once, leaves other keys alone, and requires a new query target binding", async () => {
+    const config = sharedCredentialProfile;
+    const unrelated = { ...config, id: "a-different-profile" };
+    configuration.connections = [config, unrelated];
+    const secrets = sharedSecretStorage();
+    secrets.entries.set(
+      config.id,
+      JSON.stringify({ ...originalCredentials, future: 42 }),
+    );
+    secrets.entries.set(unrelated.id, JSON.stringify(originalCredentials));
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const originSession = vi.fn();
+    const peerSession = vi.fn();
+    origin.onDidChangeConnectionSession(originSession);
+    peer.onDidChangeConnectionSession(peerSession);
+    const originDriver = credentialDriver();
+    const peerDriver = credentialDriver();
+    const otherDriver = credentialDriver();
+    const replacementDriver = credentialDriver();
+    const originFactory = credentialDriverFactory(origin).mockReturnValue(
+      originDriver as unknown as IDBDriver,
+    );
+    const peerFactory = credentialDriverFactory(peer)
+      .mockReturnValueOnce(peerDriver as unknown as IDBDriver)
+      .mockReturnValueOnce(otherDriver as unknown as IDBDriver)
+      .mockReturnValue(replacementDriver as unknown as IDBDriver);
+    try {
+      await Promise.all([
+        origin.connectTo(config.id),
+        peer.connectTo(config.id),
+      ]);
+      await peer.connectTo(unrelated.id);
+      const originalKey = peer.getQueryTargetSessionKey(config.id) as string;
+      expect(peerFactory).toHaveBeenCalledWith(
+        expect.objectContaining(originalCredentials),
+      );
+      expect(originFactory).toHaveBeenCalledWith(
+        expect.objectContaining(originalCredentials),
+      );
+      await origin.saveConnection({ ...config, ...originalCredentials });
+      expect(originSession).not.toHaveBeenCalled();
+      expect(secrets.store).not.toHaveBeenCalled();
+      const beforeRotation = configuration.writes;
+
+      const saved = await origin.saveConnection({
+        ...config,
+        ...replacementCredentials,
+      });
+      await vi.waitFor(() =>
+        expect(peerDriver.disconnect).toHaveBeenCalledOnce(),
+      );
+      expect(saved).not.toHaveProperty("awsSecretAccessKey");
+      expect(configuration.writes).toBe(beforeRotation);
+      expect(configuration.connections).toEqual([config, unrelated]);
+      expect(JSON.parse(secrets.entries.get(config.id) ?? "{}")).toMatchObject({
+        ...replacementCredentials,
+        future: 42,
+      });
+      expect(originDriver.disconnect).toHaveBeenCalledOnce();
+      expect(originSession).toHaveBeenCalledExactlyOnceWith(config.id);
+      expect(peerSession).toHaveBeenCalledExactlyOnceWith(config.id);
+      expect(peer.isConnected(unrelated.id)).toBe(true);
+      expect(peerFactory).toHaveBeenCalledTimes(2);
+      expect(peer.getDriver(config.id)).toBeUndefined();
+      await expect(
+        peer.getDriverForQuery(config.id, originalKey),
+      ).resolves.toBeUndefined();
+      const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
+      expect(currentKey).not.toBe(originalKey);
+      expect(origin.getQueryTargetSessionKey(config.id)).toBe(currentKey);
+      secrets.emit(config.id); // writer echo / duplicate or delayed broadcast resolved by read
+      await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
+        replacementDriver,
+      );
+      expect(peerFactory).toHaveBeenLastCalledWith(
+        expect.objectContaining(replacementCredentials),
+      );
+      expect(peerSession).toHaveBeenCalledOnce();
+      expect(originSession).toHaveBeenCalledOnce();
+      expect(peer.getDriver(config.id)).toBe(replacementDriver);
+
+      const restart = new ConnectionManager(secrets.context() as never);
+      try {
+        await expect(
+          restart.initializeConnectionCredentialRevision(config.id),
+        ).resolves.toBe(true);
+        expect(restart.getConnectionSessionGeneration(config.id)).toBe(0);
+        expect(restart.getQueryTargetSessionKey(config.id)).toBe(currentKey);
+      } finally {
+        await restart.dispose();
+      }
+    } finally {
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+    expect(secrets.listeners.size).toBe(0);
+  });
+
+  it.each([
+    false,
+    true,
+  ])("cancels an in-flight peer connect and does not publish a late old driver (with rename: %s)", async (rename) => {
+    const config = sharedCredentialProfile;
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const sessions = vi.fn();
+    const connected = vi.fn();
+    peer.onDidChangeConnectionSession(sessions);
+    peer.onDidConnect(connected);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const oldDriver = credentialDriver(() => held);
+    const newDriver = credentialDriver();
+    const factory = credentialDriverFactory(peer)
+      .mockReturnValueOnce(oldDriver as unknown as IDBDriver)
+      .mockReturnValue(newDriver as unknown as IDBDriver);
+    try {
+      if (rename) configuration.afterApply = fireConnectionsConfigurationChange;
+      await peer.initializeConnectionCredentialRevision(config.id);
+      const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
+      const oldQuery = peer.getDriverForQuery(config.id, oldKey);
+      await vi.waitFor(() => expect(oldDriver.connect).toHaveBeenCalledOnce());
+      await origin.saveConnection({
+        ...config,
+        ...replacementCredentials,
+        name: rename ? "Renamed in flight" : config.name,
+      });
+      await expect(oldQuery).resolves.toBeUndefined();
+      await vi.waitFor(() => expect(peer.isConnecting(config.id)).toBe(false));
+      expect(sessions).toHaveBeenCalledExactlyOnceWith(config.id);
+      expect(connected).not.toHaveBeenCalled();
+      expect(peer.getDriver(config.id)).toBeUndefined();
+      // Wait for teardown, then a user-initiated reconnect uses the new secret.
+      await peer.disconnectFrom(config.id);
+      await peer.connectTo(config.id, "explicit");
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining(replacementCredentials),
+      );
+      release();
+      await vi.waitFor(() => expect(oldDriver.isConnected()).toBe(false));
+      expect(connected).toHaveBeenCalledOnce();
+      expect(peer.getDriver(config.id)).toBe(newDriver);
+    } finally {
+      configuration.afterApply = undefined;
+      release();
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it.each([
+    "settings first",
+    "secret first",
+    "settings acknowledgement lost",
+    "secret acknowledgement lost",
+  ] as const)("publishes a combined presentation and credential save once (%s)", async (delivery) => {
+    const config = sharedCredentialProfile;
+    const edited = { ...config, name: "Renamed", color: "red", folder: "Ops" };
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    const original = withConnectionCredentialRevision(
+      JSON.stringify({ ...originalCredentials, future: 42 }),
+      originalRevision,
+    );
+    secrets.entries.set(config.id, original);
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const originDriver = credentialDriver();
+    const peerDriver = credentialDriver();
+    const replacementDriver = credentialDriver();
+    credentialDriverFactory(origin).mockReturnValue(
+      originDriver as unknown as IDBDriver,
+    );
+    const peerFactory = credentialDriverFactory(peer)
+      .mockReturnValueOnce(peerDriver as unknown as IDBDriver)
+      .mockReturnValue(replacementDriver as unknown as IDBDriver);
+    const originSession = vi.fn();
+    const peerSession = vi.fn();
+    origin.onDidChangeConnectionSession(originSession);
+    peer.onDidChangeConnectionSession(peerSession);
+    try {
+      await Promise.all([
+        origin.connectTo(config.id),
+        peer.connectTo(config.id),
+      ]);
+      const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
+      const order: string[] = [];
+      secrets.listeners.add(() => {
+        const stored = secrets.entries.get(config.id);
+        order.push(
+          readConnectionCredentialRevision(stored) === originalRevision
+            ? "staged secret event"
+            : "committed secret event",
+        );
+      });
+      configuration.afterApply = () => {
+        order.push("settings applied");
+        const staged = secrets.entries.get(config.id);
+        expect(JSON.parse(staged ?? "{}")).toMatchObject(
+          replacementCredentials,
+        );
+        expect(readConnectionCredentialRevision(staged)).toBe(originalRevision);
+        expect(peerSession).not.toHaveBeenCalled();
+        if (delivery !== "secret first") {
+          order.push("settings event");
+          fireConnectionsConfigurationChange();
+        }
+        if (delivery === "secret acknowledgement lost") {
+          secrets.store.mockImplementationOnce(async (key, value) => {
+            secrets.entries.set(key, value);
+            secrets.emit(key);
+            throw new Error("keychain acknowledgement failed");
+          });
+        }
+      };
+      configuration.rejectAfterApply =
+        delivery === "settings acknowledgement lost";
+      await expect(
+        origin.saveConnection(
+          { ...edited, ...replacementCredentials },
+          {},
+          {
+            kind: "edit",
+            id: config.id,
+            state: connectionEditState(config, originalCredentials),
+          },
+        ),
+      ).resolves.toMatchObject(edited);
+      await vi.waitFor(() =>
+        expect(peerDriver.disconnect).toHaveBeenCalledOnce(),
+      );
+      if (delivery === "secret first") {
+        order.push("settings event");
+        fireConnectionsConfigurationChange();
+      }
+      expect(order).toEqual([
+        "staged secret event",
+        "settings applied",
+        ...(delivery === "secret first"
+          ? ["committed secret event", "settings event"]
+          : ["settings event", "committed secret event"]),
+      ]);
+      expect(secrets.store).toHaveBeenCalledTimes(2);
+      const committed = secrets.entries.get(config.id);
+      expect(JSON.parse(committed ?? "{}")).toMatchObject({
+        ...replacementCredentials,
+        future: 42,
+      });
+      expect(readConnectionCredentialRevision(committed)).toEqual(
+        expect.any(String),
+      );
+      expect(readConnectionCredentialRevision(committed)).not.toBe(
+        originalRevision,
+      );
+      expect(configuration.connections).toEqual([edited]);
+      expect(peer.getConnection(config.id)).toMatchObject(edited);
+      expect(originDriver.disconnect).toHaveBeenCalledOnce();
+      await expect(
+        peer.getDriverForQuery(config.id, oldKey),
+      ).resolves.toBeUndefined();
+      const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
+      expect(currentKey).not.toBe(oldKey);
+      expect(origin.getQueryTargetSessionKey(config.id)).toBe(currentKey);
+      secrets.emit(config.id);
+      await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
+        replacementDriver,
+      );
+      expect(peerFactory).toHaveBeenLastCalledWith(
+        expect.objectContaining(replacementCredentials),
+      );
+      expect(originSession).toHaveBeenCalledExactlyOnceWith(config.id);
+      expect(peerSession).toHaveBeenCalledExactlyOnceWith(config.id);
+
+      // Saving the same credentials with another display edit isn't a rotation.
+      configuration.afterApply = undefined;
+      configuration.rejectAfterApply = false;
+      await origin.saveConnection({
+        ...edited,
+        name: "Display only",
+        ...replacementCredentials,
+      });
+      expect(secrets.store).toHaveBeenCalledTimes(2);
+      expect(originSession).toHaveBeenCalledOnce();
+      expect(peerSession).toHaveBeenCalledOnce();
+    } finally {
+      configuration.afterApply = undefined;
+      configuration.rejectAfterApply = false;
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it.each([
+    "newer credential commit",
+    "credential store failure",
+    "rollback failure",
+  ] as const)("does not acknowledge a combined save with a %s after settings applies", async (failure) => {
+    const config = sharedCredentialProfile;
+    const edited = { ...config, name: "Renamed", color: "red" };
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    const original = withConnectionCredentialRevision(
+      JSON.stringify(originalCredentials),
+      originalRevision,
+    );
+    const newerCredentials = {
+      awsAccessKeyId: "synthetic-access-key-C",
+      awsSecretAccessKey: "synthetic-secret-key-C",
+    };
+    const newer = withConnectionCredentialRevision(
+      JSON.stringify(newerCredentials),
+      "00000000-0000-4000-8000-000000000002",
+    );
+    secrets.entries.set(config.id, original);
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const originDriver = credentialDriver();
+    credentialDriverFactory(origin).mockReturnValue(
+      originDriver as unknown as IDBDriver,
+    );
+    const driver = credentialDriver();
+    const reconnected = credentialDriver();
+    const factory = credentialDriverFactory(peer)
+      .mockReturnValueOnce(driver as unknown as IDBDriver)
+      .mockReturnValue(reconnected as unknown as IDBDriver);
+    const sessions = vi.fn();
+    peer.onDidChangeConnectionSession(sessions);
+    try {
+      await Promise.all([
+        origin.connectTo(config.id),
+        peer.connectTo(config.id),
+      ]);
+      const key = peer.getQueryTargetSessionKey(config.id) as string;
+      configuration.afterApply = () => {
+        fireConnectionsConfigurationChange();
+        if (failure === "newer credential commit") {
+          // Simulate a different extension host, outside the local queue.
+          secrets.entries.set(config.id, newer);
+          secrets.emit(config.id);
+        } else {
+          secrets.store.mockRejectedValueOnce(
+            new Error("keychain write failed"),
+          );
+          if (failure === "rollback failure") {
+            secrets.store.mockRejectedValueOnce(
+              new Error("keychain restore failed"),
+            );
+          }
+        }
+      };
+      await expect(
+        origin.saveConnection({ ...edited, ...replacementCredentials }),
+      ).rejects.toThrow(
+        failure === "rollback failure"
+          ? "credential update could not be confirmed and rollback failed"
+          : "credential update could not be confirmed",
+      );
+      expect(configuration.connections).toEqual([edited]);
+      if (failure === "newer credential commit") {
+        expect(secrets.store).toHaveBeenCalledOnce();
+        expect(secrets.entries.get(config.id)).toBe(newer);
+        await vi.waitFor(() =>
+          expect(driver.disconnect).toHaveBeenCalledOnce(),
+        );
+        await expect(
+          peer.getDriverForQuery(config.id, key),
+        ).resolves.toBeUndefined();
+        await peer.connectTo(config.id, "explicit");
+        expect(factory).toHaveBeenLastCalledWith(
+          expect.objectContaining(newerCredentials),
+        );
+        expect(sessions).toHaveBeenCalledExactlyOnceWith(config.id);
+      } else {
+        if (failure === "rollback failure") {
+          const staged = secrets.entries.get(config.id);
+          expect(JSON.parse(staged ?? "{}")).toMatchObject(
+            replacementCredentials,
+          );
+          expect(readConnectionCredentialRevision(staged)).toBe(
+            originalRevision,
+          );
+          expect(originDriver.disconnect).toHaveBeenCalledOnce();
+        } else {
+          expect(secrets.entries.get(config.id)).toBe(original);
+          expect(originDriver.disconnect).not.toHaveBeenCalled();
+          await expect(peer.getDriverForQuery(config.id, key)).resolves.toBe(
+            driver,
+          );
+        }
+        expect(sessions).not.toHaveBeenCalled();
+        expect(driver.disconnect).not.toHaveBeenCalled();
+      }
+    } finally {
+      configuration.afterApply = undefined;
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it("fences automatic reconnect against newly read credentials before the peer receives the event", async () => {
+    const config = sharedCredentialProfile;
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const driver = credentialDriver();
+    const factory = credentialDriverFactory(peer).mockReturnValue(
+      driver as unknown as IDBDriver,
+    );
+    try {
+      await peer.initializeConnectionCredentialRevision(config.id);
+      const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
+      secrets.muteEvents();
+      await origin.saveConnection({ ...config, ...replacementCredentials });
+      await expect(
+        peer.getDriverForQuery(config.id, oldKey),
+      ).resolves.toBeUndefined();
+      expect(factory).not.toHaveBeenCalled();
+      await peer.disconnectFrom(config.id);
+      const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
+      expect(currentKey).not.toBe(oldKey);
+      await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
+        driver,
+      );
+      expect(factory).toHaveBeenCalledWith(
+        expect.objectContaining(replacementCredentials),
+      );
+    } finally {
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it("does not broadcast a failed atomic save or a rolled-back settings+secret save", async () => {
+    const config = sharedCredentialProfile;
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    const original = JSON.stringify(originalCredentials);
+    secrets.entries.set(config.id, original);
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const driver = credentialDriver();
+    credentialDriverFactory(peer).mockReturnValue(
+      driver as unknown as IDBDriver,
+    );
+    const sessions = vi.fn();
+    peer.onDidChangeConnectionSession(sessions);
+    try {
+      await peer.connectTo(config.id);
+      const key = peer.getQueryTargetSessionKey(config.id) as string;
+      secrets.store.mockRejectedValueOnce(new Error("keychain write failed"));
+      await expect(
+        origin.saveConnection({ ...config, ...replacementCredentials }),
+      ).rejects.toThrow("keychain write failed");
+      configuration.rejectBeforeApply = true;
+      await expect(
+        origin.saveConnection({
+          ...config,
+          ...replacementCredentials,
+          name: "New name",
+        }),
+      ).rejects.toThrow("settings write failed");
+      expect(secrets.store).toHaveBeenCalledTimes(3);
+      expect(configuration.connections).toEqual([config]);
+      await expect(peer.getDriverForQuery(config.id, key)).resolves.toBe(
+        driver,
+      );
+      expect(secrets.entries.get(config.id)).toBe(original);
+      expect(sessions).not.toHaveBeenCalled();
+      expect(driver.disconnect).not.toHaveBeenCalled();
+
+      // A runtime-affecting edit still takes the staged/rollback path.
+      await expect(
+        origin.saveConnection({
+          ...config,
+          ...replacementCredentials,
+          awsRegion: "us-west-2",
+        }),
+      ).rejects.toThrow("settings write failed");
+      expect(secrets.store).toHaveBeenCalledTimes(5);
+      expect(secrets.entries.get(config.id)).toBe(original);
+      await expect(peer.getDriverForQuery(config.id, key)).resolves.toBe(
+        driver,
+      );
+      expect(sessions).not.toHaveBeenCalled();
+      expect(driver.disconnect).not.toHaveBeenCalled();
+    } finally {
+      configuration.rejectBeforeApply = false;
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it("keeps a clear revision without retaining credentials so peers reconnect without the old identity", async () => {
+    const config = sharedCredentialProfile;
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    const origin = new ConnectionManager(secrets.context() as never);
+    const peer = new ConnectionManager(secrets.context() as never);
+    const driver = credentialDriver();
+    const factory = credentialDriverFactory(peer).mockReturnValue(
+      driver as unknown as IDBDriver,
+    );
+    try {
+      await peer.connectTo(config.id);
+      await origin.saveConnection(config, { awsCredentials: true });
+      const stored = JSON.parse(secrets.entries.get(config.id) ?? "{}");
+      expect(stored).not.toHaveProperty("awsAccessKeyId");
+      expect(stored).not.toHaveProperty("awsSecretAccessKey");
+      await vi.waitFor(() => expect(driver.disconnect).toHaveBeenCalledOnce());
+      await peer.disconnectFrom(config.id);
+      await peer.connectTo(config.id, "explicit");
+      expect(factory.mock.calls.at(-1)?.[0].awsAccessKeyId).toBeUndefined();
+      expect(factory.mock.calls.at(-1)?.[0].awsSecretAccessKey).toBeUndefined();
+      expect(peer.isConnected(config.id)).toBe(true);
+    } finally {
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+
+  it("requires confirmation in an open peer query panel and rejects a stale restored table draft", async () => {
+    const config = sharedCredentialProfile;
+    configuration.connections = [config];
+    const secrets = sharedSecretStorage();
+    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    const origin = new ConnectionManager(secrets.context() as never);
+    const context = secrets.context() as unknown as vscode.ExtensionContext;
+    const peer = new ConnectionManager(context);
+    const oldDriver = credentialDriver();
+    const newDriver = credentialDriver();
+    credentialDriverFactory(peer)
+      .mockReturnValueOnce(oldDriver as unknown as IDBDriver)
+      .mockReturnValue(newDriver as unknown as IDBDriver);
+    vi.spyOn(peer, "getQueryEditorPresentation").mockReturnValue(undefined);
+    vi.spyOn(peer, "getSchemaAsync").mockResolvedValue([]);
+    vi.spyOn(peer, "getDriverCapabilities").mockReturnValue({
+      boundedQueryResults: true,
+      tabularRead: "nosql",
+    });
+    try {
+      await peer.connectTo(config.id);
+      const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
+      QueryPanel.createOrShow(context, peer, config.id, undefined, true);
+      const panel = vi
+        .mocked(vscode.window.createWebviewPanel)
+        .mock.results.at(-1)?.value;
+      if (!panel) throw new Error("Missing query panel");
+      const webview = panel.webview as typeof panel.webview & {
+        dispatchMessage(message: unknown): Promise<void>;
+      };
+      await origin.saveConnection({ ...config, ...replacementCredentials });
+      await vi.waitFor(() => expect(peer.getDriver(config.id)).toBeUndefined());
+      await peer.disconnectFrom(config.id);
+      const newKey = peer.getQueryTargetSessionKey(config.id) as string;
+      expect(webview.postMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "connections",
+          payload: [
+            expect.objectContaining({
+              id: config.id,
+              targetSessionKey: newKey,
+            }),
+          ],
+        }),
+      );
+      const run = (key: string) =>
+        webview.dispatchMessage({
+          type: "executeQuery",
+          payload: {
+            queryText: 'SELECT * FROM "items"',
+            connectionId: config.id,
+            targetSessionKey: key,
+          },
+        });
+      await run(oldKey);
+      await run(newKey);
+      expect(oldDriver.query).not.toHaveBeenCalled();
+      expect(newDriver.query).not.toHaveBeenCalled();
+      await webview.dispatchMessage({
+        type: "activeConnectionChanged",
+        payload: { connectionId: config.id, targetSessionKey: newKey },
+      });
+      await run(newKey);
+      expect(newDriver.query).toHaveBeenCalledOnce();
+
+      const coldContext =
+        secrets.context() as unknown as vscode.ExtensionContext;
+      const cold = new ConnectionManager(coldContext);
+      try {
+        TablePanel.registerSerializer(coldContext, cold);
+        const serializer = vi
+          .mocked(vscode.window.registerWebviewPanelSerializer)
+          .mock.calls.at(-1)?.[1];
+        if (!serializer) throw new Error("Missing table serializer");
+        const restored = vscode.window.createWebviewPanel(
+          "rapidb.tablePanel",
+          "Test",
+          vscode.ViewColumn.One,
+        );
+        const closed = vi.fn();
+        restored.onDidDispose(closed);
+        await serializer.deserializeWebviewPanel(restored, {
+          initialState: {
+            connectionId: config.id,
+            database: "us-east-1",
+            schema: "",
+            table: "items",
+            connectionSessionKey: oldKey,
+          },
+          tableDraft: {},
+        });
+        expect(closed).toHaveBeenCalledOnce();
+        expect(cold.getQueryTargetSessionKey(config.id)).toBe(newKey);
+      } finally {
+        await cold.dispose();
+      }
+    } finally {
+      QueryPanel.disposeAll();
+      TablePanel.disposeAll();
+      await Promise.all([origin.dispose(), peer.dispose()]);
+    }
+  });
+});
+
 describe("ConnectionManager with VSCode SecretStorage", () => {
+  it("reuses the credentials supplied to a driver for later diagnostics without rereading Secret Storage", async () => {
+    const password = "synthetic-stored-password-11";
+    const config: ConnectionConfig = {
+      id: "diagnostic-context",
+      name: "Postgres",
+      type: "pg",
+      host: "localhost",
+      database: "app",
+      username: "postgres",
+      useSecretStorage: true,
+    };
+    configuration.connections = [config];
+    const context = createExtensionContextStub();
+    await context.secrets.store(config.id, JSON.stringify({ password }));
+    const reads = vi.spyOn(context.secrets, "get");
+    const manager = new ConnectionManager(context as never);
+    const state = manager as unknown as {
+      createDriver(config: ConnectionConfig): IDBDriver;
+    };
+    const connect = vi.fn(async () => {});
+    const factory = vi.spyOn(state, "createDriver").mockReturnValue({
+      connect,
+      disconnect: async () => {},
+      isConnected: () => true,
+    } as unknown as IDBDriver);
+    try {
+      const error = new Error(`Connection refused for ${password}`);
+      connect.mockRejectedValueOnce(error);
+      await expect(manager.connectTo(config.id)).rejects.toThrow(
+        "Connection refused for [REDACTED]",
+      );
+      await manager.connectTo(config.id);
+      expect(factory).toHaveBeenLastCalledWith(
+        expect.objectContaining({ password }),
+      );
+      expect(manager.getConnection(config.id)?.password).toBeUndefined();
+      const driver = manager.getDriver(config.id);
+      expect(driver).toBeDefined();
+      await manager.disconnectFrom(config.id);
+      reads.mockClear();
+      // A late rejection can still be redacted using its original driver.
+      expect(
+        normalizeUnknownError(
+          error,
+          manager.getConnectionDiagnosticContext(config.id, driver),
+        ).message,
+      ).toBe("Connection refused for [REDACTED]");
+      expect(reads).not.toHaveBeenCalled();
+      expect(error.message).toContain(password);
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it.each([
     {
       name: "password",

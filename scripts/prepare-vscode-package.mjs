@@ -1,5 +1,23 @@
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+function assertDirectoryOrMissing(targetPath) {
+  const entry = lstatSync(targetPath, { throwIfNoEntry: false });
+  if (entry && !entry.isDirectory()) {
+    throw new Error(
+      `[RapiDB Package] Expected a real directory: ${targetPath}`,
+    );
+  }
+}
 
 function removeIfExists(targetPath) {
   if (!existsSync(targetPath)) {
@@ -55,9 +73,7 @@ function copyPackageFiles(
   }
 }
 
-function prepareSqliteRuntimeScaffold(workspaceRoot) {
-  const sourceNodeModules = path.join(workspaceRoot, "node_modules");
-  const runtimeRoot = path.join(workspaceRoot, ".rapidb-runtime");
+function prepareSqliteRuntimeScaffold(sourceNodeModules, runtimeRoot) {
   const runtimeNodeModules = path.join(runtimeRoot, "node_modules");
   removeIfExists(runtimeRoot);
   mkdirSync(runtimeNodeModules, { recursive: true });
@@ -103,11 +119,32 @@ function pruneOracleRuntime(oracledbRoot) {
   );
 }
 
-const workspaceRoot = process.cwd();
+const workspaceRoot = path.dirname(
+  path.dirname(realpathSync(fileURLToPath(import.meta.url))),
+);
+if (realpathSync(process.cwd()) !== workspaceRoot) {
+  throw new Error(
+    `[RapiDB Package] Run the preparation script from the RapiDB workspace root: ${workspaceRoot}`,
+  );
+}
 
-removeIfExists(path.join(workspaceRoot, ".rapidb-vscode"));
-prepareSqliteRuntimeScaffold(workspaceRoot);
-pruneOracleRuntime(path.join(workspaceRoot, "node_modules", "oracledb"));
+const stagingRoot = path.join(workspaceRoot, ".rapidb-vscode");
+const runtimeRoot = path.join(workspaceRoot, ".rapidb-runtime");
+const sourceNodeModules = path.join(workspaceRoot, "node_modules");
+const oracledbRoot = path.join(sourceNodeModules, "oracledb");
+// Check parent paths first so pruning cannot traverse a linked dependency tree.
+for (const directory of [
+  stagingRoot,
+  runtimeRoot,
+  sourceNodeModules,
+  oracledbRoot,
+]) {
+  assertDirectoryOrMissing(directory);
+}
+
+removeIfExists(stagingRoot);
+prepareSqliteRuntimeScaffold(sourceNodeModules, runtimeRoot);
+pruneOracleRuntime(oracledbRoot);
 
 console.log(
   "[RapiDB Package] Prepared the packaged SQLite scaffold, cleaned staged SQLite artifacts, and pruned Oracle thick-mode packaging leftovers.",

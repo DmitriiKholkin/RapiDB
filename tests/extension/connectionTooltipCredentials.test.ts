@@ -86,6 +86,22 @@ describe("connection tooltip credentials", () => {
     expect(tooltip).toContain("es.example.com:9200");
   });
 
+  it("shows an Elasticsearch endpoint without its signed query fields", async () => {
+    const tooltip = await tooltipFor({
+      id: "conn-es",
+      name: "Elastic",
+      type: "elasticsearch",
+      endpoint:
+        "https://es.example.test:9200/?x-gOoG-%53ignature=fake%2Fsignature&mode=a%20b&X-Goog-Credential=fake-credential",
+      useSecretStorage: false,
+    });
+
+    expect(tooltip).toContain(
+      "Endpoint: `https://es.example.test:9200/?mode=a%20b`",
+    );
+    expect(tooltip).not.toMatch(/x-goog|fake/i);
+  });
+
   it("does not render an ambiguous credential-bearing endpoint", async () => {
     const tooltip = await tooltipFor({
       id: "conn-es",

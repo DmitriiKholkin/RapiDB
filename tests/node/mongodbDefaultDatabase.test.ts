@@ -9,12 +9,14 @@ import type {
   SshRuntimeRequest,
 } from "../../src/extension/services/sshRuntime";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { validateConnectionConfig } from "../../src/shared/connectionValidation";
 import { resolveMongoDatabaseName } from "../../src/shared/mongoDatabase";
 import { parseConnectionFormSubmission } from "../../src/shared/webviewContracts/connection";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
+import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
 vi.mock("vscode", async () => ({
   EventEmitter: (await import("../support/mockVscode")).MockEventEmitter,
@@ -47,14 +49,29 @@ const uriCases = [
   ["mongodb://host/ignored/../app", "app"],
   ["mongodb://host/?dbName=option", "option"],
   ["mongodb://host/?DBNAME=a%3Fb", "a?b"],
+  ["mongodb://host/?db%4Eame=a%25zz", "a%zz"],
   ["mongodb://host/app?dbName=ignored&authSource=admin", "app"],
 ] as const;
+
+const malformedUriCases = [
+  ["%zz?dbName=option", "database path"],
+  ["%C3%28", "database path"],
+  ["db?%=1", "option name"],
+  ["?dbName=option&bad%C3%28=1", "option name"],
+] as const;
+
+function malformedUri(suffix: string) {
+  return `mongodb://user:encoded-uri-secret@host/${suffix}`;
+}
 
 describe("MongoDB database resolution", () => {
   it.each(
     uriCases,
   )("matches SDK parsing without networking: %s", (uri, database) => {
     expect(new MongoClient(uri).options.dbName).toBe(database);
+    expect(validateConnectionConfig(config({ connectionUri: uri })).valid).toBe(
+      true,
+    );
     expect(resolveMongoDatabaseName({ connectionUri: uri })).toBe(database);
     expect(resolveMongoDatabaseName({ uri })).toBe(database);
     expect(
@@ -113,10 +130,28 @@ describe("MongoDB database resolution", () => {
     expect(resolveMongoDatabaseName({ database })).toBe("admin");
   });
 
-  it("does not silently select admin for malformed database escaping", () => {
-    expect(() =>
-      resolveMongoDatabaseName({ connectionUri: "mongodb://host/bad%XX" }),
-    ).toThrow();
+  it.each(
+    malformedUriCases,
+  )("reports malformed encoding without choosing another database: %s", (suffix, component) => {
+    const uri = malformedUri(suffix);
+    const message = `MongoDB URI ${component} has invalid percent-encoding. Use %25 for a literal percent sign.`;
+    for (const field of ["connectionUri", "uri"] as const) {
+      const fields = { [field]: uri };
+      const validation = validateConnectionConfig(
+        config({
+          connectionUri: undefined,
+          ...fields,
+        }),
+      );
+      expect(validation.valid).toBe(false);
+      expect(validation.message).toBe(message);
+      expect(validation.issues).toEqual([
+        { code: "invalid", fields: ["connectionUri"], message },
+      ]);
+      expect(() => resolveMongoDatabaseName(fields)).toThrow(
+        new Error(message),
+      );
+    }
   });
 });
 
@@ -237,6 +272,35 @@ describe("MongoDB default scopes with real SDK database and collection objects",
     return manager;
   }
 
+  it.each(
+    malformedUriCases,
+  )("rejects malformed encoding before connecting or saving: %s", async (suffix, component) => {
+    const connectionUri = malformedUri(suffix);
+    const message = `MongoDB URI ${component} has invalid percent-encoding. Use %25 for a literal percent sign.`;
+    const store = new FakeConnectionManagerStore();
+    const manager = createManager(store);
+    const settings = config({ connectionUri, database: "override" });
+    expect(await manager.testConnection(settings)).toMatchObject({
+      success: false,
+      error: message,
+    });
+    await expect(manager.saveConnection(settings)).rejects.toThrow(
+      new Error(message),
+    );
+    expect(store.getConnections()).toEqual([]);
+    store.setConnections([settings]);
+    await expect(manager.connectTo(settings.id, "explicit")).rejects.toThrow(
+      new Error(message),
+    );
+    for (const tls of [undefined, { mode: "disabled" }] as const) {
+      const driver = new MongoDBDriver({ ...settings, tls });
+      drivers.push(driver);
+      await expect(driver.connect()).rejects.toThrow(new Error(message));
+    }
+    expect(clients).toEqual([]);
+    expect(catalogs).toEqual([]);
+  });
+
   it.each([
     [{}, "app"],
     [{ database: undefined }, "app"],
@@ -249,6 +313,10 @@ describe("MongoDB default scopes with real SDK database and collection objects",
     [{ connectionUri: "mongodb://a,b/app" }, "app"],
     [{ connectionUri: "mongodb+srv://cluster.example/app" }, "app"],
     [{ connectionUri: "mongodb://host/a%3Fb" }, "a?b"],
+    [
+      { connectionUri: "mongodb://host/?db%4Eame=a%252Fb&%74ls=false" },
+      "a%2Fb",
+    ],
   ] satisfies Array<
     [Partial<ConnectionConfig>, string]
   >)("uses one default for connect, reads, writes, and commands: %j", async (fields, database) => {
@@ -371,8 +439,7 @@ describe("MongoDB default scopes with real SDK database and collection objects",
             remoteHost: request.remoteHost,
             remotePort: request.remotePort,
           },
-          verifiedFingerprintSha256:
-            "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+          verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
           dispose,
         };
       },
@@ -390,8 +457,7 @@ describe("MongoDB default scopes with real SDK database and collection objects",
                 authMethod: "password",
                 password: "ssh-secret",
                 hostVerificationMode: "manual",
-                hostFingerprintSha256:
-                  "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/",
+                hostFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
               },
             }
           : {}),

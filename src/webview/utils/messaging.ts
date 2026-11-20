@@ -30,7 +30,12 @@ window.addEventListener("message", (event) => {
   const msg = event.data;
   const fns = handlers.get(msg.type) ?? [];
   fns.forEach((fn) => {
-    fn(msg.payload);
+    try {
+      fn(msg.payload);
+    } catch {
+      // The payload and thrown error can contain query text or connection data.
+      console.error("RapiDB: a webview message listener failed.");
+    }
   });
 });
 

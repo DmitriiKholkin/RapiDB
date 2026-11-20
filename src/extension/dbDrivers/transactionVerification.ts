@@ -69,7 +69,9 @@ export class TransactionIdentityStore {
             mutation: verification.mutation,
             columns: verification.values.map(({ column }) => column.name),
             message:
-              "The inserted row identity could not be captured reliably.",
+              verification.mutation === "update"
+                ? "The updated row identity could not be captured reliably."
+                : "The inserted row identity could not be captured reliably.",
           });
         }
         params[parameterIndex] = value;

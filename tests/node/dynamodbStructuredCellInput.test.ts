@@ -1,13 +1,69 @@
+import {
+  DescribeTableCommand,
+  PutItemCommand,
+  UpdateItemCommand,
+} from "@aws-sdk/client-dynamodb";
 import { NumberValueImpl } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import type { ConnectionManager } from "../../src/extension/connectionManager";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
-import { getDynamoDbNativeCellValidationError } from "../../src/shared/dynamodbCellInput";
+import {
+  DYNAMODB_NATIVE_CELL_VALUE_PREFIX,
+  getDynamoDbNativeCellValidationError,
+} from "../../src/shared/dynamodbCellInput";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 
 const driver = new DynamoDBDriver({ id: "qa", name: "QA", type: "dynamodb" });
+
+function createWriteFixture(nativeType: string) {
+  const config = { id: "qa", name: "QA", type: "dynamodb" as const };
+  const localDriver = new DynamoDBDriver(config);
+  const send = vi.fn(async (command: object) => {
+    if (command instanceof DescribeTableCommand) {
+      return {
+        Table: {
+          KeySchema: [{ AttributeName: "pk", KeyType: "HASH" }],
+          AttributeDefinitions: [{ AttributeName: "pk", AttributeType: "S" }],
+        },
+      };
+    }
+    if (command instanceof PutItemCommand) return {};
+    if (command instanceof UpdateItemCommand)
+      return { Attributes: { pk: { S: "one" } } };
+    throw new Error("Unexpected DynamoDB SDK command");
+  });
+  Object.assign(localDriver, { client: { send }, connected: true });
+  const column = {
+    name: "value",
+    nativeType,
+    type: nativeType,
+    category: nativeType === "map" ? "json" : "array",
+    nullable: true,
+    isPrimaryKey: false,
+    isForeignKey: false,
+  } as ColumnTypeMeta;
+  const key = {
+    ...column,
+    name: "pk",
+    type: "string",
+    nativeType: "string",
+    category: "text",
+    nullable: false,
+    isPrimaryKey: true,
+  } as ColumnTypeMeta;
+  const columns = [key, column];
+  const manager = {
+    getConnection: () => config,
+    getDriver: () => localDriver,
+  } as unknown as ConnectionManager;
+  const service = new TableMutationService(manager, {
+    getColumns: async () => columns,
+  });
+  return { columns, manager, send, service };
+}
+
 describe("DynamoDB structured display/edit contract", () => {
   it.each([
     "[]",
@@ -20,7 +76,7 @@ describe("DynamoDB structured display/edit contract", () => {
       nativeType: "binary set",
       category: "array",
     } as ColumnTypeMeta;
-    expect(() => driver.coerceInputValue(text, column)).toThrow(/Binary Set/);
+    expect(() => driver.coerceInputValue(text, column)).toThrow(/binary set/);
     expect(
       getDynamoDbNativeCellValidationError(text, "binary set"),
     ).toBeTruthy();
@@ -102,6 +158,14 @@ describe("DynamoDB structured display/edit contract", () => {
   it.each([
     ["string set", "<<1, true>>"],
     ["string set", "<<'unclosed>>"],
+    ["string set", '["tag", 9007199254740993]'],
+    ["string set", '["tag", true]'],
+    ["string set", '["tag", null]'],
+    ["string set", '["tag", {"key":"value"}]'],
+    ["string set", '["tag", ["nested"]]'],
+    ["string set", "[]"],
+    ["string set", '{"tag":"value"}'],
+    ["string set", '["tag",]'],
     ["number set", "<<1, invalid>>"],
     ["number set", "[]"],
     ["number set", "[ ]"],
@@ -125,41 +189,39 @@ describe("DynamoDB structured display/edit contract", () => {
       "number set",
       'DynamoDB native value (nested sets/binary): {"NS":["1","1.00"]}',
     ],
-  ])("rejects invalid %s literals before update/insert, even without modal validation", async (nativeType, input) => {
+    ["binary set", '["AR=="]'],
+    ["binary set", "<<AQJ=>>"],
+    ["binary set", '["AQ"]'],
+    ["binary set", '["AQ==\\nAQ=="]'],
+    ["binary set", '[" "]'],
+    ["binary set", "<<>>"],
+    ["binary set", '["AQ==","AQ=="]'],
+    ["binary set", '["0xAB","qw=="]'],
+    ["binary set", "<<0xAB, \\xab>>"],
+    ["binary set", '<<"", 0x>>'],
+    ["binary set", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"BS":[]}`],
+    ["binary set", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"BS":["AR=="]}`],
+    ["binary set", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"BS":["0x01ab"]}`],
+    ["binary set", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"BS":["",""]}`],
+    [
+      "map",
+      `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"M":{"bytes":{"BS":["AQ==","AQ=="]}}}`,
+    ],
+    ["number set", "[1e10000]"],
+    ["number set", "[1e126]"],
+    ["number set", "<<-1e126>>"],
+    ["number set", '[ "1e-131" ]'],
+    ["number set", "<<0.9e-130>>"],
+    ["number set", "1, -1e-131"],
+    ["number set", "[01]"],
+    ["number set", "[123456789012345678901234567890123456789]"],
+    ["number set", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"NS":["10e125"]}`],
+    ["list", `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"L":[{"NS":["-1e-131"]}]}`],
+  ])("rejects invalid %s input %s before issuing SDK commands", async (nativeType, input) => {
     expect(getDynamoDbNativeCellValidationError(input, nativeType)).toMatch(
       /DynamoDB/,
     );
-    const localDriver = new DynamoDBDriver({
-      id: "qa",
-      name: "QA",
-      type: "dynamodb",
-    });
-    const column = {
-      name: "value",
-      nativeType,
-      type: nativeType,
-      category: nativeType === "map" ? "json" : "array",
-      nullable: true,
-      isPrimaryKey: false,
-      isForeignKey: false,
-    } as ColumnTypeMeta;
-    const key = {
-      ...column,
-      name: "pk",
-      type: "string",
-      nativeType: "string",
-      category: "text",
-      isPrimaryKey: true,
-    } as ColumnTypeMeta;
-    const manager = {
-      getConnection: () => ({ type: "dynamodb" }),
-      getDriver: () => localDriver,
-    } as unknown as ConnectionManager;
-    const update = vi.spyOn(localDriver, "updateRows");
-    const insert = vi.spyOn(localDriver, "insertRow");
-    const service = new TableMutationService(manager, {
-      getColumns: async () => [key, column],
-    });
+    const { columns, manager, send, service } = createWriteFixture(nativeType);
     expect(() =>
       prepareApplyChangesPlan(
         manager,
@@ -171,12 +233,9 @@ describe("DynamoDB structured display/edit contract", () => {
           {
             primaryKeys: { pk: "one" },
             changes: { value: input },
-            originalValues: {
-              value: nativeType === "string set" ? "<<'old'>>" : "<<1>>",
-            },
           },
         ],
-        [key, column],
+        columns,
       ),
     ).toThrow(/DynamoDB/);
     await expect(
@@ -190,13 +249,114 @@ describe("DynamoDB structured display/edit contract", () => {
       ),
     ).rejects.toThrow(/DynamoDB/);
     await expect(
-      service.prepareInsertRow("qa", "qa", "", "items", {
+      service.insertRow("qa", "qa", "", "items", {
         pk: "two",
         value: input,
       }),
     ).rejects.toThrow(/DynamoDB/);
-    expect(update).not.toHaveBeenCalled();
-    expect(insert).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "string set",
+      ' ["  spaced  ", "", "9007199254740993", "true", "null", "a,b", "a\\\\b", "true"] ',
+      {
+        SS: [
+          "  spaced  ",
+          "",
+          "9007199254740993",
+          "true",
+          "null",
+          "a,b",
+          "a\\b",
+        ],
+      },
+    ],
+    [
+      "string set",
+      "<<'O''Brien', \"a,b\", '', 'O''Brien'>>",
+      { SS: ["O'Brien", "a,b", ""] },
+    ],
+    [
+      "string set",
+      `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"SS":["", "  spaced  ", ""]}`,
+      { SS: ["", "  spaced  "] },
+    ],
+    ["binary set", '["", " 0xAB ", "AQI="]', { BS: ["", "qw==", "AQI="] }],
+    ["binary set", "<<0x, \\xAB, 'AQI='>>", { BS: ["", "qw==", "AQI="] }],
+    [
+      "binary set",
+      `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"BS":["","0xAB"]}`,
+      { BS: ["", "0xAB"] },
+    ],
+    [
+      "number set",
+      "[9.9999999999999999999999999999999999999e125,-1e-130,9007199254740993,-0e10000]",
+      {
+        NS: [
+          "9.9999999999999999999999999999999999999e125",
+          "-1e-130",
+          "9007199254740993",
+          "-0e10000",
+        ],
+      },
+    ],
+    [
+      "number set",
+      "<<+000.10000e-129, -1e125, 7.500>>",
+      { NS: ["+000.10000e-129", "-1e125", "7.500"] },
+    ],
+    ["number set", "1e-130, -1e125", { NS: ["1e-130", "-1e125"] }],
+    [
+      "number set",
+      `${DYNAMODB_NATIVE_CELL_VALUE_PREFIX}{"NS":["1e-130","-1e125","-0"]}`,
+      { NS: ["1e-130", "-1e125", "-0"] },
+    ],
+  ] as const)("writes valid %s input %s without changing the values", async (nativeType, input, expected) => {
+    expect(getDynamoDbNativeCellValidationError(input, nativeType)).toBeNull();
+    const { send, service } = createWriteFixture(nativeType);
+    await service.insertRow("qa", "qa", "", "items", {
+      pk: "two",
+      value: input,
+    });
+    await service.updateRow(
+      "qa",
+      "qa",
+      "",
+      "items",
+      { pk: "one" },
+      { value: input },
+    );
+    const commands = send.mock.calls.map(([command]) => command);
+    const put = commands.find((command) => command instanceof PutItemCommand);
+    const update = commands.find(
+      (command) => command instanceof UpdateItemCommand,
+    );
+    const attribute =
+      "BS" in expected
+        ? { BS: expected.BS.map((value) => Buffer.from(value, "base64")) }
+        : expected;
+    expect(put?.input.Item?.value).toEqual(attribute);
+    expect(update?.input.ExpressionAttributeValues?.[":u0"]).toEqual(attribute);
+  });
+
+  it("classifies huge exponents, including signed zero, without losing valid compensated magnitudes", () => {
+    const validate = (input: string) =>
+      getDynamoDbNativeCellValidationError(input, "number set");
+    const huge = "9".repeat(100_000);
+    const leadingZeros = "0".repeat(100_000);
+    expect(validate(`[1e${huge}]`)).toMatch(/overflow/);
+    expect(validate(`[9.${"9".repeat(38)}e125]`)).toMatch(/overflow/);
+    expect(validate(`<<-1e-${huge}>>`)).toMatch(/underflow/);
+    expect(validate(`[-0e-${huge}, 1]`)).toBeNull();
+    expect(validate(`[-0e-${huge}, 0]`)).toMatch(/unique/);
+    expect(validate("[-123456789012345678901234567890123456789]")).toMatch(
+      /38 significant digits/,
+    );
+    expect(validate(`<<0.${leadingZeros}1e100001>>`)).toBeNull();
+    expect(validate(`[1e-${leadingZeros}130]`)).toBeNull();
+    expect(validate(`["1${"0".repeat(150)}e-25"]`)).toBeNull();
   });
 
   it.each([

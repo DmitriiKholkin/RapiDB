@@ -152,6 +152,7 @@ Editing support depends on the database engine and column types. Review importan
 | `rapidb.queryRowLimit` | `10000` | Displayed rows per query, up to 10,000 |
 | `rapidb.queryHistoryLimit` | `100` | Saved history entries; `0` disables history |
 | `rapidb.defaultPageSize` | `25` | Default rows per page in the Table Data Viewer |
+| `rapidb.export.csvUtf8Bom` | `false` | Add a UTF-8 BOM to CSV exports for Excel |
 | `rapidb.skipTableMutationPreview` | `false` | Apply table edits without the preview dialog |
 
 For database-specific behavior and safety details, see the [usage notes](https://github.com/DmitriiKholkin/RapiDB/blob/main/docs/usage-notes.md).

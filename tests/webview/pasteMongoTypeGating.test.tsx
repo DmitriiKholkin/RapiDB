@@ -199,6 +199,12 @@ describe("TableView passes the Mongo flag into paste validation", () => {
     grid.paste(index, "1,234");
     expect(screen.queryByText(/Paste failed/)).toBeNull();
     expect(grid.cell(index).textContent).toContain("1234");
+    fireEvent.click(screen.getByRole("button", { name: "Apply Changes" }));
+    expect(messages("applyChanges").at(-1)?.payload).toMatchObject(
+      draft
+        ? { insertValues: [{ qty: "1234" }] }
+        : { updates: [{ changes: { qty: "1234" } }] },
+    );
   });
 
   it.each([

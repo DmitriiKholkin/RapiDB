@@ -14,6 +14,7 @@ import type { ClipboardWrittenPayload } from "../../shared/webviewContracts/tabl
 import type { SchemaObject } from "../store";
 import { formatJsonPreservingTokens } from "../utils/jsonFormatting";
 import { onMessage, postMessage } from "../utils/messaging";
+import { hasPostgresStringContinuation } from "../utils/postgresStringContinuation";
 import {
   buildSqlCompletionSuggestions,
   type SqlCompletionSuggestionKind,
@@ -211,6 +212,11 @@ export function formatSQLOrError(
   dialect = "sql",
 ): { result: string } | { error: string } {
   if (!sql.trim()) {
+    return { result: sql };
+  }
+  // sql-formatter can replace a required newline between PostgreSQL string
+  // pieces with a space. Keep the original query rather than rewriting it.
+  if (dialect === "postgresql" && hasPostgresStringContinuation(sql)) {
     return { result: sql };
   }
   try {

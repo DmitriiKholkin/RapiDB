@@ -87,6 +87,10 @@ describe("normalizeNumericToken", () => {
       ["$1,234,567.89", "1234567.89"],
       ["1 000.50", "1000.50"],
       ["$1 234.56", "1234.56"],
+      ["\t1 234 567.89\r\n", "1234567.89"],
+      ["-$\u00a01\u00a0234.56", "-1234.56"],
+      ["(EUR\u202f1\u202f234.56)", "-1234.56"],
+      ["+1\u202f234\u202f567.89e-2", "+1234567.89e-2"],
     ])("normalizes %s -> %s", (input, expected) => {
       expect(normalizeNumericToken(input)).toBe(expected);
     });
@@ -136,5 +140,29 @@ describe("normalizeNumericToken", () => {
     ])("rejects %s", (input) => {
       expect(normalizeNumericToken(input)).toBeNull();
     });
+  });
+
+  it.each([
+    "1 2",
+    "1\t2\n3",
+    "1\t234",
+    "1\n234",
+    "1\u2009234",
+    "1  234",
+    "1234 567",
+    "1 234\u00a0567",
+    "1 234,567.89",
+    "1'234 567.89",
+    "- 123",
+    "1 .23",
+    "1.2 345",
+    "1 e2",
+    "1e +2",
+    "1e2 345",
+    "$1 2.34",
+    "1 $234",
+  ])("rejects non-grouping whitespace in %j in both numeric modes", (input) => {
+    expect(normalizeNumericToken(input)).toBeNull();
+    expect(normalizeNumericToken(input, false)).toBeNull();
   });
 });

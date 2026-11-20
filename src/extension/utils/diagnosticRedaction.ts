@@ -1,8 +1,13 @@
+import { isSignedUrlParameterName } from "../../shared/connectionUriSecurity";
+
 const REDACTED = "[REDACTED]";
 const SECRET_KEY =
   /^(?:password|passwd|pwd|passphrase|tlsCertificateKeyFilePassword|privateKey|keyPassphrase|tlsKeyPassphrase|sshPassword|sshPrivateKey|sshPassphrase|ssl[_-]?key|ssl[_-]?password|(?:x[_-]?)?api[_-]?key|access[_-]?token|auth[_-]?token|refresh[_-]?token|authorization|cookie|token|secret|client[_-]?secret|(?:aws)?AccessKeyId|(?:aws)?SecretAccessKey|(?:aws)?SessionToken|proxyPassword)$/i;
 const URI_SECRET_KEY =
   /^(?:auth|key|sig|proxyUsername|username|user|authMechanismProperties|aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key|session[_-]?token))$/i;
+// Redact signing metadata by name, but not unrelated occurrences of its values.
+const PUBLIC_SIGNING_METADATA =
+  /^x-(?:amz|goog)-(?:algorithm|date|expires|signedheaders|content-sha256)$/i;
 const URI_KEY = /^(?:connectionUri|uri|endpoint|awsEndpoint)$/i;
 const MAX_DEPTH = 40;
 const MAX_OBJECTS = 1000;
@@ -13,11 +18,21 @@ interface Secrets {
   uris: Map<string, string>;
 }
 
-function isSecretKey(key: string, uri = false): boolean {
+function decodeDiagnosticKey(key: string): string {
   try {
-    key = decodeURIComponent(key.replace(/\+/g, " "));
-  } catch {}
-  return SECRET_KEY.test(key) || (uri && URI_SECRET_KEY.test(key));
+    return decodeURIComponent(key.replace(/\+/g, " "));
+  } catch {
+    return key;
+  }
+}
+
+function isSecretKey(key: string, uri = false): boolean {
+  key = decodeDiagnosticKey(key);
+  return (
+    SECRET_KEY.test(key) ||
+    isSignedUrlParameterName(key) ||
+    (uri && URI_SECRET_KEY.test(key))
+  );
 }
 
 function collectSecrets(
@@ -36,7 +51,9 @@ function collectSecrets(
       return;
     }
     if (isSecretKey(key) && typeof item === "string" && item.length > 0) {
-      secrets.values.add(item);
+      if (!PUBLIC_SIGNING_METADATA.test(decodeDiagnosticKey(key))) {
+        secrets.values.add(item);
+      }
     } else if (URI_KEY.test(key) && typeof item === "string") {
       const safe = redactUri(item);
       if (safe !== item) secrets.uris.set(item, safe);
@@ -57,7 +74,13 @@ function collectSecrets(
         }
       }
       for (const match of item.matchAll(/[?&#;]([^=&#;\s]+)=([^&#;]*)/g)) {
-        if (!isSecretKey(match[1], true) || !match[2]) continue;
+        if (
+          !isSecretKey(match[1], true) ||
+          !match[2] ||
+          PUBLIC_SIGNING_METADATA.test(decodeDiagnosticKey(match[1]))
+        ) {
+          continue;
+        }
         secrets.values.add(match[2]);
         try {
           secrets.values.add(decodeURIComponent(match[2]));
@@ -142,12 +165,8 @@ function redactUriSpans(text: string): string {
         ? text.lastIndexOf(quote, lineEnd - 1)
         : -1;
     const tokenBoundary = text.slice(start, lineEnd).search(/[\s"'<>`]/);
-    let end =
-      closingQuote > start
-        ? closingQuote
-        : tokenBoundary < 0
-          ? lineEnd
-          : start + tokenBoundary;
+    const tokenEnd = tokenBoundary < 0 ? lineEnd : start + tokenBoundary;
+    let end = closingQuote > start ? closingQuote : tokenEnd;
     const quotedPassword =
       /^[a-z][a-z\d+.-]*:\/\/[^\s/?#"'<>`]*:[^\s/?#"'<>`]*["'][^\s/?#<>`]*@/i.exec(
         text.slice(start, lineEnd),
@@ -157,9 +176,25 @@ function redactUriSpans(text: string): string {
       const hostBoundary = text.slice(hostStart, lineEnd).search(/[\s"'<>`]/);
       end = hostBoundary < 0 ? lineEnd : hostStart + hostBoundary;
     }
+    const keys = Array.from(
+      text.slice(start, tokenEnd).matchAll(/[?&#;]([^=&#;\s]+)=/g),
+      (match) => decodeDiagnosticKey(match[1]),
+    );
+    const hasLegacySecretKey = keys.some(
+      (key) => SECRET_KEY.test(key) || URI_SECRET_KEY.test(key),
+    );
+    // Signing values use URL encoding. Don't swallow prose or a second signed
+    // URL on the same line when no legacy query credentials need wider parsing.
     if (
+      !quotedPassword &&
+      !hasLegacySecretKey &&
+      (closingQuote <= start || text[tokenEnd] === quote) &&
+      keys.some(isSignedUrlParameterName)
+    ) {
+      end = tokenEnd;
+    } else if (
       closingQuote <= start &&
-      /[?&#;]([^=&#;\s]+)=/.test(text.slice(start, end))
+      (hasLegacySecretKey || quotedPassword)
     ) {
       for (const parameter of text
         .slice(start, end)

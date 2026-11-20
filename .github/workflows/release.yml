@@ -13,7 +13,7 @@ on:
           - major
           - custom
       custom_version:
-        description: "Custom version (only used if bump type is 'custom')"
+        description: "Stable X.Y.Z version, without suffixes (only for 'custom')"
         required: false
         type: string
 
@@ -58,16 +58,22 @@ jobs:
           BUMP: ${{ inputs.version_bump }}
           CUSTOM_VERSION: ${{ inputs.custom_version }}
         run: |
+          is_stable_version() {
+            node -e '
+              const parts = process.argv[1].split(".");
+              const valid = parts.length === 3 && parts.every(part =>
+                /^(0|[1-9][0-9]*)$/.test(part) && Number.isSafeInteger(Number(part))
+              );
+              process.exitCode = valid ? 0 : 1;
+            ' -- "$1"
+          }
+
           CURRENT=$(node -p "require('./package.json').version")
 
           if [ "$BUMP" = "custom" ]; then
             NEW_VERSION="$CUSTOM_VERSION"
             if [ -z "$NEW_VERSION" ]; then
               echo "::error::Custom version is required when bump type is 'custom'"
-              exit 1
-            fi
-            if ! [[ "$NEW_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
-              echo "::error::Invalid semver: $NEW_VERSION"
               exit 1
             fi
           else
@@ -77,6 +83,10 @@ jobs:
             fi
             WITHOUT_BUILD="${CURRENT%%+*}"
             BASE_VERSION="${WITHOUT_BUILD%%-*}"
+            if ! is_stable_version "$BASE_VERSION"; then
+              echo "::error::Invalid current version: $CURRENT"
+              exit 1
+            fi
             IFS='.' read -r MAJOR MINOR PATCH <<< "$BASE_VERSION"
             MAJOR=$((10#$MAJOR))
             MINOR=$((10#$MINOR))
@@ -97,6 +107,12 @@ jobs:
                 NEW_VERSION="$MAJOR.0.0" ;;
               *) echo "::error::Invalid version bump type"; exit 1 ;;
             esac
+          fi
+
+          # vsce package accepts SemVer prereleases, but Marketplace publish rejects them.
+          if ! is_stable_version "$NEW_VERSION"; then
+            echo "::error::VS Code Marketplace requires a stable X.Y.Z version without leading zeros, prerelease suffixes, or build metadata."
+            exit 1
           fi
 
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
@@ -149,14 +165,21 @@ jobs:
       - name: Package VSIX
         run: |
           NEW_VERSION="${{ steps.version.outputs.new }}"
-          npx @vscode/vsce package --allow-missing-repository
           VSIX_FILE="rapidb-${NEW_VERSION}.vsix"
-          if [ -f "$VSIX_FILE" ]; then
-            echo "VSIX created: $VSIX_FILE"
-          else
-            VSIX_FILE=$(ls *.vsix | head -1)
-            echo "VSIX created: $VSIX_FILE"
+          VSIX_DIR=$(mktemp -d "$RUNNER_TEMP/rapidb-vsix.XXXXXX")
+          VSIX_PATH="$VSIX_DIR/$VSIX_FILE"
+          npx @vscode/vsce package --allow-missing-repository --out "$VSIX_PATH"
+          if [ ! -f "$VSIX_PATH" ] || [ -L "$VSIX_PATH" ] || [ ! -s "$VSIX_PATH" ]; then
+            echo "::error::Packaging did not produce the expected non-empty VSIX: $VSIX_PATH"
+            exit 1
           fi
+          # Keep the basename for consumers that download the artifact in a separate job.
+          if [ -d "$VSIX_FILE" ]; then
+            echo "::error::Cannot place VSIX at $VSIX_FILE: the destination is a directory"
+            exit 1
+          fi
+          mv -f -- "$VSIX_PATH" "$VSIX_FILE"
+          echo "VSIX created: $VSIX_FILE"
           echo "vsix=$VSIX_FILE" >> "$GITHUB_OUTPUT"
         id: package
 

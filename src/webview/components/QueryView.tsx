@@ -2,6 +2,7 @@ import type React from "react";
 import type {
   QueryEditorLanguage,
   QueryEditorPresentation,
+  QueryTargetBinding,
 } from "../../shared/webviewContracts";
 import { QueryEditorPanels } from "./query/QueryEditorPanels";
 import { QueryToolbar } from "./query/QueryToolbar";
@@ -11,6 +12,8 @@ import { useQueryViewController } from "./query/useQueryViewController";
 interface Props {
   panelId?: string;
   connectionId: string;
+  postgresDatabase?: string;
+  targetBinding?: QueryTargetBinding;
   initialQueryText: string;
   formatOnOpen?: boolean;
   connectionType?: string;
@@ -22,8 +25,10 @@ interface Props {
 export function QueryView({
   panelId = "query",
   connectionId,
+  postgresDatabase,
+  targetBinding,
   initialQueryText,
-  formatOnOpen = false,
+  formatOnOpen,
   connectionType: _connectionType = "",
   isBookmarked: initialIsBookmarked = false,
   editorLanguage,
@@ -32,6 +37,8 @@ export function QueryView({
   const view = useQueryViewController({
     panelId,
     connectionId,
+    postgresDatabase,
+    initialTargetBinding: targetBinding,
     editorLanguage,
     editorPresentation,
     formatOnOpen,
@@ -46,6 +53,9 @@ export function QueryView({
         bookmarking={view.bookmarking}
         canFormat={view.editorState.canFormat}
         connectionId={connectionId}
+        postgresDatabase={postgresDatabase}
+        pinnedTargetUnavailable={view.pinnedTargetUnavailable}
+        targetReviewRequired={view.targetReviewRequired || view.targetChecking}
         connections={view.connections}
         formatButtonTitle={view.editorState.formatButtonTitle}
         schemaError={view.schemaError}
@@ -59,6 +69,27 @@ export function QueryView({
         onFormat={view.formatQuery}
         onRun={view.executeQuery}
       />
+
+      {view.targetReviewRequired && !view.targetChecking && (
+        <div role="alert" style={{ padding: "6px 12px", flexShrink: 0 }}>
+          {view.currentTargetAvailable
+            ? "This draft's target changed or could not be verified. Review the connection settings and confirm the target before running."
+            : postgresDatabase !== undefined
+              ? "The pinned target is unavailable. Your draft is preserved."
+              : "The previous target is unavailable. Select a connection to use this draft."}
+          {view.currentTargetAvailable && (
+            <button
+              type="button"
+              style={{ marginLeft: 8 }}
+              onClick={() =>
+                view.handleConnectionChange(view.activeConnectionId)
+              }
+            >
+              Use current target
+            </button>
+          )}
+        </div>
+      )}
 
       {view.bookmarkError && (
         <div

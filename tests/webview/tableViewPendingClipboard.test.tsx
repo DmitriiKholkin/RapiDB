@@ -114,6 +114,38 @@ function setup() {
 }
 
 describe("TableView pending edits and clipboard", () => {
+  it("reports a blocked paste into a persisted row while refreshing", () => {
+    const grid = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Revert All" }));
+    grid.select(1, 2);
+    fireEvent.paste(document.activeElement as HTMLElement);
+    const request = messages("readClipboard").at(-1);
+    expect(request).toBeDefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(messages("fetchPage")).toHaveLength(2);
+    act(() =>
+      dispatchIncomingMessage("clipboardText", {
+        ...(request?.payload as object),
+        text: "not staged",
+      }),
+    );
+    expect(
+      screen.getByText(/Wait for the table to finish loading/),
+    ).toBeTruthy();
+    expect(grid.cell(1, 2).textContent).toContain("Bob");
+
+    fireEvent.click(screen.getByTitle("Dismiss"));
+    grid.select(1, 2);
+    clearPostedMessages();
+    expect(fireEvent.paste(document.activeElement as HTMLElement)).toBe(false);
+    expect(
+      screen.getByText(/Wait for the table to finish loading/),
+    ).toBeTruthy();
+    expect(messages("readClipboard")).toHaveLength(0);
+    expect(grid.cell(1, 2).textContent).toContain("Bob");
+  });
+
   it("blocks sorting with pending edits and copies the unchanged visible row", () => {
     const grid = setup();
     clearPostedMessages();

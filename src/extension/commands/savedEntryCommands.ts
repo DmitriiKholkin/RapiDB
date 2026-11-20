@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
+import { isPostgresQueryDatabase } from "../../shared/postgresQueryDatabase";
 import type {
   BookmarkEntry,
   ConnectionManager,
@@ -13,20 +14,39 @@ export interface SavedEntryCommandContext {
   readonly connectionManager: ConnectionManager;
 }
 
-function showSavedQuery(
+async function showSavedQuery(
   context: vscode.ExtensionContext,
   connectionManager: ConnectionManager,
-  entry: Pick<HistoryEntry, "connectionId" | "sql">,
+  entry: Pick<HistoryEntry, "connectionId" | "sql" | "postgresDatabase">,
   options?: {
     forceNew?: boolean;
     formatOnOpen?: boolean;
     isBookmarked?: boolean;
   },
-): void {
+): Promise<void> {
   if (!entry.connectionId || !entry.sql) {
     return;
   }
+  if (
+    entry.postgresDatabase !== undefined &&
+    !isPostgresQueryDatabase(entry.postgresDatabase)
+  ) {
+    vscode.window.showErrorMessage(
+      "[RapiDB] Cannot open this saved query: its PostgreSQL database is invalid.",
+    );
+    return;
+  }
 
+  const initializing =
+    connectionManager.initializeConnectionCredentialRevision?.(
+      entry.connectionId,
+    );
+  if (initializing && !(await initializing)) {
+    vscode.window.showErrorMessage(
+      "[RapiDB] Could not verify the connection's saved credentials. Unlock Secret Storage and retry.",
+    );
+    return;
+  }
   QueryPanel.createOrShow(
     context,
     connectionManager,
@@ -35,6 +55,8 @@ function showSavedQuery(
     options?.forceNew,
     options?.formatOnOpen,
     options?.isBookmarked,
+    undefined,
+    entry.postgresDatabase,
   );
 }
 
@@ -63,17 +85,17 @@ export function registerSavedEntryCommands(
 ): void {
   const { context, connectionManager } = ctx;
 
-  registerCommand(CMD.openHistoryEntry, (entry: HistoryEntry) => {
-    showSavedQuery(context, connectionManager, entry);
-  });
+  registerCommand(CMD.openHistoryEntry, (entry: HistoryEntry) =>
+    showSavedQuery(context, connectionManager, entry),
+  );
 
-  registerCommand(CMD.openBookmarkEntry, (entry: BookmarkEntry) => {
+  registerCommand(CMD.openBookmarkEntry, (entry: BookmarkEntry) =>
     showSavedQuery(context, connectionManager, entry, {
       forceNew: true,
       formatOnOpen: false,
       isBookmarked: true,
-    });
-  });
+    }),
+  );
 
   registerCommand(
     CMD.deleteBookmark,

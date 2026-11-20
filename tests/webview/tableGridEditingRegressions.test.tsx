@@ -8,10 +8,7 @@ import {
 import userEvent from "@testing-library/user-event";
 import { createRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import {
-  type ColumnTypeMeta,
-  NULL_SENTINEL,
-} from "../../src/shared/tableTypes";
+import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import type { ClipboardReadPayload } from "../../src/shared/webviewContracts";
 import { EditInput } from "../../src/webview/components/table/EditInput";
 import { QueryResultsGrid } from "../../src/webview/components/table/grid/QueryResultsGrid";
@@ -330,7 +327,7 @@ describe("EditInput multiline text", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="text"
         onCommit={onCommit}
@@ -366,7 +363,7 @@ describe("EditInput multiline text", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="integer"
         onCommit={onCommit}
@@ -379,7 +376,7 @@ describe("EditInput multiline text", () => {
   });
 
   it.each([
-    ["NULL", NULL_SENTINEL, false],
+    ["NULL", null, false],
     ["missing", "", true],
   ])("preserves pasted line breaks into an initially %s text cell", async (_label, initial, initialMissing) => {
     const user = userEvent.setup();
@@ -407,7 +404,7 @@ describe("EditInput multiline text", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="lob"
         onCommit={onCommit}
@@ -433,7 +430,7 @@ describe("EditInput multiline text", () => {
     const onCommit = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="text"
         onCommit={onCommit}
@@ -459,7 +456,7 @@ describe("EditInput multiline text", () => {
     const onCancel = vi.fn();
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="text"
         onCommit={onCommit}
@@ -478,7 +475,7 @@ describe("EditInput multiline text", () => {
     const onCommitNull = vi.fn();
     const { unmount } = render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="text"
         onCommit={onCommitNull}
@@ -486,7 +483,7 @@ describe("EditInput multiline text", () => {
       />,
     );
     fireEvent.blur(cellValueEditor());
-    expect(onCommitNull).toHaveBeenCalledExactlyOnceWith(NULL_SENTINEL);
+    expect(onCommitNull).toHaveBeenCalledExactlyOnceWith(null);
     unmount();
 
     const onCommitDefault = vi.fn();
@@ -522,7 +519,7 @@ describe("EditInput multiline text", () => {
   });
 
   it.each([
-    ["NULL", NULL_SENTINEL, false],
+    ["NULL", null, false],
     ["missing", "", true],
   ])("preserves pasted line breaks into an initially %s opaque-type cell", async (_label, initial, initialMissing) => {
     const user = userEvent.setup();
@@ -568,7 +565,7 @@ describe("EditInput multiline text", () => {
   it("keeps a single-line input for non-text categories", () => {
     render(
       <EditInput
-        initial={NULL_SENTINEL}
+        initial={null}
         nullable
         category="integer"
         onCommit={vi.fn()}

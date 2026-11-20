@@ -2,7 +2,6 @@ import { act, renderHook } from "@testing-library/react";
 import type React from "react";
 import { describe, expect, it } from "vitest";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
-import { NULL_SENTINEL } from "../../src/shared/tableTypes";
 import { useCellSelection } from "../../src/webview/components/table/useCellSelection";
 import {
   formatNormalizedPasteValue,
@@ -73,6 +72,39 @@ describe("decimal comma detection ignores whitespace before the comma", () => {
       expect(result.valid).toBe(false);
       expect(result.error).toContain("Ambiguous");
     }
+  });
+});
+
+describe("whitespace in numeric clipboard cells", () => {
+  it("reports bad grouping and leaves quoted tabs or newlines out of the numeric edits", () => {
+    const pasteData = parseTsv('1 2\t"1\t2\n3"\t"1e+ 2"');
+    expect(pasteData.rows).toEqual([["1 2", "1\t2\n3", "1e+ 2"]]);
+    const result = validatePasteData(
+      pasteData,
+      0,
+      0,
+      [SQL_INTEGER, FLOAT, DECIMAL],
+      1,
+      () => true,
+    );
+    expect(result.rows).toEqual([[]]);
+    expect(result.errors.map(({ value }) => value)).toEqual([
+      "1 2",
+      "1\t2\n3",
+      "1e+ 2",
+    ]);
+  });
+
+  it.each([
+    " ",
+    "\u00a0",
+    "\u202f",
+  ])("preserves exact digits with %j thousands grouping", (separator) => {
+    const value = ["9", "007", "199", "254", "740", "993"].join(separator);
+    expect(validatePasteValue(value, SQL_INTEGER)).toEqual({
+      valid: true,
+      coercedValue: "9007199254740993",
+    });
   });
 });
 
@@ -165,9 +197,7 @@ describe("blank cells pasted into numeric columns", () => {
   ])("treats an unquoted empty value as NULL for nullable $category", (column) => {
     const result = validatePasteValue("", column, false);
     expect(result).toEqual({ valid: true, coercedValue: null });
-    expect(formatNormalizedPasteValue("", result.coercedValue)).toBe(
-      NULL_SENTINEL,
-    );
+    expect(formatNormalizedPasteValue("", result.coercedValue)).toBeNull();
   });
 
   it("pastes a single blank Excel cell as NULL", () => {
@@ -183,9 +213,7 @@ describe("blank cells pasted into numeric columns", () => {
     );
     expect(result.errors).toEqual([]);
     const [cell] = result.rows[0];
-    expect(formatNormalizedPasteValue(cell.value, cell.normalized)).toBe(
-      NULL_SENTINEL,
-    );
+    expect(formatNormalizedPasteValue(cell.value, cell.normalized)).toBeNull();
   });
 
   it("still rejects a quoted empty value", () => {

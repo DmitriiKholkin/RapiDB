@@ -27,7 +27,6 @@ import {
   type FilterDraft,
   type FilterDraftMap,
   isNumericCategory,
-  NULL_SENTINEL,
 } from "../../../shared/tableTypes";
 import type { ClipboardTextPayload } from "../../../shared/webviewContracts";
 import type { QueryResult, QueryStatus } from "../../store";
@@ -42,6 +41,8 @@ import { isEditableElement } from "../../utils/editableElement";
 import { onMessage, postMessage } from "../../utils/messaging";
 import {
   formatNormalizedPasteValue,
+  PASTE_LOADING_MESSAGE,
+  type PasteError,
   type PasteValidationError,
   parseTsv,
   validatePasteData,
@@ -50,7 +51,7 @@ import {
 import { Icon } from "../Icon";
 import { CellDisplay } from "./CellDisplay";
 import { ColumnFilterControl } from "./ColumnFilterControl";
-import { EditInput, valueToEditString } from "./EditInput";
+import { EditInput, toEditValue } from "./EditInput";
 import { GridContextMenu } from "./GridContextMenu";
 import { QueryModeTableGrid } from "./grid/QueryModeTableGrid";
 import {
@@ -311,12 +312,32 @@ function renderBodyCell(cell: TanStackCell<Row, unknown>): React.ReactNode {
     : flexRender(renderer, cell.getContext());
 }
 
-function toDraftEditInitialValue(value: unknown): string {
+function toDraftEditInitialValue(value: unknown): string | null {
   if (value === INSERT_DEFAULT_SENTINEL) {
     return "";
   }
 
-  return valueToEditString(value);
+  return toEditValue(value);
+}
+
+function resolveRedisValueEditColumn(
+  column: ColumnMeta,
+  storageType: unknown,
+): ColumnMeta {
+  if (!column.redisValue) return column;
+  switch (storageType) {
+    case "string":
+      return { ...column, nativeType: storageType, category: "text" };
+    case "hash":
+      return { ...column, nativeType: storageType, category: "json" };
+    case "list":
+    case "set":
+    case "zset":
+    case "stream":
+      return { ...column, nativeType: storageType, category: "array" };
+    default:
+      return { ...column, category: "other" };
+  }
 }
 
 export interface TableGridLayout {
@@ -329,6 +350,9 @@ export interface TableGridLayout {
 interface TableGridProps {
   getRowMutationBlockReason?: (rowIdx: number) => string | null;
   canEditRows: boolean;
+  // Base permission for paste intent, before temporary busy-state restrictions.
+  canPasteIntoPersistedRows?: boolean;
+  getPasteBlockReason?: () => string | null;
   canSelectAndDeleteRows: boolean;
   rowSelectionDisabled?: boolean;
   colSizes: Record<string, number>;
@@ -345,30 +369,34 @@ interface TableGridProps {
     edits: Array<{
       rowIdx: number;
       column: ColumnMeta;
-      newVal: string;
+      newVal: string | null;
       originalVal: unknown;
     }>,
-  ) => PasteValidationError[] | undefined;
+  ) => PasteError[] | undefined;
   onCommitCellEdit: (
     rowIdx: number,
     column: ColumnMeta,
-    newVal: string,
+    newVal: string | null,
     originalVal: unknown,
   ) => void;
   onCommitDraftCellEdit: (
     rowIdx: number,
     column: ColumnMeta,
-    value: string,
+    value: string | null,
   ) => void;
   onMixedBatchEdit: (
-    draftEdits: Array<{ rowIdx: number; column: ColumnMeta; newVal: string }>,
+    draftEdits: Array<{
+      rowIdx: number;
+      column: ColumnMeta;
+      newVal: string | null;
+    }>,
     persistedEdits: Array<{
       rowIdx: number;
       column: ColumnMeta;
-      newVal: string;
+      newVal: string | null;
       originalVal: unknown;
     }>,
-  ) => PasteValidationError[] | undefined;
+  ) => PasteError[] | undefined;
   onFilterDraftChange: (
     columnName: string,
     nextDraft: FilterDraft | undefined,
@@ -376,6 +404,7 @@ interface TableGridProps {
   ) => void;
   onSelectionChange: (selection: Set<number>) => void;
   onSort: (column: string) => void;
+  nonSortableColumnNames?: ReadonlySet<string>;
   getRowCellColumn?: (rowIdx: number, column: ColumnMeta) => ColumnMeta;
   onOpenStructuredCell: (options: {
     rowKind: "persisted" | "draft";
@@ -422,6 +451,8 @@ function TableDataGrid({
   getRowCellColumn,
   getRowMutationBlockReason,
   canEditRows,
+  canPasteIntoPersistedRows = canEditRows,
+  getPasteBlockReason,
   canSelectAndDeleteRows,
   rowSelectionDisabled = false,
   colSizes: defaultColSizes,
@@ -441,6 +472,7 @@ function TableDataGrid({
   onFilterDraftChange,
   onSelectionChange,
   onSort,
+  nonSortableColumnNames,
   onOpenStructuredCell,
   onStartDraftEdit,
   onStartEdit,
@@ -547,7 +579,7 @@ function TableDataGrid({
   }, [columnOrder, columnSizing, colSizes, hiddenColumnIdsRef]);
 
   const containerRef = React.useRef<HTMLDivElement>(null);
-  const [pasteErrors, setPasteErrors] = useState<PasteValidationError[]>([]);
+  const [pasteErrors, setPasteErrors] = useState<PasteError[]>([]);
   const [copyBlocked, setCopyBlocked] = useState(false);
   const newRowsRef = useRef(newRows);
   const scrollToCellRef = useRef<(row: number, col: number) => void>(() => {});
@@ -576,7 +608,6 @@ function TableDataGrid({
           ? draft[colId]?.value
           : undefined;
         if (dv === INSERT_DEFAULT_SENTINEL) return undefined;
-        if (dv === NULL_SENTINEL) return null;
         return dv;
       }
       const row = rows[rowIndex];
@@ -616,19 +647,37 @@ function TableDataGrid({
   const handleAbsentCopy = useCallback(() => setCopyBlocked(true), []);
 
   const clipboardRecipientRef = useRef(`table-grid:${crypto.randomUUID()}`);
-  const clipboardRequestRef = useRef<string | null>(null);
-  const clipboardEpochRef = useRef(fetchEpochRef.current);
-  const pendingPasteRangeRef = useRef<CellRange | null>(null);
-  const pendingPasteContextRef = useRef<{ row: number; col: number } | null>(
-    null,
-  );
-  const clipboardStructureEpochRef = useRef(pasteStructureEpochRef?.current);
+  const pendingPasteRef = useRef<
+    | {
+        requestId: string;
+        range: CellRange;
+        context: { row: number; col: number } | null;
+        fetchEpoch: number;
+        structureEpoch: number | undefined;
+      }
+    | { requestId: string; blockedReason: string }
+    | null
+  >(null);
   const committedStructureEpochRef = useRef(pasteStructureEpochRef?.current);
   const layoutUpdatePendingRef = useRef(false);
   const selectionRangeRef = useRef<CellRange | null>(null);
   const pasteContextRef = useRef<{
     current: { row: number; col: number } | null;
   } | null>(null);
+
+  const getBusyPasteMessage = useCallback(
+    () =>
+      loadingRef.current
+        ? PASTE_LOADING_MESSAGE
+        : (getPasteBlockReason?.() ?? null),
+    [loadingRef, getPasteBlockReason],
+  );
+  const canHandlePersistedPaste = useCallback(
+    () =>
+      canPasteIntoPersistedRows &&
+      (canEditRows || Boolean(getBusyPasteMessage())),
+    [canPasteIntoPersistedRows, canEditRows, getBusyPasteMessage],
+  );
 
   const pasteLayout = JSON.stringify(
     columnOrder.map((id) => [
@@ -642,9 +691,14 @@ function TableDataGrid({
   });
   // biome-ignore lint/correctness/useExhaustiveDependencies: these values invalidate an outstanding request, not a derived render value.
   useLayoutEffect(() => {
-    clipboardRequestRef.current = null;
-    pendingPasteRangeRef.current = null;
-    pendingPasteContextRef.current = null;
+    const request = pendingPasteRef.current;
+    if (request && "range" in request) {
+      const blockedReason = getBusyPasteMessage();
+      // Retain only the ID for feedback; a canceled request has no paste target.
+      pendingPasteRef.current = blockedReason
+        ? { requestId: request.requestId, blockedReason }
+        : null;
+    }
     setCopyBlocked(false);
   }, [
     pasteLayout,
@@ -657,47 +711,56 @@ function TableDataGrid({
     canSelectAndDeleteRows,
     loading,
     fetchEpochRef,
+    getBusyPasteMessage,
   ]);
 
   const handlePaste = useCallback(
     (fromContextMenu = false) => {
       if (
-        loadingRef.current ||
         layoutUpdatePendingRef.current ||
         committedStructureEpochRef.current !== pasteStructureEpochRef?.current
       )
         return;
-      const range = selectionRangeRef.current;
       const contextCell = fromContextMenu
         ? pasteContextRef.current?.current
         : null;
-      if (!range && !contextCell) return;
-      const targetRow =
-        contextCell?.row ??
-        (range ? Math.min(range.anchorRow, range.activeRow) : undefined);
-      if (targetRow === undefined || (!canEditRows && targetRow >= 0)) return;
-      if (targetRow < -newRowsRef.current.length) return;
-      const requestId = crypto.randomUUID();
-      clipboardRequestRef.current = requestId;
-      clipboardEpochRef.current = fetchEpochRef.current;
-      clipboardStructureEpochRef.current = pasteStructureEpochRef?.current;
-      pendingPasteContextRef.current = contextCell ?? null;
-      pendingPasteRangeRef.current = contextCell
+      const range = contextCell
         ? {
             anchorRow: contextCell.row,
             anchorCol: contextCell.col,
             activeRow: contextCell.row,
             activeCol: contextCell.col,
           }
-        : range
-          ? { ...range }
-          : null;
+        : selectionRangeRef.current;
+      if (!range) return;
+      const targetRow = Math.min(range.anchorRow, range.activeRow);
+      if (targetRow >= 0 && !canHandlePersistedPaste()) return;
+      if (targetRow < -newRowsRef.current.length) return;
+      const reason = getBusyPasteMessage();
+      if (reason) {
+        pendingPasteRef.current = null;
+        setPasteErrors([{ kind: "blocked", message: reason }]);
+        return;
+      }
+      const requestId = crypto.randomUUID();
+      pendingPasteRef.current = {
+        requestId,
+        range: { ...range },
+        context: contextCell ?? null,
+        fetchEpoch: fetchEpochRef.current,
+        structureEpoch: pasteStructureEpochRef?.current,
+      };
       postMessage("readClipboard", {
         requestId,
         recipient: clipboardRecipientRef.current,
       });
     },
-    [loadingRef, fetchEpochRef, pasteStructureEpochRef, canEditRows],
+    [
+      canHandlePersistedPaste,
+      getBusyPasteMessage,
+      fetchEpochRef,
+      pasteStructureEpochRef,
+    ],
   );
 
   const isColumnCollapsed = useCallback(
@@ -755,8 +818,13 @@ function TableDataGrid({
       const schemaColumn = columnsMap.get(columnId);
       const isDraft = row < 0;
       const rowIdx = isDraft ? row + newRows.length : row;
-      const column =
-        schemaColumn && !isDraft
+      const column = schemaColumn?.redisValue
+        ? resolveRedisValueEditColumn(
+            schemaColumn,
+            // New Redis rows are always written with SET.
+            isDraft ? "string" : rows[rowIdx]?.type,
+          )
+        : schemaColumn && !isDraft
           ? (getRowCellColumn?.(rowIdx, schemaColumn) ?? schemaColumn)
           : schemaColumn;
       const rowKind = isDraft ? "draft" : "persisted";
@@ -772,21 +840,23 @@ function TableDataGrid({
       if (isDraft ? !newRows[rowIdx] : !rows[rowIdx]) return;
 
       const originalValue = isDraft
-        ? ((Object.hasOwn(newRows[rowIdx], columnId)
-            ? newRows[rowIdx][columnId]?.value
-            : undefined) ?? INSERT_DEFAULT_SENTINEL)
+        ? Object.hasOwn(newRows[rowIdx], columnId)
+          ? newRows[rowIdx][columnId]?.value
+          : INSERT_DEFAULT_SENTINEL
         : rows[rowIdx][columnId];
       const pendingRow = pendingEdits.get(rowIdx);
       const currentValue = isDraft
-        ? originalValue === NULL_SENTINEL
-          ? null
-          : originalValue
+        ? originalValue
         : pendingRow?.has(columnId)
           ? pendingRow.get(columnId)
           : originalValue;
       const structuredValue = getStructuredCellDialogValue(
-        isDraft && currentValue === INSERT_DEFAULT_SENTINEL
-          ? null
+        isDraft &&
+          (currentValue === INSERT_DEFAULT_SENTINEL ||
+            currentValue === undefined)
+          ? column.redisValue
+            ? undefined
+            : null
           : currentValue,
         column,
       );
@@ -856,7 +926,7 @@ function TableDataGrid({
             scrollRef.current?.contains(target)
           )) ||
           document.activeElement !== scrollRef.current ||
-          (!canEditRows &&
+          (!canHandlePersistedPaste() &&
             (selection.range
               ? Math.min(selection.range.anchorRow, selection.range.activeRow)
               : 0) >= 0))
@@ -868,7 +938,7 @@ function TableDataGrid({
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
   }, [
-    canEditRows,
+    canHandlePersistedPaste,
     openCell,
     scrollRef,
     selection.handleKeyDown,
@@ -891,7 +961,7 @@ function TableDataGrid({
       const range = selectionRangeRef.current;
       if (!range) return;
       const topRow = Math.min(range.anchorRow, range.activeRow);
-      if (!canEditRows && topRow >= 0) return;
+      if (topRow >= 0 && !canHandlePersistedPaste()) return;
       if (topRow < -newRowsRef.current.length) return;
       event.preventDefault();
       event.stopPropagation();
@@ -899,7 +969,7 @@ function TableDataGrid({
     };
     window.addEventListener("paste", handlePasteEvent, true);
     return () => window.removeEventListener("paste", handlePasteEvent, true);
-  }, [canEditRows, handlePaste, scrollRef]);
+  }, [canHandlePersistedPaste, handlePaste, scrollRef]);
 
   const handleCopy = useCallback(() => {
     const text = selection.copySelection();
@@ -914,24 +984,30 @@ function TableDataGrid({
       recipient,
       text,
     }: ClipboardTextPayload) => {
+      const request = pendingPasteRef.current;
       if (
         recipient !== clipboardRecipientRef.current ||
-        requestId !== clipboardRequestRef.current
+        !request ||
+        request.requestId !== requestId
       )
         return;
-      clipboardRequestRef.current = null;
-      const requestedRange = pendingPasteRangeRef.current;
-      const requestedContext = pendingPasteContextRef.current;
-      pendingPasteRangeRef.current = null;
-      pendingPasteContextRef.current = null;
+      pendingPasteRef.current = null;
+      if (!text.length) return;
+      if ("blockedReason" in request) {
+        setPasteErrors([{ kind: "blocked", message: request.blockedReason }]);
+        return;
+      }
+      if (loadingRef.current) {
+        setPasteErrors([{ kind: "blocked", message: PASTE_LOADING_MESSAGE }]);
+        return;
+      }
       if (
-        loadingRef.current ||
-        clipboardEpochRef.current !== fetchEpochRef.current ||
-        clipboardStructureEpochRef.current !== pasteStructureEpochRef?.current
+        request.fetchEpoch !== fetchEpochRef.current ||
+        request.structureEpoch !== pasteStructureEpochRef?.current
       ) {
         return;
       }
-      if (!requestedRange) return;
+      const { range: requestedRange, context: requestedContext } = request;
 
       const pasteData = parseTsv(text);
       if (pasteData.rows.length === 0) return;
@@ -1110,7 +1186,7 @@ function TableDataGrid({
       const edits: Array<{
         rowIdx: number;
         column: ColumnMeta;
-        newVal: string;
+        newVal: string | null;
         originalVal: unknown;
       }> = [];
 
@@ -1240,7 +1316,7 @@ function TableDataGrid({
     useColumnDragReorder({
       getColumnOrder: () => columnOrderRef.current,
       setColumnOrder: (updater) => {
-        clipboardRequestRef.current = null;
+        pendingPasteRef.current = null;
         layoutUpdatePendingRef.current = true;
         setColumnOrder(updater);
       },
@@ -1385,13 +1461,16 @@ function TableDataGrid({
 
             if (isEditing) {
               const startValue = hasPending ? pendingValue : originalValue;
-              const startString = valueToEditString(startValue);
+              const editColumn = resolveRedisValueEditColumn(
+                column,
+                row.original.type,
+              );
               return (
                 <EditInput
-                  initial={startString}
+                  initial={toEditValue(startValue)}
                   initialMissing={startValue === undefined}
                   nullable={column.nullable}
-                  category={column.category}
+                  category={editColumn.category}
                   readOnly={
                     !canEditRows ||
                     !canEditColumn(column) ||
@@ -1533,6 +1612,9 @@ function TableDataGrid({
                   const isSelectionColumn =
                     header.column.id === selectionColumnId;
                   const columnId = header.column.id;
+                  const canSort =
+                    !isSelectionColumn &&
+                    !nonSortableColumnNames?.has(columnId);
                   const headerSize = header.getSize();
                   const isCollapsed = isCollapsedWidth(headerSize);
                   const displayHeaderSize = getDisplaySize(headerSize);
@@ -1587,7 +1669,7 @@ function TableDataGrid({
                         if (!isSelectionColumn) {
                           const wasDragged = wasDraggedRef.current;
                           wasDraggedRef.current = false;
-                          if (!wasDragged) {
+                          if (!wasDragged && canSort) {
                             onSort(columnId);
                           }
                         }
@@ -1610,7 +1692,7 @@ function TableDataGrid({
                             header.getContext(),
                           )}
                         </span>
-                        {!isSelectionColumn && (
+                        {canSort && (
                           <span
                             style={{
                               opacity: isSorted ? 1 : 0.25,
@@ -1655,7 +1737,7 @@ function TableDataGrid({
                                 isCollapsedWidth(oldWidth) !==
                                 isCollapsedWidth(nextWidth)
                               ) {
-                                clipboardRequestRef.current = null;
+                                pendingPasteRef.current = null;
                                 layoutUpdatePendingRef.current = true;
                               }
                               setColumnSizing((previous) => ({
@@ -1885,6 +1967,7 @@ function TableDataGrid({
 
       {pasteErrors.length > 0 && (
         <div
+          role="alert"
           style={{
             position: "absolute",
             bottom: 0,
@@ -1914,17 +1997,23 @@ function TableDataGrid({
               {pasteErrors.length > 1 ? "s" : ""}
             </div>
             <div style={{ opacity: 0.9, maxHeight: 60, overflow: "auto" }}>
-              {pasteErrors.slice(0, 3).map((error) => (
-                <div
-                  key={`${error.rowIndex}-${error.columnIndex}-${error.columnName}`}
-                  style={{ marginBottom: 2 }}
-                >
-                  {error.columnName
-                    ? `Row ${error.rowIndex + 1}, ${error.columnName}: `
-                    : `Row ${error.rowIndex + 1}: `}
-                  {error.message}
-                </div>
-              ))}
+              {pasteErrors.slice(0, 3).map((error) =>
+                "kind" in error ? (
+                  <div key="blocked" style={{ marginBottom: 2 }}>
+                    {error.message}
+                  </div>
+                ) : (
+                  <div
+                    key={`${error.rowIndex}-${error.columnIndex}-${error.columnName}`}
+                    style={{ marginBottom: 2 }}
+                  >
+                    {error.columnName
+                      ? `Row ${error.rowIndex + 1}, ${error.columnName}: `
+                      : `Row ${error.rowIndex + 1}: `}
+                    {error.message}
+                  </div>
+                ),
+              )}
               {pasteErrors.length > 3 && (
                 <div style={{ opacity: 0.7, fontStyle: "italic" }}>
                   ...and {pasteErrors.length - 3} more error
@@ -1958,7 +2047,7 @@ function TableDataGrid({
         onClose={handleContextMenuClose}
         onCopy={handleCopy}
         onPaste={() => handlePaste(true)}
-        canPaste={canEditRows || newRows.length > 0}
+        canPaste={canPasteIntoPersistedRows || newRows.length > 0}
       />
     </div>
   );
@@ -2147,7 +2236,7 @@ function DraftTableRow({
   draftRowCount: number;
   editingCol: string | null;
   onOpenCell: (rowIndex: number, columnId: string) => void;
-  onCommit: (rowIdx: number, column: ColumnMeta, value: string) => void;
+  onCommit: (rowIdx: number, column: ColumnMeta, value: string | null) => void;
   onCancelEdit: () => void;
   onEditorDirtyChange?: (dirty: boolean) => void;
   selection?: {
@@ -2206,8 +2295,7 @@ function DraftTableRow({
         const canOpenCellEditor = canOpenColumn(columnDef, "draft");
         const isEditing = editingCol === columnId;
         const isDefault = draftCell.value === INSERT_DEFAULT_SENTINEL;
-        const displayValue =
-          draftCell.value === NULL_SENTINEL ? null : draftCell.value;
+        const displayValue = draftCell.value;
         const columnSize = column.getSize();
         const isCollapsed = isCollapsedWidth(columnSize);
         const displayColumnSize = isCollapsed ? 0 : columnSize;
@@ -2300,7 +2388,9 @@ function DraftTableRow({
                     initial={toDraftEditInitialValue(draftCell.value)}
                     initialMissing={isDefault}
                     nullable={columnDef.nullable}
-                    category={columnDef.category}
+                    category={
+                      resolveRedisValueEditColumn(columnDef, "string").category
+                    }
                     suppressPlaceholder
                     showDefaultButton
                     onSetDefault={() =>

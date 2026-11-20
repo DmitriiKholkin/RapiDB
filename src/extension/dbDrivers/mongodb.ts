@@ -23,9 +23,12 @@ import {
   UUID,
 } from "mongodb";
 import {
+  assertMongoUriOptionNameEncoding,
   buildMongoFieldsUri,
+  decodeMongoUriDatabasePath,
   getMongoConnectionUri,
   normalizeMongoConnectionConfig,
+  parseMongoUriPathAndQuery,
   resolveMongoConnectionMode,
   stripMongoUriTlsOptions,
 } from "../../shared/mongoConnection";
@@ -51,6 +54,13 @@ import {
 } from "./BaseDBDriver";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import { getMetadataSdkOptions } from "./metadataCancellation";
+import {
+  decodeMongoExportCommand,
+  MONGO_EXPORT_BSON_OPTIONS,
+  MONGO_NATIVE_BSON_OPTIONS,
+  mongoExportDbPointerNamespace,
+  readMongoExportCursor,
+} from "./mongodbExportBson";
 import { assertMongoshSupportedSyntax } from "./mongoshSyntax";
 import {
   applyFilters,
@@ -76,6 +86,7 @@ import type {
   DriverMutationResult,
   DriverOperationContext,
   DriverTableExportChunk,
+  DriverTableExportFormat,
   DriverTablePageRequest,
   DriverTablePageResult,
   DriverUpdateRowOutcome,
@@ -95,8 +106,8 @@ import type {
   TypeCategory,
 } from "./types";
 import {
+  colKey,
   filterOperatorsForCategory,
-  NULL_SENTINEL,
   resolveFilterOperators,
 } from "./types";
 import {
@@ -119,11 +130,7 @@ const MONGODB_ENTITY_MANIFEST: DriverEntityManifest = {
   },
 };
 
-type MongoSchemaType = {
-  category: TypeCategory;
-  nativeType: string;
-  bsonSubtype?: number;
-};
+type MongoSchemaType = MongoValueTypeHint;
 
 type MongoshChainOperation = {
   op: string;
@@ -131,6 +138,35 @@ type MongoshChainOperation = {
 };
 
 type MongoSdkOptions = { signal?: AbortSignal; timeoutMS?: number };
+
+// MongoDB permits collection-scoped discovery only when both flags are set.
+const MONGO_AUTHORIZED_COLLECTION_NAMES = {
+  authorizedCollections: true,
+  nameOnly: true,
+} as const;
+
+function toMongoTableTotalCount(value: unknown): number {
+  // countDocuments is typed as number, but inherits the URI's BSON options.
+  let count = value;
+  if (value instanceof Int32 || value instanceof Double) {
+    count = value.valueOf();
+  } else if (value instanceof Long && !(value instanceof Timestamp)) {
+    count = value.toBigInt();
+  }
+  if (typeof count === "number" && Number.isSafeInteger(count) && count >= 0) {
+    return count;
+  }
+  if (
+    typeof count === "bigint" &&
+    count >= 0n &&
+    count <= BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    return Number(count);
+  }
+  throw new Error(
+    "MongoDB returned a document count that is not a non-negative safe integer. The Table Viewer cannot paginate this result; try a narrower filter or the Query Editor.",
+  );
+}
 
 const MONGO_DB_POINTER_TYPE: MongoSchemaType = {
   category: "other",
@@ -1628,7 +1664,7 @@ function parseMongoDisplayJavascriptWithScope(value: string): Code | null {
   }
 }
 
-function parseMongoDisplayDbPointer(value: string): DBRef | null {
+function parseLegacyMongoDisplayDbRef(value: string): DBRef | null {
   try {
     const parsed = JSON.parse(value) as {
       $ref?: unknown;
@@ -1657,6 +1693,102 @@ function parseMongoDisplayDbPointer(value: string): DBRef | null {
   } catch {
     return null;
   }
+}
+
+function parseMongoTableDbRef(value: string): DBRef | null {
+  let parsed: unknown;
+  try {
+    parsed = parseJsonForWrite(value);
+  } catch (error) {
+    if (error instanceof JsonNumericPrecisionError) throw error;
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const { $ref, $id, $db } = parsed as Record<string, unknown>;
+  if (typeof $ref !== "string") return null;
+  if (
+    $id == null ||
+    (Object.hasOwn(parsed, "$db") && typeof $db !== "string")
+  ) {
+    throw new Error(
+      "A MongoDB DBRef requires a non-null $id and an optional string $db.",
+    );
+  }
+  if (typeof $id === "string" && /^[0-9a-f]{24}$/i.test($id)) {
+    throw new Error(
+      'A bare 24-hex MongoDB DBRef $id is ambiguous in older table drafts. Refresh and re-enter the edit with {"$oid":"..."} for ObjectId or {"$string":"..."} for a string ID.',
+    );
+  }
+  if (Object.hasOwn(parsed, "__proto__")) {
+    throw new Error(
+      "A MongoDB DBRef cannot preserve a __proto__ custom field.",
+    );
+  }
+  if (typeof $id === "object" && Object.hasOwn($id, "$oid")) {
+    const { $oid } = $id as { $oid?: unknown };
+    if (
+      Object.keys($id).length !== 1 ||
+      typeof $oid !== "string" ||
+      !/^[0-9a-f]{24}$/i.test($oid)
+    ) {
+      throw new Error(
+        "MongoDB DBRef $oid requires one 24-hex ObjectId string.",
+      );
+    }
+  }
+  const ref: unknown = BSON.EJSON.parse(value, { relaxed: false });
+  if (!(ref instanceof DBRef)) {
+    throw new Error(
+      "Enter a MongoDB DBRef with $ref, $id, optional $db, and any custom fields as Extended JSON.",
+    );
+  }
+  // The SDK's DBRef types declare ObjectId, but the wire decoder accepts
+  // other BSON IDs. The table-only string marker disambiguates legacy text.
+  if (typeof $id === "object" && Object.hasOwn($id, "$string")) {
+    const { $string } = $id as { $string?: unknown };
+    if (Object.keys($id).length !== 1 || typeof $string !== "string") {
+      throw new Error(
+        "MongoDB DBRef $string requires exactly one string value.",
+      );
+    }
+    ref.oid = $string as unknown as ObjectId;
+  }
+  return ref;
+}
+
+function mongoDbRefDocument(value: DBRef): Record<string, unknown> {
+  return {
+    $ref: value.collection,
+    $id: value.oid,
+    ...(value.db !== undefined ? { $db: value.db } : {}),
+    ...value.fields,
+  };
+}
+
+function formatMongoTableDbRef(value: DBRef): string | null {
+  try {
+    const document = mongoDbRefDocument(value);
+    if (typeof document.$id === "string") {
+      document.$id = { $string: document.$id };
+    }
+    const text = BSON.EJSON.stringify(document, { relaxed: false });
+    const restored = parseMongoTableDbRef(text);
+    // Extended JSON has reserved shapes. Do not make a DBRef editable if
+    // parsing would reinterpret a literal document or lose a BSON value.
+    if (
+      restored &&
+      Buffer.from(BSON.serialize({ value })).equals(
+        BSON.serialize({ value: restored }),
+      )
+    ) {
+      return text;
+    }
+  } catch {
+    // Keep the original display for references the table editor cannot round-trip.
+  }
+  return null;
 }
 
 function parseMongoDisplayDate(value: string): Date | null {
@@ -1857,6 +1989,7 @@ const MONGO_EJSON_RESERVED_DOCUMENT_KEYS = new Set([
 
 function serializeMongoExportValue(
   value: unknown,
+  preserveDbPointer = true,
   ancestors = new Set<object>(),
 ): unknown {
   if (value === undefined) {
@@ -1877,29 +2010,31 @@ function serializeMongoExportValue(
   }
   ancestors.add(value);
   try {
+    const serialize = (entry: unknown) =>
+      serializeMongoExportValue(entry, preserveDbPointer, ancestors);
     if (Array.isArray(value)) {
-      return value.map((entry) => serializeMongoExportValue(entry, ancestors));
+      return value.map(serialize);
     }
     if (value instanceof Code) {
       return {
         $code: value.code,
-        ...(value.scope
-          ? { $scope: serializeMongoExportValue(value.scope, ancestors) }
-          : {}),
+        ...(value.scope ? { $scope: serialize(value.scope) } : {}),
       };
     }
     if (value instanceof DBRef) {
+      if (preserveDbPointer) {
+        const namespace = mongoExportDbPointerNamespace(value);
+        if (namespace !== undefined) {
+          return { $dbPointer: { $ref: namespace, $id: serialize(value.oid) } };
+        }
+      }
       const result: Record<string, unknown> = {
         $ref: value.collection,
-        $id: serializeMongoExportValue(value.oid, ancestors),
+        $id: serialize(value.oid),
         ...(value.db ? { $db: value.db } : {}),
       };
       for (const [name, entry] of Object.entries(value.fields)) {
-        setOwnMongoRecordField(
-          result,
-          name,
-          serializeMongoExportValue(entry, ancestors),
-        );
+        setOwnMongoRecordField(result, name, serialize(entry));
       }
       return result;
     }
@@ -1918,16 +2053,73 @@ function serializeMongoExportValue(
     }
     const result: Record<string, unknown> = {};
     for (const [name, entry] of Object.entries(value)) {
-      setOwnMongoRecordField(
-        result,
-        name,
-        serializeMongoExportValue(entry, ancestors),
-      );
+      setOwnMongoRecordField(result, name, serialize(entry));
     }
     return result;
   } finally {
     ancestors.delete(value);
   }
+}
+
+function serializeMongoJsonExportRow(
+  entries: readonly [string, unknown][],
+): string {
+  const row = serializeMongoExportValue(Object.fromEntries(entries)) as Record<
+    string,
+    unknown
+  >;
+  return `{${entries
+    .map(([key]) => `${JSON.stringify(key)}:${JSON.stringify(row[key])}`)
+    .join(",")}}`;
+}
+
+function promoteMongoCommandDisplayDocument(
+  document: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(document).map(([key, value]) => [
+      key,
+      promoteMongoCommandDisplayValue(value),
+    ]),
+  );
+}
+
+// Retain the former numeric and symbol display/CSV promotion, but leave regexes
+// native so the formatter can render the original PCRE pattern and BSON options.
+function promoteMongoCommandDisplayValue(value: unknown): unknown {
+  if (value instanceof Int32 || value instanceof Double) return value.valueOf();
+  if (value instanceof Long && !(value instanceof Timestamp)) {
+    // BSON's promotion includes ±2^53, not just JS safe integers.
+    const integer = value.toBigInt();
+    const max = 2n ** 53n;
+    return integer >= -max && integer <= max ? Number(integer) : value;
+  }
+  if (value instanceof BSONSymbol) return value.valueOf();
+  if (value instanceof Code && value.scope) {
+    return new Code(
+      value.code,
+      promoteMongoCommandDisplayDocument(value.scope),
+    );
+  }
+  if (value instanceof DBRef) {
+    return new DBRef(
+      value.collection,
+      promoteMongoCommandDisplayValue(value.oid) as ObjectId,
+      value.db,
+      promoteMongoCommandDisplayDocument(value.fields),
+    );
+  }
+  if (Array.isArray(value)) return value.map(promoteMongoCommandDisplayValue);
+  if (
+    value &&
+    typeof value === "object" &&
+    !(value instanceof BSON.BSONValue) &&
+    !(value instanceof Date) &&
+    !(value instanceof RegExp)
+  ) {
+    return promoteMongoCommandDisplayDocument(value as Record<string, unknown>);
+  }
+  return value;
 }
 
 function bsonBinaryBytes(value: unknown): Buffer | null {
@@ -1993,7 +2185,9 @@ function formatMongoScalarValue(
       const code = (value as { code?: unknown }).code;
       const scope = bsonCodeScope(value);
       if (typeof code === "string" && scope) {
-        return JSON.stringify({ code, scope });
+        return JSON.stringify({ code, scope }, (_key, entry: unknown) =>
+          entry instanceof BSONRegExp ? formatMongoScalarValue(entry) : entry,
+        );
       }
       return typeof code === "string" ? code : String(value);
     }
@@ -2080,6 +2274,17 @@ function formatMongoDisplayValue(value: unknown): unknown {
   }
 
   return value;
+}
+
+function formatMongoQueryRow(
+  document: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(document).map(([key, value]) => [
+      key,
+      formatMongoDisplayValue(value),
+    ]),
+  );
 }
 
 function inferMongoSchemaType(value: unknown): MongoSchemaType {
@@ -2303,11 +2508,30 @@ function assertSupportedMongoTableUpdate(update: {
     ) {
       throw new Error(dbPointerMongoTableFieldMessage(name));
     }
+    if (
+      Object.hasOwn(update.changes ?? {}, name) &&
+      hint.nativeType === "bsonDbRef"
+    ) {
+      throw new Error(unsupportedDbRefMongoTableFieldMessage(name));
+    }
+    if (
+      Object.hasOwn(update.originalValues ?? {}, name) &&
+      hint.nativeType === "dbRef" &&
+      hint.dbRefTextVersion !== 1
+    ) {
+      throw new Error(
+        `MongoDB DBRef field ${JSON.stringify(name)} has a legacy table baseline whose BSON type cannot be verified. Refresh and re-enter the edit.`,
+      );
+    }
   }
 }
 
 function dbPointerMongoTableFieldMessage(name: string): string {
   return `MongoDB Table Viewer cannot safely edit field ${JSON.stringify(name)}: it contains deprecated DBPointer values, which the MongoDB driver reads as DBRef and cannot write back as DBPointer. Use the Query Editor with an explicit update instead.`;
+}
+
+function unsupportedDbRefMongoTableFieldMessage(name: string): string {
+  return `MongoDB Table Viewer cannot safely edit field ${JSON.stringify(name)}: its DBRef cannot be represented losslessly as Extended JSON. Use the Query Editor with an explicit update instead.`;
 }
 
 function isMongoInterruption(error: unknown, signal?: AbortSignal): boolean {
@@ -2438,10 +2662,18 @@ export class MongoDBDriver implements IDBDriver {
     this.connectionAbortController = abortController;
     let client: MongoClient | undefined;
     try {
-      const configuredUri =
-        resolveMongoConnectionMode(this.config) === "uri"
-          ? (getMongoConnectionUri(this.config) ?? "")
-          : this.buildUri();
+      const uriMode = resolveMongoConnectionMode(this.config) === "uri";
+      const configuredUri = uriMode
+        ? (getMongoConnectionUri(this.config) ?? "")
+        : this.buildUri();
+      if (uriMode && configuredUri) {
+        decodeMongoUriDatabasePath(
+          parseMongoUriPathAndQuery(configuredUri).pathname,
+        );
+        if (this.config.tls === undefined) {
+          assertMongoUriOptionNameEncoding(configuredUri);
+        }
+      }
       const uri =
         this.config.tls !== undefined
           ? stripMongoUriTlsOptions(
@@ -2490,12 +2722,14 @@ export class MongoDBDriver implements IDBDriver {
       this.assertConnectionEpoch(epoch);
       await client.connect();
       this.assertConnectionEpoch(epoch);
-      const catalog = client
-        .db(this.defaultDatabaseName())
-        .listCollections(
-          {},
-          { nameOnly: true, batchSize: 1, signal: abortController.signal },
-        );
+      const catalog = client.db(this.defaultDatabaseName()).listCollections(
+        {},
+        {
+          ...MONGO_AUTHORIZED_COLLECTION_NAMES,
+          batchSize: 1,
+          signal: abortController.signal,
+        },
+      );
       try {
         await catalog.hasNext();
       } finally {
@@ -2625,7 +2859,10 @@ export class MongoDBDriver implements IDBDriver {
   async listObjects(database: string): Promise<TableInfo[]> {
     const db = this.requireDb(database);
     const collections = await db
-      .listCollections({}, { nameOnly: false, ...getMetadataSdkOptions() })
+      .listCollections(
+        {},
+        { ...MONGO_AUTHORIZED_COLLECTION_NAMES, ...getMetadataSdkOptions() },
+      )
       .toArray();
     return collections
       .filter((collection) => !this.isSystemNamespace(collection.name))
@@ -2830,6 +3067,10 @@ export class MongoDBDriver implements IDBDriver {
         Object.keys(sdkOptions).length > 0
           ? ([sdkOptions] as const)
           : ([] as const);
+      const bsonCommandOptions = {
+        ...sdkOptions,
+        ...MONGO_EXPORT_BSON_OPTIONS,
+      };
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
 
       const limitOp = chainOps.filter((chain) => chain.op === "limit").at(-1);
@@ -2861,7 +3102,7 @@ export class MongoDBDriver implements IDBDriver {
           const collections = await this.requireDb(dbName)
             .listCollections(
               {},
-              { authorizedCollections: true, nameOnly: true, ...sdkOptions },
+              { ...MONGO_AUTHORIZED_COLLECTION_NAMES, ...sdkOptions },
             )
             .toArray();
           return this.buildMongoDocumentRowsQueryResult(
@@ -2873,9 +3114,12 @@ export class MongoDBDriver implements IDBDriver {
           const cmd = this.normalizeFilterCriteria(
             opArgs[0] as Record<string, unknown>,
           );
-          const result = await this.requireDb(dbName).command(cmd, ...sdkArgs);
-          return this.buildMongoSingleRowQueryResult(
-            this.toRow(result as Record<string, unknown>),
+          const result = await this.requireDb(dbName).command(
+            cmd,
+            bsonCommandOptions,
+          );
+          return this.buildMongoCommandQueryResult(
+            decodeMongoExportCommand(result),
             startedAt,
           );
         },
@@ -2957,11 +3201,10 @@ export class MongoDBDriver implements IDBDriver {
           ? this.normalizeCriteria(projectionArg as Record<string, unknown>)
           : undefined;
         const findOptions: FindOptions = {
-          promoteValues: false,
-          bsonRegExp: true,
           ...(projection !== undefined ? { projection } : {}),
           ...sdkOptions,
           ...helperOptions,
+          ...MONGO_EXPORT_BSON_OPTIONS,
         };
         let cursor = mongoCollection.find(normalizeCriteria(), findOptions);
         for (const chain of chainOps) {
@@ -2970,7 +3213,11 @@ export class MongoDBDriver implements IDBDriver {
             cursor = cursor.sort(sort as NonNullable<FindOptions["sort"]>);
           }
         }
-        return cursor.skip(skip).limit(limitValue).toArray();
+        return readMongoExportCursor(
+          cursor.skip(skip).limit(limitValue),
+          mongoCollection.bsonOptions?.enableUtf8Validation,
+          options?.signal,
+        );
       };
       const runUpdate = async (single: boolean) => {
         const update = opArgs[1] as Record<string, unknown>;
@@ -2987,10 +3234,10 @@ export class MongoDBDriver implements IDBDriver {
         drop: async () => {
           const result = await this.requireDb(dbName).command(
             { drop: collName },
-            ...sdkArgs,
+            bsonCommandOptions,
           );
-          return this.buildMongoSingleRowQueryResult(
-            this.toRow(result),
+          return this.buildMongoCommandQueryResult(
+            decodeMongoExportCommand(result),
             startedAt,
           );
         },
@@ -3087,14 +3334,15 @@ export class MongoDBDriver implements IDBDriver {
               $limit: fetchLimit,
             });
           }
-          const docs = await mongoCollection
-            .aggregate(boundedPipeline, {
-              promoteValues: false,
-              bsonRegExp: true,
+          const docs = await readMongoExportCursor(
+            mongoCollection.aggregate(boundedPipeline, {
               ...sdkOptions,
               ...helperOptions,
-            })
-            .toArray();
+              ...MONGO_EXPORT_BSON_OPTIONS,
+            }),
+            mongoCollection.bsonOptions?.enableUtf8Validation,
+            options?.signal,
+          );
           return this.buildMongoDocumentRowsQueryResult(
             docs,
             startedAt,
@@ -3144,6 +3392,7 @@ export class MongoDBDriver implements IDBDriver {
     }
 
     const rawRows: Record<string, unknown>[] = [];
+    const exportDocuments: (Record<string, unknown> | undefined)[] = [];
     const categoriesByColumn = new Map<string, (TypeCategory | null)[]>();
     let affectedRows = 0;
     let sawAffectedRows = false;
@@ -3181,6 +3430,20 @@ export class MongoDBDriver implements IDBDriver {
       if (availableSlots > 0) {
         const retainedRows = mappedRows.slice(0, availableSlots);
         rawRows.push(...retainedRows);
+        retainedRows.forEach((_row, rowIndex) => {
+          const exportRow = result.exportRows?.[rowIndex];
+          exportDocuments.push(
+            exportRow
+              ? Object.fromEntries(
+                  result.columns.flatMap((column, index) =>
+                    Object.hasOwn(exportRow, colKey(index))
+                      ? [[column, exportRow[colKey(index)]]]
+                      : [],
+                  ),
+                )
+              : undefined,
+          );
+        });
         result.columns.forEach((column, index) => {
           if (
             !retainedRows.some(
@@ -3210,6 +3473,16 @@ export class MongoDBDriver implements IDBDriver {
         ),
       ),
       rows: rawRows.map((row) => this.mapRowToQueryRow(row, columns)),
+      ...(exportDocuments.some((document) => document !== undefined)
+        ? {
+            exportRows: exportDocuments.map((document) =>
+              document
+                ? this.mapBsonQueryExportRow(document, columns)
+                : undefined,
+            ),
+            serializeJsonExportRow: serializeMongoJsonExportRow,
+          }
+        : {}),
       ...(missingCells.length ? { missingCells } : {}),
       rowCount: totalRowCount,
       affectedRows: sawAffectedRows ? affectedRows : undefined,
@@ -3263,26 +3536,27 @@ export class MongoDBDriver implements IDBDriver {
             ...(request.sort.column === "_id" ? [] : [["_id", 1] as const]),
           ] as Array<[string, 1 | -1]>)
         : ([["_id", 1]] as Array<[string, 1 | -1]>);
-      const docs = await this.requireDb(request.database)
-        .collection(request.table)
-        .find(criteria, {
-          promoteValues: false,
-          bsonRegExp: true,
-          ...this.tablePageSdkOptions(request),
-        })
-        .sort(sort)
-        .skip(offset)
-        .limit(request.pageSize)
-        .toArray();
-      const rows = docs.map((doc) =>
-        this.toRow(doc as Record<string, unknown>),
-      );
-      await this.markDbPointerCells(request, rows);
-      const countOptions = this.tablePageSdkOptions(request);
       const collection = this.requireDb(request.database).collection(
         request.table,
       );
-      const totalCount = request.skipCount
+      const docs = await readMongoExportCursor(
+        collection
+          .find(criteria, {
+            ...this.tablePageSdkOptions(request),
+            ...MONGO_EXPORT_BSON_OPTIONS,
+          })
+          .sort(sort)
+          .skip(offset)
+          .limit(request.pageSize),
+        collection.bsonOptions?.enableUtf8Validation,
+        request.signal,
+      );
+      const rows = docs.map((doc) =>
+        this.toRow(doc as Record<string, unknown>),
+      );
+      await this.prepareTableDbRefCells(request, rows);
+      const countOptions = this.tablePageSdkOptions(request);
+      const rawCount = request.skipCount
         ? 0
         : Object.keys(countOptions).length > 0
           ? await collection.countDocuments(criteria, countOptions)
@@ -3306,7 +3580,7 @@ export class MongoDBDriver implements IDBDriver {
         rows,
         mongoIdTypes: rows.map((row) => this.tableRowIdTypes.get(row) ?? null),
         mongoValueTypes: rows.map((row) => this.getTableRowValueTypes(row)),
-        totalCount,
+        totalCount: toMongoTableTotalCount(rawCount),
         executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
@@ -3390,7 +3664,7 @@ export class MongoDBDriver implements IDBDriver {
       this.rowValueCategory,
     );
     const paged = pageRows(sorted, request.page, request.pageSize);
-    await this.markDbPointerCells(request, paged);
+    await this.prepareTableDbRefCells(request, paged);
     return {
       columns: comparisonColumns,
       rows: paged,
@@ -3404,6 +3678,7 @@ export class MongoDBDriver implements IDBDriver {
   formatTableExportChunk(
     chunk: DriverTableExportChunk,
     selectedColumns?: readonly string[],
+    format: DriverTableExportFormat = "json",
   ): DriverTableExportChunk {
     const documents = chunk.rows.map((row) => {
       const document = this.tableRowRawDocuments.get(row);
@@ -3433,7 +3708,10 @@ export class MongoDBDriver implements IDBDriver {
       })),
       rows: documents.map(
         (document) =>
-          serializeMongoExportValue(document) as Record<string, unknown>,
+          serializeMongoExportValue(document, format === "json") as Record<
+            string,
+            unknown
+          >,
       ),
     };
   }
@@ -3576,6 +3854,9 @@ export class MongoDBDriver implements IDBDriver {
       return value;
     }
     const normalized = unwrapQuotedMongoDisplay(value);
+    if (column.nativeType === "dbRef") {
+      return parseLegacyMongoDisplayDbRef(normalized) ?? normalized;
+    }
     let coerced: unknown;
     try {
       coerced = this.coerceInputValue(value, column);
@@ -3799,7 +4080,11 @@ export class MongoDBDriver implements IDBDriver {
             ? "applied"
             : "not_applied";
         if (status === "applied") affectedRows++;
-        updateRowOutcomes.push({ rowIndex, status });
+        updateRowOutcomes.push({
+          rowIndex,
+          status,
+          ...(status === "not_applied" && { conflict: true }),
+        });
       } catch (error: unknown) {
         throw failedDriverUpdateRows(
           error,
@@ -3966,9 +4251,17 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   coerceOriginalValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (typeof value === "string" && column.nativeType === "dbRef") {
+      const ref = parseMongoTableDbRef(value);
+      if (!ref) {
+        throw new Error(
+          "MongoDB DBRef table baseline is not valid. Refresh the table before editing.",
+        );
+      }
+      return ref;
+    }
     if (
       typeof value === "string" &&
-      value !== NULL_SENTINEL &&
       /^binData(?:\(\d+\))?$/i.test(column.nativeType)
     ) {
       return coerceMongoBinaryValue(
@@ -3977,11 +4270,7 @@ export class MongoDBDriver implements IDBDriver {
         false,
       );
     }
-    if (
-      typeof value === "string" &&
-      value !== NULL_SENTINEL &&
-      isMongoIntegerType(column.nativeType)
-    ) {
+    if (typeof value === "string" && isMongoIntegerType(column.nativeType)) {
       return coerceMongoNumericInput(unwrapQuotedMongoDisplay(value), column);
     }
     if (column.nativeType === "string") return value;
@@ -4031,7 +4320,7 @@ export class MongoDBDriver implements IDBDriver {
         : unwrapQuotedMongoDisplay(quoted);
     }
     if (options?.preserveNativeType && isMongoIntegerType(column.nativeType)) {
-      if (value === null || value === undefined || value === NULL_SENTINEL) {
+      if (value === null || value === undefined) {
         return this.coerceInputValue(value, column);
       }
       const normalized =
@@ -4099,10 +4388,6 @@ export class MongoDBDriver implements IDBDriver {
     }
     if (value === null || value === undefined || value === "") {
       return value;
-    }
-
-    if (value === NULL_SENTINEL) {
-      return null;
     }
 
     if (typeof value !== "string") {
@@ -4180,8 +4465,11 @@ export class MongoDBDriver implements IDBDriver {
       return parseMongoDisplayJavascriptWithScope(normalized) ?? normalized;
     }
 
-    if (column.nativeType === "dbPointer" || column.nativeType === "dbRef") {
-      return parseMongoDisplayDbPointer(normalized) ?? normalized;
+    if (column.nativeType === "dbRef") {
+      return parseMongoTableDbRef(normalized) ?? normalized;
+    }
+    if (column.nativeType === "dbPointer") {
+      return parseLegacyMongoDisplayDbRef(normalized) ?? normalized;
     }
 
     if (column.nativeType === "regex") {
@@ -4205,6 +4493,13 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   formatOutputValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (typeof value === "string" && column.nativeType === "dbRef") {
+      // Identity-free query results use the historical display, not table input.
+      const normalized = unwrapQuotedMongoDisplay(value);
+      return formatMongoDisplayValue(
+        parseLegacyMongoDisplayDbRef(normalized) ?? normalized,
+      );
+    }
     if (
       typeof value === "string" &&
       (column.category === "json" || column.category === "array")
@@ -4225,21 +4520,15 @@ export class MongoDBDriver implements IDBDriver {
       );
     }
     if (typeof value === "string") {
-      const coerced =
-        value !== NULL_SENTINEL &&
-        /^binData(?:\(\d+\))?$/i.test(column.nativeType)
-          ? coerceMongoBinaryValue(
+      const coerced = /^binData(?:\(\d+\))?$/i.test(column.nativeType)
+        ? coerceMongoBinaryValue(unwrapQuotedMongoDisplay(value), column, false)
+        : isMongoIntegerType(column.nativeType)
+          ? coerceMongoIntegerValue(
               unwrapQuotedMongoDisplay(value),
               column,
               false,
             )
-          : value !== NULL_SENTINEL && isMongoIntegerType(column.nativeType)
-            ? coerceMongoIntegerValue(
-                unwrapQuotedMongoDisplay(value),
-                column,
-                false,
-              )
-            : this.coerceInputValue(value, column);
+          : this.coerceInputValue(value, column);
       if (coerced !== value) {
         return formatMongoDisplayValue(coerced);
       }
@@ -4265,6 +4554,29 @@ export class MongoDBDriver implements IDBDriver {
         shouldVerify: false,
         message: dbPointerMongoTableFieldMessage(column.name),
       };
+    }
+    if (column.nativeType === "bsonDbRef") {
+      return {
+        ok: false,
+        shouldVerify: false,
+        message: unsupportedDbRefMongoTableFieldMessage(column.name),
+      };
+    }
+    if (
+      typeof expectedValue === "string" &&
+      expectedValue !== "" &&
+      column.nativeType === "dbRef" &&
+      !isQuotedMongoString(expectedValue)
+    ) {
+      try {
+        this.coerceTableEditValue(expectedValue, column);
+      } catch (error) {
+        return {
+          ok: false,
+          shouldVerify: false,
+          message: error instanceof Error ? error.message : String(error),
+        };
+      }
     }
     if (
       typeof expectedValue === "string" &&
@@ -4293,8 +4605,7 @@ export class MongoDBDriver implements IDBDriver {
         } else if (
           typeof coerceMongoBinaryValue(normalized, column, true) ===
             "string" &&
-          expectedValue !== "" &&
-          expectedValue !== NULL_SENTINEL
+          expectedValue !== ""
         ) {
           throw new Error(
             `Invalid MongoDB ${column.nativeType} value ${JSON.stringify(expectedValue)}. Quote the value to store it as a string.`,
@@ -4424,14 +4735,16 @@ export class MongoDBDriver implements IDBDriver {
   private async getCollectionDefinition(
     database: string,
     table: string,
-    sdkOptions: MongoSdkOptions = getMetadataSdkOptions(),
   ): Promise<{
     type: "collection" | "view";
     options: Record<string, unknown>;
   }> {
     const collection = (
       await this.requireDb(database)
-        .listCollections({ name: table }, { nameOnly: false, ...sdkOptions })
+        .listCollections(
+          { name: table },
+          { nameOnly: false, ...getMetadataSdkOptions() },
+        )
         .toArray()
     ).find((entry) => entry.name === table);
 
@@ -4454,12 +4767,7 @@ export class MongoDBDriver implements IDBDriver {
   }
 
   private toRow(document: Record<string, unknown>): Record<string, unknown> {
-    const row = Object.fromEntries(
-      Object.entries(document).map(([key, value]) => [
-        key,
-        formatMongoDisplayValue(value),
-      ]),
-    );
+    const row = formatMongoQueryRow(document);
     this.tableRowRawDocuments.set(row, document);
     this.tableRowSchemas.set(
       row,
@@ -4483,10 +4791,7 @@ export class MongoDBDriver implements IDBDriver {
 
   private getTableRowValueTypes(
     row: Record<string, unknown>,
-  ): Record<
-    string,
-    { category: TypeCategory; nativeType: string; bsonSubtype?: number }
-  > {
+  ): Record<string, MongoValueTypeHint> {
     const schemas = this.tableRowSchemas.get(row);
     if (!schemas) return {};
     return Object.fromEntries(
@@ -4660,12 +4965,15 @@ export class MongoDBDriver implements IDBDriver {
   ): Promise<boolean> {
     const options = sdkOptions();
     try {
-      const definition = await this.getCollectionDefinition(
-        database,
-        table,
-        options,
+      const collections = await this.requireDb(database)
+        .listCollections(
+          { name: table },
+          { ...MONGO_AUTHORIZED_COLLECTION_NAMES, ...options },
+        )
+        .toArray();
+      return collections.some(
+        (collection) => collection.name === table && collection.type === "view",
       );
-      return definition.type === "view";
     } catch (error) {
       if (isMongoInterruption(error, options.signal)) throw error;
       return false;
@@ -4715,7 +5023,7 @@ export class MongoDBDriver implements IDBDriver {
               ),
             },
           ],
-          { promoteValues: false, bsonRegExp: true, ...options },
+          { ...options, ...MONGO_NATIVE_BSON_OPTIONS },
         )
         .toArray();
     } catch (error) {
@@ -4736,7 +5044,7 @@ export class MongoDBDriver implements IDBDriver {
     return pointers;
   }
 
-  private async markDbPointerCells(
+  private async prepareTableDbRefCells(
     request: DriverTablePageRequest,
     rows: readonly Record<string, unknown>[],
   ): Promise<void> {
@@ -4752,8 +5060,25 @@ export class MongoDBDriver implements IDBDriver {
     );
     for (const { row, document } of documents) {
       const schema = this.tableRowSchemas.get(row);
-      for (const name of pointers.get(document) ?? []) {
-        schema?.set(name, MONGO_DB_POINTER_TYPE);
+      for (const [name, value] of Object.entries(document)) {
+        if (!(value instanceof DBRef)) continue;
+        if (pointers.get(document)?.has(name)) {
+          schema?.set(name, MONGO_DB_POINTER_TYPE);
+          continue;
+        }
+        // Add lossless editor text only to table pages, after fallback filtering
+        // and sorting have used the historical display values.
+        const text = formatMongoTableDbRef(value);
+        if (text === null) {
+          schema?.set(name, { category: "other", nativeType: "bsonDbRef" });
+        } else {
+          row[name] = text;
+          schema?.set(name, {
+            category: "other",
+            nativeType: "dbRef",
+            dbRefTextVersion: 1,
+          });
+        }
       }
     }
   }
@@ -4769,9 +5094,8 @@ export class MongoDBDriver implements IDBDriver {
       .find(
         {},
         {
-          promoteValues: false,
-          bsonRegExp: true,
           ...sdkOptions(),
+          ...MONGO_NATIVE_BSON_OPTIONS,
         },
       )
       .limit(limit)
@@ -4786,15 +5110,17 @@ export class MongoDBDriver implements IDBDriver {
     sdkOptions: MongoSdkOptions = {},
     criteria: Record<string, unknown> = {},
   ): Promise<Record<string, unknown>[]> {
-    const docs = await this.requireDb(database)
-      .collection(table)
-      .find(criteria, {
-        promoteValues: false,
-        bsonRegExp: true,
-        ...sdkOptions,
-      })
-      .limit(limit)
-      .toArray();
+    const collection = this.requireDb(database).collection(table);
+    const docs = await readMongoExportCursor(
+      collection
+        .find(criteria, {
+          ...sdkOptions,
+          ...MONGO_EXPORT_BSON_OPTIONS,
+        })
+        .limit(limit),
+      collection.bsonOptions?.enableUtf8Validation,
+      sdkOptions.signal,
+    );
     return docs.map((doc) => this.toRow(doc as Record<string, unknown>));
   }
 
@@ -4882,6 +5208,9 @@ export class MongoDBDriver implements IDBDriver {
       return `new BinData(${bsonBinarySubtype(value) ?? 0}, ${JSON.stringify(bytes?.toString("base64") ?? "")})`;
     }
     if (value instanceof DBRef) {
+      if (Object.keys(value.fields).length > 0 || value.db === "") {
+        return this.serializeMongosh(mongoDbRefDocument(value));
+      }
       return `new DBRef(${JSON.stringify(value.collection)}, ${this.serializeMongosh(value.oid)}${value.db ? `, ${JSON.stringify(value.db)}` : ""})`;
     }
     if (value instanceof BSONSymbol) {
@@ -5019,6 +5348,21 @@ export class MongoDBDriver implements IDBDriver {
     };
   }
 
+  private buildMongoCommandQueryResult(
+    document: Record<string, unknown>,
+    startedAt: number,
+  ): QueryResult {
+    const result = this.buildMongoSingleRowQueryResult(
+      formatMongoQueryRow(promoteMongoCommandDisplayDocument(document)),
+      startedAt,
+    );
+    return {
+      ...result,
+      exportRows: [this.mapBsonQueryExportRow(document, result.columns)],
+      serializeJsonExportRow: serializeMongoJsonExportRow,
+    };
+  }
+
   private buildMongoDocumentRowsQueryResult(
     docs: readonly Record<string, unknown>[],
     startedAt: number,
@@ -5026,7 +5370,7 @@ export class MongoDBDriver implements IDBDriver {
   ): QueryResult {
     const truncated = docs.length > rowLimit;
     const retainedDocs = truncated ? docs.slice(0, rowLimit) : docs;
-    const rows = retainedDocs.map((doc) => this.toRow(doc));
+    const rows = retainedDocs.map(formatMongoQueryRow);
     const columns = inferColumnsFromRows(rows, "_id").map(
       (column) => column.name,
     );
@@ -5037,6 +5381,10 @@ export class MongoDBDriver implements IDBDriver {
         mongoQueryColumnMeta(retainedDocs.map((doc) => doc[column])),
       ),
       rows: rows.map((row) => this.mapRowToQueryRow(row, columns)),
+      exportRows: retainedDocs.map((document) =>
+        this.mapBsonQueryExportRow(document, columns),
+      ),
+      serializeJsonExportRow: serializeMongoJsonExportRow,
       ...(missingCells.length ? { missingCells } : {}),
       rowCount: rows.length,
       executionTimeMs: Date.now() - startedAt,
@@ -5057,7 +5405,7 @@ export class MongoDBDriver implements IDBDriver {
         result.columns.flatMap((column, index) =>
           missing.has(`${rowIndex}:${index}`)
             ? []
-            : [[column, row[`__col_${index}`]]],
+            : [[column, row[colKey(index)]]],
         ),
       ),
     );
@@ -5083,7 +5431,19 @@ export class MongoDBDriver implements IDBDriver {
   ): Record<string, unknown> {
     const mapped: Record<string, unknown> = {};
     columns.forEach((columnName, index) => {
-      mapped[`__col_${index}`] = row[columnName];
+      mapped[colKey(index)] = row[columnName];
+    });
+    return mapped;
+  }
+
+  private mapBsonQueryExportRow(
+    document: Record<string, unknown>,
+    columns: string[],
+  ): Record<string, unknown> {
+    const mapped: Record<string, unknown> = {};
+    columns.forEach((column, index) => {
+      if (Object.hasOwn(document, column))
+        mapped[colKey(index)] = document[column];
     });
     return mapped;
   }

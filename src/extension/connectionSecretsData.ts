@@ -96,3 +96,28 @@ export function parseStoredConnectionSecretDocument(
     isLegacy: true,
   };
 }
+
+const CREDENTIAL_REVISION_FIELD = "rapidbCredentialRevision";
+
+// The revision travels with the secret in the same atomic write. It is random,
+// not derived from credentials. A revision-only document records a clear.
+export function withConnectionCredentialRevision(
+  value: string | undefined,
+  revision: string,
+): string {
+  const { record } = parseStoredConnectionSecretDocument(value);
+  return JSON.stringify({ ...record, [CREDENTIAL_REVISION_FIELD]: revision });
+}
+
+export function readConnectionCredentialRevision(
+  value: string | undefined,
+): string | undefined {
+  const revision =
+    parseStoredConnectionSecretDocument(value).record[
+      CREDENTIAL_REVISION_FIELD
+    ];
+  return typeof revision === "string" &&
+    /^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/.test(revision)
+    ? revision
+    : undefined;
+}

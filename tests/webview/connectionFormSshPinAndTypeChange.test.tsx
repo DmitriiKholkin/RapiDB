@@ -3,9 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { ConnectionFormSubmission } from "../../src/shared/webviewContracts/connection";
 import { ConnectionFormView } from "../../src/webview/components/ConnectionFormView";
+import { SSH_HOST_FINGERPRINT_SHA256 as PIN } from "../support/sshFingerprints";
 import { dispatchIncomingMessage, getLastPostedMessage } from "./testUtils";
-
-const PIN = "SHA256:AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/";
 
 const pinnedProfile = {
   id: "tunnelled",
@@ -113,7 +112,9 @@ describe("trust-on-first-use SSH fingerprint pin", () => {
     const user = userEvent.setup();
     render(<ConnectionFormView existing={pinnedProfile} />);
 
-    expect(screen.getByText(new RegExp(PIN.slice(7, 20)))).toBeTruthy();
+    expect(
+      screen.getByText(`Current pinned fingerprint: ${PIN}`, { exact: false }),
+    ).toBeTruthy();
     await user.click(
       screen.getByRole("button", { name: "Reset pinned fingerprint" }),
     );

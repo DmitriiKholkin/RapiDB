@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { parseErdPanelMessage } from "../../shared/webviewContracts";
+import { formatErdDiscoveryNotice } from "../../shared/webviewContracts/erd";
 import type { ConnectionManager } from "../connectionManager";
 import { ErdGraphService } from "../services/erdGraphService";
 import {
@@ -290,6 +291,7 @@ export class ErdPanel {
     this.loadAbortController = abortController;
 
     this.post("erdLoading", {
+      loadId: generation,
       forceReload,
     });
 
@@ -306,6 +308,7 @@ export class ErdPanel {
       if (generation !== this.loadGeneration) return;
 
       this.post("erdGraph", {
+        loadId: generation,
         graph: result.graph,
         fromCache: result.fromCache,
         partial: result.partial,
@@ -319,7 +322,9 @@ export class ErdPanel {
       } else if (!result.fromCache || !this.partialWarned) {
         this.partialWarned = true;
         void vscode.window.showWarningMessage(
-          "[RapiDB] Some schema metadata could not be loaded, so this ERD may be incomplete. Reload the diagram to try again.",
+          result.graph.discoveryTruncated
+            ? `[RapiDB] ${formatErdDiscoveryNotice(result.graph.discoveryTruncated)}`
+            : "[RapiDB] Some schema metadata could not be loaded, so this ERD may be incomplete. Reload the diagram to try again.",
         );
       }
     } catch (error) {
@@ -327,7 +332,7 @@ export class ErdPanel {
       this.lastLoadFailed = true;
       this.awaitingConnect = !this.isConnectionReady();
       const normalized = normalizeUnknownError(error);
-      this.post("erdError", { error: normalized.message });
+      this.post("erdError", { loadId: generation, error: normalized.message });
     } finally {
       if (this.loadAbortController === abortController) {
         this.loadAbortController = undefined;
