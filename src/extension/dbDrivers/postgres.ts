@@ -3,6 +3,7 @@ import type { ClientConfig, PoolClient } from "pg";
 import { Connection, DatabaseError, Pool, types as pgTypes } from "pg";
 import type { DdlOnlyDbObjectKind } from "../../shared/dbObjectKinds";
 import { isPostgresArrayPrimaryKeyValue } from "../../shared/postgresArrayRowIdentity";
+import { isPostgresIntervalPrimaryKeyValue } from "../../shared/postgresIntervalRowIdentity";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -368,6 +369,17 @@ pgTypes.setTypeParser(PG_OID_TIMESTAMP, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_TIMESTAMPTZ, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_JSON, (val: string) => val);
 pgTypes.setTypeParser(PG_OID_JSONB, (val: string) => val);
+const parseLegacyInterval = pgTypes.getTypeParser(PG_OID_INTERVAL, "text");
+// The stock parser silently accepts partial matches. Only use it for text it
+// understands completely; return ISO, postgres_verbose and SQL-standard
+// spellings as supplied by the server rather than displaying a wrong value.
+const POSTGRES_LEGACY_INTERVAL_TEXT =
+  /^(?=[+\-\d])(?:[+-]?\d+ years? ?)?(?:[+-]?\d+ mons? ?)?(?:[+-]?\d+ days? ?)?(?:[+-]?\d+:\d{2}:\d{2}(?:\.\d{1,6})?)?$/;
+pgTypes.setTypeParser(PG_OID_INTERVAL, (value: string) =>
+  POSTGRES_LEGACY_INTERVAL_TEXT.test(value)
+    ? parseLegacyInterval(value)
+    : value,
+);
 for (const oid of PG_ARRAY_OIDS) {
   pgTypes.setTypeParser(oid, (value: string) =>
     parsePostgresArrayLiteral(
@@ -831,6 +843,10 @@ export class PostgresDriver extends BaseDBDriver {
   private connectedDatabaseName = "";
   private timeoutRecoveryInFlight: Promise<void> | null = null;
   private readonly activeTransactionClients = new Set<PoolClient>();
+  private readonly intervalKeyPreviews = new WeakMap<
+    Buffer,
+    { sql: string; preview: string }
+  >();
   private readonly activeQueryClients = new Set<PoolClient>();
   private readonly activeQueryOperations = new Set<PostgresQueryOperation>();
   private sessionResetUnsupported = false;
@@ -1447,6 +1463,7 @@ export class PostgresDriver extends BaseDBDriver {
       column_name: string;
       data_type: string;
       is_array_type: boolean | null;
+      interval_key_kind?: "scalar" | "array" | null;
       array_base_type: string | null;
       array_base_is_array?: boolean | number | string | null;
       range_subtype: string | null;
@@ -1470,6 +1487,7 @@ export class PostgresDriver extends BaseDBDriver {
            ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
          END                                      AS data_type,
          array_type.typcategory = 'A'             AS is_array_type,
+          interval_base.key_kind                   AS interval_key_kind,
          array_base.base_type                     AS array_base_type,
          array_base.base_is_array                 AS array_base_is_array,
          CASE
@@ -1533,8 +1551,22 @@ export class PostgresDriver extends BaseDBDriver {
              AND con.contype = 'p'
              AND pk_key.attnum = a.attnum
          LIMIT 1
-       ) pk ON TRUE
-       WHERE n.nspname = $1
+        ) pk ON TRUE
+        LEFT JOIN LATERAL (
+          WITH RECURSIVE key_type(oid, is_array) AS (
+            SELECT a.atttypid, false WHERE pk.pk_ordinal IS NOT NULL
+            UNION ALL
+            SELECT CASE WHEN t.typtype = 'd' THEN t.typbasetype ELSE t.typelem END,
+                   k.is_array OR t.typtype <> 'd'
+            FROM key_type k
+            JOIN pg_catalog.pg_type t ON t.oid = k.oid
+            LEFT JOIN pg_catalog.pg_type e ON e.oid = t.typelem
+            WHERE t.typtype = 'd' OR (NOT k.is_array AND e.typarray = t.oid)
+          )
+          SELECT CASE WHEN is_array THEN 'array' ELSE 'scalar' END AS key_kind
+          FROM key_type WHERE oid = 'pg_catalog.interval'::pg_catalog.regtype
+        ) interval_base ON TRUE
+        WHERE n.nspname = $1
          AND c.relname = $2
          AND a.attnum > 0
          AND NOT a.attisdropped
@@ -1583,8 +1615,13 @@ export class PostgresDriver extends BaseDBDriver {
             ? undefined
             : mappedGeneratedKind === "stored",
         isPrimaryKey: isPgTrue(r.is_pk),
-        ...(isPgTrue(r.is_pk) && isPgTrue(r.is_array_type)
+        ...(isPgTrue(r.is_pk) &&
+        isPgTrue(r.is_array_type) &&
+        r.interval_key_kind !== "array"
           ? { postgresArrayPrimaryKey: true }
+          : {}),
+        ...(isPgTrue(r.is_pk) && r.interval_key_kind
+          ? { postgresIntervalPrimaryKey: r.interval_key_kind }
           : {}),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
@@ -3023,11 +3060,35 @@ export class PostgresDriver extends BaseDBDriver {
     return `${this.quoteIdentifier(column.name)} = ${this.buildInsertValueExpr(column, paramIndex)}`;
   }
   buildTablePrimaryKeyExpr(column: ColumnTypeMeta): string | null {
+    if (column.postgresIntervalPrimaryKey) {
+      return this.postgresIntervalKeyBytes(column);
+    }
     return column.postgresArrayPrimaryKey
       ? `${this.quoteIdentifier(column.name)}::pg_catalog.text`
       : null;
   }
+  private postgresIntervalKeyBytes(
+    column: ColumnTypeMeta,
+    expression = this.quoteIdentifier(column.name),
+  ): string {
+    return column.postgresIntervalPrimaryKey === "array"
+      ? `pg_catalog.array_send(${expression})`
+      : `pg_catalog.interval_send(${expression})`;
+  }
   coercePrimaryKeyValue(value: unknown, column: ColumnTypeMeta): unknown {
+    if (column.postgresIntervalPrimaryKey) {
+      if (
+        !isPostgresIntervalPrimaryKeyValue(
+          value,
+          column.postgresIntervalPrimaryKey,
+        )
+      ) {
+        throw new Error(
+          `PostgreSQL interval primary key "${column.name}" is missing its exact row identity. Refresh the table and retry.`,
+        );
+      }
+      return Buffer.from(value.$rapidbPgIntervalKey, "hex");
+    }
     if (!column.postgresArrayPrimaryKey) {
       return this.coerceInputValue(value, column);
     }
@@ -3045,6 +3106,27 @@ export class PostgresDriver extends BaseDBDriver {
     value: unknown,
     paramIndex: number,
   ): MutationSqlExpression | null {
+    if (column.postgresIntervalPrimaryKey) {
+      const name = this.quoteIdentifier(column.name);
+      // pg binds Buffer as a binary parameter, so the server receives the
+      // stored interval/array directly, without parsing IntervalStyle text.
+      // Native equality uses the PK index; check the exact bytes too because
+      // PostgreSQL can consider distinct interval representations equal.
+      // Infer the parameter type from equality before using it with array_send,
+      // including for arrays of domains and domains over arrays.
+      const bind = `$${paramIndex}`;
+      const bytes = this.postgresIntervalKeyBytes(column);
+      const sql = `(${name} = ${bind} AND ${bytes} = ${this.postgresIntervalKeyBytes(column, bind)})`;
+      if (Buffer.isBuffer(value)) {
+        this.intervalKeyPreviews.set(value, {
+          sql,
+          // A copyable SQL preview cannot express pg's typed binary bind.
+          // Show the equivalent exact byte comparison instead.
+          preview: `(${bytes} = pg_catalog.decode(${bind}, 'hex'))`,
+        });
+      }
+      return { sql, params: [value] };
+    }
     const stored = this.buildTablePrimaryKeyExpr(column);
     if (!stored) return null;
     const name = this.quoteIdentifier(column.name);
@@ -3077,6 +3159,26 @@ export class PostgresDriver extends BaseDBDriver {
   protected override getQuestionMarkPlaceholderOptions(): IndexedPlaceholderOptions {
     return { dialect: "pg" };
   }
+  private materializeIntervalKeyPreviews(
+    sql: string,
+    params: readonly unknown[] | undefined,
+  ): { sql: string; params: readonly unknown[] | undefined } {
+    const previewParams = params?.map((param) => {
+      if (!Buffer.isBuffer(param)) return param;
+      const key = this.intervalKeyPreviews.get(param);
+      if (!key || !sql.includes(key.sql)) return param;
+      sql = sql.replace(key.sql, () => key.preview);
+      return param.toString("hex");
+    });
+    return { sql, params: previewParams };
+  }
+  override materializePreviewSql(
+    sql: string,
+    params?: readonly unknown[],
+  ): string {
+    const preview = this.materializeIntervalKeyPreviews(sql, params);
+    return super.materializePreviewSql(preview.sql, preview.params);
+  }
   materializePreviewColumnSql(
     sql: string,
     params: readonly unknown[] | undefined,
@@ -3085,16 +3187,24 @@ export class PostgresDriver extends BaseDBDriver {
     if (!params || params.length === 0 || columns.length === 0) {
       return this.materializePreviewSql(sql, params);
     }
-    const offsets = indexedPlaceholderOffsets(sql, "$", { dialect: "pg" });
-    return replaceIndexedPlaceholders(sql, offsets, ({ index, text }) => {
-      if (index < 0 || index >= params.length) {
-        return text;
-      }
-      return this.formatColumnAwarePreviewLiteral(
-        params[index],
-        columns[index],
-      );
+    const preview = this.materializeIntervalKeyPreviews(sql, params);
+    const previewParams = preview.params ?? params;
+    const offsets = indexedPlaceholderOffsets(preview.sql, "$", {
+      dialect: "pg",
     });
+    return replaceIndexedPlaceholders(
+      preview.sql,
+      offsets,
+      ({ index, text }) => {
+        if (index < 0 || index >= previewParams.length) {
+          return text;
+        }
+        return this.formatColumnAwarePreviewLiteral(
+          previewParams[index],
+          columns[index],
+        );
+      },
+    );
   }
   materializePreviewInsertSql(
     sql: string,

@@ -3,6 +3,7 @@ import type { MssqlSqlVariantRowIdentity } from "../../../shared/mssqlSqlVariant
 import type { MySQLTimestampRowIdentity } from "../../../shared/mysqlTimestampRowIdentity";
 import type { OracleTemporalRowIdentity } from "../../../shared/oracleTemporalRowIdentity";
 import type { PostgresArrayRowIdentity } from "../../../shared/postgresArrayRowIdentity";
+import type { PostgresIntervalRowIdentity } from "../../../shared/postgresIntervalRowIdentity";
 import type { SqlDeleteObservation } from "../../../shared/sqlDeleteObservation";
 import type { SQLiteRowIdentity } from "../../../shared/sqliteRowIdentity";
 import {
@@ -623,6 +624,10 @@ export function readSqlDeleteObservation(row: Row) {
 
 const sqliteRowIdentities = new WeakMap<Row, SQLiteRowIdentity>();
 const postgresArrayRowIdentities = new WeakMap<Row, PostgresArrayRowIdentity>();
+const postgresIntervalRowIdentities = new WeakMap<
+  Row,
+  PostgresIntervalRowIdentity
+>();
 const mysqlTimestampRowIdentities = new WeakMap<
   Row,
   MySQLTimestampRowIdentity
@@ -648,6 +653,13 @@ export function registerPostgresArrayRowIdentity(
   identity: PostgresArrayRowIdentity,
 ): void {
   postgresArrayRowIdentities.set(row, identity);
+}
+
+export function registerPostgresIntervalRowIdentity(
+  row: Row,
+  identity: PostgresIntervalRowIdentity,
+): void {
+  postgresIntervalRowIdentities.set(row, identity);
 }
 
 export function registerMySQLTimestampRowIdentity(
@@ -679,6 +691,10 @@ function storedRowKey(row: Row, name: string): unknown {
   const postgresIdentity = postgresArrayRowIdentities.get(row);
   if (postgresIdentity && Object.hasOwn(postgresIdentity, name)) {
     return postgresIdentity[name];
+  }
+  const intervalIdentity = postgresIntervalRowIdentities.get(row);
+  if (intervalIdentity && Object.hasOwn(intervalIdentity, name)) {
+    return intervalIdentity[name];
   }
   const mysqlIdentity = mysqlTimestampRowIdentities.get(row);
   if (mysqlIdentity && Object.hasOwn(mysqlIdentity, name)) {
@@ -725,6 +741,14 @@ export function rowMutationBlockReason(
     return "This row cannot be edited or deleted: a complete primary key is required.";
   }
   for (const name of primaryKeyColumns) {
+    const intervalIdentity = postgresIntervalRowIdentities.get(row);
+    if (
+      intervalIdentity &&
+      Object.hasOwn(intervalIdentity, name) &&
+      intervalIdentity[name] === null
+    ) {
+      return `This row cannot be edited or deleted: the exact identity for PostgreSQL interval primary key ${name} is unavailable. Refresh the table and retry.`;
+    }
     const oracleIdentity = oracleTemporalRowIdentities.get(row);
     if (
       oracleIdentity &&

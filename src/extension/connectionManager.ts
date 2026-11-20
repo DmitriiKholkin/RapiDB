@@ -4534,6 +4534,7 @@ export class ConnectionManager
     connectionId: string,
     sql: string,
     postgresDatabase?: string,
+    targetSessionKey?: string,
   ): Promise<void> {
     const trimmed = sql.trim();
     if (!trimmed) {
@@ -4548,7 +4549,8 @@ export class ConnectionManager
       if (
         latest?.sql === trimmed &&
         latest.connectionId === connectionId &&
-        latest.postgresDatabase === postgresDatabase
+        latest.postgresDatabase === postgresDatabase &&
+        latest.targetSessionKey === targetSessionKey
       )
         return;
       const entry: HistoryEntry = {
@@ -4556,6 +4558,7 @@ export class ConnectionManager
         sql: trimmed,
         connectionId,
         ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
+        ...(targetSessionKey ? { targetSessionKey } : {}),
         executedAt: new Date().toISOString(),
       };
       const updated = [entry, ...all].slice(0, this.getHistoryLimit());
@@ -4583,6 +4586,7 @@ export class ConnectionManager
     connectionId: string,
     sql: string,
     postgresDatabase?: string,
+    targetSessionKey?: string,
   ): Promise<BookmarkEntry> {
     const trimmed = sql.trim();
     const entry: BookmarkEntry = {
@@ -4590,6 +4594,7 @@ export class ConnectionManager
       sql: trimmed,
       connectionId,
       ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
+      ...(targetSessionKey ? { targetSessionKey } : {}),
       savedAt: new Date().toISOString(),
     };
     return await this._enqueueBookmarkMutation(async () => {

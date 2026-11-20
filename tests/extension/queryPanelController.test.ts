@@ -194,7 +194,13 @@ describe("QueryPanelController", () => {
     });
 
     expect(isConnected).toHaveBeenNthCalledWith(1, "override");
-    expect(addToHistory).toHaveBeenNthCalledWith(1, "override", "select 1");
+    expect(addToHistory).toHaveBeenNthCalledWith(
+      1,
+      "override",
+      "select 1",
+      undefined,
+      undefined,
+    );
     expect(query).toHaveBeenNthCalledWith(1, "select 1", undefined, {
       requestToken: 1,
     });
@@ -204,7 +210,12 @@ describe("QueryPanelController", () => {
       payload: { queryText: "select 2" },
     });
 
-    expect(addBookmark).toHaveBeenCalledWith("active", "select 2");
+    expect(addBookmark).toHaveBeenCalledWith(
+      "active",
+      "select 2",
+      undefined,
+      undefined,
+    );
 
     activeConnectionId = "";
 
@@ -247,7 +258,12 @@ describe("QueryPanelController", () => {
         requestId: "bookmark:1",
       },
     });
-    expect(addBookmark).toHaveBeenCalledWith("conn:1", "select 1");
+    expect(addBookmark).toHaveBeenCalledWith(
+      "conn:1",
+      "select 1",
+      undefined,
+      undefined,
+    );
     expect(view.postMessage).toHaveBeenLastCalledWith({
       type: "bookmarkSaved",
       payload: { ok: true, requestId: "bookmark:1" },
@@ -339,8 +355,20 @@ describe("QueryPanelController", () => {
         requestId: "save:2",
       },
     });
-    expect(addBookmark).toHaveBeenNthCalledWith(1, "explicit", "select 1");
-    expect(addBookmark).toHaveBeenNthCalledWith(2, "explicit", "select 1");
+    expect(addBookmark).toHaveBeenNthCalledWith(
+      1,
+      "explicit",
+      "select 1",
+      undefined,
+      undefined,
+    );
+    expect(addBookmark).toHaveBeenNthCalledWith(
+      2,
+      "explicit",
+      "select 1",
+      undefined,
+      undefined,
+    );
     expect(view.postMessage).toHaveBeenCalledTimes(2);
     expect(view.postMessage).toHaveBeenLastCalledWith({
       type: "bookmarkSaved",
@@ -1750,6 +1778,8 @@ describe("QueryPanelController", () => {
     expect(connectionManager.addToHistory).toHaveBeenCalledWith(
       "active",
       original,
+      undefined,
+      undefined,
     );
     expect(view.postMessage).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -1813,6 +1843,8 @@ describe("QueryPanelController", () => {
     expect(connectionManager.addToHistory).toHaveBeenCalledWith(
       "active",
       original,
+      undefined,
+      undefined,
     );
     expect(view.setLastQueryResult).toHaveBeenCalled();
   });
@@ -1845,6 +1877,8 @@ describe("QueryPanelController", () => {
     expect(connectionManager.addToHistory).toHaveBeenCalledWith(
       "active",
       original,
+      undefined,
+      undefined,
     );
     expect(view.setLastQueryResult).toHaveBeenCalled();
     expect(view.postMessage).toHaveBeenCalledWith(
@@ -3074,7 +3108,12 @@ describe("QueryPanelController", () => {
       { requestToken: 2 },
     );
     expect(addToHistory).toHaveBeenCalledTimes(1);
-    expect(addToHistory).toHaveBeenCalledWith("active", "select fresh");
+    expect(addToHistory).toHaveBeenCalledWith(
+      "active",
+      "select fresh",
+      undefined,
+      undefined,
+    );
   });
 
   it("actively cancels in-flight query execution when superseded", async () => {

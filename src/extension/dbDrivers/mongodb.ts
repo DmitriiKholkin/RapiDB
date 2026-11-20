@@ -9,6 +9,7 @@ import {
   Code,
   DBRef,
   Decimal128,
+  type Document,
   Double,
   type FindOptions,
   Int32,
@@ -18,6 +19,7 @@ import {
   MongoClient,
   MongoOperationTimeoutError,
   MongoServerError,
+  MongoWriteConcernError,
   ObjectId,
   Timestamp,
   UUID,
@@ -3072,6 +3074,38 @@ export class MongoDBDriver implements IDBDriver {
         ...MONGO_EXPORT_BSON_OPTIONS,
       };
       const { dbName, collName, op, args: opArgs, chainOps } = operation;
+      const runRawCommand = async (command: Document) => {
+        let reply: Document;
+        try {
+          reply = await this.requireDb(dbName).command(
+            command,
+            bsonCommandOptions,
+          );
+        } catch (error) {
+          const response =
+            error instanceof MongoWriteConcernError
+              ? error.result
+              : error instanceof MongoOperationTimeoutError &&
+                  error.cause instanceof MongoServerError
+                ? error.cause.errorResponse
+                : undefined;
+          if (!response) throw error;
+          // The SDK decodes these error replies before applying our BSON
+          // options. Preserve embedded write diagnostics, but don't claim
+          // lossless export or treat a bare timeout as a write reply.
+          const failure = this.buildMongoCommandQueryResult(
+            response,
+            startedAt,
+            false,
+          );
+          if (failure.error === undefined) throw error;
+          return failure;
+        }
+        return this.buildMongoCommandQueryResult(
+          decodeMongoExportCommand(reply),
+          startedAt,
+        );
+      };
 
       const limitOp = chainOps.filter((chain) => chain.op === "limit").at(-1);
       const explicitLimit = limitOp?.args[0] as number | undefined;
@@ -3114,14 +3148,7 @@ export class MongoDBDriver implements IDBDriver {
           const cmd = this.normalizeFilterCriteria(
             opArgs[0] as Record<string, unknown>,
           );
-          const result = await this.requireDb(dbName).command(
-            cmd,
-            bsonCommandOptions,
-          );
-          return this.buildMongoCommandQueryResult(
-            decodeMongoExportCommand(result),
-            startedAt,
-          );
+          return runRawCommand(cmd);
         },
         createCollection: async () => {
           const name = String(opArgs[0]);
@@ -3231,16 +3258,7 @@ export class MongoDBDriver implements IDBDriver {
           : mongoCollection.deleteMany(normalizeCriteria(), ...sdkArgs);
 
       const collectionHandlers: Record<string, () => Promise<QueryResult>> = {
-        drop: async () => {
-          const result = await this.requireDb(dbName).command(
-            { drop: collName },
-            bsonCommandOptions,
-          );
-          return this.buildMongoCommandQueryResult(
-            decodeMongoExportCommand(result),
-            startedAt,
-          );
-        },
+        drop: () => runRawCommand({ drop: collName }),
         find: async () =>
           this.buildMongoDocumentRowsQueryResult(
             await findDocuments(fetchLimit),
@@ -3459,6 +3477,9 @@ export class MongoDBDriver implements IDBDriver {
       if (typeof result.affectedRows === "number") {
         affectedRows += result.affectedRows;
         sawAffectedRows = true;
+      }
+      if (result.error !== undefined) {
+        partialError = `MongoDB ${statement} failed: ${result.error}${index + 1 < total ? " Later statements were not run." : ""}`;
       }
       if (partialError !== undefined) break;
     }
@@ -5351,15 +5372,63 @@ export class MongoDBDriver implements IDBDriver {
   private buildMongoCommandQueryResult(
     document: Record<string, unknown>,
     startedAt: number,
+    preserveBson = true,
   ): QueryResult {
+    const display = promoteMongoCommandDisplayDocument(document);
     const result = this.buildMongoSingleRowQueryResult(
-      formatMongoQueryRow(promoteMongoCommandDisplayDocument(document)),
+      formatMongoQueryRow(display),
       startedAt,
     );
+    const writeErrors: unknown[] = Array.isArray(display.writeErrors)
+      ? display.writeErrors
+      : [];
+    const writeErrorCount = Math.max(
+      writeErrors.length,
+      // The bulkWrite command returns individual errors in a cursor.
+      typeof display.nErrors === "number" &&
+        Number.isSafeInteger(display.nErrors)
+        ? display.nErrors
+        : 0,
+    );
+    const describeCode = (value: unknown): string => {
+      const code =
+        value && typeof value === "object" && "code" in value
+          ? value.code
+          : undefined;
+      return typeof code === "number" && Number.isSafeInteger(code)
+        ? ` (code ${code})`
+        : "";
+    };
+    const writeConcernError = display.writeConcernError;
+    const replyCount =
+      typeof display.n === "number" && Number.isSafeInteger(display.n)
+        ? ` The server reported n=${display.n}.`
+        : "";
+    const failure = [
+      ...(writeErrorCount > 0
+        ? [
+            `The server reported ${writeErrorCount} write error(s)${describeCode(writeErrors[0])}.`,
+          ]
+        : []),
+      ...(writeConcernError && typeof writeConcernError === "object"
+        ? [
+            `The server reported a write concern error${describeCode(writeConcernError)}.`,
+          ]
+        : []),
+    ].join(" ");
     return {
       ...result,
-      exportRows: [this.mapBsonQueryExportRow(document, result.columns)],
-      serializeJsonExportRow: serializeMongoJsonExportRow,
+      ...(preserveBson
+        ? {
+            exportRows: [this.mapBsonQueryExportRow(document, result.columns)],
+            serializeJsonExportRow: serializeMongoJsonExportRow,
+          }
+        : {}),
+      ...(failure
+        ? {
+            error: `${failure}${replyCount} Some writes may already have been applied.`,
+          }
+        : {}),
     };
   }
 

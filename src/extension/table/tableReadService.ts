@@ -1,5 +1,6 @@
 import { isMssqlSqlVariantPrimaryKeyValue } from "../../shared/mssqlSqlVariantRowIdentity";
 import { isOracleTemporalPrimaryKeyValue } from "../../shared/oracleTemporalRowIdentity";
+import { isPostgresIntervalPrimaryKeyValue } from "../../shared/postgresIntervalRowIdentity";
 import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
 import type { QueryMissingCell } from "../../shared/tableTypes";
 import type { ConnectionManager } from "../connectionManager";
@@ -366,12 +367,15 @@ export class TableReadService {
     let identityAliasIndex = 0;
     const identityProjection = identityColumns
       .map(({ column, expression }) => {
-        if (!column.postgresArrayPrimaryKey && !column.oracleTemporalPrimaryKey)
-          return `, ${expression}`;
-        // Do not shadow any real column in the result or ORDER BY.
         const prefix = column.postgresArrayPrimaryKey
           ? "pg_array"
-          : "oracle_temporal";
+          : column.postgresIntervalPrimaryKey
+            ? "pg_interval"
+            : column.oracleTemporalPrimaryKey
+              ? "oracle_temporal"
+              : undefined;
+        if (!prefix) return `, ${expression}`;
+        // Do not shadow any real column in the result or ORDER BY.
         let alias: string;
         do {
           alias = `__rapidb_${prefix}_key_${identityAliasIndex++}`;
@@ -451,15 +455,22 @@ export class TableReadService {
     const rows = hasMoreRows ? fetchedRows.slice(0, pageSize) : fetchedRows;
     const readIdentities = <T>(
       encode: (value: unknown) => T,
+      includes: (column: ColumnTypeMeta) => boolean = () => true,
     ): Record<string, T>[] =>
       dataResult.rows
         .slice(0, rows.length)
         .map((row) =>
           Object.fromEntries(
-            identityColumns.map(({ column }, index) => [
-              column.name,
-              encode(row[`__col_${displayColumnCount + index}`]),
-            ]),
+            identityColumns.flatMap(({ column }, index) =>
+              includes(column)
+                ? [
+                    [
+                      column.name,
+                      encode(row[`__col_${displayColumnCount + index}`]),
+                    ],
+                  ]
+                : [],
+            ),
           ),
         );
     const hasMssqlSqlVariantIdentities = identityColumns.some(
@@ -467,6 +478,9 @@ export class TableReadService {
     );
     const hasPostgresArrayIdentities = identityColumns.some(
       ({ column }) => column.postgresArrayPrimaryKey,
+    );
+    const hasPostgresIntervalIdentities = identityColumns.some(
+      ({ column }) => column.postgresIntervalPrimaryKey,
     );
     const hasOracleTemporalIdentities = identityColumns.some(
       ({ column }) => column.oracleTemporalPrimaryKey,
@@ -480,8 +494,10 @@ export class TableReadService {
         }
       : hasPostgresArrayIdentities
         ? {
-            postgresArrayRowIdentities: readIdentities((value) =>
-              typeof value === "string" ? { $rapidbPgArrayKey: value } : null,
+            postgresArrayRowIdentities: readIdentities(
+              (value) =>
+                typeof value === "string" ? { $rapidbPgArrayKey: value } : null,
+              (column) => column.postgresArrayPrimaryKey === true,
             ),
           }
         : hasOracleTemporalIdentities
@@ -491,7 +507,7 @@ export class TableReadService {
                 return isOracleTemporalPrimaryKeyValue(key) ? key : null;
               }),
             }
-          : identityColumns.length > 0
+          : identityColumns.length > 0 && !hasPostgresIntervalIdentities
             ? {
                 sqliteRowIdentities: readIdentities((value) => {
                   const key = { $rapidbSqliteKey: value };
@@ -505,6 +521,21 @@ export class TableReadService {
       columns,
       rows,
       ...identities,
+      ...(hasPostgresIntervalIdentities
+        ? {
+            postgresIntervalRowIdentities: readIdentities(
+              (value) => {
+                const key = {
+                  $rapidbPgIntervalKey: Buffer.isBuffer(value)
+                    ? value.toString("hex")
+                    : null,
+                };
+                return isPostgresIntervalPrimaryKeyValue(key) ? key : null;
+              },
+              (column) => !!column.postgresIntervalPrimaryKey,
+            ),
+          }
+        : {}),
       ...(deleteSnapshot && deleteColumnCount > 0
         ? {
             sqlDeleteObservations: readSqlDeleteObservations(

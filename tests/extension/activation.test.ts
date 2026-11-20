@@ -556,6 +556,7 @@ describe("extension activation", () => {
           connectionId?: string;
           sql?: string;
           postgresDatabase?: string;
+          targetSessionKey?: string;
         }) => void)
       | undefined;
     const openBookmarkCommand = vscodeState.registerCommand.mock.calls.find(
@@ -565,6 +566,7 @@ describe("extension activation", () => {
           connectionId?: string;
           sql?: string;
           postgresDatabase?: string;
+          targetSessionKey?: string;
         }) => void)
       | undefined;
 
@@ -579,6 +581,7 @@ describe("extension activation", () => {
       connectionId: "conn-1",
       sql: "select current_database()",
       postgresDatabase: '  Case:"δοκιμή"  ',
+      targetSessionKey: "a".repeat(64),
     };
     openHistoryCommand(scoped);
     openBookmarkCommand(scoped);
@@ -596,6 +599,7 @@ describe("extension activation", () => {
       undefined,
       undefined,
       undefined,
+      { connectionId: "conn-1", sessionKey: null },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       2,
@@ -608,6 +612,7 @@ describe("extension activation", () => {
       true,
       undefined,
       undefined,
+      { connectionId: "conn-1", sessionKey: null },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       3,
@@ -620,6 +625,7 @@ describe("extension activation", () => {
       undefined,
       undefined,
       scoped.postgresDatabase,
+      { connectionId: "conn-1", sessionKey: scoped.targetSessionKey },
     );
     expect(queryPanelCreateOrShow).toHaveBeenNthCalledWith(
       4,
@@ -632,6 +638,7 @@ describe("extension activation", () => {
       true,
       undefined,
       scoped.postgresDatabase,
+      { connectionId: "conn-1", sessionKey: scoped.targetSessionKey },
     );
     expect(vscodeState.showErrorMessage).toHaveBeenCalledWith(
       expect.stringContaining("PostgreSQL database is invalid"),

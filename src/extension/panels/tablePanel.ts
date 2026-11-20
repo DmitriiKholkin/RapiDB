@@ -1498,6 +1498,12 @@ export class TablePanel {
         ...(result.postgresArrayRowIdentities
           ? { postgresArrayRowIdentities: result.postgresArrayRowIdentities }
           : {}),
+        ...(result.postgresIntervalRowIdentities
+          ? {
+              postgresIntervalRowIdentities:
+                result.postgresIntervalRowIdentities,
+            }
+          : {}),
         ...(result.mysqlTimestampRowIdentities
           ? { mysqlTimestampRowIdentities: result.mysqlTimestampRowIdentities }
           : {}),

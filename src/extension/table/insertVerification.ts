@@ -198,7 +198,9 @@ export function prepareInsertVerification(
       .map((column, index) => {
         if (!captureKeys) return keyBinds[index].comparison;
         if (
-          (backend === "pg" && column.postgresArrayPrimaryKey) ||
+          (backend === "pg" &&
+            (column.postgresArrayPrimaryKey ||
+              column.postgresIntervalPrimaryKey)) ||
           (backend === "mysql" && driver.buildTablePrimaryKeyExpr?.(column))
         ) {
           return (

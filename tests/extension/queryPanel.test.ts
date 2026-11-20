@@ -632,6 +632,112 @@ describe("QueryPanel", () => {
     vscodeMock.serializers.clear();
   });
 
+  it("requires explicit confirmation for a repointed saved query or a legacy entry", async () => {
+    const { QueryPanel, manager, context, drivers } =
+      await queryTargetFixture();
+    const { registerSavedEntryCommands } = await import(
+      "../../src/extension/commands/savedEntryCommands"
+    );
+    const commands = new Map<string, (...args: unknown[]) => unknown>();
+    registerSavedEntryCommands(
+      { context, connectionManager: manager },
+      (name, run) => {
+        commands.set(name, run as (...args: unknown[]) => unknown);
+        return { dispose: vi.fn() };
+      },
+    );
+    async function open(command: string, entry: unknown) {
+      const run = commands.get(command);
+      if (!run) throw new Error(`Missing ${command}`);
+      await run(entry);
+      const panel = createdPanel();
+      if (!panel) throw new Error("Missing saved query panel");
+      return panel;
+    }
+    const connectionId = originalTarget.id;
+    const queryText = "select 1";
+    const oldDriver = queryDriver(originalTarget.database ?? "");
+    const newDriver = queryDriver("replacement");
+    drivers
+      .mockReturnValueOnce(oldDriver as unknown as IDBDriver)
+      .mockReturnValue(newDriver as unknown as IDBDriver);
+    try {
+      await manager.saveConnection(originalTarget);
+      const targetSessionKey = manager.getQueryTargetSessionKey(connectionId);
+      QueryPanel.createOrShow(context, manager, connectionId, queryText, true);
+      const originalPanel = createdPanel();
+      if (!originalPanel) throw new Error("Missing original panel");
+      const payload = { connectionId, queryText, targetSessionKey };
+      await originalPanel.webview.dispatchMessage({
+        type: "executeQuery",
+        payload,
+      });
+      await originalPanel.webview.dispatchMessage({
+        type: "addBookmark",
+        payload,
+      });
+      await vi.waitFor(() =>
+        expect(manager.getHistory()[0]?.targetSessionKey).toBe(
+          targetSessionKey,
+        ),
+      );
+      const [history] = manager.getHistory();
+      const [bookmark] = manager.getBookmarks();
+      expect(bookmark?.targetSessionKey).toBe(targetSessionKey);
+      const bookmarkCommand = "rapidb.openBookmarkEntry";
+      const historyCommand = "rapidb.openHistoryEntry";
+      const verified = await open(bookmarkCommand, bookmark);
+      await verified.webview.dispatchMessage({ type: "executeQuery", payload });
+      expect(oldDriver.query).toHaveBeenCalledTimes(2);
+
+      await manager.saveConnection({
+        ...originalTarget,
+        host: "replacement.invalid",
+        database: "replacement",
+      });
+      const newKey = manager.getQueryTargetSessionKey(connectionId);
+      expect(newKey).not.toBe(targetSessionKey);
+      const replacement = { ...payload, targetSessionKey: newKey };
+      for (const [command, entry] of [
+        [historyCommand, history],
+        [bookmarkCommand, bookmark],
+        [bookmarkCommand, { ...bookmark, targetSessionKey: undefined }],
+      ] as const) {
+        const reopened = await open(command, entry);
+        await reopened.webview.dispatchMessage({
+          type: "executeQuery",
+          payload: replacement,
+        });
+        expect(reopened.webview.postMessage).toHaveBeenCalledWith({
+          type: "queryResult",
+          payload: expect.objectContaining({
+            error: expect.stringContaining("confirm"),
+          }),
+        });
+      }
+      expect(newDriver.query).not.toHaveBeenCalled();
+
+      const reviewed = await open(historyCommand, history);
+      await reviewed.webview.dispatchMessage({
+        type: "activeConnectionChanged",
+        payload: { connectionId, targetSessionKey: newKey },
+      });
+      await reviewed.webview.dispatchMessage({
+        type: "executeQuery",
+        payload: replacement,
+      });
+      expect(newDriver.query).toHaveBeenCalledOnce();
+      await vi.waitFor(() =>
+        expect(
+          manager.getHistory().map((entry) => entry.targetSessionKey),
+        ).toEqual([newKey, targetSessionKey]),
+      );
+    } finally {
+      QueryPanel.disposeAll();
+      await manager.dispose();
+    }
+  });
+
   it("requires confirmation after a same-engine save, keeps reconnects valid, and restores both verified and older drafts", async () => {
     const { QueryPanel, manager, store, context, drivers } =
       await queryTargetFixture();
@@ -1353,11 +1459,13 @@ describe("QueryPanel", () => {
       primary.id,
       "select current_database()",
       postgresDatabase,
+      targetSessionKey,
     );
     expect(connectionManager.addToHistory).toHaveBeenCalledExactlyOnceWith(
       primary.id,
       "select current_database()",
       postgresDatabase,
+      targetSessionKey,
     );
 
     QueryPanel.createOrShow(context, connectionManager as never, primary.id);

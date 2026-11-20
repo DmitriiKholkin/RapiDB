@@ -21,6 +21,7 @@ export interface HistoryEntry {
   sql: string;
   connectionId: string;
   postgresDatabase?: string;
+  targetSessionKey?: string;
   executedAt: string;
 }
 export interface BookmarkEntry {
@@ -28,6 +29,7 @@ export interface BookmarkEntry {
   sql: string;
   connectionId: string;
   postgresDatabase?: string;
+  targetSessionKey?: string;
   savedAt: string;
 }
 export interface ConnectAttempt {

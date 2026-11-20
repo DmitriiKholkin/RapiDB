@@ -434,15 +434,15 @@ export function prepareApplyChangesPlan(
   const skippedRows = new Set<number>();
   const keyColumns = columns.filter((column) => column.isPrimaryKey);
   const backend = connectionManager.getConnection(connectionId)?.type;
-  const hasPostgresArrayKey = keyColumns.some(
-    (column) => column.postgresArrayPrimaryKey,
+  const hasPostgresExactKey = keyColumns.some(
+    (column) =>
+      column.postgresArrayPrimaryKey || column.postgresIntervalPrimaryKey,
   );
   const hasOracleTemporalKey =
     backend === "oracle" &&
     keyColumns.some((column) => driver.buildTablePrimaryKeyExpr?.(column));
   const hasSQLiteKey =
     backend === "sqlite" &&
-    !hasPostgresArrayKey &&
     Boolean(driver.buildPrimaryKeyComparison) &&
     keyColumns.some((column) => driver.buildTablePrimaryKeyExpr?.(column));
   for (const [
@@ -500,7 +500,7 @@ export function prepareApplyChangesPlan(
     const captureColumns =
       !captureSQLiteRowid &&
       verificationValues.length > 0 &&
-      (hasPostgresArrayKey ||
+      (hasPostgresExactKey ||
         (hasOracleTemporalKey &&
           keyColumns.some((column) => Object.hasOwn(changes, column.name))) ||
         (hasSQLiteKey &&

@@ -365,13 +365,26 @@ it("postgres Explorer definitions, regular queries and saved entries execute onl
     expect(
       screen.getByRole("textbox", { name: "SQL fixture editor" }),
     ).toHaveProperty("value", sql);
-    await unavailable.user.click(
+    for (const [command, entry] of [
+      ["rapidb.openHistoryEntry", history],
+      ["rapidb.openBookmarkEntry", bookmark],
+    ] as const) {
+      await loadPanel(command, entry);
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Run" }).disabled,
+      ).toBe(true);
+      expect(
+        screen.getByRole("textbox", { name: "SQL fixture editor" }),
+      ).toHaveProperty("value", sql);
+    }
+    const reviewed = await loadPanel("rapidb.openBookmarkEntry", bookmark);
+    await reviewed.user.click(
       screen.getByRole("button", { name: "Use current target" }),
     );
     expect(screen.getByText(/Pinned target/).textContent).toContain(
       JSON.stringify(target),
     );
-    expect((await runInUi(unavailable)).rows).toEqual([
+    expect((await runInUi(reviewed)).rows).toEqual([
       { [colKey(0)]: target, [colKey(1)]: 2 },
     ]);
     expect(connectionManager.getHistory()[0]).toMatchObject({
@@ -383,7 +396,7 @@ it("postgres Explorer definitions, regular queries and saved entries execute onl
       await admin.query(`DROP DATABASE ${quotedTarget}`);
     });
     createdDatabase = false;
-    const result = await runInUi(unavailable);
+    const result = await runInUi(reviewed);
     expect(result.error).toBeTruthy();
     expect(result.rows).toEqual([]);
     expect(

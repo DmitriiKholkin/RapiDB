@@ -155,4 +155,25 @@ describe("PostgreSQL query results through formatting and JSON export", () => {
     });
     expect(JSON.parse(exported).doc).toEqual({ x: 1, y: 2 });
   });
+
+  it("preserves the PostgreSQL ISO interval supplied by the server", async () => {
+    const { formatted, exported } = await queryWireRow(
+      [field("duration", 1186)],
+      ["P1DT-2.000001S"],
+    );
+    expect(formatted.rows).toEqual([{ __col_0: "P1DT-2.000001S" }]);
+    expect(JSON.parse(exported)).toEqual({ duration: "P1DT-2.000001S" });
+  });
+
+  it.each([
+    "@ 1 day 2 hours ago",
+    "-1-2",
+    "+2 03:04:05.123456",
+  ])("preserves an interval the stock PostgreSQL decoder cannot parse: %s", async (interval) => {
+    const { formatted } = await queryWireRow(
+      [field("duration", 1186)],
+      [interval],
+    );
+    expect(formatted.rows).toEqual([{ __col_0: interval }]);
+  });
 });

@@ -88,6 +88,11 @@ describe("MSSQL affected-row uncertainty through the query panel", () => {
           ],
         }),
       );
-    expect(history).toHaveBeenCalledExactlyOnceWith("mssql-nested", queryText);
+    expect(history).toHaveBeenCalledExactlyOnceWith(
+      "mssql-nested",
+      queryText,
+      undefined,
+      undefined,
+    );
   });
 });

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
 import { isPostgresQueryDatabase } from "../../shared/postgresQueryDatabase";
+import { parseQueryTargetBinding } from "../../shared/webviewContracts/query";
 import type {
   BookmarkEntry,
   ConnectionManager,
@@ -17,7 +18,10 @@ export interface SavedEntryCommandContext {
 async function showSavedQuery(
   context: vscode.ExtensionContext,
   connectionManager: ConnectionManager,
-  entry: Pick<HistoryEntry, "connectionId" | "sql" | "postgresDatabase">,
+  entry: Pick<
+    HistoryEntry,
+    "connectionId" | "sql" | "postgresDatabase" | "targetSessionKey"
+  >,
   options?: {
     forceNew?: boolean;
     formatOnOpen?: boolean;
@@ -57,6 +61,12 @@ async function showSavedQuery(
     options?.isBookmarked,
     undefined,
     entry.postgresDatabase,
+    // Legacy entries still open, but cannot inherit the current target until
+    // the user explicitly confirms it in the query panel.
+    parseQueryTargetBinding({
+      connectionId: entry.connectionId,
+      sessionKey: entry.targetSessionKey,
+    }) ?? { connectionId: entry.connectionId, sessionKey: null },
   );
 }
 

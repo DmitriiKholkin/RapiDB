@@ -2,6 +2,7 @@ import type { MssqlSqlVariantRowIdentity } from "../../shared/mssqlSqlVariantRow
 import type { MySQLTimestampRowIdentity } from "../../shared/mysqlTimestampRowIdentity";
 import type { OracleTemporalRowIdentity } from "../../shared/oracleTemporalRowIdentity";
 import type { PostgresArrayRowIdentity } from "../../shared/postgresArrayRowIdentity";
+import type { PostgresIntervalRowIdentity } from "../../shared/postgresIntervalRowIdentity";
 import type { SqlDeleteObservation } from "../../shared/sqlDeleteObservation";
 import type { SQLiteRowIdentity } from "../../shared/sqliteRowIdentity";
 import type { ApplyResultPayload } from "../../shared/webviewContracts";
@@ -27,6 +28,7 @@ export interface TablePage {
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   sqliteRowIdentities?: SQLiteRowIdentity[];
   postgresArrayRowIdentities?: PostgresArrayRowIdentity[];
+  postgresIntervalRowIdentities?: PostgresIntervalRowIdentity[];
   mysqlTimestampRowIdentities?: MySQLTimestampRowIdentity[];
   mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[];
   oracleTemporalRowIdentities?: OracleTemporalRowIdentity[];

@@ -10,6 +10,7 @@ import {
   parsePersistedTableDraft,
   parsePersistedTableViewState,
   registerPostgresArrayRowIdentity,
+  registerPostgresIntervalRowIdentity,
   registerSQLiteRowIdentity,
   restorePendingEditsSafely,
   rowMutationBlockReason,
@@ -111,6 +112,36 @@ it("restores a PostgreSQL array-key draft only to the original bounds", () => {
   expect(rowMutationBlockReason(display, keys)).toMatch(
     /cannot be targeted safely/,
   );
+});
+
+it("uses both exact PostgreSQL key parts and never falls back to a displayed interval", () => {
+  const formerRow = { arr: "[4]", duration: "P0D", amount: 1 };
+  const currentRow = { ...formerRow };
+  const arrayKey = { arr: { $rapidbPgArrayKey: "[0:0]={4}" } };
+  const exactKey = { duration: { $rapidbPgIntervalKey: `${"0".repeat(31)}1` } };
+  const zeroKey = { duration: { $rapidbPgIntervalKey: "0".repeat(32) } };
+  registerPostgresArrayRowIdentity(formerRow, arrayKey);
+  registerPostgresArrayRowIdentity(currentRow, arrayKey);
+  registerPostgresIntervalRowIdentity(formerRow, exactKey);
+  registerPostgresIntervalRowIdentity(currentRow, zeroKey);
+  const keys = ["arr", "duration"];
+  expect(rowMutationPrimaryKeys(formerRow, keys, undefined, false)).toEqual({
+    ...arrayKey,
+    ...exactKey,
+  });
+  const draft = buildPendingRestoreState(
+    pendingEditsFrom([[0, { amount: 2 }]]),
+    [formerRow],
+    keys,
+  );
+  expect(
+    restorePendingEditsSafely(draft, [currentRow, formerRow], keys),
+  ).toEqual({
+    pendingEdits: pendingEditsFrom([[1, { amount: 2 }]]),
+    unresolved: [],
+  });
+  registerPostgresIntervalRowIdentity(currentRow, { duration: null });
+  expect(rowMutationBlockReason(currentRow, keys)).toMatch(/exact identity/);
 });
 
 describe("table filter draft validation", () => {

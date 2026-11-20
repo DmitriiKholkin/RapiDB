@@ -24,6 +24,10 @@ import {
   type PostgresArrayRowIdentity,
 } from "../../../shared/postgresArrayRowIdentity";
 import {
+  isPostgresIntervalPrimaryKeyValue,
+  type PostgresIntervalRowIdentity,
+} from "../../../shared/postgresIntervalRowIdentity";
+import {
   isSqlDeleteObservation,
   type SqlDeleteObservation,
 } from "../../../shared/sqlDeleteObservation";
@@ -60,6 +64,7 @@ import {
   registerMySQLTimestampRowIdentity,
   registerOracleTemporalRowIdentity,
   registerPostgresArrayRowIdentity,
+  registerPostgresIntervalRowIdentity,
   registerSQLiteRowIdentity,
   registerSqlDeleteObservation,
   type TableFetchOptions,
@@ -109,6 +114,7 @@ interface TableDataReply {
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   sqliteRowIdentities?: SQLiteRowIdentity[];
   postgresArrayRowIdentities?: PostgresArrayRowIdentity[];
+  postgresIntervalRowIdentities?: PostgresIntervalRowIdentity[];
   mysqlTimestampRowIdentities?: MySQLTimestampRowIdentity[];
   mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[];
   oracleTemporalRowIdentities?: OracleTemporalRowIdentity[];
@@ -177,6 +183,11 @@ function isTableDataReply(
       isPostgresArrayPrimaryKeyValue,
     ) &&
     isRowIdentityList(
+      payload.postgresIntervalRowIdentities,
+      payload.rows.length,
+      isPostgresIntervalPrimaryKeyValue,
+    ) &&
+    isRowIdentityList(
       payload.mysqlTimestampRowIdentities,
       payload.rows.length,
       isMySQLTimestampPrimaryKeyValue,
@@ -222,6 +233,7 @@ function buildTableInitSignature(
       isPrimaryKey: column.isPrimaryKey,
       primaryKeyRole: column.primaryKeyRole ?? null,
       postgresArrayPrimaryKey: column.postgresArrayPrimaryKey ?? false,
+      postgresIntervalPrimaryKey: column.postgresIntervalPrimaryKey ?? null,
       mysqlTimestampPrimaryKey: column.mysqlTimestampPrimaryKey ?? false,
       mssqlSqlVariantPrimaryKey: column.mssqlSqlVariantPrimaryKey ?? false,
       oracleTemporalPrimaryKey: column.oracleTemporalPrimaryKey ?? false,
@@ -955,6 +967,7 @@ export function useTableDataController({
           rowValueTypes,
           sqliteRowIdentities,
           postgresArrayRowIdentities,
+          postgresIntervalRowIdentities,
           mysqlTimestampRowIdentities,
           mssqlSqlVariantRowIdentities,
           oracleTemporalRowIdentities,
@@ -966,6 +979,9 @@ export function useTableDataController({
         const nextRowValueTypes = rowValueTypes ?? mongoValueTypes ?? [];
         const postgresArrayKeyNames = columnsRef.current
           .filter((column) => column.postgresArrayPrimaryKey)
+          .map((column) => column.name);
+        const postgresIntervalKeyNames = columnsRef.current
+          .filter((column) => column.postgresIntervalPrimaryKey)
           .map((column) => column.name);
         const mysqlTimestampKeyNames = columnsRef.current
           .filter((column) => column.mysqlTimestampPrimaryKey)
@@ -1007,6 +1023,20 @@ export function useTableDataController({
               copy,
               Object.fromEntries(
                 postgresArrayKeyNames.map((name) => [
+                  name,
+                  identity && Object.hasOwn(identity, name)
+                    ? identity[name]
+                    : null,
+                ]),
+              ),
+            );
+          }
+          if (postgresIntervalKeyNames.length > 0) {
+            const identity = postgresIntervalRowIdentities?.[index];
+            registerPostgresIntervalRowIdentity(
+              copy,
+              Object.fromEntries(
+                postgresIntervalKeyNames.map((name) => [
                   name,
                   identity && Object.hasOwn(identity, name)
                     ? identity[name]

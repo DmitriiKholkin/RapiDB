@@ -292,6 +292,8 @@ export interface ColumnMeta {
   primaryKeyRole?: PrimaryKeyRole;
   /** PostgreSQL array key whose native text must travel outside display cells. */
   postgresArrayPrimaryKey?: boolean;
+  /** PostgreSQL interval key whose stored identity must travel outside display cells. */
+  postgresIntervalPrimaryKey?: "scalar" | "array";
   /** MySQL TIMESTAMP key whose stored instant must travel outside display cells. */
   mysqlTimestampPrimaryKey?: boolean;
   /** SQL Server sql_variant key whose typed identity must travel outside display cells. */

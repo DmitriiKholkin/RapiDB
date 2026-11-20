@@ -218,6 +218,7 @@ describe("native driver timeout wiring", () => {
       Pool: MockPool,
       types: {
         setTypeParser: vi.fn(),
+        getTypeParser: () => (value: string) => value,
       },
     }));
 
@@ -280,6 +281,7 @@ describe("native driver timeout wiring", () => {
       Pool: MockPool,
       types: {
         setTypeParser: vi.fn(),
+        getTypeParser: () => (value: string) => value,
       },
     }));
 
@@ -356,6 +358,7 @@ describe("native driver timeout wiring", () => {
         Pool: MockPool,
         types: {
           setTypeParser: vi.fn(),
+          getTypeParser: () => (value: string) => value,
         },
       }));
 

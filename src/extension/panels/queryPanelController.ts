@@ -641,9 +641,8 @@ export class QueryPanelController {
       .addToHistory(
         connectionId,
         queryText,
-        ...(this.postgresDatabase !== undefined
-          ? ([this.postgresDatabase] as const)
-          : []),
+        this.postgresDatabase,
+        this.targetBinding?.sessionKey ?? undefined,
       )
       .catch((error) => {
         logger.error("Failed to save query history", error);
@@ -1510,9 +1509,8 @@ export class QueryPanelController {
       await this.connectionManager.addBookmark(
         connectionId,
         queryText,
-        ...(this.postgresDatabase !== undefined
-          ? ([this.postgresDatabase] as const)
-          : []),
+        this.postgresDatabase,
+        this.targetBinding?.sessionKey ?? undefined,
       );
       this.view.postMessage({
         type: "bookmarkSaved",
