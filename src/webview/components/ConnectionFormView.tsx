@@ -12,12 +12,14 @@ import {
   useState,
 } from "react";
 import type {
+  AwsCredentialMode,
   ConnectionSshAuthMethod,
   ConnectionSshHostVerificationMode,
   ConnectionTlsMode,
 } from "../../shared/connectionConfig";
 import {
   getConnectionTlsSupport,
+  hasAwsCredentialMaterial,
   isConnectionTlsEnabled,
   resolveConnectionTlsMode,
 } from "../../shared/connectionConfig";
@@ -626,15 +628,16 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     "none" | "password" | "apiKey"
   >(initialElasticAuthMode);
   const [awsCredentialMode, setAwsCredentialMode] = useState<
-    "default" | "profile" | "static"
+    AwsCredentialMode | ""
   >(
-    existing?.hasStoredAwsKeyPair || existing?.awsAccessKeyId
-      ? "static"
-      : existing?.awsProfile
-        ? "profile"
-        : existing?.hasStoredAwsCredentials
+    existing?.awsCredentialMode ??
+      (existing?.type !== "dynamodb"
+        ? "default"
+        : existing.hasStoredAwsCredentials ||
+            existing.hasStoredAwsKeyPair ||
+            hasAwsCredentialMaterial(existing)
           ? "static"
-          : "default",
+          : ""),
   );
   const [keepConnectionUriCredentials, setKeepConnectionUriCredentials] =
     useState(existing?.hasStoredConnectionUriCredentials ?? false);
@@ -652,6 +655,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
   const [awsProfile, setAwsProfile] = useState(existing?.awsProfile ?? "");
   const [dynamoEndpoint, setDynamoEndpoint] = useState(
     existing?.endpoint ?? existing?.awsEndpoint ?? "",
+  );
+  const [awsStsEndpoint, setAwsStsEndpoint] = useState(
+    existing?.awsStsEndpoint ?? "",
   );
   const [sshEnabled, setSshEnabled] = useState(!!existing?.ssh);
   const [sshHost, setSshHost] = useState(existing?.ssh?.host ?? "");
@@ -1007,7 +1013,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
       clearTlsKeyPassphrase,
       clearAmbiguousStoredUri: clearAmbiguousStoredUri || undefined,
       clearAwsCredentials:
-        isDynamo && (clearAwsCredentials || awsCredentialMode !== "static"),
+        isDynamo && awsCredentialMode !== "static" && awsCredentialMode !== "",
       ssh: effectiveSshEnabled
         ? {
             host: sshHost.trim() || undefined,
@@ -1034,6 +1040,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
         : isDynamo
           ? {
               awsRegion: awsRegion.trim() || undefined,
+              awsCredentialMode: awsCredentialMode || undefined,
               awsAccessKeyId:
                 awsCredentialMode !== "static"
                   ? undefined
@@ -1048,10 +1055,9 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   : awsSessionToken.trim() || undefined,
               awsProfile: awsProfileSelected
                 ? awsProfile.trim() || undefined
-                : awsCredentialMode === "static"
-                  ? existing?.awsProfile
-                  : undefined,
+                : undefined,
               endpoint: dynamoEndpoint.trim() || undefined,
+              awsStsEndpoint: awsStsEndpoint.trim() || undefined,
             }
           : {
               host:
@@ -1185,6 +1191,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     awsSecretAccessKey,
     awsSessionToken,
     dynamoEndpoint,
+    awsStsEndpoint,
     sshHost,
     sshPort,
     sshUsername,
@@ -1227,7 +1234,6 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
     keepConnectionUriCredentials,
     clearPassword,
     clearApiKey,
-    clearAwsCredentials,
     awsProfileSelected,
     awsCredentialMode,
     elasticAddressMode,
@@ -1291,6 +1297,10 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
           !elasticsearchApiKey.trim() &&
           (!hasStoredApiKey || clearApiKey),
         "API key is required for API key authentication.",
+      ],
+      [
+        isDynamo && awsCredentialMode === "",
+        "Choose an AWS credential source. The source for this older connection could not be determined.",
       ],
       [
         isDynamo && awsCredentialMode === "profile" && !awsProfile.trim(),
@@ -1553,11 +1563,14 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 aria-label="AWS credential source"
                 value={awsCredentialMode}
                 onChange={(e) =>
-                  setAwsCredentialMode(
-                    e.target.value as "default" | "profile" | "static",
-                  )
+                  setAwsCredentialMode(e.target.value as AwsCredentialMode | "")
                 }
               >
+                {awsCredentialMode === "" && (
+                  <option value="" disabled>
+                    Choose a credential source
+                  </option>
+                )}
                 <option value="default">Default AWS credential chain</option>
                 <option value="profile">AWS profile</option>
                 <option value="static">Access keys</option>
@@ -1592,6 +1605,17 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                 value={dynamoEndpoint}
                 onChange={(e) => setDynamoEndpoint(e.target.value)}
                 placeholder="http://localhost:8000"
+              />
+            </Field>
+            <Field
+              label="STS endpoint"
+              hint="Optional. RapiDB verifies the AWS account of AWS endpoints through regional STS. If it is unreachable (for example a private subnet with an STS VPC endpoint without private DNS), enter that endpoint's HTTPS DNS name."
+            >
+              <FocusInput
+                aria-label="AWS STS endpoint"
+                value={awsStsEndpoint}
+                onChange={(e) => setAwsStsEndpoint(e.target.value)}
+                placeholder="https://vpce-….sts.us-east-1.vpce.amazonaws.com"
               />
             </Field>
             {awsCredentialMode === "static" && (
@@ -1633,9 +1657,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                   <Toggle
                     label="Remove saved AWS credentials"
                     hint={
-                      clearAwsCredentials || awsProfileSelected
-                        ? "Saved static credentials are removed; AWS Profile (when set) or the default credential chain will be used."
-                        : "Saved AWS credentials are kept; a complete static key pair takes priority over AWS Profile. New values replace them."
+                      "Switch to the default AWS credential chain and remove the saved access keys when this connection is saved."
                     }
                     checked={clearAwsCredentials || awsProfileSelected}
                     disabled={saving || awsProfileSelected}
@@ -1954,7 +1976,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             {redisUriMode && existing?.hasStoredConnectionUriCredentials && (
               <Toggle
                 label="Keep saved URI credentials"
-                hint="Reuse saved URI credentials when editing. Turn off to remove them, or enter a complete URI to replace them."
+                hint="Reuse saved credentials only for the same connection target. Enter a complete URI to connect to a new target."
                 checked={keepConnectionUriCredentials}
                 disabled={saving}
                 onChange={setKeepConnectionUriCredentials}
@@ -1963,7 +1985,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
             {mongoUriMode && existing?.hasStoredMongoUriCredentials && (
               <Toggle
                 label="Keep saved URI credentials"
-                hint="Reuse the saved credentials when editing this URI. Turn off to remove them, or paste a complete URI to replace them."
+                hint="Reuse saved credentials only for the same connection target. Enter a complete URI to connect to a new target."
                 checked={keepMongoUriCredentials}
                 disabled={saving}
                 onChange={setKeepMongoUriCredentials}
@@ -1989,7 +2011,7 @@ export function ConnectionFormView({ existing }: Props): ReactElement {
                     {existing?.hasStoredConnectionUriCredentials && (
                       <Toggle
                         label="Keep saved endpoint credentials"
-                        hint="Reuse credentials stored in this endpoint or connection URI. Turn off to remove them, or enter a complete endpoint to replace them."
+                        hint="Reuse saved credentials only for the same connection target. Enter a complete endpoint to connect to a new target."
                         checked={keepConnectionUriCredentials}
                         disabled={saving}
                         onChange={setKeepConnectionUriCredentials}

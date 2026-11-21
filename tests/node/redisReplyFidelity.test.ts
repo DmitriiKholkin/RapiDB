@@ -28,10 +28,14 @@ function array(items: Buffer[]): Buffer {
 
 const binaryMember = Buffer.from([0xff, 0x00]);
 
-const values: Record<string, { type: string; reply: Buffer; size: number }> = {
+const values: Record<
+  string,
+  { type: string; reply?: Buffer; fields?: Buffer[]; size: number }
+> = {
   "h:proto": {
     type: "hash",
     size: 2,
+    fields: [bulk("__proto__"), bulk("polluted"), bulk("name"), bulk("ok")],
     reply: Buffer.concat([
       Buffer.from("%2\r\n"),
       bulk("__proto__"),
@@ -43,7 +47,7 @@ const values: Record<string, { type: string; reply: Buffer; size: number }> = {
   "l:bin": {
     type: "list",
     size: 2,
-    reply: array([bulk("text"), bulk(binaryMember)]),
+    fields: [bulk("text"), bulk(binaryMember)],
   },
   "s:events": {
     type: "stream",
@@ -58,11 +62,14 @@ const values: Record<string, { type: string; reply: Buffer; size: number }> = {
   "z:inf": {
     type: "zset",
     size: 3,
-    reply: array([
-      array([bulk("low"), Buffer.from(",-inf\r\n")]),
-      array([bulk("mid"), Buffer.from(",1.5\r\n")]),
-      array([bulk("high"), Buffer.from(",inf\r\n")]),
-    ]),
+    fields: [
+      bulk("low"),
+      bulk("-inf"),
+      bulk("mid"),
+      bulk("1.5"),
+      bulk("high"),
+      bulk("inf"),
+    ],
   },
 };
 
@@ -116,6 +123,20 @@ class ReplyServer {
         return ":100\r\n";
       case "TTL":
         return ":-1\r\n";
+      case "EVAL_RO": {
+        const entry = values[args[3]];
+        const nil = Buffer.from("$-1\r\n");
+        return entry?.fields
+          ? array([
+              bulk(entry.type),
+              nil,
+              Buffer.from(":-1\r\n"),
+              nil,
+              array(entry.fields),
+              nil,
+            ])
+          : nil;
+      }
       case "HGETALL":
       case "LRANGE":
       case "SMEMBERS":
@@ -418,14 +439,21 @@ describe("Redis query reply fidelity", () => {
 });
 
 describe("Redis table value fidelity", () => {
-  it("keeps __proto__ hash and stream fields", async () => {
+  it("keeps __proto__ hash fields and does not materialize streams in the grid", async () => {
     const rows = await rowsByKey();
     expect(JSON.parse(String(rows.get("h:proto")?.value))).toEqual({
       ["__proto__"]: "polluted",
       name: "ok",
     });
-    expect(JSON.parse(String(rows.get("s:events")?.value))).toEqual([
-      { id: "1-0", message: { ["__proto__"]: "v", f: "w" } },
+    expect(
+      redisBinarySnapshotDisplay(rows.get("s:events")?.value, "stream"),
+    ).toBe("RedisValueUnavailable(stream, no byte-bounded read)");
+    expect(server.commands.some(([command]) => command === "XRANGE")).toBe(
+      false,
+    );
+    const stream = await driver.query("XRANGE s:events - +");
+    expect(JSON.parse(String(stream.rows[0].__col_0))).toEqual([
+      ["1-0", ["__proto__", "v", "f", "w"]],
     ]);
   });
 

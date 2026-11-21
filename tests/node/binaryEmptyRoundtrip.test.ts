@@ -15,6 +15,7 @@ import type {
 } from "../../src/extension/dbDrivers/types";
 import type { TableColumnsProvider } from "../../src/extension/table/tableDataContracts";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const binaryColumn: ColumnTypeMeta = {
   name: "payload",
@@ -75,6 +76,7 @@ function createTableCellSaver(
   driverType: ConnectionConfig["type"],
 ): (value: string | null) => Promise<unknown> {
   const connection = config(driverType);
+  mockPostgresTableScope(driver);
   let persistedValue: unknown;
 
   if (typeof driver.updateRows === "function") {

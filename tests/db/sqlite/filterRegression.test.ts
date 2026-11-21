@@ -74,11 +74,13 @@ describe.each([
     const sqlite = await driver.query(
       "SELECT TIME('24:30'), TIME('24:30+01:00'), TIME('25:00'), datetime(julianday('24:30'))",
     );
+    // SQLite >= 3.54 (better-sqlite3 13.x) accepts hour 24 only as exactly
+    // 24:00:00. RapiDB's own TIME keys still normalize 24:MM modulo the day.
     expect(sqlite.rows[0]).toEqual({
-      __col_0: "24:30:00",
-      __col_1: "23:30:00",
+      __col_0: null,
+      __col_1: null,
       __col_2: null,
-      __col_3: "2000-01-02 00:30:00",
+      __col_3: null,
     });
     expect(await ids("event", "eq", "24:00Z")).toEqual([1, 2]);
     expect(await ids("event", "eq", "24:30:00.123456789Z")).toEqual([3, 4]);
@@ -132,6 +134,74 @@ describe.each([
       driver.buildFilterCondition(column, "in", "24:30Z, 24:00+01:00", 1)
         ?.params,
     ).toEqual(["24:30:00Z", "24:00:00+01:00"]);
+  });
+
+  it("applies RapiDB's hour-24 rule to DATE filters exactly as to DATETIME filters", async () => {
+    const { driver, ids } = await setup(
+      mode,
+      `
+      CREATE TABLE items (id INTEGER PRIMARY KEY, day DATE, stamp DATETIME);
+      INSERT INTO items VALUES
+        (1, '2024-01-01 24:30', '2024-01-01 24:30'),
+        (2, '2024-01-02', '2024-01-02 00:00'),
+        (3, '2024-01-01 24:00', '2024-01-01 24:00'),
+        (4, '2024-01-01 24:59:59', '2024-01-01 24:59:59'),
+        (5, '2024-01-01 24:60', '2024-01-01 24:60'),
+        (6, '2024-12-31 24:00', '2024-12-31 24:00'),
+        (7, '2024-02-28 24:00', '2024-02-28 24:00'),
+        (8, '2023-02-28 24:00', '2023-02-28 24:00'),
+        (9, '2024-01-01 23:59:59', '2024-01-01 23:59:59'),
+        (10, '-0001-12-31 24:00', '-0001-12-31 24:00'),
+        (11, NULL, NULL),
+        (12, '2024-01-01T23:30:00-01:00', '2024-01-01T23:30:00-01:00'),
+        (13, 2460311.5, 2460311.5),
+        (14, '2024-02-29 24:00', '2024-02-29 24:00'),
+        (15, '2024-01-01 25:00', '2024-01-01 25:00');
+    `,
+    );
+    const sqlite = await driver.query(
+      "SELECT DATE('2024-01-01 24:30'), DATE('2024-01-01 24:59:59'), DATE('2024-01-01 24:00')",
+    );
+    // SQLite 3.54's DATE() rejects hour 24 except 24:00:00; RapiDB does not
+    // use it for filters.
+    expect(sqlite.rows[0].__col_0).toBeNull();
+    expect(sqlite.rows[0].__col_1).toBeNull();
+
+    const nextDay = [1, 2, 3, 4, 12, 13];
+    expect(await ids("day", "eq", "2024-01-02")).toEqual(nextDay);
+    expect(await ids("stamp", "eq", "2024-01-02 00:00")).toEqual([2, 3, 13]);
+    expect(
+      await ids("stamp", "between", [
+        "2024-01-02 00:00:00",
+        "2024-01-02 23:59:59.999999999",
+      ]),
+    ).toEqual(nextDay);
+    expect(await ids("stamp", "eq", "2024-01-02 00:30")).toEqual([1, 12]);
+    expect(await ids("stamp", "eq", "2024-01-01 24:30")).toEqual([1, 12]);
+    expect(await ids("stamp", "eq", "2024-01-02 00:59:59")).toEqual([4]);
+
+    // Year, leap-day and month boundaries.
+    expect(await ids("day", "eq", "2025-01-01")).toEqual([6]);
+    expect(await ids("stamp", "eq", "2025-01-01 00:00")).toEqual([6]);
+    expect(await ids("day", "eq", "2024-02-29")).toEqual([7]);
+    expect(await ids("day", "eq", "2024-03-01")).toEqual([14]);
+    expect(await ids("day", "eq", "2023-03-01")).toEqual([8]);
+    expect(await ids("day", "eq", "2024-01-01")).toEqual([9]);
+    // Negative (astronomical) years: -0001-12-31 24:00 is 0000-01-01.
+    expect(await ids("day", "eq", "0000-01-01")).toEqual([10]);
+    expect(await ids("stamp", "eq", "0000-01-01 00:00")).toEqual([10]);
+
+    // Invalid values (24:60, 25:00) and NULL never match, also not for neq.
+    expect(await ids("day", "neq", "2024-01-02")).toEqual([6, 7, 8, 9, 10, 14]);
+    expect(await ids("day", "lt", "2024-01-02")).toEqual([8, 9, 10]);
+    expect(await ids("day", "gte", "2024-01-02")).toEqual([
+      1, 2, 3, 4, 6, 7, 12, 13, 14,
+    ]);
+    expect(await ids("day", "between", ["2024-01-01", "2024-01-02"])).toEqual([
+      1, 2, 3, 4, 9, 12, 13,
+    ]);
+    expect(await ids("day", "in", "2024-02-29, 2025-01-01")).toEqual([6, 7]);
+    expect(await ids("day", "is_null")).toEqual([11]);
   });
 
   it("preserves fractions in SQLite-normalized dates and rejects invalid offsets and direct IN values", async () => {

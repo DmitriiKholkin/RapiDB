@@ -42,10 +42,9 @@ async function exportedDocument(
       sort: () => cursor,
       skip: () => cursor,
       limit: () => cursor,
-      map: (decode: (raw: Uint8Array) => unknown) => ({
-        toArray: async () => [decode(bytes)],
-      }),
-      toArray: async () => [BSON.deserialize(bytes, options)],
+      async *[Symbol.asyncIterator]() {
+        yield options.raw ? bytes : BSON.deserialize(bytes, options);
+      },
     };
     return cursor;
   };

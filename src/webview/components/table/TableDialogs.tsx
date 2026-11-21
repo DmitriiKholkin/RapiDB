@@ -486,10 +486,10 @@ function MutationPreviewDialog({
   onConfirm,
 }: MutationPreviewDialogProps) {
   const confirmLabel =
-    preview.kind === "applyChanges"
-      ? "Apply Changes"
-      : preview.kind === "insertRow"
-        ? "Insert Row"
+    preview.kind === "insertRow"
+      ? "Insert Row"
+      : preview.kind === "deleteRows" && preview.confirmationWarning
+        ? "Delete Keys"
         : "Apply Changes";
 
   return (
@@ -498,8 +498,21 @@ function MutationPreviewDialog({
       description={
         <>
           {preview.statementCount} planned operation
-          {preview.statementCount === 1 ? "" : "s"}. The preview below is read
-          only; descriptions marked non-executable are not commands to run.
+          {preview.statementCount === 1 ? "" : "s"}.
+          {!preview.confirmationOnly &&
+            " The preview below is read only; descriptions marked non-executable are not commands to run."}
+          {preview.confirmationWarning && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 13,
+                fontWeight: 600,
+                color: "var(--vscode-editorWarning-foreground)",
+              }}
+            >
+              {preview.confirmationWarning}
+            </div>
+          )}
         </>
       }
       value={preview.text ?? preview.sql}
@@ -512,6 +525,11 @@ function MutationPreviewDialog({
       }
       ariaLabel="Mutation preview"
       readOnly
+      unavailableMessage={
+        preview.confirmationOnly
+          ? "Command preview is disabled in settings."
+          : undefined
+      }
       confirmLabel={confirmLabel}
       closeAriaLabel="Close mutation preview"
       onCancel={onCancel}

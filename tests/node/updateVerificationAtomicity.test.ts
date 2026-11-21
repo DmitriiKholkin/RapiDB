@@ -16,6 +16,8 @@ import {
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
+import { mysqlLockedMutationMetadata } from "../support/mysqlLockedMutationMetadata";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -56,6 +58,8 @@ function harness(risk: string | null = riskMessage, mismatch = true) {
   const events: string[] = [];
   const stored = new Map<number, unknown>();
   const query = vi.fn(async (input: { sql: string; values?: unknown[] }) => {
+    const metadata = mysqlLockedMutationMetadata(input.sql);
+    if (metadata) return metadata;
     const params = input.values ?? [];
     if (input.sql === "ROLLBACK") {
       events.push("ROLLBACK");
@@ -426,6 +430,7 @@ describe("verified UPDATE rollback preflight", () => {
             type: "sqlite",
             filePath: ":memory:",
           });
+    mockPostgresTableScope(driver);
     const manager = {
       getConnection: () => ({ id: `safe-${dialect}`, readOnly: false }),
       getDriver: () => driver,

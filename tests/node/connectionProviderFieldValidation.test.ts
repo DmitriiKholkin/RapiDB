@@ -231,3 +231,37 @@ describe("MongoDB authSource validation", () => {
     ).toBe(true);
   });
 });
+
+describe("DynamoDB STS endpoint validation", () => {
+  const config = {
+    type: "dynamodb",
+    name: "DynamoDB",
+    awsRegion: "us-east-1",
+    awsCredentialMode: "default",
+  } as const;
+
+  it.each([
+    "http://sts.us-east-1.amazonaws.com",
+    "https://user@sts.us-east-1.amazonaws.com",
+    "https://sts.us-east-1.amazonaws.com:8443",
+    "https://sts.us-east-1.amazonaws.com/path",
+    "https://sts.us-east-1.amazonaws.com/?x=1",
+    "https://sts.us-east-1.amazonaws.com/#x",
+    "sts.us-east-1.amazonaws.com",
+  ])("rejects %s", (awsStsEndpoint) => {
+    expect(
+      expectInvalidField({ ...config, awsStsEndpoint }, "awsStsEndpoint"),
+    ).toMatch(/STS endpoint must be an HTTPS URL/);
+  });
+
+  it.each([
+    undefined,
+    "",
+    "https://vpce-0abc-def.sts.us-east-1.vpce.amazonaws.com",
+    "https://sts.us-east-1.amazonaws.com/",
+  ])("accepts %s", (awsStsEndpoint) => {
+    expect(validateConnectionConfig({ ...config, awsStsEndpoint }).valid).toBe(
+      true,
+    );
+  });
+});

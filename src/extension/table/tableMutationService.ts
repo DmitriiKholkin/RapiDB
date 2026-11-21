@@ -1,4 +1,8 @@
 import {
+  noSqlDeleteObservationError,
+  observedNoSqlDeleteBackend,
+} from "../../shared/noSqlDeleteObservation";
+import {
   MISSING_DELETE_OBSERVATION,
   type SqlDeleteObservation,
 } from "../../shared/sqlDeleteObservation";
@@ -22,12 +26,18 @@ import type {
   ColumnTypeMeta,
   DriverMutationResult,
   IDBDriver,
+  NoSqlDeleteObservation,
+  PreparedObservedDelete,
   TransactionOperation,
 } from "../dbDrivers/types";
 import { pMapWithLimit } from "../utils/concurrency";
 import { assertConnectionWritable } from "../utils/readOnlyGuards";
 import { buildInsertRowOperation } from "./insertSql";
 import { prepareInsertVerification } from "./insertVerification";
+import {
+  lockedTableMutationOptions,
+  runLockedTableTransaction,
+} from "./lockedTableMutation";
 import {
   PersistedEditValidationError,
   validateInsertColumnNames,
@@ -38,6 +48,7 @@ import type {
   PreparedInsertPlan,
   TableColumnsProvider,
 } from "./tableDataContracts";
+import { tableDataReference } from "./tableDataReference";
 import {
   appendPrimaryKeyComparison,
   buildUpdateRowSql,
@@ -289,10 +300,23 @@ export class TableMutationService {
         error,
       );
     }
-    await driver.runTransaction(
-      [{ ...operation, checkAffectedRows: true, expectedAffectedRows: 1 }],
-      undefined,
-      { database },
+    await runLockedTableTransaction(
+      lockedTableMutationOptions(
+        this.connectionManager,
+        driver,
+        connectionId,
+        "update data",
+        [{ database, schema, table, event: "UPDATE" }],
+      ),
+      (locked) =>
+        driver.runTransaction(
+          [{ ...operation, checkAffectedRows: true, expectedAffectedRows: 1 }],
+          undefined,
+          {
+            database,
+            ...locked,
+          },
+        ),
     );
   }
   async insertRow(
@@ -535,16 +559,35 @@ export class TableMutationService {
           error,
         );
       }
-      await driver.runTransaction(
-        [{ ...plan.operation, checkAffectedRows: true }],
-        undefined,
-        {
-          database: plan.database,
-          ...(plan.sqliteAttachmentTarget
-            ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
-            : {}),
-          verifications: [plan.verification],
-        },
+      const verification = plan.verification;
+      await runLockedTableTransaction(
+        lockedTableMutationOptions(
+          this.connectionManager,
+          driver,
+          plan.connectionId,
+          "insert data",
+          [
+            {
+              database: plan.database,
+              schema: plan.schema,
+              table: plan.table,
+              event: "INSERT",
+            },
+          ],
+        ),
+        (locked) =>
+          driver.runTransaction(
+            [{ ...plan.operation, checkAffectedRows: true }],
+            undefined,
+            {
+              database: plan.database,
+              ...locked,
+              ...(plan.sqliteAttachmentTarget
+                ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+                : {}),
+              verifications: [verification],
+            },
+          ),
       );
       return;
     }
@@ -595,6 +638,7 @@ export class TableMutationService {
     table: string,
     primaryKeyValuesList: Record<string, unknown>[],
     observations?: readonly (SqlDeleteObservation | null)[],
+    noSqlObservations?: readonly (NoSqlDeleteObservation | null)[],
   ): Promise<PreparedDeletePlan | null> {
     if (primaryKeyValuesList.length === 0) {
       return null;
@@ -605,6 +649,19 @@ export class TableMutationService {
       "delete data",
     );
     const { driver } = this.getConnectionDriver(connectionId);
+    const backend = this.connectionManager.getConnection(connectionId)?.type;
+    const observedBackend = observedNoSqlDeleteBackend(backend);
+    const missingNoSqlObservation = () =>
+      new Error(
+        observedBackend
+          ? noSqlDeleteObservationError[observedBackend]
+          : MISSING_DELETE_OBSERVATION,
+      );
+    if (
+      noSqlObservations &&
+      (!driver.deleteRows || observedBackend === "dynamodb")
+    )
+      throw missingNoSqlObservation();
     const columns = await this.columnsProvider.getColumns(
       connectionId,
       database,
@@ -623,32 +680,72 @@ export class TableMutationService {
           return coercePrimaryKeyValues(driver, criteria, columns, "delete");
         },
       );
-      const previewStatements = driver.buildMutationPreviewStatements
-        ? await driver.buildMutationPreviewStatements(
-            "delete",
-            database,
-            schema,
-            table,
-            {
-              primaryKeyValuesList: coercedPrimaryKeyValuesList,
-            },
+      const { uniqueIndexes, uniquePositions } = uniquePrimaryKeyIdentities(
+        coercedPrimaryKeyValuesList,
+      );
+      const uniqueKeys = uniqueIndexes.map(
+        (index) => coercedPrimaryKeyValuesList[index],
+      );
+      if (driver.assertTableRowMutationIdentity) {
+        await driver.assertTableRowMutationIdentity(database, schema, table);
+      }
+      let observedPlan: PreparedObservedDelete | undefined;
+      if (noSqlObservations) {
+        if (
+          !driver.prepareObservedDelete ||
+          !observedBackend ||
+          noSqlObservations.length !== primaryKeyValuesList.length
+        ) {
+          throw missingNoSqlObservation();
+        }
+        const uniqueObservations = uniqueIndexes.map((index) => {
+          const observation = noSqlObservations[index];
+          if (!observation) throw missingNoSqlObservation();
+          return observation;
+        });
+        if (
+          uniquePositions.some(
+            (position, index) =>
+              noSqlObservations[index] !== uniqueObservations[position],
           )
-        : driver.buildMutationPreviewStatement
-          ? [
-              driver.buildMutationPreviewStatement(
-                "delete",
-                database,
-                schema,
-                table,
-                {
-                  primaryKeyValuesList: coercedPrimaryKeyValuesList,
-                },
-              ),
-            ]
-          : coercedPrimaryKeyValuesList.map(
-              (criteria) =>
-                `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
-            );
+        ) {
+          throw missingNoSqlObservation();
+        }
+        observedPlan = driver.prepareObservedDelete(
+          { database, schema, table, primaryKeyValuesList: uniqueKeys },
+          uniqueObservations,
+        );
+      }
+      const previewKeys =
+        backend === "redis" ? uniqueKeys : coercedPrimaryKeyValuesList;
+      const previewStatements =
+        observedPlan?.previewStatements ??
+        (driver.buildMutationPreviewStatements
+          ? await driver.buildMutationPreviewStatements(
+              "delete",
+              database,
+              schema,
+              table,
+              {
+                primaryKeyValuesList: previewKeys,
+              },
+            )
+          : driver.buildMutationPreviewStatement
+            ? [
+                driver.buildMutationPreviewStatement(
+                  "delete",
+                  database,
+                  schema,
+                  table,
+                  {
+                    primaryKeyValuesList: previewKeys,
+                  },
+                ),
+              ]
+            : coercedPrimaryKeyValuesList.map(
+                (criteria) =>
+                  `DELETE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify(criteria)}`,
+              ));
       return {
         connectionId,
         database,
@@ -657,19 +754,22 @@ export class TableMutationService {
         mode: "driver",
         executionMode: "sequential",
         primaryKeyValuesList: coercedPrimaryKeyValuesList,
+        ...(observedPlan
+          ? { observedDelete: { driver, plan: observedPlan } }
+          : {}),
         rowIdentities: primaryKeyValuesList,
         operations: [],
         previewStatements,
-        verificationCriteriaList: uniquePrimaryKeyIdentities(
-          coercedPrimaryKeyValuesList,
-        ).uniqueIndexes.map((index) => coercedPrimaryKeyValuesList[index]),
+        verificationCriteriaList: uniqueKeys,
       };
     }
 
-    const qualifiedTableName = driver.qualifiedTableName(
+    const qualifiedTableName = tableDataReference(
+      driver,
       database,
       schema,
       table,
+      columns,
     );
     const primaryKeyColumns = columns.filter((column) => column.isPrimaryKey);
     if (primaryKeyColumns.length === 0) {
@@ -699,7 +799,6 @@ export class TableMutationService {
     if (coercedPrimaryKeys.length === 0) {
       return null;
     }
-    const backend = this.connectionManager.getConnection(connectionId)?.type;
     const guarded = observations !== undefined;
     const snapshot = guarded
       ? buildSqlDeleteSnapshot(backend, driver, columns)
@@ -791,6 +890,9 @@ export class TableMutationService {
         driver.materializePreviewSql(operation.sql, operation.params),
       ),
       verificationCriteriaList: coercedPrimaryKeys,
+      ...(driver.getTableDataReference
+        ? { sqlTableReference: qualifiedTableName }
+        : {}),
     };
   }
   async executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {
@@ -820,18 +922,28 @@ export class TableMutationService {
           ),
         );
       }
+      if (plan.observedDelete && plan.observedDelete.driver !== driver) {
+        throw new DeleteExecutionError(
+          unattemptedDeleteResult(
+            identities,
+            "Connection changed after the delete preview. Refresh the table and try again.",
+          ),
+        );
+      }
       const primaryKeyValuesList = plan.primaryKeyValuesList ?? [];
       const { uniqueIndexes, uniquePositions } =
         uniquePrimaryKeyIdentities(primaryKeyValuesList);
       try {
-        const result = await driver.deleteRows({
-          database: plan.database,
-          schema: plan.schema,
-          table: plan.table,
-          primaryKeyValuesList: uniqueIndexes.map(
-            (index) => primaryKeyValuesList[index],
-          ),
-        });
+        const result = plan.observedDelete
+          ? await plan.observedDelete.plan.execute()
+          : await driver.deleteRows({
+              database: plan.database,
+              schema: plan.schema,
+              table: plan.table,
+              primaryKeyValuesList: uniqueIndexes.map(
+                (index) => primaryKeyValuesList[index],
+              ),
+            });
         const outcome = buildDeleteResult(
           identities,
           expandUniqueDeleteEvidence(result, uniquePositions),
@@ -893,12 +1005,30 @@ export class TableMutationService {
 
     let committed = false;
     try {
-      await driver.runTransaction(plan.operations, undefined, {
-        database: plan.database,
-        ...(plan.sqliteAttachmentTarget
-          ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
-          : {}),
-      });
+      await runLockedTableTransaction(
+        lockedTableMutationOptions(
+          this.connectionManager,
+          driver,
+          plan.connectionId,
+          "delete data",
+          [
+            {
+              database: plan.database,
+              schema: plan.schema,
+              table: plan.table,
+              event: "DELETE",
+            },
+          ],
+        ),
+        (locked) =>
+          driver.runTransaction(plan.operations, undefined, {
+            database: plan.database,
+            ...locked,
+            ...(plan.sqliteAttachmentTarget
+              ? { sqliteAttachmentTarget: plan.sqliteAttachmentTarget }
+              : {}),
+          }),
+      );
       committed = true;
       const columns = await this.columnsProvider.getColumns(
         plan.connectionId,
@@ -914,6 +1044,7 @@ export class TableMutationService {
         columns,
         plan.verificationCriteriaList,
         plan.sqliteAttachmentTarget,
+        plan.sqlTableReference,
       );
     } catch (error) {
       if (!committed && isMutationNotExecutedError(error)) {
@@ -944,7 +1075,12 @@ export class TableMutationService {
     columns: ColumnTypeMeta[],
     criteriaList: Record<string, unknown>[],
     sqliteAttachmentTarget?: SQLiteAttachmentTarget,
+    sqlTableReference?: string,
   ): Promise<void> {
+    if (criteriaList.length === 0) return;
+    const from =
+      sqlTableReference ??
+      tableDataReference(driver, database, schema, table, columns);
     const existenceChecks = await pMapWithLimit(
       criteriaList,
       DELETE_VERIFICATION_CONCURRENCY_LIMIT,
@@ -952,8 +1088,7 @@ export class TableMutationService {
         await this.rowExistsByCriteria(
           driver,
           database,
-          schema,
-          table,
+          from,
           columns,
           criteria,
           sqliteAttachmentTarget,
@@ -968,8 +1103,7 @@ export class TableMutationService {
   private async rowExistsByCriteria(
     driver: NonNullable<ReturnType<ConnectionManager["getDriver"]>>,
     database: string,
-    schema: string,
-    table: string,
+    from: string,
     columns: ColumnTypeMeta[],
     criteria: Record<string, unknown>,
     sqliteAttachmentTarget?: SQLiteAttachmentTarget,
@@ -978,11 +1112,6 @@ export class TableMutationService {
     if (criteriaEntries.length === 0) {
       return false;
     }
-    const qualifiedTableName = driver.qualifiedTableName(
-      database,
-      schema,
-      table,
-    );
     const columnMetaByName = new Map(
       columns.map((column) => [column.name, column]),
     );
@@ -996,7 +1125,7 @@ export class TableMutationService {
       ),
     );
     const result = await driver.query(
-      `SELECT 1 FROM ${qualifiedTableName} WHERE ${whereParts.join(" AND ")}`,
+      `SELECT 1 FROM ${from} WHERE ${whereParts.join(" AND ")}`,
       parameters,
       {
         database,

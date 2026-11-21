@@ -1,5 +1,5 @@
 import { fork } from "node:child_process";
-import { cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { isBuiltin } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { listFiles, PackageManager } from "@vscode/vsce";
@@ -10,10 +10,13 @@ import type {
   SQLiteWorkerRequest,
   SQLiteWorkerResponse,
 } from "../../src/extension/dbDrivers/sqliteWorkerProtocol";
+import { SQLITE_ARTIFACTS } from "../../src/extension/utils/sqliteArtifactPins";
+import { sqliteNativeBindingPath } from "../../src/extension/utils/sqliteInstaller";
+import { resolveSQLiteNativeTarget } from "../../src/extension/utils/sqliteNativeTarget";
 import { createProjectTempDir } from "../runtime/tempDirectories";
 
 describe("SQLite packaged execution process", () => {
-  it("ships a node20 CJS worker and runs a production bundle with only the native runtime scaffold", async () => {
+  it("ships a node20 CJS worker without SQLite files and runs it on a managed runtime outside the package", async () => {
     const root = await createProjectTempDir("sqlite-worker-package");
     const dist = join(root, "dist");
     await mkdir(dist);
@@ -35,19 +38,26 @@ describe("SQLite packaged execution process", () => {
     const bundle = await readFile(workerFile, "utf8");
     expect(bundle).not.toMatch(/require\(["'](?:tsx|typescript|vscode)["']\)/);
 
-    const runtime = join(root, ".rapidb-runtime", "node_modules");
-    const sqlitePackage = join(runtime, "better-sqlite3");
-    await mkdir(runtime, { recursive: true });
-    for (const name of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-      const source = dirname(require.resolve(`${name}/package.json`));
-      await cp(source, join(runtime, name), {
-        recursive: true,
-        filter: (path) =>
-          !["src", "deps", "node_modules"].includes(
-            path.slice(source.length + 1).split(/[\\/]/)[0],
-          ),
-      });
+    // Lay out the managed runtime exactly as the installer does: reviewed
+    // JavaScript files plus one prebuild as build/Release/better_sqlite3.node.
+    const source = dirname(require.resolve("better-sqlite3/package.json"));
+    const sqlitePackage = join(
+      root,
+      "global-storage",
+      "node_modules",
+      "better-sqlite3",
+    );
+    for (const path of Object.keys(SQLITE_ARTIFACTS.files)) {
+      await mkdir(dirname(join(sqlitePackage, path)), { recursive: true });
+      await copyFile(join(source, path), join(sqlitePackage, path));
     }
+    await mkdir(dirname(sqliteNativeBindingPath(sqlitePackage)), {
+      recursive: true,
+    });
+    await copyFile(
+      join(source, "prebuilds", `${resolveSQLiteNativeTarget()}.node`),
+      sqliteNativeBindingPath(sqlitePackage),
+    );
     const ignore = await readFile(resolve(".vscodeignore"), "utf8");
     await writeFile(join(root, ".vscodeignore"), ignore);
     await writeFile(
@@ -66,9 +76,7 @@ describe("SQLite packaged execution process", () => {
       packageManager: PackageManager.None,
     });
     expect(files).toContain("dist/sqliteWorker.js");
-    expect(files).toContain(
-      ".rapidb-runtime/node_modules/better-sqlite3/lib/index.js",
-    );
+    expect(files.filter((file) => /sqlite3|\.node$/.test(file))).toEqual([]);
     expect(
       files.filter((file) => /\.tsx?$/.test(file) && !file.endsWith(".d.ts")),
     ).toEqual([]);
@@ -114,6 +122,7 @@ describe("SQLite packaged execution process", () => {
             filePath: ":memory:",
           },
           runtimeTargets: [sqlitePackage],
+          managedRuntimePackage: sqlitePackage,
         }),
       ).not.toHaveProperty("error");
       const query = await request({

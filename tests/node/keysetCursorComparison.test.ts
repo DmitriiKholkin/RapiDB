@@ -8,6 +8,7 @@ import type {
 } from "../../src/extension/dbDrivers/types";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { TEST_CONNECTION_SEEDS } from "../contracts/testingContracts";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 function column(
   nativeType: string,
@@ -255,6 +256,7 @@ describe("TableReadService cursor integration", () => {
   it("keeps decimal/bigint composite PK precision and indexed filter/pagination binds", async () => {
     const config = TEST_CONNECTION_SEEDS.postgres.connection;
     const driver = new PostgresDriver(config);
+    mockPostgresTableScope(driver);
     const meta = [
       {
         ...column("bigint", "integer", "id"),
@@ -316,6 +318,7 @@ describe("TableReadService cursor integration", () => {
   ])("fails closed on a missing non-null raw cursor %s", async (raw) => {
     const config = TEST_CONNECTION_SEEDS.postgres.connection;
     const driver = new PostgresDriver(config);
+    mockPostgresTableScope(driver);
     vi.spyOn(driver, "describeColumns").mockResolvedValue([
       { ...column("int", "integer", "id"), isPrimaryKey: true },
     ]);
@@ -337,6 +340,7 @@ describe("TableReadService cursor integration", () => {
   it("fails closed before yielding a repeated raw cursor", async () => {
     const config = TEST_CONNECTION_SEEDS.postgres.connection;
     const driver = new PostgresDriver(config);
+    mockPostgresTableScope(driver);
     vi.spyOn(driver, "describeColumns").mockResolvedValue([
       { ...column("int", "integer", "id"), isPrimaryKey: true },
     ]);

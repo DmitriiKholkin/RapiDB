@@ -779,6 +779,33 @@ describe("ConnectionFormView", () => {
     expect(dynamoMessage?.payload).not.toHaveProperty("awsEndpoint");
   });
 
+  it("posts the optional DynamoDB STS endpoint", async () => {
+    const user = userEvent.setup();
+    render(<ConnectionFormView existing={null} />);
+    await user.clear(screen.getByLabelText("Connection name"));
+    await user.type(screen.getByLabelText("Connection name"), "Dynamo VPC");
+    await user.click(screen.getByRole("button", { name: /dynamodb/i }));
+    await user.type(screen.getByLabelText("AWS region"), "us-east-1");
+    await user.selectOptions(
+      screen.getByLabelText("AWS credential source"),
+      "default",
+    );
+    await user.type(
+      screen.getByLabelText("AWS STS endpoint"),
+      " https://vpce-0abc-def.sts.us-east-1.vpce.amazonaws.com ",
+    );
+    clearPostedMessages();
+    await submitCreateConnection(user);
+    expect(getLastPostedMessage()).toEqual({
+      type: "saveConnection",
+      payload: expect.objectContaining({
+        type: "dynamodb",
+        awsStsEndpoint:
+          "https://vpce-0abc-def.sts.us-east-1.vpce.amazonaws.com",
+      }),
+    });
+  });
+
   it("posts TLS configuration and legacy compatibility flags in save payloads", async () => {
     const user = userEvent.setup();
 
@@ -1868,11 +1895,16 @@ describe("saved credential removal controls", () => {
         }}
       />,
     );
+    await user.selectOptions(
+      screen.getByLabelText("AWS credential source"),
+      "profile",
+    );
     await user.click(screen.getByRole("button", { name: /save changes/i }));
     const payload = getLastPostedMessage()?.payload as
       | Record<string, unknown>
       | undefined;
     expect(payload).toMatchObject({
+      awsCredentialMode: "profile",
       awsProfile: "team",
       clearAwsCredentials: true,
     });

@@ -91,10 +91,7 @@
       }
     },
     {
-      "includes": [
-        "tests/node/releaseVersionWorkflow.test.ts",
-        "tests/node/sqliteGypPathSecurity.test.ts"
-      ],
+      "includes": ["tests/node/releaseVersionWorkflow.test.ts"],
       "linter": {
         "rules": {
           "suspicious": {

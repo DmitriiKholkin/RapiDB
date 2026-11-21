@@ -245,8 +245,8 @@ export function QueryModeTableGrid({
             color: "var(--vscode-editor-foreground)",
           }}
         >
-          Some result sets were omitted because the query exceeded the result
-          metadata display limit.
+          Some result sets were omitted because the query exceeded a result
+          display limit.
         </div>
       )}
       {resultSets.length > 1 && (
@@ -371,7 +371,15 @@ export function QueryModeTableGrid({
             size={12}
             style={{ opacity: 0.8, flexShrink: 0 }}
           />
-          {rowCountIsReturned ? (
+          {displayedResult.truncatedBySize ? (
+            <span>
+              Display stopped at{" "}
+              <strong>{formatRowCount(truncatedCount)}</strong> because a value
+              or the combined result exceeded the PostgreSQL size limit. Select
+              fewer columns or smaller values. Exporting this result set only
+              exports displayed rows.
+            </span>
+          ) : rowCountIsReturned ? (
             <span>
               Result limited to{" "}
               <strong>{formatRowCount(truncatedCount)}</strong>. Increase{" "}
@@ -425,7 +433,11 @@ export function QueryModeTableGrid({
       {displayedResult.columns.length === 0 ? (
         <QueryEmptyState
           icon={result.error || warnings.length > 0 ? "warning" : "pass"}
-          primary="No rows in this response"
+          primary={
+            result.resultSetsTruncated
+              ? "No result set available to display"
+              : "No rows in this response"
+          }
           secondary={
             rowCountIsReturned
               ? undefined

@@ -207,6 +207,8 @@ describe("MongoDB URI options with native BSON reads", () => {
         expect.objectContaining({ name: "reference", nativeType: "dbRef" }),
       ]),
     );
+    expect(page.mongoIdTypes).toEqual(["string"]);
+    expect(page.mongoRowMutationBlockReason).toBeUndefined();
     expect(page.mongoValueTypes?.[0].reference.nativeType).toBe("dbRef");
     expect(page.rows[0].largeLong).toBe("9007199254740993");
     expect(driver.formatTableExportChunk(page).rows).toEqual([extendedJson]);

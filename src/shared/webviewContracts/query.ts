@@ -1,5 +1,9 @@
 import type { ConnectionType } from "../connectionTypes";
-import { isPostgresQueryDatabase } from "../postgresQueryDatabase";
+import {
+  type QueryDatabaseFields,
+  queryDatabaseFields,
+  readQueryDatabaseScope,
+} from "../queryDatabaseTarget";
 import type { QueryColumnMeta } from "../tableTypes";
 import type { PanelRetentionState, WebviewMessageEnvelope } from "./shared";
 import {
@@ -44,6 +48,12 @@ export interface QueryTargetBinding {
   sessionKey: string | null;
 }
 
+export interface QueryTargetChangeResult {
+  requestId: string;
+  accepted: boolean;
+  binding: QueryTargetBinding;
+}
+
 function readQuerySessionKey(value: unknown): string | undefined {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value)
     ? value
@@ -62,13 +72,26 @@ export function parseQueryTargetBinding(
     : undefined;
 }
 
-export interface QueryInitialState extends PanelRetentionState {
+export function parseQueryTargetChangeResult(
+  input: unknown,
+): QueryTargetChangeResult | undefined {
+  if (!isRecord(input) || typeof input.accepted !== "boolean") return;
+  const requestId = readRequiredString(input, "requestId");
+  const binding = parseQueryTargetBinding(input.binding);
+  return requestId && binding
+    ? { requestId, accepted: input.accepted, binding }
+    : undefined;
+}
+
+export interface QueryInitialState
+  extends PanelRetentionState,
+    QueryDatabaseFields {
   view: "query";
   panelId?: string;
   connectionId: string;
   connectionType?: ConnectionType | "";
-  postgresDatabase?: string;
   targetBinding?: QueryTargetBinding;
+  queryRunStatus?: boolean;
   queryText?: string;
   initialSql?: string;
   formatOnOpen?: boolean;
@@ -154,12 +177,8 @@ export function parseQueryInitialState(
 ): QueryInitialState | null {
   const connectionId = readRequiredString(input, "connectionId");
   const connectionType = readConnectionType(input.connectionType);
-  if (
-    !connectionId ||
-    connectionType === undefined ||
-    (input.postgresDatabase !== undefined &&
-      !isPostgresQueryDatabase(input.postgresDatabase))
-  ) {
+  const databaseScope = readQueryDatabaseScope(input);
+  if (!connectionId || connectionType === undefined || databaseScope === null) {
     return null;
   }
 
@@ -210,9 +229,8 @@ export function parseQueryInitialState(
           },
         }
       : {}),
-    ...(isPostgresQueryDatabase(input.postgresDatabase)
-      ? { postgresDatabase: input.postgresDatabase }
-      : {}),
+    ...queryDatabaseFields(databaseScope),
+    ...(input.queryRunStatus === true ? { queryRunStatus: true } : {}),
     queryText,
     initialSql: queryText,
     formatOnOpen,
@@ -254,6 +272,7 @@ export interface QueryResultSet {
   rowCount: number;
   affectedRows?: number;
   truncated?: boolean;
+  truncatedBySize?: boolean;
   truncatedAt?: number;
   partial?: boolean;
 }
@@ -305,10 +324,108 @@ export interface QueryOperationIdentity {
   operationId: string;
 }
 
+export interface QueryRunIdentity
+  extends QueryOperationIdentity,
+    QueryDatabaseFields {
+  panelId: string;
+  targetSessionKey: string | null;
+}
+
+export type QueryRunOutcome = "completed" | "not-run" | "unknown";
+export type QueryRunStatus = "accepted" | "running" | QueryRunOutcome;
+
+export interface QueryRunStatusRequest {
+  run: QueryRunIdentity;
+  requestId: string;
+}
+
+export interface QueryRunStatusReply extends QueryRunStatusRequest {
+  status: QueryRunStatus;
+}
+
+function readRunId(
+  input: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const id = readRequiredString(input, key);
+  return id && id.length <= 256 ? id : undefined;
+}
+
+export function parseQueryRunIdentity(
+  input: unknown,
+): QueryRunIdentity | undefined {
+  if (!isRecord(input)) return;
+  const panelId = readRunId(input, "panelId");
+  const operationId = readRunId(input, "operationId");
+  const connectionId = readRunId(input, "connectionId");
+  const databaseScope = readQueryDatabaseScope(input);
+  const targetSessionKey =
+    input.targetSessionKey === null
+      ? null
+      : readQuerySessionKey(input.targetSessionKey);
+  if (
+    !panelId ||
+    !operationId ||
+    !connectionId ||
+    databaseScope === null ||
+    targetSessionKey === undefined
+  )
+    return;
+  return {
+    panelId,
+    operationId,
+    connectionId,
+    targetSessionKey,
+    ...queryDatabaseFields(databaseScope),
+  };
+}
+
+export function sameQueryRun(
+  left: QueryRunIdentity,
+  right: QueryRunIdentity,
+): boolean {
+  return (
+    left.panelId === right.panelId &&
+    left.operationId === right.operationId &&
+    left.connectionId === right.connectionId &&
+    left.targetSessionKey === right.targetSessionKey &&
+    left.postgresDatabase === right.postgresDatabase &&
+    left.mssqlDatabase === right.mssqlDatabase
+  );
+}
+
+function parseQueryRunStatusRequest(
+  input: unknown,
+): QueryRunStatusRequest | undefined {
+  if (!isRecord(input)) return;
+  const requestId = readRunId(input, "requestId");
+  const run = parseQueryRunIdentity(input.run);
+  if (requestId && run) return { requestId, run };
+}
+
+export function parseQueryRunOutcome(
+  input: unknown,
+): QueryRunOutcome | undefined {
+  if (input === "completed" || input === "not-run" || input === "unknown")
+    return input;
+}
+
+export function parseQueryRunStatusReply(
+  input: unknown,
+): QueryRunStatusReply | undefined {
+  if (!isRecord(input)) return;
+  const request = parseQueryRunStatusRequest(input);
+  const status =
+    input.status === "accepted" || input.status === "running"
+      ? input.status
+      : parseQueryRunOutcome(input.status);
+  if (request && status) return { ...request, status };
+}
+
 export type QueryPanelMessage =
   | WebviewMessageEnvelope<
       "activeConnectionChanged",
-      { connectionId: string; targetSessionKey?: string }
+      { connectionId: string; targetSessionKey?: string; requestId?: string }
     >
   | WebviewMessageEnvelope<
       "executeQuery",
@@ -318,9 +435,14 @@ export type QueryPanelMessage =
         connectionId?: string;
         targetSessionKey?: string;
         operationId?: string;
+        run?: QueryRunIdentity;
       }
     >
-  | WebviewMessageEnvelope<"cancelQuery", QueryOperationIdentity>
+  | WebviewMessageEnvelope<
+      "cancelQuery",
+      QueryOperationIdentity & { run?: QueryRunIdentity }
+    >
+  | WebviewMessageEnvelope<"getQueryRunStatus", QueryRunStatusRequest>
   | WebviewMessageEnvelope<"getConnections">
   | WebviewMessageEnvelope<"getSchema", { connectionId?: string }>
   | WebviewMessageEnvelope<"exportResultsCSV", QueryResultExportPayload>
@@ -343,6 +465,8 @@ export function parseQueryPanelMessage(
         return null;
       }
       const connectionId = readRequiredString(envelope.payload, "connectionId");
+      const requestId = readRequiredString(envelope.payload, "requestId");
+      if (envelope.payload.requestId !== undefined && !requestId) return null;
       const targetSessionKey = readQuerySessionKey(
         envelope.payload.targetSessionKey,
       );
@@ -352,6 +476,7 @@ export function parseQueryPanelMessage(
             payload: {
               connectionId,
               ...(targetSessionKey !== undefined ? { targetSessionKey } : {}),
+              ...(requestId ? { requestId } : {}),
             },
           }
         : null;
@@ -385,12 +510,25 @@ export function parseQueryPanelMessage(
       const targetSessionKey = readQuerySessionKey(
         envelope.payload.targetSessionKey,
       );
+      const operationId = readOptionalString(envelope.payload, "operationId");
+      const run = parseQueryRunIdentity(envelope.payload.run);
+      if (
+        envelope.payload.run !== undefined &&
+        (!run ||
+          run.connectionId !== payload.connectionId ||
+          run.operationId !== operationId ||
+          (envelope.payload.targetSessionKey !== undefined &&
+            targetSessionKey === undefined) ||
+          run.targetSessionKey !== (targetSessionKey ?? null))
+      )
+        return null;
       return {
         type: envelope.type,
         payload: {
           ...payload,
-          operationId: readOptionalString(envelope.payload, "operationId"),
+          operationId,
           ...(targetSessionKey !== undefined ? { targetSessionKey } : {}),
+          ...(run ? { run } : {}),
         },
       };
     }
@@ -399,9 +537,25 @@ export function parseQueryPanelMessage(
       if (!isRecord(envelope.payload)) return null;
       const connectionId = readRequiredString(envelope.payload, "connectionId");
       const operationId = readRequiredString(envelope.payload, "operationId");
+      const run = parseQueryRunIdentity(envelope.payload.run);
+      if (
+        envelope.payload.run !== undefined &&
+        (!run ||
+          run.connectionId !== connectionId ||
+          run.operationId !== operationId)
+      )
+        return null;
       return connectionId && operationId
-        ? { type: envelope.type, payload: { connectionId, operationId } }
+        ? {
+            type: envelope.type,
+            payload: { connectionId, operationId, ...(run ? { run } : {}) },
+          }
         : null;
+    }
+
+    case "getQueryRunStatus": {
+      const payload = parseQueryRunStatusRequest(envelope.payload);
+      return payload ? { type: envelope.type, payload } : null;
     }
 
     case "getConnections":

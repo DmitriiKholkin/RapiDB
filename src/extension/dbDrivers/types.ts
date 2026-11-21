@@ -80,11 +80,18 @@ export interface QueryResult
   missingCells?: QueryMissingCell[];
   executionTimeMs: number;
   truncated?: boolean;
+  truncatedBySize?: boolean;
   resultSets?: DriverQueryResultSet[];
   resultSetsTruncated?: boolean;
   /** Execution warnings that do not imply an incomplete response. */
   warnings?: string[];
   error?: string;
+  /**
+   * The database answered `error` for the request on a live session, so the
+   * run's outcome is known (earlier statements may have taken effect).
+   * Never set for transport loss, timeouts, cancellation or fatal errors.
+   */
+  serverReportedError?: boolean;
 }
 export interface DatabaseExecutionScope {
   database?: string;
@@ -205,6 +212,7 @@ export interface DriverTablePageRequest {
   skipCount: boolean;
   omitRowIdentity?: boolean;
   observeSqlDelete?: boolean;
+  observeNoSqlDelete?: boolean;
   conflictRefresh?: boolean;
   /** Stable across pages of one viewer/query. Abort when that view is reset. */
   browsingSnapshot?: AbortSignal;
@@ -215,11 +223,15 @@ export interface DriverTablePageRequest {
 export interface DriverTablePageResult {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
+  /** Page-aligned reasons to block updates, without blocking row deletion. */
+  rowUpdateBlockReasons?: Array<string | null>;
   mongoIdTypes?: Array<"objectId" | "string" | null>;
+  mongoRowMutationBlockReason?: string;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   mysqlTimestampRowIdentities?: MySQLTimestampRowIdentity[];
   sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
+  noSqlDeleteObservations?: Array<NoSqlDeleteObservation | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -268,6 +280,16 @@ export interface DriverDeleteRowsRequest {
   primaryKeyValuesList: Record<string, unknown>[];
 }
 
+/** Extension-owned handle. Only its issuing driver can resolve the native state. */
+export interface NoSqlDeleteObservation {
+  readonly backend: "mongodb" | "redis";
+}
+
+export interface PreparedObservedDelete {
+  previewStatements: string[];
+  execute(context?: DriverOperationContext): Promise<DriverMutationResult>;
+}
+
 export interface DriverMutationResult {
   affectedRows: number;
   rowOutcomes?: import("../../shared/webviewContracts").DeleteRowOutcome[];
@@ -298,6 +320,9 @@ export interface PersistedEditCheckResult {
   message?: string;
 }
 export interface IDBDriver {
+  /** The observed DynamoDB destination, never a credential or profile name. */
+  getDynamoDBTargetFingerprint?(): string | undefined;
+  verifyDynamoDBTarget?(): Promise<void>;
   readonly supportsAtomicUpdateRows?: boolean;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -413,6 +438,12 @@ export interface IDBDriver {
       "changes" | "originalValues" | "originalTypes"
     >[],
   ): void;
+  /** Preflight for previews targeting existing rows; writes must check again. */
+  assertTableRowMutationIdentity?(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<void>;
   updateRows?(
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
@@ -425,6 +456,10 @@ export interface IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult>;
+  prepareObservedDelete?(
+    request: DriverDeleteRowsRequest,
+    observations: readonly NoSqlDeleteObservation[],
+  ): PreparedObservedDelete;
   buildMutationPreviewStatement?(
     operation: "insert" | "update" | "delete",
     database: string,
@@ -463,8 +498,17 @@ export interface IDBDriver {
     schema: string,
     table: string,
   ): Promise<string | null>;
+  /** This driver checks Table Viewer rollback support on the DML session. */
+  readonly usesLockedTableMutationChecks?: boolean;
   quoteIdentifier(name: string): string;
   qualifiedTableName(database: string, schema: string, table: string): string;
+  /** Table Viewer row scope, derived from the same catalog read as the columns. */
+  getTableDataReference?(
+    database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): string;
   buildTableDataProjection?(columns: readonly ColumnTypeMeta[]): string;
   /** Project a stored key without the display/driver conversion; null opts out. */
   buildTablePrimaryKeyExpr?(column: ColumnTypeMeta): string | null;
@@ -594,6 +638,22 @@ export interface TransactionVerification {
 
 export interface TransactionOptions extends DatabaseExecutionScope {
   verifications?: TransactionVerification[];
+  lockedTableMutation?: {
+    targets: readonly TableMutationTarget[];
+    assertWritable: () => void;
+    /**
+     * Qualified table names for which the user explicitly accepted that
+     * trigger visibility cannot be proven. Visible triggers still block.
+     */
+    acceptUnverifiedTriggerVisibility?: readonly string[];
+  };
+}
+
+export interface TableMutationTarget {
+  database: string;
+  schema: string;
+  table: string;
+  event: "INSERT" | "UPDATE" | "DELETE";
 }
 
 export interface TransactionOperation {

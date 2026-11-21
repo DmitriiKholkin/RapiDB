@@ -40,13 +40,20 @@ describe("SQLite VS Code runtime packaging scripts", () => {
     expect(activationEvents).toContain("onStartupFinished");
   });
 
-  it("does not block the extension host with synchronous child processes", () => {
-    const installerSource = readFileSync(
-      new URL("../../src/extension/utils/sqliteInstaller.ts", import.meta.url),
-      "utf8",
-    );
-
-    expect(installerSource).not.toContain("execSync");
-    expect(installerSource).toContain("execFileAsync");
+  it("never runs child processes, build tools or package scripts while installing", () => {
+    for (const file of [
+      "sqliteInstaller.ts",
+      "sqliteArchive.ts",
+      "sqliteArtifactPins.ts",
+      "sqliteNativeTarget.ts",
+    ]) {
+      const source = readFileSync(
+        new URL(`../../src/extension/utils/${file}`, import.meta.url),
+        "utf8",
+      );
+      expect(source).not.toMatch(
+        /child_process|execFile|execSync|spawn|node-gyp|npm-cli/,
+      );
+    }
   });
 });

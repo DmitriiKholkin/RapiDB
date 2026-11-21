@@ -59,6 +59,5 @@ export interface SQLiteWorkerResponse {
     verificationFailure?: TransactionVerificationFailure;
     rollbackConfirmed?: boolean;
     executionState?: "not-executed" | "unknown";
-    managedNativeFailure?: true;
   };
 }

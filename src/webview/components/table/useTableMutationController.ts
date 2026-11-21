@@ -7,6 +7,10 @@ import {
   useState,
 } from "react";
 import { mssqlSqlVariantKeyChangeMessage } from "../../../shared/mssqlSqlVariantRowIdentity";
+import {
+  noSqlDeleteObservationError,
+  type ObservedNoSqlDeleteBackend,
+} from "../../../shared/noSqlDeleteObservation";
 import { MISSING_DELETE_OBSERVATION } from "../../../shared/sqlDeleteObservation";
 import type {
   ColumnTypeMeta as ColumnMeta,
@@ -61,6 +65,8 @@ import {
   type PersistedTableDraft,
   type PersistedTableMutation,
   type PersistedTableViewState,
+  readNoSqlDeleteObservationId,
+  readRowUpdateBlockReason,
   readSqlDeleteObservation,
   restorePendingEditsSafely,
   rowMutationBlockReason,
@@ -386,6 +392,9 @@ export function useTableMutationController({
   const deleteRequestSignaturesRef = useRef<Array<string | null>>([]);
   const deleteConnectionInvalidatedRef = useRef(false);
   const requiresSqlDeleteObservationRef = useRef(false);
+  const noSqlDeleteBackendRef = useRef<ObservedNoSqlDeleteBackend | undefined>(
+    undefined,
+  );
   const pendingRestoreRef = useRef<PendingRestoreState | null>(
     initialDraft?.restoreState ?? null,
   );
@@ -605,9 +614,14 @@ export function useTableMutationController({
     () =>
       onMessage<TableInitPayload>(
         "tableInit",
-        ({ connectionSessionKey, requiresSqlDeleteObservation }) => {
+        ({
+          connectionSessionKey,
+          requiresSqlDeleteObservation,
+          noSqlDeleteBackend,
+        }) => {
           requiresSqlDeleteObservationRef.current =
             requiresSqlDeleteObservation === true;
+          noSqlDeleteBackendRef.current = noSqlDeleteBackend;
           if (connectionSessionKey === undefined) return;
           updateWebviewState((state) => {
             const initialState = state.initialState;
@@ -638,10 +652,19 @@ export function useTableMutationController({
       ),
     [rowsRef, pkColsRef, mongoIdTypesRef, mongoRowIdentity],
   );
+  const getRowUpdateBlockReason = useCallback(
+    (rowIdx: number) =>
+      getRowMutationBlockReason(rowIdx) ??
+      readRowUpdateBlockReason(rowsRef.current[rowIdx]),
+    [getRowMutationBlockReason, rowsRef],
+  );
   const blockUnsafeRows = useCallback(
-    (rowIndexes: Iterable<number>) => {
+    (rowIndexes: Iterable<number>, operation: "update" | "delete") => {
       for (const rowIdx of rowIndexes) {
-        const reason = getRowMutationBlockReason(rowIdx);
+        const reason =
+          operation === "update"
+            ? getRowUpdateBlockReason(rowIdx)
+            : getRowMutationBlockReason(rowIdx);
         if (reason) {
           setLocalMutationError(`Row ${rowIdx + 1}: ${reason}`);
           return true;
@@ -649,7 +672,7 @@ export function useTableMutationController({
       }
       return false;
     },
-    [getRowMutationBlockReason, setLocalMutationError],
+    [getRowMutationBlockReason, getRowUpdateBlockReason, setLocalMutationError],
   );
 
   const buildPendingUpdatesPayload = useCallback(
@@ -1336,7 +1359,7 @@ export function useTableMutationController({
     if (unsavedRowCount === 0 || applying) {
       return;
     }
-    if (blockUnsafeRows(currentPending.keys())) return;
+    if (blockUnsafeRows(currentPending.keys(), "update")) return;
 
     applyPendingSnapshotRef.current = clonePendingEdits(currentPending);
     applyRowIndexesRef.current = [...currentPending.keys()];
@@ -1490,7 +1513,13 @@ export function useTableMutationController({
           : undefined;
       const errors = validatePersistedBatch(edits);
       if (errors.length > 0) return errors;
-      if (blockUnsafeRows(edits.map((edit) => edit.rowIdx))) return;
+      if (
+        blockUnsafeRows(
+          edits.map((edit) => edit.rowIdx),
+          "update",
+        )
+      )
+        return;
       setEditCell(null);
 
       const currentPending = pendingEditsRef.current;
@@ -1585,7 +1614,7 @@ export function useTableMutationController({
       ) {
         return;
       }
-      if (blockUnsafeRows([rowIdx])) return;
+      if (blockUnsafeRows([rowIdx], "update")) return;
       if (column.mssqlSqlVariantPrimaryKey) {
         setLocalMutationError(mssqlSqlVariantKeyChangeMessage(column.name));
         return;
@@ -1782,7 +1811,13 @@ export function useTableMutationController({
           : undefined;
       const errors = validatePersistedBatch(persistedEdits);
       if (errors.length > 0) return errors;
-      if (blockUnsafeRows(persistedEdits.map((edit) => edit.rowIdx))) return;
+      if (
+        blockUnsafeRows(
+          persistedEdits.map((edit) => edit.rowIdx),
+          "update",
+        )
+      )
+        return;
       setEditCell(null);
 
       const currentRows = newRowsRef.current;
@@ -1910,7 +1945,7 @@ export function useTableMutationController({
       )
         return;
       if (isBusy()) return;
-      if (canEditRowsRef.current && blockUnsafeRows([rowIdx])) return;
+      if (canEditRowsRef.current && blockUnsafeRows([rowIdx], "update")) return;
       if (canEditRowsRef.current && column.mssqlSqlVariantPrimaryKey) {
         setLocalMutationError(mssqlSqlVariantKeyChangeMessage(column.name));
         return;
@@ -1992,7 +2027,7 @@ export function useTableMutationController({
           : (getStructuredCellDialogValue(currentValue, cellColumn) ?? value);
       const rowBlockReason =
         rowKind === "persisted" && rowIdx !== undefined
-          ? getRowMutationBlockReason(rowIdx)
+          ? getRowUpdateBlockReason(rowIdx)
           : null;
       const keyChangeBlockReason =
         rowKind === "persisted" && column.mssqlSqlVariantPrimaryKey
@@ -2040,7 +2075,7 @@ export function useTableMutationController({
     [
       isBusy,
       committedColumnNamesRef,
-      getRowMutationBlockReason,
+      getRowUpdateBlockReason,
       getRowCellColumn,
       dismissApplyStatus,
     ],
@@ -2138,8 +2173,22 @@ export function useTableMutationController({
       return;
     }
 
-    if (blockUnsafeRows(selectedRef.current)) return;
+    if (blockUnsafeRows(selectedRef.current, "delete")) return;
     const selectedIndexes = [...selectedRef.current];
+    const noSqlBackend = noSqlDeleteBackendRef.current;
+    const noSqlDeleteObservationIds = noSqlBackend
+      ? selectedIndexes.map((index) =>
+          readNoSqlDeleteObservationId(rowsRef.current[index]),
+        )
+      : undefined;
+    if (
+      noSqlBackend &&
+      (noSqlBackend === "dynamodb" ||
+        noSqlDeleteObservationIds?.some((id) => id === null))
+    ) {
+      setLocalMutationError(noSqlDeleteObservationError[noSqlBackend]);
+      return;
+    }
     const sqlDeleteObservations = selectedIndexes.map((index) =>
       readSqlDeleteObservation(rowsRef.current[index]),
     );
@@ -2185,6 +2234,7 @@ export function useTableMutationController({
       ...(requiresSqlDeleteObservationRef.current
         ? { sqlDeleteObservations }
         : {}),
+      ...(noSqlDeleteObservationIds ? { noSqlDeleteObservationIds } : {}),
     });
   }, [
     applying,
@@ -2311,6 +2361,7 @@ export function useTableMutationController({
     getPasteBlockReason,
     getRowCellColumn,
     getRowMutationBlockReason,
+    getRowUpdateBlockReason,
     isFilterNavigationBlocked: () =>
       activeOperationRef.current !== null ||
       editCellRef.current !== null ||

@@ -22,6 +22,8 @@ import {
   elasticsearchIndexSettings,
   elasticsearchKeys,
 } from "../support/elasticsearchIdentity";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
+import { mockStandaloneMongoClient } from "../support/mockStandaloneMongoClient";
 
 const engines = ["redis", "dynamodb", "elasticsearch", "mongodb"] as const;
 type Engine = (typeof engines)[number];
@@ -81,14 +83,21 @@ function harness(engine: Engine, write: (index: number) => Promise<boolean>) {
     withAbortSignal: vi.fn(() => client),
     indices: { getSettings: async () => elasticsearchIndexSettings("items") },
   };
-  Object.assign(driver, {
-    getDatabaseClient: async () => client,
-    requireClient: () => client,
-    getTableSchema: async () => ({ keys: ["id"] }),
-    requireDb: () => ({ collection: () => client }),
-  });
-  if (driver instanceof ElasticsearchDriver)
-    Object.assign(driver, { connected: true, client });
+  if (driver instanceof MongoDBDriver) {
+    Object.assign(driver, {
+      connected: true,
+      client: mockStandaloneMongoClient({ deleteOne: call }),
+    });
+  } else {
+    Object.assign(driver, {
+      getDatabaseClient: async () => client,
+      requireClient: () => client,
+      getTableSchema: async () => ({ keys: ["id"] }),
+      requireDb: () => ({ collection: () => client }),
+    });
+    if (driver instanceof ElasticsearchDriver)
+      Object.assign(driver, { connected: true, client });
+  }
   const identities = ["a", "b", "c"].map((id) =>
     engine === "redis"
       ? { key: id }
@@ -292,7 +301,6 @@ describe("B12 service and preview results", () => {
   });
 
   it.each([
-    "redis",
     "dynamodb",
     "elasticsearch",
   ] as const)("reports a local %s identity validation failure after a completed delete", async (engine) => {
@@ -306,6 +314,24 @@ describe("B12 service and preview results", () => {
       getDeleteEvidence(error)?.rowOutcomes?.map((row) => row.status),
     ).toEqual(["deleted", "failed", "skipped"]);
     expect(call).toHaveBeenCalledOnce();
+  });
+
+  it("reports all Redis deletes as unattempted when a key fails local validation", async () => {
+    const { driver, request, call } = harness("redis", async () => true);
+    request.primaryKeyValuesList[1] = {};
+    const error = await driver
+      .deleteRows(request)
+      .catch((error: unknown) => error);
+    expect(getDeleteEvidence(error)).toMatchObject({
+      affectedRows: 0,
+      outcomeUnknown: false,
+      rowOutcomes: [
+        { status: "skipped" },
+        { status: "skipped" },
+        { status: "skipped" },
+      ],
+    });
+    expect(call).not.toHaveBeenCalled();
   });
 
   it("does not infer which rows were deleted from a legacy aggregate partial count", async () => {
@@ -559,6 +585,7 @@ describe("B12 service and preview results", () => {
       name: config.name,
       type: "pg",
     });
+    mockPostgresTableScope(driver);
     const runTransaction = vi
       .spyOn(driver, "runTransaction")
       .mockResolvedValue();
@@ -610,7 +637,7 @@ describe("B12 service and preview results", () => {
     });
     expect(runTransaction).toHaveBeenCalledOnce();
     expect(query).toHaveBeenCalledTimes(identities.length);
-    const existenceSql = `SELECT 1 FROM ${driver.qualifiedTableName("db", "", "items")} WHERE "id" = $1`;
+    const existenceSql = `SELECT 1 FROM ONLY ${driver.qualifiedTableName("db", "", "items")} WHERE "id" = $1`;
     for (const { id } of identities) {
       expect(query).toHaveBeenCalledWith(existenceSql, [id], {
         database: "db",
@@ -653,6 +680,7 @@ describe("B12 service and preview results", () => {
       name: config.name,
       type: "pg",
     });
+    mockPostgresTableScope(driver);
     const events: string[] = [];
     const runTransaction = vi
       .spyOn(driver, "runTransaction")

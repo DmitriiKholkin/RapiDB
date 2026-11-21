@@ -12,6 +12,7 @@ import { TableMutationService } from "../../src/extension/table/tableMutationSer
 import { parseJsonForWrite } from "../../src/extension/utils/jsonWriteSafety";
 import { NUMERIC_COMPARISON_LIMITS } from "../../src/shared/numericNormalization";
 import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import { mockStandaloneMongoClient } from "../support/mockStandaloneMongoClient";
 
 const unsafe = [
   "9007199254740993",
@@ -124,7 +125,7 @@ describe("JSON numeric write safety", () => {
       .mockResolvedValue({ acknowledged: true, matchedCount: 1 });
     Object.assign(mongo, {
       connected: true,
-      client: { db: () => ({ collection: () => ({ updateOne }) }) },
+      client: mockStandaloneMongoClient({ updateOne }),
     });
     const meta: ColumnTypeMeta = { ...column, name: "payload", category };
     const oldText =

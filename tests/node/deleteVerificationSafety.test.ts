@@ -9,6 +9,7 @@ import { SQLiteCoreDriver } from "../../src/extension/dbDrivers/sqliteCore";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { createProjectTempDir } from "../runtime/tempDirectories";
+import { mysqlLockedMutationMetadata } from "../support/mysqlLockedMutationMetadata";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -37,6 +38,8 @@ function harness(transactional = false) {
     }
   });
   const query = vi.fn(async (input: { sql: string; values?: unknown[] }) => {
+    const metadata = mysqlLockedMutationMetadata(input.sql);
+    if (metadata) return metadata;
     if (input.sql === "ROLLBACK") {
       await rollback();
       return [{ warningStatus: 0 }];

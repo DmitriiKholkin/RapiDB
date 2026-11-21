@@ -4,6 +4,7 @@ import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockStandaloneMongoClient } from "../support/mockStandaloneMongoClient";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -38,6 +39,10 @@ describe("MongoDB row identity guards", () => {
       id: "mongo",
       name: "Mongo",
       type: "mongodb",
+    });
+    Object.assign(driver, {
+      connected: true,
+      client: mockStandaloneMongoClient(),
     });
     const sampledColumns = columns.map((column) =>
       column.name === "_id"
@@ -123,6 +128,10 @@ describe("MongoDB row identity guards", () => {
       id: "mongo",
       name: "Mongo",
       type: "mongodb",
+    });
+    Object.assign(driver, {
+      connected: true,
+      client: mockStandaloneMongoClient(),
     });
     const manager = {
       getConnection: () => ({ id: "mongo" }),

@@ -195,4 +195,31 @@ describe("Redis table read cancellation", () => {
       { key: "audit:one", value: "value", ttl: null, type: "string" },
     ]);
   });
+
+  it("does not reuse a reply slot when cancellation only stops waiting for the caller", async () => {
+    const h = fixture();
+    h.client.scan.mockResolvedValue({
+      cursor: "0",
+      keys: Array.from({ length: 4 }, (_, i) => Buffer.from(`audit:${i}`)),
+    });
+    const reply = deferred<Buffer<ArrayBuffer>>();
+    h.client.getRange.mockImplementation(() => reply.promise);
+    const abort = new AbortController();
+    const first = h.driver.readTablePage({ ...request, signal: abort.signal });
+    const rejected = expect(first).rejects.toThrow(
+      /Read cancelled|Operation aborted/,
+    );
+    await vi.waitFor(() => expect(h.client.getRange).toHaveBeenCalledTimes(4));
+    abort.abort(new Error("Read cancelled"));
+    await rejected;
+
+    const retry = h.driver.readTablePage(request);
+    await vi.waitFor(() => expect(h.client.strLen).toHaveBeenCalledTimes(8));
+    expect(h.client.getRange).toHaveBeenCalledTimes(4);
+    reply.resolve(Buffer.from("value"));
+    expect((await retry).rows.map(({ value }) => value)).toEqual(
+      Array(4).fill("value"),
+    );
+    expect(h.client.getRange).toHaveBeenCalledTimes(8);
+  });
 });

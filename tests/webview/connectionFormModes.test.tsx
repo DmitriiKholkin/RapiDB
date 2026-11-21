@@ -279,7 +279,8 @@ describe("connection method selection and legacy profiles", () => {
     ).toBe("static");
     await save(user);
     expect(payload()).toMatchObject({
-      awsProfile: "dormant-profile",
+      awsCredentialMode: "static",
+      awsProfile: undefined,
       clearAwsCredentials: false,
     });
     await user.selectOptions(

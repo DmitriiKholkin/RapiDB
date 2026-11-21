@@ -77,6 +77,8 @@ export const CONNECTION_TLS_SUPPORT_BY_TYPE: Readonly<
   elasticsearch: FULL_TLS_SUPPORT,
 };
 
+export type AwsCredentialMode = "static" | "profile" | "default";
+
 export interface ConnectionConfig {
   id: string;
   name: string;
@@ -94,6 +96,7 @@ export interface ConnectionConfig {
   connectionUri?: string;
   replicaSet?: string;
   directConnection?: boolean;
+  awsCredentialMode?: AwsCredentialMode;
   awsProfile?: string;
   endpoint?: string;
   apiKey?: string;
@@ -109,10 +112,43 @@ export interface ConnectionConfig {
   awsAccessKeyId?: string;
   awsSecretAccessKey?: string;
   awsSessionToken?: string;
+  awsSessionTokenRequired?: boolean;
   awsEndpoint?: string;
+  /** Explicit HTTPS STS endpoint for AWS account verification (DynamoDB). */
+  awsStsEndpoint?: string;
   ssh?: ConnectionSshConfig;
   useSecretStorage?: boolean;
+  /** Internal link to the Secret Storage document for this saved profile. */
+  secretStorageProfile?: string;
   color?: string;
+}
+
+export function hasAwsCredentialMaterial(
+  config: Pick<
+    ConnectionConfig,
+    "awsAccessKeyId" | "awsSecretAccessKey" | "awsSessionToken"
+  >,
+): boolean {
+  return [
+    config.awsAccessKeyId,
+    config.awsSecretAccessKey,
+    config.awsSessionToken,
+  ].some((value) => typeof value === "string" && value.trim() !== "");
+}
+
+export function resolveAwsCredentialMode(
+  config: Partial<ConnectionConfig>,
+): AwsCredentialMode | undefined {
+  if (config.awsCredentialMode !== undefined) return config.awsCredentialMode;
+  if (hasAwsCredentialMaterial(config)) return "static";
+  // Older versions could store a static pair alongside a profile name, or
+  // leave no credential fields at all in settings. Only a known plaintext
+  // profile without any key material is unambiguous.
+  if (config.useSecretStorage === false) {
+    return typeof config.awsProfile === "string" && config.awsProfile.trim()
+      ? "profile"
+      : "default";
+  }
 }
 
 export function getConnectionTlsSupport(

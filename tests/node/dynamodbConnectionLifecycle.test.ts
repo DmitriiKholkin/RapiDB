@@ -15,11 +15,15 @@ const harness = vi.hoisted(() => ({
 vi.mock("@aws-sdk/client-dynamodb", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@aws-sdk/client-dynamodb")>();
-  class MockClient {
-    constructor() {
+  class MockClient extends actual.DynamoDBClient {
+    constructor(
+      options: ConstructorParameters<typeof actual.DynamoDBClient>[0],
+    ) {
+      super(options ?? {});
+      if (!options?.endpointProvider) return;
       const client = harness.clients.shift();
       if (!client) throw new Error("Unexpected DynamoDB client creation");
-      return client as never;
+      Object.assign(this, client);
     }
   }
   return { ...actual, DynamoDBClient: MockClient };
@@ -45,11 +49,19 @@ function createClient() {
 }
 
 function createDriver() {
-  return new DynamoDBDriver({ id: "dynamo", name: "Dynamo", type: "dynamodb" });
+  return new DynamoDBDriver({
+    id: "dynamo",
+    name: "Dynamo",
+    type: "dynamodb",
+    endpoint: "http://127.0.0.1:8000",
+    awsCredentialMode: "static",
+    awsAccessKeyId: "fixture",
+    awsSecretAccessKey: "fixture-secret",
+  });
 }
 
 async function flushMicrotasks() {
-  for (let i = 0; i < 30; i++) await Promise.resolve();
+  for (let i = 0; i < 100; i++) await Promise.resolve();
 }
 
 afterEach(() => {

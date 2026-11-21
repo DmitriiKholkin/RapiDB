@@ -7,6 +7,7 @@ import {
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mysqlLockedMutationMetadata } from "../support/mysqlLockedMutationMetadata";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -188,7 +189,13 @@ function harness(
     destroy: vi.fn(),
     release: vi.fn(),
   };
-  const lease = vi.fn(async () => conn);
+  const lease = vi.fn(async () => ({
+    ...conn,
+    query: async (input: string | { sql: string; values?: unknown[] }) =>
+      mysqlLockedMutationMetadata(
+        typeof input === "string" ? input : input.sql,
+      ) ?? conn.query(input),
+  }));
   const poolQuery = vi.fn(async () => [
     [{ __rapidb_sql_mode: mode === noAuto ? "" : noAuto }],
   ]);

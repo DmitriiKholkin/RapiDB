@@ -3,10 +3,11 @@ import { registerConnectionCommands } from "../../src/extension/commands/connect
 import { connectionEditState } from "../../src/extension/connectionEditState";
 import { ConnectionManager } from "../../src/extension/connectionManager";
 import { VSCodeConnectionManagerStore } from "../../src/extension/connectionManagerStore";
+import { withConnectionCredentialRevision } from "../../src/extension/connectionSecretsData";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import { createWebviewShell } from "../../src/extension/panels/webviewShell";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
-import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
+import { registerConnectionStorageFixture } from "../support/connectionStorageContext";
 import type { MockWebviewPanel } from "../support/mockVscode";
 
 vi.mock("vscode", async () => {
@@ -18,6 +19,8 @@ vi.mock("../../src/extension/panels/webviewShell", () => ({
 }));
 
 import * as vscode from "vscode";
+
+const createExtensionContextStub = registerConnectionStorageFixture();
 
 function deferred() {
   let resolve!: () => void;
@@ -105,6 +108,78 @@ function expectConflict(panel: MockWebviewPanel, message: string) {
 describe("connection edits through real commands, form, manager and VSCode store", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it.each([
+    "settings",
+    "revision only",
+    "during read",
+    "missing",
+    "unavailable",
+  ] as const)("does not start Test for an unverifiable draft (%s)", async (change) => {
+    const f = fixture();
+    await f.manager.saveConnection({
+      ...original,
+      host: "db.invalid",
+      password: "original",
+    });
+    const entry = await f.context.secrets.get("a");
+    const current = f.connections()[0];
+    const edit = await f.openEdit();
+    const connect = vi
+      .spyOn(f.manager, "testConnection")
+      .mockResolvedValue({ success: true });
+    try {
+      if (change === "settings") {
+        await f.manager.saveConnection({
+          ...current,
+          host: "other.invalid",
+          password: "next",
+        });
+      } else if (change === "revision only") {
+        await f.context.secrets.store(
+          "a",
+          withConnectionCredentialRevision(
+            entry,
+            "00000000-0000-4000-8000-000000000001",
+          ),
+        );
+      } else if (change === "missing") {
+        await f.context.secrets.delete("a");
+      } else if (change === "unavailable") {
+        vi.spyOn(f.context.secrets, "get").mockRejectedValue(
+          new Error("keychain unavailable"),
+        );
+      } else {
+        const get = f.context.secrets.get.bind(f.context.secrets);
+        vi.spyOn(f.context.secrets, "get").mockImplementationOnce(
+          async (id) => {
+            const old = await get(id);
+            await f.configuration.update("connections", [
+              { ...current, host: "other.invalid" },
+            ]);
+            return old;
+          },
+        );
+      }
+      await edit.panel.webview.dispatchMessage({
+        type: "testConnection",
+        payload: { ...current, requestId: "stale-check" },
+      });
+      expect(connect).not.toHaveBeenCalled();
+      expect(edit.panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "testResult",
+        payload: {
+          requestId: "stale-check",
+          success: false,
+          error: expect.any(String),
+        },
+      });
+    } finally {
+      edit.panel.dispose();
+      await edit.result;
+      await f.manager.dispose();
+    }
+  });
+
   it("does not resurrect a connection deleted through the tree command", async () => {
     const f = fixture();
     await f.context.secrets.store(
@@ -119,7 +194,7 @@ describe("connection edits through real commands, form, manager and VSCode store
     await save(edit.panel, { name: "Resurrected", password: "new-secret" });
     expectConflict(edit.panel, "deleted");
     expect(f.connections()).toEqual([]);
-    expect(await f.context.secrets.get("a")).toBeUndefined();
+    expect(await f.context.secrets.get("a")).toBe('{"password":"old-secret"}');
     await edit.panel.webview.dispatchMessage({ type: "cancel" });
     await edit.result;
   });
@@ -150,7 +225,7 @@ describe("connection edits through real commands, form, manager and VSCode store
     await saving;
     expectConflict(edit.panel, "deleted");
     expect(f.connections()).toEqual([]);
-    expect(await get("a")).toBeUndefined();
+    expect(await get("a")).toBe('{"password":"old-secret"}');
     edit.panel.dispose();
     await edit.result;
   });
@@ -178,7 +253,7 @@ describe("connection edits through real commands, form, manager and VSCode store
       secretOnly ? "Original" : "First edit",
     );
     expect(await f.context.secrets.get("a")).toBe(savedSecrets);
-    expect(JSON.parse(savedSecrets ?? "null")).toEqual({
+    expect(JSON.parse(savedSecrets ?? "null")).toMatchObject({
       password: secretOnly ? "new-secret" : "old-secret",
       futureSecret: "retain",
     });
@@ -216,7 +291,9 @@ describe("connection edits through real commands, form, manager and VSCode store
     await Promise.all([savingFirst, savingSecond]);
     expectConflict(second.panel, "changed since");
     expect(writes).toHaveBeenCalledOnce();
-    expect(JSON.parse((await f.context.secrets.get("a")) ?? "null")).toEqual({
+    expect(
+      JSON.parse((await f.context.secrets.get("a")) ?? "null"),
+    ).toMatchObject({
       password: "winner-secret",
     });
     expect(f.connections()[0].password).toBeUndefined();
@@ -281,7 +358,9 @@ describe("connection edits through real commands, form, manager and VSCode store
     await save(panel, { name: "After migration" });
     await pending;
     expect(f.connections()[0].name).toBe("After migration");
-    expect(JSON.parse((await f.context.secrets.get("a")) ?? "null")).toEqual({
+    expect(
+      JSON.parse((await f.context.secrets.get("a")) ?? "null"),
+    ).toMatchObject({
       password: "legacy-secret",
     });
   });
@@ -304,7 +383,7 @@ describe("connection edits through real commands, form, manager and VSCode store
     await pending;
   });
 
-  it("rolls credentials back after a failed conditional write and allows retry with the original snapshot", async () => {
+  it("rolls credentials back after a failed settings write and refuses to retry from the uncertain snapshot", async () => {
     const f = fixture();
     await f.context.secrets.store(
       "a",
@@ -328,13 +407,14 @@ describe("connection edits through real commands, form, manager and VSCode store
     expect(JSON.parse((await f.context.secrets.get("a")) ?? "null")).toEqual({
       password: "old-secret",
     });
-    await f.manager.saveConnection(
-      { ...original, password: "new-secret" },
-      {},
-      precondition,
-    );
-    expect(JSON.parse((await f.context.secrets.get("a")) ?? "null")).toEqual({
-      password: "new-secret",
-    });
+    await expect(
+      f.manager.saveConnection(
+        { ...original, password: "new-secret" },
+        {},
+        precondition,
+      ),
+    ).rejects.toThrow("stale");
+    expect(await f.context.secrets.get("a")).toBe('{"password":"old-secret"}');
+    expect(f.configuration.update).toHaveBeenCalledOnce();
   });
 });

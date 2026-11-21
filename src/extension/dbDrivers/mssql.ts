@@ -6,6 +6,7 @@ import {
   isMssqlSqlVariantPrimaryKeyValue,
   mssqlSqlVariantKeyChangeMessage,
 } from "../../shared/mssqlSqlVariantRowIdentity";
+import { isMssqlQueryDatabase } from "../../shared/queryDatabaseTarget";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { QueryResultSet } from "../../shared/webviewContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -47,6 +48,7 @@ import {
   mssqlSqlVariantPrimaryKeyExpression,
 } from "./mssqlSqlVariantIdentity";
 import { MutationNotExecutedError } from "./mutationExecutionState";
+import { isServerReportedQueryError } from "./queryErrorOutcome";
 import {
   type QuestionMarkPlaceholderOptions,
   questionMarkPlaceholderOffsets,
@@ -2393,6 +2395,10 @@ export class MSSQLDriver extends BaseDBDriver {
     operationContext?: QueryExecutionOptions,
   ): Promise<QueryResult> {
     throwIfQueryCancelled(operationContext);
+    const database = operationContext?.database;
+    if (database !== undefined && !isMssqlQueryDatabase(database)) {
+      throw new Error("[RapiDB] Invalid SQL Server query database.");
+    }
     const hardCap = queryCollectionLimit(operationContext?.hardCap);
     const start = Date.now();
     const batches = parseMssqlBatches(sql);
@@ -2421,6 +2427,21 @@ export class MSSQLDriver extends BaseDBDriver {
     let resultError: Error | undefined;
     try {
       return await session.run(async () => {
+        if (database !== undefined) {
+          // A raw batch changes the context of this leased connection, not the
+          // profile or the pool. Verify the server's literal catalog name before
+          // sending any user batch, separately from its SQL and result sets.
+          const result = await session.execute(session.request(), (request) =>
+            request.batch<{ databaseName: string }>(
+              `USE [${escapeMssqlId(database)}]; SELECT DB_NAME() AS databaseName;`,
+            ),
+          );
+          if (result.recordset?.[0]?.databaseName !== database) {
+            throw new Error(
+              "[RapiDB] SQL Server did not enter the pinned database. The query was not executed.",
+            );
+          }
+        }
         let lastResult: QueryResult = {
           columns: [],
           rows: [],
@@ -2467,6 +2488,9 @@ export class MSSQLDriver extends BaseDBDriver {
                 rowCount: 0,
                 executionTimeMs: Date.now() - start,
                 error: normalizeUnknownError(error, this.config).message,
+                ...(isServerReportedQueryError(error)
+                  ? { serverReportedError: true }
+                  : {}),
               };
             }
             resultSetsTruncated ||= batchResult.resultSetsTruncated === true;
@@ -2522,9 +2546,12 @@ export class MSSQLDriver extends BaseDBDriver {
           return failedResult;
         }
         if (error !== resultError) {
-          throw new Error(
-            `${failedResult.error} ${normalizeUnknownError(error, this.config).message}`,
-            { cause: error },
+          throw Object.assign(
+            new Error(
+              `${failedResult.error} ${normalizeUnknownError(error, this.config).message}`,
+              { cause: error },
+            ),
+            { executionState: "unknown" as const },
           );
         }
       }
@@ -2666,6 +2693,7 @@ export class MSSQLDriver extends BaseDBDriver {
         }
         return new Error(
           `${normalizeUnknownError(error, this.config).message} (SQL Server line ${lineNumber})`,
+          { cause: error },
         );
       };
       const createResult = (error?: unknown): QueryResult => {
@@ -2693,7 +2721,12 @@ export class MSSQLDriver extends BaseDBDriver {
           ...(resultSets.length > 0 ? { resultSets } : {}),
           ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
           ...(error !== undefined
-            ? { error: normalizeUnknownError(error, this.config).message }
+            ? {
+                error: normalizeUnknownError(error, this.config).message,
+                ...(isServerReportedQueryError(error)
+                  ? { serverReportedError: true }
+                  : {}),
+              }
             : {}),
           executionTimeMs: Date.now() - start,
         };

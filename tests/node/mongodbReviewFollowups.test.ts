@@ -63,6 +63,11 @@ function harness() {
     connected: true,
     client: {
       db: () => ({
+        command: async () => ({
+          ok: 1,
+          isWritablePrimary: true,
+          maxWireVersion: 21,
+        }),
         collection: () => ({
           find,
           insertOne,

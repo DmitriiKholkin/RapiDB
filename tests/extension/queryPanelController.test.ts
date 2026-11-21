@@ -1,6 +1,17 @@
+import {
+  DynamoDBServiceException,
+  InternalServerError,
+} from "@aws-sdk/client-dynamodb";
+import { errors as esErrors } from "@elastic/elasticsearch";
+import { DatabaseError } from "pg";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { QueryResult } from "../../src/extension/dbDrivers/types";
 import type { QueryPanelCachedResult } from "../../src/extension/panels/queryPanelController";
 import { createSqlReadOnlyQueryGuard } from "../../src/extension/utils/readOnlyGuards";
+import type {
+  QueryRunIdentity,
+  QueryRunStatus,
+} from "../../src/shared/webviewContracts";
 import {
   MONGO_ERROR_URI,
   MONGO_NUMERIC_PASSWORD_ERROR_URIS,
@@ -55,6 +66,540 @@ describe("QueryPanelController", () => {
     vi.doMock("../../src/extension/utils/queryResultFormatting", () => ({
       formatQueryResult,
     }));
+  });
+
+  describe("query run status", () => {
+    const connectionId = "status-connection";
+    const panelId = "status-panel";
+    const targetSessionKey = "a".repeat(64);
+    const pinned = "Original DB";
+    const result: QueryResult = {
+      columns: ["value"],
+      rows: [{ value: 1 }],
+      rowCount: 1,
+      executionTimeMs: 1,
+    };
+
+    async function createController() {
+      let sessionKey = targetSessionKey;
+      const driver = {
+        query: vi.fn(async () => result),
+        cancelCurrentOperation: vi.fn(async () => undefined),
+      };
+      const manager = {
+        getConnection: () => ({ id: connectionId, type: "pg" }),
+        getConnections: () => [{ id: connectionId, type: "pg" }],
+        getQueryTargetSessionKey: () => sessionKey,
+        getQueryEditorPresentation: () => undefined,
+        getDriver: () => driver,
+        getDriverForQuery: vi.fn(async () => driver),
+        getQueryRowLimit: () => 100,
+        addToHistory: vi.fn(async () => undefined),
+      };
+      // Return false to model a result dropped by the transport.
+      const view = {
+        getActiveConnectionId: () => connectionId,
+        getInitialConnectionId: () => connectionId,
+        getLastQueryResult: () => null,
+        postMessage: vi.fn((_message: unknown) => false),
+        setActiveConnectionId: vi.fn(),
+        setLastQueryResult: vi.fn(),
+        syncTitle: vi.fn(),
+      };
+      const { QueryPanelController } = await import(
+        "../../src/extension/panels/queryPanelController"
+      );
+      const build = () =>
+        new QueryPanelController(
+          manager as never,
+          view,
+          undefined,
+          pinned,
+          { connectionId, sessionKey: targetSessionKey },
+          panelId,
+        );
+      const controller = build();
+      const identity = (operationId: string): QueryRunIdentity => ({
+        panelId,
+        connectionId,
+        operationId,
+        targetSessionKey,
+        postgresDatabase: pinned,
+      });
+      const submit = (run: QueryRunIdentity) =>
+        controller.handleMessage({
+          type: "executeQuery",
+          payload: {
+            connectionId: run.connectionId,
+            operationId: run.operationId,
+            targetSessionKey: run.targetSessionKey,
+            queryText: "SELECT 1",
+            run,
+          },
+        });
+      const stop = (run: QueryRunIdentity) =>
+        controller.handleMessage({
+          type: "cancelQuery",
+          payload: {
+            connectionId: run.connectionId,
+            operationId: run.operationId,
+            run,
+          },
+        });
+      const expectStatus = async (
+        run: QueryRunIdentity,
+        status: QueryRunStatus,
+        host = controller,
+      ) => {
+        const requestId = `${run.operationId}-probe`;
+        await host.handleMessage({
+          type: "getQueryRunStatus",
+          payload: { run, requestId },
+        });
+        expect(view.postMessage).toHaveBeenLastCalledWith({
+          type: "queryRunStatus",
+          payload: { run, requestId, status },
+        });
+      };
+      return {
+        build,
+        controller,
+        driver,
+        expectStatus,
+        identity,
+        manager,
+        stop,
+        submit,
+        view,
+        replaceTarget: () => {
+          sessionKey = "b".repeat(64);
+        },
+      };
+    }
+
+    it("reconciles accepted, running and completed without replaying text, rows, or execution", async () => {
+      const {
+        build,
+        driver,
+        expectStatus,
+        identity,
+        manager,
+        stop,
+        submit,
+        view,
+      } = await createController();
+      let connect!: () => void;
+      let finish!: () => void;
+      manager.getDriverForQuery.mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          connect = resolve;
+        });
+        return driver;
+      });
+      driver.query.mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return result;
+      });
+      const run = identity("known");
+      const running = submit(run);
+      await expectStatus(run, "accepted");
+      await submit(run);
+      expect(manager.getDriverForQuery).toHaveBeenCalledOnce();
+      connect();
+      await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+      expect(driver.query).toHaveBeenCalledWith(
+        expect.stringContaining("SELECT 1"),
+        undefined,
+        expect.objectContaining({ database: pinned }),
+      );
+      await expectStatus(run, "running");
+      for (const wrong of [
+        { ...run, panelId: "other-panel" },
+        { ...run, postgresDatabase: "Other DB" },
+        { ...run, targetSessionKey: "b".repeat(64) },
+      ]) {
+        await expectStatus(wrong, "unknown");
+        await stop(wrong);
+      }
+      expect(driver.cancelCurrentOperation).not.toHaveBeenCalled();
+      await stop(run);
+      await expectStatus(run, "running");
+      finish();
+      await running;
+      expect(view.postMessage).toHaveBeenLastCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          run,
+          runOutcome: "completed",
+          rows: result.rows,
+        }),
+      });
+      await expectStatus(run, "completed");
+      await expectStatus(run, "unknown", build());
+      await submit(run);
+      expect(driver.query).toHaveBeenCalledOnce();
+    });
+
+    it("withholds an oversized PostgreSQL IPC result without changing the completed outcome", async () => {
+      const moduleId = "../../src/extension/utils/queryResultSize";
+      const limit = 1024;
+      vi.doMock(moduleId, async (importOriginal) => ({
+        ...(await importOriginal<
+          typeof import("../../src/extension/utils/queryResultSize")
+        >()),
+        POSTGRES_QUERY_RESULT_IPC_BYTES: limit,
+      }));
+      try {
+        const { driver, view, identity, submit, expectStatus } =
+          await createController();
+        const actual = await vi.importActual<
+          typeof import("../../src/extension/utils/queryResultFormatting")
+        >("../../src/extension/utils/queryResultFormatting");
+        formatQueryResult.mockImplementation(actual.formatQueryResult);
+        const completed = {
+          ...result,
+          rowCount: 1,
+          affectedRows: 1,
+          rows: [{ value: "\u0001".repeat(250) }],
+        };
+        driver.query.mockResolvedValueOnce(completed);
+        const run = identity("completed-but-not-displayed");
+        await submit(run);
+        const message = view.postMessage.mock.calls[0]?.[0];
+        expect(message).toMatchObject({
+          type: "queryResult",
+          payload: {
+            run,
+            runOutcome: "completed",
+            rows: [],
+            affectedRows: 1,
+            resultSetsTruncated: true,
+            warnings: [expect.stringContaining("finished executing")],
+          },
+        });
+        expect(message).not.toMatchObject({
+          payload: { error: expect.anything() },
+        });
+        expect(Buffer.byteLength(JSON.stringify(message))).toBeLessThan(limit);
+        expect(view.setLastQueryResult).toHaveBeenLastCalledWith(null);
+        await expectStatus(run, "completed");
+        expect(driver.query).toHaveBeenCalledOnce();
+      } finally {
+        vi.doUnmock(moduleId);
+      }
+    });
+
+    it.each([
+      [
+        "a PostgreSQL syntax error",
+        () =>
+          Object.assign(
+            new DatabaseError('syntax error at or near "SELEC"', 0, "error"),
+            {
+              code: "42601",
+            },
+          ),
+        "completed",
+      ],
+      [
+        "a SQL Server RequestError",
+        () =>
+          Object.assign(new Error("Incorrect syntax near 'SELEC'."), {
+            name: "RequestError",
+            code: "EREQUEST",
+            number: 102,
+            class: 15,
+          }),
+        "completed",
+      ],
+      [
+        "a wrapped MySQL server error",
+        () =>
+          new Error("line 2: You have an error in your SQL syntax", {
+            cause: Object.assign(new Error("parse"), {
+              code: "ER_PARSE_ERROR",
+              errno: 1064,
+              sqlState: "42000",
+              fatal: false,
+            }),
+          }),
+        "completed",
+      ],
+      [
+        "a PostgreSQL connection failure",
+        () =>
+          Object.assign(
+            new DatabaseError("terminating connection", 0, "error"),
+            {
+              code: "57P01",
+            },
+          ),
+        "unknown",
+      ],
+      [
+        "a PostgreSQL statement cancellation (timeout)",
+        () =>
+          Object.assign(new DatabaseError("canceling statement", 0, "error"), {
+            code: "57014",
+          }),
+        "unknown",
+      ],
+      [
+        "a lost MySQL connection",
+        () =>
+          Object.assign(new Error("Connection lost"), {
+            code: "PROTOCOL_CONNECTION_LOST",
+            fatal: true,
+          }),
+        "unknown",
+      ],
+      [
+        "a MySQL client-side error",
+        () =>
+          Object.assign(new Error("Lost connection to server during query"), {
+            code: "CR_SERVER_LOST",
+            errno: 2013,
+            sqlState: "HY000",
+          }),
+        "unknown",
+      ],
+      [
+        "a SQL Server timeout",
+        () =>
+          Object.assign(new Error("Timeout: Request failed to complete"), {
+            name: "RequestError",
+            code: "ETIMEOUT",
+            number: 0,
+          }),
+        "unknown",
+      ],
+      [
+        "an Elasticsearch DSL parsing error",
+        () =>
+          new esErrors.ResponseError({
+            body: {
+              error: { type: "parsing_exception", reason: "unknown query" },
+              status: 400,
+            },
+            statusCode: 400,
+            headers: {},
+            warnings: null,
+            meta: {
+              context: null,
+              name: "elasticsearch-js",
+              request: {
+                params: { method: "POST", path: "/logs/_search" },
+                options: {},
+                id: 1,
+              },
+              connection: null,
+              attempts: 0,
+              aborted: false,
+            },
+          } as never),
+        "completed",
+      ],
+      [
+        "an Elasticsearch timeout",
+        () => new esErrors.TimeoutError("Request timed out"),
+        "unknown",
+      ],
+      [
+        "a DynamoDB ValidationException",
+        () =>
+          new DynamoDBServiceException({
+            name: "ValidationException",
+            $fault: "client",
+            message: "Invalid KeyConditionExpression",
+            $metadata: { httpStatusCode: 400, attempts: 1 },
+          }),
+        "completed",
+      ],
+      [
+        "a DynamoDB InternalServerError",
+        () =>
+          new InternalServerError({
+            message: "Internal server error",
+            $metadata: { httpStatusCode: 500, attempts: 1 },
+          }),
+        "unknown",
+      ],
+      ["a driver timeout", () => new Error("Query timed out"), "unknown"],
+    ] as const)("records %s as a %s run", async (_label, makeError, outcome) => {
+      const { driver, expectStatus, identity, submit, view } =
+        await createController();
+      driver.query.mockRejectedValueOnce(makeError());
+      const run = identity(`error-${outcome}-${_label}`);
+      await submit(run);
+      expect(view.postMessage).toHaveBeenLastCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          run,
+          runOutcome: outcome,
+          error: expect.any(String),
+        }),
+      });
+      await expectStatus(run, outcome);
+    });
+
+    it("keeps a server error unknown when the session was lost with it", async () => {
+      const { driver, expectStatus, identity, submit } =
+        await createController();
+      Object.assign(driver, { isConnected: () => false });
+      driver.query.mockRejectedValueOnce(
+        Object.assign(
+          new DatabaseError("relation does not exist", 0, "error"),
+          {
+            code: "42P01",
+          },
+        ),
+      );
+      const run = identity("lost-session");
+      await submit(run);
+      await expectStatus(run, "unknown");
+    });
+
+    it("treats a partial script result as completed only when the server reported its error", async () => {
+      const { driver, expectStatus, identity, submit, view } =
+        await createController();
+      const actual = await vi.importActual<
+        typeof import("../../src/extension/utils/queryResultFormatting")
+      >("../../src/extension/utils/queryResultFormatting");
+      formatQueryResult.mockImplementation(actual.formatQueryResult);
+      const partial = {
+        ...result,
+        error: 'relation "missing" does not exist',
+      };
+      driver.query.mockResolvedValueOnce({
+        ...partial,
+        serverReportedError: true,
+      });
+      const known = identity("partial-known");
+      await submit(known);
+      const message = view.postMessage.mock.calls.at(-1)?.[0] as {
+        payload: Record<string, unknown>;
+      };
+      expect(message.payload).toMatchObject({
+        runOutcome: "completed",
+        error: partial.error,
+        rows: [expect.objectContaining({})],
+      });
+      expect(message.payload).not.toHaveProperty("serverReportedError");
+      await expectStatus(known, "completed");
+
+      driver.query.mockResolvedValueOnce(partial);
+      const unknown = identity("partial-unknown");
+      await submit(unknown);
+      await expectStatus(unknown, "unknown");
+    });
+
+    it("records pre-start cancellation as not run and driver errors after Stop as unknown", async () => {
+      const { driver, expectStatus, identity, manager, stop, submit, view } =
+        await createController();
+      let connect!: () => void;
+      manager.getDriverForQuery.mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          connect = resolve;
+        });
+        return driver;
+      });
+      const beforeStart = identity("before-start");
+      const connecting = submit(beforeStart);
+      await vi.waitFor(() =>
+        expect(manager.getDriverForQuery).toHaveBeenCalledOnce(),
+      );
+      await stop(beforeStart);
+      await expectStatus(beforeStart, "not-run");
+      connect();
+      await connecting;
+      expect(driver.query).not.toHaveBeenCalled();
+
+      let fail!: () => void;
+      driver.query.mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            fail = () => reject(new Error("Query stopped"));
+          }),
+      );
+      const inDriver = identity("in-driver");
+      const running = submit(inDriver);
+      await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+      await stop(inDriver);
+      fail();
+      await running;
+      expect(view.postMessage).toHaveBeenLastCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          runOutcome: "unknown",
+          error: expect.stringContaining(
+            "cancellation does not confirm rollback",
+          ),
+        }),
+      });
+      await expectStatus(inDriver, "unknown");
+    });
+
+    it("does not expose a retired live target's status or recreate its run after dispose", async () => {
+      const {
+        controller,
+        driver,
+        expectStatus,
+        identity,
+        replaceTarget,
+        submit,
+        view,
+      } = await createController();
+      let finish!: () => void;
+      driver.query.mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return result;
+      });
+      const run = identity("retired");
+      const running = submit(run);
+      await vi.waitFor(() => expect(driver.query).toHaveBeenCalledOnce());
+      replaceTarget();
+      await expectStatus(run, "unknown");
+      await controller.dispose();
+      view.postMessage.mockClear();
+      finish();
+      await running;
+      await submit(identity("disposed"));
+      expect(driver.query).toHaveBeenCalledOnce();
+      expect(view.postMessage).not.toHaveBeenCalled();
+    });
+
+    it("settles a superseded preparation and retains only a bounded set of terminal summaries", async () => {
+      const { driver, expectStatus, identity, manager, submit } =
+        await createController();
+      let connect!: () => void;
+      manager.getDriverForQuery.mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          connect = resolve;
+        });
+        return driver;
+      });
+      const old = identity("superseded");
+      const before = submit(old);
+      await vi.waitFor(() =>
+        expect(manager.getDriverForQuery).toHaveBeenCalledOnce(),
+      );
+      const latest = identity("next");
+      await submit(latest);
+      await expectStatus(old, "not-run");
+      connect();
+      await before;
+      expect(driver.query).toHaveBeenCalledOnce();
+      await expectStatus(old, "not-run");
+      await expectStatus(latest, "completed");
+      for (let i = 0; i < 32; i++) await submit(identity(`completed-${i}`));
+      await expectStatus(old, "unknown");
+      await expectStatus(latest, "unknown");
+      await expectStatus(identity("completed-31"), "completed");
+    });
   });
 
   it.each(
@@ -712,6 +1257,8 @@ describe("QueryPanelController", () => {
     const posted = view.postMessage.mock.calls.find(
       ([message]) => message.type === "queryResult",
     )?.[0].payload;
+    expect(posted).toMatchObject({ columns: [], columnMeta: [], rows: [] });
+    expect(posted.resultSets[0].rows).toHaveLength(first.length);
     expect(posted.resultSets[1]).toMatchObject({
       truncated: true,
       truncatedAt: 4000,
@@ -734,6 +1281,73 @@ describe("QueryPanelController", () => {
         "Export displayed rows",
       );
     }
+  });
+
+  it("confirms that a PostgreSQL byte-limited result can only export its displayed prefix", async () => {
+    const actual = await vi.importActual<
+      typeof import("../../src/extension/utils/queryResultFormatting")
+    >("../../src/extension/utils/queryResultFormatting");
+    formatQueryResult.mockImplementation(actual.formatQueryResult);
+    const first = {
+      id: "result-1",
+      columns: ["bytes"],
+      rows: [{ __col_0: Buffer.from([0, 255]) }],
+      rowCount: 2,
+      truncated: true,
+      truncatedBySize: true,
+    };
+    const manager = {
+      isConnected: () => true,
+      getConnection: () => ({ id: "qa", type: "pg" }),
+      getDriver: () => ({
+        query: async () => ({
+          ...first,
+          resultSets: [first],
+          executionTimeMs: 1,
+        }),
+      }),
+      getDriverCapabilities: () => ({ boundedQueryResults: true }),
+      getQueryRowLimit: () => 20,
+      addToHistory: vi.fn(async () => undefined),
+    };
+    let cached: QueryPanelCachedResult | null = null;
+    const view = {
+      getActiveConnectionId: () => "qa",
+      getInitialConnectionId: () => "qa",
+      getLastQueryResult: () => cached,
+      postMessage: vi.fn(),
+      setActiveConnectionId: vi.fn(),
+      setLastQueryResult: (value: QueryPanelCachedResult | null) => {
+        cached = value;
+      },
+      syncTitle: vi.fn(),
+    };
+    const { QueryPanelController } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    const controller = new QueryPanelController(manager as never, view);
+    await controller.handleMessage({
+      type: "executeQuery",
+      payload: { queryText: "SELECT bytes FROM items" },
+    });
+    const posted = view.postMessage.mock.lastCall?.[0].payload;
+    expect(posted.resultSets[0]).toMatchObject({
+      rows: [{ __col_0: "0x00ff" }],
+      truncatedBySize: true,
+    });
+    showWarningMessage.mockResolvedValueOnce("Export displayed rows");
+    await controller.handleMessage({ type: "exportResultsJSON" });
+    expect(exportQueryResultsAsJson).toHaveBeenCalledWith(
+      posted.resultSets[0],
+      {
+        context: undefined,
+      },
+    );
+    expect(showWarningMessage).toHaveBeenCalledWith(
+      expect.stringContaining("PostgreSQL display size limit"),
+      { modal: true },
+      "Export displayed rows",
+    );
   });
 
   it("warns and skips both exports when cached results are empty", async () => {
@@ -3988,6 +4602,245 @@ describe("QueryPanelController", () => {
     ]);
     resolveQuery?.({ columns: [], rows: [], rowCount: 0, executionTimeMs: 1 });
     await second;
+  });
+
+  describe("bound target selection", () => {
+    function deferred<T>() {
+      let resolve!: (value: T) => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    async function setup() {
+      const { currentQueryTargetSessionKey, QueryPanelController } =
+        await import("../../src/extension/panels/queryPanelController");
+      const connections = ["a", "b", "c"].map((id) => ({
+        id,
+        name: id,
+        type: "pg",
+      }));
+      const driver = { query: vi.fn(async () => ({ columns: [], rows: [] })) };
+      const verification = new Map<string, Promise<boolean>>();
+      const manager = {
+        getConnections: () => connections,
+        getConnection: (id: string) =>
+          connections.find((connection) => connection.id === id),
+        initializeConnectionCredentialRevision: (id: string) =>
+          verification.get(id),
+        getQueryEditorPresentation: () => undefined,
+        getQueryRowLimit: () => 100,
+        getDriver: () => driver,
+        getDriverForQuery: vi.fn(async () => driver),
+        isConnected: () => false,
+        addToHistory: vi.fn(async () => undefined),
+        addBookmark: vi.fn(async () => undefined),
+      };
+      let activeConnectionId = "a";
+      const view = {
+        getActiveConnectionId: () => activeConnectionId,
+        getInitialConnectionId: () => "a",
+        getLastQueryResult: () => null,
+        postMessage: vi.fn(),
+        setActiveConnectionId: vi.fn((id: string) => {
+          activeConnectionId = id;
+        }),
+        setLastQueryResult: vi.fn(),
+        syncTitle: vi.fn(),
+      };
+      const binding = (id: string) => ({
+        connectionId: id,
+        sessionKey: currentQueryTargetSessionKey(manager as never, id),
+      });
+      const controller = new QueryPanelController(
+        manager as never,
+        view,
+        undefined,
+        undefined,
+        binding("a"),
+      );
+      const change = (id: string, requestId: string) =>
+        controller.handleMessage({
+          type: "activeConnectionChanged",
+          payload: {
+            connectionId: id,
+            targetSessionKey: binding(id).sessionKey,
+            requestId,
+          },
+        });
+      const run = (id: string, operationId: string) =>
+        controller.handleMessage({
+          type: "executeQuery",
+          payload: {
+            connectionId: id,
+            targetSessionKey: binding(id).sessionKey,
+            operationId,
+            queryText: "select 1",
+          },
+        });
+      const replies = () =>
+        view.postMessage.mock.calls
+          .map(([message]) => message)
+          .filter(({ type }) => type === "queryTargetChangeResult")
+          .map(({ payload }) => payload);
+      return {
+        binding,
+        change,
+        controller,
+        driver,
+        manager,
+        replies,
+        run,
+        verification,
+        view,
+      };
+    }
+
+    it("does not run or bookmark against the old binding during verification", async () => {
+      const {
+        binding,
+        change,
+        controller,
+        driver,
+        manager,
+        replies,
+        run,
+        verification,
+        view,
+      } = await setup();
+      const preparing = deferred<typeof driver>();
+      manager.getDriverForQuery.mockReturnValueOnce(preparing.promise);
+      const earlierRun = run("a", "preparing");
+      await vi.waitFor(() =>
+        expect(manager.getDriverForQuery).toHaveBeenCalledOnce(),
+      );
+
+      const credential = deferred<boolean>();
+      verification.set("b", credential.promise);
+      const switching = change("b", "switch");
+      await run("a", "while-pending");
+      await controller.handleMessage({
+        type: "addBookmark",
+        payload: {
+          connectionId: "a",
+          targetSessionKey: binding("a").sessionKey,
+          requestId: "bookmark",
+          queryText: "select 1",
+        },
+      });
+      preparing.resolve(driver);
+      await earlierRun;
+      expect(driver.query).not.toHaveBeenCalled();
+      expect(manager.addToHistory).not.toHaveBeenCalled();
+      expect(manager.addBookmark).not.toHaveBeenCalled();
+      expect(manager.getDriverForQuery).toHaveBeenCalledOnce();
+      for (const operationId of ["preparing", "while-pending"]) {
+        expect(view.postMessage).toHaveBeenCalledWith({
+          type: "queryResult",
+          payload: expect.objectContaining({
+            operationId,
+            connectionId: "a",
+            error: expect.stringContaining("Wait for"),
+          }),
+        });
+      }
+      expect(view.postMessage).toHaveBeenCalledWith({
+        type: "bookmarkSaved",
+        payload: {
+          requestId: "bookmark",
+          ok: false,
+          error: expect.stringContaining("Wait for"),
+        },
+      });
+      expect(replies()).toEqual([]);
+
+      credential.resolve(true);
+      await switching;
+      expect(replies()).toEqual([
+        { requestId: "switch", accepted: true, binding: binding("b") },
+      ]);
+      await run("a", "old-after-confirmation");
+      expect(driver.query).not.toHaveBeenCalled();
+      await run("b", "confirmed");
+      expect(manager.getDriverForQuery).toHaveBeenLastCalledWith(
+        "b",
+        binding("b").sessionKey,
+      );
+      expect(driver.query).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+      "older first",
+      "newer first",
+    ])("commits only the latest choice when verification settles %s", async (order) => {
+      const { binding, change, replies, verification, view } = await setup();
+      const older = deferred<boolean>();
+      const newer = deferred<boolean>();
+      verification.set("b", older.promise);
+      verification.set("c", newer.promise);
+      const first = change("b", "first");
+      const latest = change("c", "latest");
+      if (order === "older first") {
+        older.resolve(true);
+        await first;
+        expect(replies()).toEqual([]);
+        expect(view.setActiveConnectionId).not.toHaveBeenCalled();
+        newer.resolve(true);
+        await latest;
+      } else {
+        newer.resolve(true);
+        await latest;
+        older.resolve(true);
+        await first;
+      }
+      expect(view.setActiveConnectionId.mock.calls).toEqual([["c"]]);
+      expect(replies()).toEqual([
+        { requestId: "latest", accepted: true, binding: binding("c") },
+      ]);
+    });
+
+    it.each([
+      "false",
+      "rejected",
+    ])("keeps the previous target after the latest verification returns %s", async (outcome) => {
+      const { binding, change, driver, replies, run, verification, view } =
+        await setup();
+      const older = deferred<boolean>();
+      const newer = deferred<boolean>();
+      verification.set("b", older.promise);
+      verification.set("c", newer.promise);
+      const first = change("b", "first");
+      const latest = change("c", "latest");
+      if (outcome === "rejected") newer.reject(new Error("Unavailable"));
+      else newer.resolve(false);
+      await latest;
+      older.resolve(true);
+      await first;
+
+      expect(view.setActiveConnectionId).not.toHaveBeenCalled();
+      expect(replies()).toEqual([
+        { requestId: "latest", accepted: false, binding: binding("a") },
+      ]);
+      await run("a", "restored");
+      expect(driver.query).toHaveBeenCalledOnce();
+    });
+
+    it("acknowledges reselecting the confirmed target and supersedes the pending choice", async () => {
+      const { binding, change, replies, verification, view } = await setup();
+      const older = deferred<boolean>();
+      verification.set("b", older.promise);
+      const first = change("b", "first");
+      await change("a", "back");
+      older.resolve(true);
+      await first;
+      expect(view.setActiveConnectionId).not.toHaveBeenCalled();
+      expect(replies()).toEqual([
+        { requestId: "back", accepted: true, binding: binding("a") },
+      ]);
+    });
   });
 
   it.each([

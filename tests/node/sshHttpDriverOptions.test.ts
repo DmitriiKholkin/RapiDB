@@ -2,6 +2,7 @@ import * as http from "node:http";
 import * as https from "node:https";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { awsIdentityResponse } from "../support/awsIdentityResponse";
 
 const elasticMocks = vi.hoisted(() => ({
   constructorCalls: [] as Array<Record<string, unknown>>,
@@ -40,6 +41,12 @@ vi.mock("@smithy/node-http-handler", () => ({
     constructor(options: Record<string, unknown>) {
       dynamoMocks.handlerOptions.push(options);
     }
+
+    async handle() {
+      return awsIdentityResponse("123456789012");
+    }
+
+    destroy() {}
   },
 }));
 
@@ -47,13 +54,18 @@ vi.mock("@aws-sdk/client-dynamodb", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("@aws-sdk/client-dynamodb")>();
 
-  class MockDynamoDBClient {
-    constructor(options: Record<string, unknown>) {
-      dynamoMocks.constructorCalls.push(options);
+  class MockDynamoDBClient extends actual.DynamoDBClient {
+    constructor(
+      options: ConstructorParameters<typeof actual.DynamoDBClient>[0],
+    ) {
+      super(options ?? {});
+      if (!options?.endpointProvider) return;
+      dynamoMocks.constructorCalls.push({ ...options });
+      Object.assign(this, {
+        send: dynamoMocks.send,
+        destroy: dynamoMocks.destroy,
+      });
     }
-
-    send = dynamoMocks.send;
-    destroy = dynamoMocks.destroy;
   }
 
   return {
@@ -156,6 +168,8 @@ describe("SSH HTTP driver options", () => {
       name: "Dynamo SSH",
       type: "dynamodb",
       awsRegion: "us-east-1",
+      awsAccessKeyId: "fixture",
+      awsSecretAccessKey: "fixture-secret",
       endpoint,
       runtimeOverrides: {
         transport: {
@@ -168,11 +182,15 @@ describe("SSH HTTP driver options", () => {
 
     await driver.connect();
 
+    // The SDK normalizes an empty path and does not send endpoint query
+    // parameters. Our pin uses that effective destination.
+    const effectiveEndpoint = new URL(endpoint);
+    effectiveEndpoint.search = "";
     expect(dynamoMocks.constructorCalls[0]).toMatchObject({
       region: "us-east-1",
-      endpoint,
+      endpoint: effectiveEndpoint.href,
     });
-    expect(dynamoMocks.handlerOptions[0]).toMatchObject({
+    expect(dynamoMocks.handlerOptions.at(-1)).toMatchObject({
       httpAgent,
       httpsAgent,
     });
@@ -184,13 +202,15 @@ describe("SSH HTTP driver options", () => {
       id: "ddb-ipv6-tunnel",
       name: "Dynamo IPv6",
       type: "dynamodb",
+      awsAccessKeyId: "fixture",
+      awsSecretAccessKey: "fixture-secret",
       endpoint: "https://127.0.0.1:15432/service?keep=true",
       runtimeOverrides: { tlsServername: "2001:db8::12" },
     } as ConnectionConfig);
     try {
       await driver.connect();
       expect(dynamoMocks.constructorCalls[0]).toMatchObject({
-        endpoint: "https://127.0.0.1:15432/service?keep=true",
+        endpoint: "https://127.0.0.1:15432/service",
       });
       expect(dynamoMocks.handlerOptions[0]?.httpsAgent).toMatchObject({
         options: { servername: "2001:db8::12" },

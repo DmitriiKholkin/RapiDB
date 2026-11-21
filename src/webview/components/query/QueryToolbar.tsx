@@ -14,9 +14,10 @@ interface QueryToolbarProps {
   bookmarking: boolean;
   canFormat: boolean;
   connectionId: string;
-  postgresDatabase?: string;
+  pinnedDatabase?: string;
   pinnedTargetUnavailable: boolean;
   targetReviewRequired: boolean;
+  runReviewRequired: boolean;
   connections: readonly ConnectionEntry[];
   formatButtonTitle: string;
   schemaError?: string | null;
@@ -36,9 +37,10 @@ export function QueryToolbar({
   bookmarking,
   canFormat,
   connectionId,
-  postgresDatabase,
+  pinnedDatabase,
   pinnedTargetUnavailable,
   targetReviewRequired,
+  runReviewRequired,
   connections,
   formatButtonTitle,
   schemaError,
@@ -65,9 +67,9 @@ export function QueryToolbar({
   const clearDisabled = noConnection || queryRunning;
   const formatDisabled = noConnection || !canFormat || queryRunning;
   const pinnedTarget =
-    postgresDatabase === undefined
+    pinnedDatabase === undefined
       ? undefined
-      : `${connections[0]?.name ?? connectionId} / ${JSON.stringify(postgresDatabase)}${pinnedTargetUnavailable ? " (connection unavailable)" : ""}`;
+      : `${connections[0]?.name ?? connectionId} / ${JSON.stringify(pinnedDatabase)}${pinnedTargetUnavailable ? " (connection unavailable)" : ""}`;
   return (
     <div style={queryToolbarStyle}>
       {pinnedTarget !== undefined ? (
@@ -113,7 +115,7 @@ export function QueryToolbar({
         </select>
       )}
 
-      {postgresDatabase === undefined &&
+      {pinnedDatabase === undefined &&
         connections.length === 0 &&
         selectedConnectionId && (
           <Icon
@@ -127,8 +129,8 @@ export function QueryToolbar({
 
       <button
         type="button"
-        style={buildQueryPrimaryButtonStyle(runDisabled)}
-        disabled={runDisabled}
+        style={buildQueryPrimaryButtonStyle(runDisabled || runReviewRequired)}
+        disabled={runDisabled || runReviewRequired}
         onClick={onRun}
         title={`Run query (${queryRunShortcutLabel()} / F5)`}
       >

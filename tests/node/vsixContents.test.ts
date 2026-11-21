@@ -79,23 +79,9 @@ describe("VSIX contents", () => {
       );
       required.push(file);
     }
-    for (const [name, entry, license] of [
-      ["better-sqlite3", "lib/index.js", "LICENSE"],
-      ["bindings", "bindings.js", "LICENSE.md"],
-      ["file-uri-to-path", "index.js", "LICENSE"],
-    ]) {
-      for (const file of ["package.json", entry, license]) {
-        const runtimeFile = `.rapidb-runtime/node_modules/${name}/${file}`;
-        required.push(runtimeFile);
-        if (file === "package.json") {
-          await put(runtimeFile, JSON.stringify({ name, version: "1.0.0" }));
-        }
-      }
-    }
     required.push(
       "node_modules/oracledb/lib/certs/ca.pem",
       "node_modules/oracledb/lib/certs/package.key",
-      ".rapidb-runtime/node_modules/better-sqlite3/lib/certs/ca.crt",
     );
     for (const file of required.filter(
       (file) => !file.endsWith("package.json"),
@@ -116,6 +102,15 @@ describe("VSIX contents", () => {
       "node_modules/ssh2/install.js",
       "node_modules/ssh2/lib/protocol/crypto/build/Release/sshcrypto.node",
       "node_modules/ssh2/lib/protocol/crypto/src/binding.cc",
+      // The SQLite runtime is downloaded on demand; neither the former
+      // packaged scaffold nor any native better-sqlite3 binary is shipped.
+      ".rapidb-runtime/node_modules/better-sqlite3/package.json",
+      ".rapidb-runtime/node_modules/better-sqlite3/lib/index.js",
+      ".rapidb-runtime/node_modules/bindings/bindings.js",
+      "node_modules/better-sqlite3/package.json",
+      "node_modules/better-sqlite3/lib/index.js",
+      "node_modules/better-sqlite3/prebuilds/linux-x64.node",
+      "node_modules/better-sqlite3/build/Release/better_sqlite3.node",
     ];
     for (const prefix of [
       "",

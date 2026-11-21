@@ -12,7 +12,7 @@ import { createProjectTempDir } from "../runtime/tempDirectories";
 it.each([
   "missing",
   "wrong",
-])("uses the development package if repair of a cache with a %s manifest is declined", async (manifest) => {
+])("uses the development package if reinstalling an unverified cache with a %s manifest is declined", async (manifest) => {
   vi.resetModules();
   const {
     configureSQLiteInstaller,
@@ -27,22 +27,20 @@ it.each([
   configureSQLiteInstaller({ storageRoot, allowInstall });
   try {
     const { installedPackagePath, installedBinaryPath } =
-      probeInstalledBetterSqlite3Runtime(__dirname);
+      probeInstalledBetterSqlite3Runtime();
     if (!installedPackagePath || !installedBinaryPath) {
       throw new Error("Could not resolve managed SQLite fixture paths");
     }
     const runtimeRoot = dirname(dirname(installedPackagePath));
     await mkdir(dirname(installedBinaryPath), { recursive: true });
-    for (const name of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-      const source = dirname(require.resolve(`${name}/package.json`));
-      await cp(source, join(runtimeRoot, "node_modules", name), {
-        recursive: true,
-        filter: (path) =>
-          !["build", "src", "deps", "node_modules"].includes(
-            path.slice(source.length + 1).split(/[\\/]/)[0],
-          ),
-      });
-    }
+    const source = dirname(require.resolve("better-sqlite3/package.json"));
+    await cp(source, join(runtimeRoot, "node_modules", "better-sqlite3"), {
+      recursive: true,
+      filter: (path) =>
+        !["build", "src", "deps", "prebuilds", "node_modules"].includes(
+          path.slice(source.length + 1).split(/[\\/]/)[0],
+        ),
+    });
     // The normal JS constructor is present, but the native artifact is incomplete.
     await writeFile(installedBinaryPath, "");
     if (manifest === "wrong") {

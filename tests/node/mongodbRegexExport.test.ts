@@ -19,19 +19,21 @@ describe("MongoDB native regex decoding and EJSON export", () => {
     const find = vi.fn(
       (
         _criteria: unknown,
-        options: { bsonRegExp?: boolean; promoteValues?: boolean },
+        options: {
+          bsonRegExp?: boolean;
+          promoteValues?: boolean;
+          raw?: boolean;
+        },
       ) => {
         const cursor = {
           limit: (_count: number) => cursor,
           skip: (_offset: number) => cursor,
           sort: (_sort: unknown) => cursor,
-          toArray: async () =>
-            wire.map((bytes) =>
-              BSON.deserialize(bytes, {
-                bsonRegExp: options.bsonRegExp,
-                promoteValues: options.promoteValues,
-              }),
-            ),
+          async *[Symbol.asyncIterator]() {
+            for (const bytes of wire) {
+              yield options.raw ? bytes : BSON.deserialize(bytes, options);
+            }
+          },
         };
         return cursor;
       },

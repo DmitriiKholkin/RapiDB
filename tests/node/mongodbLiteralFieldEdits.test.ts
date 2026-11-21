@@ -6,6 +6,7 @@ import type {
 } from "../../src/extension/dbDrivers/types";
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 const unsupportedNames = ["", "a.b", ".a", "a.", "$literal", "$where"];
 const primaryKeys = {
@@ -40,6 +41,7 @@ function setup() {
     sort: vi.fn().mockReturnThis(),
     skip: vi.fn().mockReturnThis(),
     toArray: async () => [document],
+    [Symbol.asyncIterator]: mockMongoCursorIterator,
   };
   const find = vi.fn(() => cursor);
   const collection = vi.fn(() => ({ find, updateOne }));
@@ -47,6 +49,11 @@ function setup() {
     connected: true,
     client: {
       db: () => ({
+        command: async () => ({
+          ok: 1,
+          isWritablePrimary: true,
+          maxWireVersion: 21,
+        }),
         collection,
         listCollections: () => ({
           toArray: async () => [
@@ -115,6 +122,7 @@ describe("MongoDB Table Viewer literal field edit safety", () => {
     s.find.mockReturnValueOnce({
       ...s.cursor,
       toArray: async () => [],
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
     });
     if (clientFallback)
       Object.assign(s.driver, {

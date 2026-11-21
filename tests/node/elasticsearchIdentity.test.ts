@@ -11,6 +11,7 @@ import { TableMutationService } from "../../src/extension/table/tableMutationSer
 import {
   elasticsearchIndexSettings,
   elasticsearchKeys,
+  elasticsearchSourceMetadata,
 } from "../support/elasticsearchIdentity";
 import {
   deferred,
@@ -64,7 +65,7 @@ function fixture() {
       getSettings: vi
         .fn()
         .mockResolvedValue(elasticsearchIndexSettings("records-1")),
-      get: vi.fn().mockResolvedValue({}),
+      get: vi.fn().mockResolvedValue(elasticsearchSourceMetadata("records-1")),
     },
     delete: vi.fn().mockResolvedValue({ result: "deleted" }),
     update: vi.fn().mockResolvedValue({ result: "updated" }),
@@ -104,6 +105,9 @@ describe("Elasticsearch read-to-mutation identity", () => {
     client.indices.getSettings.mockResolvedValue(
       elasticsearchIndexSettings("records-1", rebuiltUuid),
     );
+    client.indices.get.mockResolvedValue(
+      elasticsearchSourceMetadata("records-1", rebuiltUuid),
+    );
     const fresh = primaryKeys(await driver.readTablePage(request));
     expect(fresh._identity).not.toEqual(stale._identity);
     const mutate = (primaryKeys: Record<string, unknown>) =>
@@ -132,10 +136,22 @@ describe("Elasticsearch read-to-mutation identity", () => {
     expect(client.update).not.toHaveBeenCalled();
     expect(client.index).not.toHaveBeenCalled();
     await expect(mutate(fresh)).resolves.toMatchObject({ affectedRows: 1 });
-    expect(client.indices.getSettings).toHaveBeenLastCalledWith(
-      { index: "records-1", name: "index.uuid", local: false },
-      undefined,
-    );
+    if (operation === "delete") {
+      expect(client.indices.getSettings).toHaveBeenLastCalledWith(
+        { index: "records-1", name: "index.uuid", local: false },
+        undefined,
+      );
+    } else {
+      expect(client.indices.get).toHaveBeenLastCalledWith(
+        {
+          index: "records-1",
+          include_defaults: true,
+          flat_settings: true,
+          local: false,
+        },
+        undefined,
+      );
+    }
   });
 
   it.each([
@@ -210,8 +226,11 @@ describe("Elasticsearch read-to-mutation identity", () => {
   ] as const)("does not dispatch a %s if cancelled during the UUID check", async (operation) => {
     const { driver, client } = fixture();
     const keys = primaryKeys(await driver.readTablePage(request));
-    const checked = deferred<ReturnType<typeof elasticsearchIndexSettings>>();
-    client.indices.getSettings.mockReturnValueOnce(checked.promise);
+    const checked = deferred<unknown>();
+    (operation === "delete"
+      ? client.indices.getSettings
+      : client.indices.get
+    ).mockReturnValueOnce(checked.promise);
     const abort = new AbortController();
     const context = { signal: abort.signal, deadline: Infinity };
     const mutation =
@@ -227,12 +246,18 @@ describe("Elasticsearch read-to-mutation identity", () => {
             },
             context,
           );
-    expect(client.indices.getSettings).toHaveBeenLastCalledWith(
-      { index: "records-1", name: "index.uuid", local: false },
+    expect(
+      operation === "delete" ? client.indices.getSettings : client.indices.get,
+    ).toHaveBeenLastCalledWith(
+      expect.objectContaining({ index: "records-1", local: false }),
       { signal: abort.signal },
     );
     abort.abort();
-    checked.resolve(elasticsearchIndexSettings("records-1"));
+    checked.resolve(
+      operation === "delete"
+        ? elasticsearchIndexSettings("records-1")
+        : elasticsearchSourceMetadata("records-1"),
+    );
     await expect(mutation).rejects.toMatchObject(
       operation === "delete" ? failedDelete : failedUpdate,
     );
@@ -253,7 +278,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
       changes: { _source: '{"nested":[2]}' },
       originalValues,
     };
-    const preview = driver.buildMutationPreviewStatement(
+    const [preview] = await driver.buildMutationPreviewStatements(
       "update",
       "default",
       "indices",
@@ -412,15 +437,15 @@ describe("Elasticsearch read-to-mutation identity", () => {
     };
     const message =
       /conditional _source updates require a complete replacement/;
-    expect(() =>
-      driver.buildMutationPreviewStatement(
+    await expect(
+      driver.buildMutationPreviewStatements(
         "update",
         "default",
         "indices",
         "current",
         update,
       ),
-    ).toThrow(message);
+    ).rejects.toThrow(message);
     await expect(
       driver.updateRows({ ...request, updates: [update] }),
     ).rejects.toThrow(message);
@@ -539,7 +564,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
     let preview: string;
     if (operation === "insert") {
       const values = { _id: "new", _source: JSON.stringify(document) };
-      preview = driver.buildMutationPreviewStatement(
+      [preview] = await driver.buildMutationPreviewStatements(
         "insert",
         "default",
         "indices",
@@ -558,7 +583,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
         primaryKeys: primaryKeys(page),
         changes: { _source: JSON.stringify(document) },
       };
-      preview = driver.buildMutationPreviewStatement(
+      [preview] = await driver.buildMutationPreviewStatements(
         "update",
         "default",
         "indices",
@@ -643,7 +668,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
       refresh: "wait_for",
     };
     expect(client.delete).toHaveBeenLastCalledWith(expected, undefined);
-    const preview = driver.buildMutationPreviewStatement(
+    const [preview] = await driver.buildMutationPreviewStatements(
       "delete",
       "default",
       "indices",
@@ -717,7 +742,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
       if_primary_term: 1,
     });
     expect(JSON.stringify(actual)).not.toContain("_identity");
-    const preview = driver.buildMutationPreviewStatement(
+    const [preview] = await driver.buildMutationPreviewStatements(
       "update",
       "default",
       "indices",
@@ -754,7 +779,7 @@ describe("Elasticsearch read-to-mutation identity", () => {
       "current",
       routing,
     );
-    const preview = driver.buildMutationPreviewStatement(
+    const [preview] = await driver.buildMutationPreviewStatements(
       "delete",
       "default",
       "indices",
@@ -814,15 +839,15 @@ describe("Elasticsearch read-to-mutation identity", () => {
     if (kind === "old epoch") Object.assign(driver, { connectionEpoch: 1 });
     if (kind === "wrong table") table = "other";
     for (const operation of ["delete", "update"] as const) {
-      expect(() =>
-        driver.buildMutationPreviewStatement(
+      await expect(
+        driver.buildMutationPreviewStatements(
           operation,
           "default",
           "indices",
           table,
           { primaryKeys: keys, changes: { _source: "{}" } },
         ),
-      ).toThrow(/Refresh the table/);
+      ).rejects.toThrow(/Refresh the table/);
     }
     await expect(
       driver.buildMutationPreviewStatements(
@@ -884,15 +909,15 @@ describe("Elasticsearch read-to-mutation identity", () => {
     const { driver, client } = fixture();
     const keys = elasticsearchKeys(driver, "same-id", "records-1", "current");
     const changes = { [field]: "different" };
-    expect(() =>
-      driver.buildMutationPreviewStatement(
+    await expect(
+      driver.buildMutationPreviewStatements(
         "update",
         "default",
         "indices",
         "current",
         { primaryKeys: keys, changes },
       ),
-    ).toThrow(/read-only/);
+    ).rejects.toThrow(/read-only/);
     await expect(
       driver.updateRows({
         ...request,

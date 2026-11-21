@@ -102,6 +102,20 @@ describe("webview crash recovery", () => {
     expect(useQueryStore.getState().status).toBe("success");
     const crashedState = useQueryStore.getState();
 
+    expect(vscode.setState).toHaveBeenNthCalledWith(1, {
+      ...persisted,
+      queryRun: {
+        phase: "pending",
+        run: {
+          operationId: operation.operationId,
+          connectionId: operation.connectionId,
+          panelId: "panel",
+          targetSessionKey: null,
+        },
+      },
+    });
+    expect(vscode.setState).toHaveBeenLastCalledWith(persisted);
+    vi.mocked(vscode.setState).mockClear();
     clearPostedMessages();
     expect(screen.getByRole("alert").textContent).toContain(
       "Query results crashed",

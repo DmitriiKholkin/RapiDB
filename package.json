@@ -570,6 +570,10 @@
                 "type": "boolean",
                 "description": "Store secrets in VS Code Secret Storage. When false, secrets stay in settings.json. Set automatically to false when secrets are written here by hand."
               },
+              "secretStorageProfile": {
+                "type": "string",
+                "description": "Internal link to saved credentials. Managed by RapiDB; do not edit."
+              },
               "filePath": {
                 "type": "string",
                 "description": "SQLite only: absolute path to the .db file"
@@ -621,6 +625,15 @@
                 "type": "string",
                 "description": "AWS access key ID for DynamoDB."
               },
+              "awsCredentialMode": {
+                "type": "string",
+                "enum": [
+                  "static",
+                  "profile",
+                  "default"
+                ],
+                "description": "DynamoDB credential source. Choose static access keys, a named AWS profile, or the AWS SDK default credential chain."
+              },
               "awsSecretAccessKey": {
                 "type": "string",
                 "description": "AWS secret access key for DynamoDB."
@@ -629,9 +642,18 @@
                 "type": "string",
                 "description": "Optional AWS session token for temporary credentials."
               },
+              "awsSessionTokenRequired": {
+                "type": "boolean",
+                "description": "Set for static temporary credentials so a missing session token fails closed."
+              },
               "awsProfile": {
                 "type": "string",
                 "description": "Shared AWS profile name to use for DynamoDB credentials."
+              },
+              "awsStsEndpoint": {
+                "type": "string",
+                "pattern": "^https://[^/?#@:\\s]+/?$",
+                "description": "Optional HTTPS STS endpoint used to verify the AWS account of an AWS DynamoDB endpoint instead of regional STS, for example the DNS name of an STS interface VPC endpoint (https://vpce-….sts.<region>.vpce.amazonaws.com). It must be an AWS STS host name for the connection's region; no port, path, query or credentials."
               },
               "mongoConnectionMode": {
                 "type": "string",
@@ -789,7 +811,7 @@
         "rapidb.skipTableMutationPreview": {
           "type": "boolean",
           "default": false,
-          "description": "Apply insert, edit, and delete actions in the Table Data Viewer without opening the mutation preview dialog.",
+          "description": "Skip command previews for Table Data Viewer mutations. Deleting multiple Redis keys still requires a brief confirmation because some keys can be deleted even if others fail.",
           "scope": "application"
         }
       }
@@ -873,7 +895,6 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
-    "@electron/rebuild": "4.0.4",
     "@testing-library/react": "16.3.2",
     "@testing-library/user-event": "14.6.1",
     "@types/mssql": "12.3.0",
@@ -886,6 +907,7 @@
     "@vscode/test-electron": "2.5.2",
     "@vscode/vsce": "4.1.0",
     "axe-core": "4.11.4",
+    "better-sqlite3": "13.2.0",
     "esbuild": "0.28.1",
     "jsdom": "29.1.1",
     "ovsx": "1.4.0",
@@ -903,19 +925,21 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "3.1057.0",
+    "@aws-sdk/core": "3.974.20",
     "@aws-sdk/credential-providers": "3.1057.0",
     "@aws-sdk/lib-dynamodb": "3.1057.0",
     "@aws-sdk/util-dynamodb": "3.996.2",
+    "@aws-sdk/xml-builder": "3.972.29",
     "@dagrejs/dagre": "3.0.0",
     "@elastic/elasticsearch": "9.4.2",
     "@smithy/core": "3.24.7",
     "@smithy/node-http-handler": "4.7.5",
+    "@smithy/signature-v4": "5.4.7",
     "@tanstack/react-table": "8.21.3",
     "@tanstack/react-virtual": "3.13.26",
     "@vscode/codicons": "0.0.45",
     "@xyflow/react": "12.10.2",
     "agent-base": "9.0.0",
-    "better-sqlite3": "12.10.0",
     "monaco-editor": "0.53.0",
     "mongodb": "7.2.0",
     "mongodb-connection-string-url": "7.0.1",

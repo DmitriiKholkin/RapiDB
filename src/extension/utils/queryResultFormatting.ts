@@ -34,13 +34,24 @@ export function formatQueryResult(
 ): FormattedQueryResult {
   const truncated = result.truncated === true || result.rows.length > rowLimit;
   const sampledRows = truncated ? result.rows.slice(0, rowLimit) : result.rows;
-  const columnMeta = resolveQueryColumnMeta(result.columns, result.columnMeta);
   let remainingRows = rowLimit;
   const resultSets = result.resultSets?.map((resultSet) => {
     const formatted = formatQueryResultSet(resultSet, remainingRows);
     remainingRows = Math.max(0, remainingRows - formatted.rows.length);
     return formatted;
   });
+  // PostgreSQL exposes its first set as top-level aliases for driver callers.
+  // Both views have the same row limit, so reuse the already formatted set.
+  const first = result.resultSets?.[0];
+  const primary =
+    first?.rows === result.rows &&
+    first.columns === result.columns &&
+    first.columnMeta === result.columnMeta
+      ? resultSets?.[0]
+      : undefined;
+  const columnMeta =
+    primary?.columnMeta ??
+    resolveQueryColumnMeta(result.columns, result.columnMeta);
 
   return {
     ...result,
@@ -63,7 +74,9 @@ export function formatQueryResult(
         }
       : {}),
     columnMeta,
-    rows: normalizeQueryRows(sampledRows, result.columns, columnMeta),
+    rows:
+      primary?.rows ??
+      normalizeQueryRows(sampledRows, result.columns, columnMeta),
     truncated,
     truncatedAt: sampledRows.length,
     resultSets,

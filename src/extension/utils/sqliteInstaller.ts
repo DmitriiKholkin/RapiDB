@@ -1,53 +1,51 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
-  chmodSync,
-  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { hostname, tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
-import { promisify } from "node:util";
+import { hostname } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { logger } from "./logger";
 import {
-  extractSQLiteArchive,
+  extractSQLitePackage,
   SQLITE_ARCHIVE_LIMITS,
-  SQLITE_SOURCE,
+  sqliteSha256Matches,
   verifySQLiteIntegrity,
 } from "./sqliteArchive";
 import {
-  type SQLiteArtifactPin,
-  type SQLiteArtifactTarget,
-  type SQLiteHeaderPins,
+  reviewedSQLiteVersion,
+  SQLITE_ARTIFACTS,
+  SQLITE_INSTALLED_BINARY_PATH,
+  SQLITE_REGISTRY_HOST,
+  type SQLitePackagePlan,
+  type SQLiteTarballPin,
   sqliteArtifactPolicyId,
-  sqliteHeaderPins,
-  sqlitePrebuiltFileName,
-  sqlitePrebuiltPin,
+  sqlitePackagePlan,
 } from "./sqliteArtifactPins";
 import {
-  assertSQLiteBuildPath,
-  createSQLiteBuildToolLock,
-  pinSQLiteSourceNodeActions,
-  resolveSQLiteBuildTools,
-} from "./sqliteBuildTools";
+  currentSQLiteHostProbe,
+  resolveSQLiteNativeHost,
+  type SQLiteHostProbe,
+  type SQLiteNativeHost,
+  type SQLiteNativeTarget,
+  sqliteHostLibraryRequirementError,
+} from "./sqliteNativeTarget";
+import { oldestVSCodeWithNodeApi } from "./vscodeNodeApi";
 
-const execFileAsync = promisify(execFile);
-
-const SQLITE_DOWNLOAD_TIMEOUT_MS = 60_000;
-const SQLITE_BUILD_STEP_TIMEOUT_MS = 300_000;
+const SQLITE_DOWNLOAD_IDLE_TIMEOUT_MS = 60_000;
+const SQLITE_TARBALL_DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 const SQLITE_INSTALL_MAX_DURATION_MS =
-  5 * SQLITE_DOWNLOAD_TIMEOUT_MS + 2 * SQLITE_BUILD_STEP_TIMEOUT_MS + 120_000;
+  SQLITE_TARBALL_DOWNLOAD_TIMEOUT_MS + 120_000;
 const SQLITE_INSTALL_LOCK_OWNER_FILE = "owner.json";
 const SQLITE_INSTALL_LOCK_TRANSIENT_ERRORS = new Set([
   "EPERM",
@@ -68,21 +66,39 @@ const DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS = {
 };
 let installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
 const SQLITE_RUNTIME_LAST_USED_FILE = ".rapidb-last-used";
+const SQLITE_RUNTIME_MANIFEST_FILE = "runtime.json";
+const SQLITE_RUNTIME_MANIFEST_SCHEMA = 3;
 const SQLITE_OBSOLETE_RUNTIME_MAX_IDLE_MS = 30 * 24 * 60 * 60 * 1000;
 // Runtimes used this recently cannot be cleanup candidates, so their use can
 // be recorded without the runtime lock.
 const SQLITE_RUNTIME_RECENT_USE_MS = 7 * 24 * 60 * 60 * 1000;
 const SQLITE_RUNTIME_USE_CLOCK_SKEW_MS = 5 * 60 * 1000;
 const SQLITE_OBSOLETE_RUNTIME_MAX_REMOVALS = 3;
+// Bounds the mtime scan of a runtime written by a RapiDB version that did not
+// record use; larger trees are kept.
+const SQLITE_UNTRACKED_RUNTIME_MAX_ENTRIES = 10_000;
+// Errors that prove a runtime is incomplete or was tampered with. Any other
+// I/O error (EACCES, EPERM, EBUSY, EMFILE, EIO, ... — often an antivirus scan
+// or a sharing violation) is temporary: the runtime is neither used nor
+// replaced, and the connection fails with a retryable error.
+const SQLITE_RUNTIME_CORRUPTION_ERRORS = new Set([
+  "ENOENT",
+  "ENOTDIR",
+  "ELOOP",
+  "EISDIR",
+]);
 const SQLITE_RUNTIME_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/;
-const SQLITE_RUNTIME_NAME =
+// better-sqlite3 <= 12 runtimes were keyed by the host's Electron/Node ABI.
+// RapiDB never loads them again; they are removed once idle.
+const SQLITE_LEGACY_RUNTIME_NAME =
   "(?:electron|node)-abi-[0-9]+(?:-[a-z0-9]+){2,3}(?:-archive-v1|-pins-v[0-9]+-[0-9a-f]{16})?";
+const SQLITE_NAPI_RUNTIME_NAME =
+  "(?:darwin|linux|linuxmusl|win32)-(?:x64|arm64)-pins-v[0-9]+-[0-9a-f]{16}";
+const SQLITE_RUNTIME_NAME = `(?:${SQLITE_LEGACY_RUNTIME_NAME}|${SQLITE_NAPI_RUNTIME_NAME})`;
 const SQLITE_RUNTIME_DIRECTORY_PATTERN = new RegExp(`^${SQLITE_RUNTIME_NAME}$`);
 const SQLITE_RUNTIME_TRASH_PATTERN = new RegExp(
   `^${SQLITE_RUNTIME_NAME}\\.obsolete-[0-9]+-[0-9a-f-]{36}$`,
 );
-const SQLITE_USE_TRACKING_POLICY_PATTERN = /-pins-v([0-9]+)-[0-9a-f]{16}$/;
-const SQLITE_USE_TRACKING_MIN_POLICY_VERSION = 5;
 
 interface SQLiteInstallLockOwner {
   pid: number;
@@ -91,52 +107,85 @@ interface SQLiteInstallLockOwner {
   token: string;
 }
 
-type BetterSqlite3PackageJson = {
-  name?: string;
-  version?: string;
-  repository?: unknown;
-};
-
 export interface SQLiteInstalledRuntimeProbe {
   runtime: "electron" | "node";
   target: string;
-  packageRoot: string | null;
-  bundledPackagePath: string | null;
-  bundledPackageExists: boolean;
+  nodeApi: string;
   installedPackagePath: string | null;
   installedPackageExists: boolean;
   installedBinaryPath: string | null;
   installedBinaryExists: boolean;
 }
 
+export interface SQLiteInstallProgress {
+  // Aborted only by an explicit user cancellation of the installation.
+  signal: AbortSignal;
+  report(receivedBytes: number, totalBytes: number): void;
+}
+
 interface SQLiteInstallerConfiguration {
   storageRoot: string;
   log?: (message: string) => void;
   allowInstall?: () => boolean | Promise<boolean>;
-  workspaceRoots?: () => readonly string[];
+  // False in an untrusted (Restricted Mode) workspace.
+  isTrusted?: () => boolean;
+  withInstallProgress?: <T>(
+    task: (progress: SQLiteInstallProgress) => Promise<T>,
+  ) => Promise<T>;
+}
+
+export class SQLiteRuntimeUnreadableError extends Error {
+  constructor(path: string, cause: unknown) {
+    const code = (cause as NodeJS.ErrnoException)?.code;
+    super(
+      `The SQLite runtime at ${path} could not be read right now (${code ?? errorMessage(cause)}); it was neither used nor replaced. This is usually temporary, for example while an antivirus scan or another program holds the file. Try again in a moment.`,
+      { cause },
+    );
+    this.name = "SQLiteRuntimeUnreadableError";
+  }
+}
+
+export class SQLiteRuntimeInUseError extends Error {
+  constructor(path: string, cause: unknown) {
+    super(
+      `The SQLite runtime at ${path} failed verification and must be replaced, but it is in use (${(cause as NodeJS.ErrnoException)?.code ?? errorMessage(cause)}). Close SQLite connections in other VS Code windows (or close those windows), then try again. Nothing was deleted or downloaded.`,
+      { cause },
+    );
+    this.name = "SQLiteRuntimeInUseError";
+  }
+}
+
+export class SQLiteRuntimeInstallCancelledError extends Error {
+  constructor() {
+    super(
+      "The SQLite runtime download was cancelled. Nothing was installed; open the SQLite database again to retry.",
+    );
+    this.name = "SQLiteRuntimeInstallCancelledError";
+  }
 }
 
 interface InstalledRuntimeManifest {
+  schemaVersion: number;
   betterSqlite3Version: string;
-  runtime: "electron" | "node";
-  abi: string;
-  platform: NodeJS.Platform;
-  arch: NodeJS.Architecture;
-  libc: string;
+  target: SQLiteNativeTarget;
+  policy: string;
+  nodeApiVersion: number;
 }
 
-export interface SQLiteManagedRuntimeSnapshot {
-  readonly packagePath: string;
-  readonly revision: string;
+interface RuntimeLayout {
+  plan: SQLitePackagePlan;
+  policy: string;
+  runtimeRoot: string;
+  packagePath: string;
+  manifest: InstalledRuntimeManifest;
 }
 
 let installerConfiguration: SQLiteInstallerConfiguration | null = null;
 let inFlightInstall: Promise<string | null> | null = null;
-const inFlightRepairs = new Map<
-  string,
-  { signals: Set<AbortSignal | undefined>; result: Promise<string | null> }
->();
 let obsoleteRuntimeCleanupDone = false;
+let hostProbeOverride: SQLiteHostProbe | null = null;
+let nodeApiVersionOverride: string | undefined;
+let cachedHost: { host: SQLiteNativeHost } | { error: Error } | null = null;
 
 function installerLog(message: string): void {
   const line = `[RapiDB SQLite] ${message}`;
@@ -157,321 +206,296 @@ function currentRuntime(): "electron" | "node" {
   return process.versions.electron ? "electron" : "node";
 }
 
-function detectLinuxLibc(): string {
-  if (process.platform !== "linux") {
-    return "";
-  }
-
-  try {
-    const detectLibc = require("detect-libc") as {
-      GLIBC?: string;
-      familySync?: () => string | null;
-      isNonGlibcLinuxSync?: () => boolean;
-    };
-    if (!detectLibc.isNonGlibcLinuxSync?.()) {
-      return "";
-    }
-    const family = detectLibc.familySync?.();
-    if (!family || family === detectLibc.GLIBC) {
-      return "";
-    }
-    return family.toLowerCase();
-  } catch {
-    return "";
-  }
+function hostNodeApiVersion(): string {
+  return nodeApiVersionOverride ?? process.versions.napi ?? "";
 }
 
-function currentTargetLabel(): string {
-  return [process.platform, detectLinuxLibc() || null, process.arch]
-    .filter(
-      (part): part is string => typeof part === "string" && part.length > 0,
-    )
-    .join("-");
-}
-
-function currentArtifactTarget(
-  betterSqlite3Version: string,
-): SQLiteArtifactTarget {
-  return {
-    betterSqlite3Version,
-    runtime: currentRuntime(),
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: detectLinuxLibc(),
-    electronVersion: process.versions.electron,
-  };
-}
-
-function currentRuntimeStorageKey(betterSqlite3Version: string): string {
-  return [
-    currentRuntime(),
-    `abi-${process.versions.modules}`,
-    process.platform,
-    detectLinuxLibc() || null,
-    process.arch,
-    sqliteArtifactPolicyId(currentArtifactTarget(betterSqlite3Version)),
-  ]
-    .filter(
-      (part): part is string => typeof part === "string" && part.length > 0,
-    )
-    .join("-");
-}
-
-function findPackageRoot(startDir: string): string | null {
-  let currentDir = resolve(startDir);
-  while (true) {
-    if (existsSync(join(currentDir, "package.json"))) {
-      return currentDir;
-    }
-    const parentDir = resolve(currentDir, "..");
-    if (parentDir === currentDir) {
-      return null;
-    }
-    currentDir = parentDir;
-  }
-}
-
-function bundledPackagePathFor(baseDir: string): string | null {
-  const packageRoot = findPackageRoot(baseDir);
-  if (!packageRoot) {
-    return null;
-  }
-
-  for (const candidate of [
-    join(packageRoot, ".rapidb-runtime", "node_modules", "better-sqlite3"),
-    join(packageRoot, "node_modules", "better-sqlite3"),
-  ]) {
-    if (existsSync(join(candidate, "package.json"))) {
-      return candidate;
+function currentHost(): SQLiteNativeHost {
+  if (!cachedHost) {
+    try {
+      cachedHost = {
+        host: resolveSQLiteNativeHost(
+          hostProbeOverride ?? currentSQLiteHostProbe(),
+        ),
+      };
+    } catch (error) {
+      cachedHost = {
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
     }
   }
-
-  return join(packageRoot, ".rapidb-runtime", "node_modules", "better-sqlite3");
+  if ("error" in cachedHost) throw cachedHost.error;
+  return cachedHost.host;
 }
 
-function bundledHelperPackagePathFor(
-  baseDir: string,
-  packageName: "bindings" | "file-uri-to-path",
-): string | null {
-  const packageRoot = findPackageRoot(baseDir);
-  if (!packageRoot) {
-    return null;
-  }
-
-  for (const candidate of [
-    join(packageRoot, ".rapidb-runtime", "node_modules", packageName),
-    join(packageRoot, "node_modules", packageName),
-  ]) {
-    if (existsSync(join(candidate, "package.json"))) {
-      return candidate;
-    }
-  }
-
-  return join(packageRoot, ".rapidb-runtime", "node_modules", packageName);
+function currentTarget(): SQLiteNativeTarget {
+  return currentHost().target;
 }
 
-function readBundledBetterSqlite3Package(
-  baseDir: string,
-): BetterSqlite3PackageJson {
-  const bundledPackagePath = bundledPackagePathFor(baseDir);
-  if (!bundledPackagePath) {
+function assertHostNodeApi(plan: SQLitePackagePlan): void {
+  const available = Number(hostNodeApiVersion());
+  if (!Number.isSafeInteger(available) || available < plan.nodeApiVersion) {
+    const vscode = oldestVSCodeWithNodeApi(plan.nodeApiVersion);
     throw new Error(
-      "Could not resolve the extension package root for SQLite runtime installation.",
+      `SQLite requires Node-API ${plan.nodeApiVersion} (better-sqlite3 ${plan.version}), but this ${currentRuntime() === "electron" ? "VS Code" : "Node.js"} runtime (Node.js ${process.version}) provides Node-API ${hostNodeApiVersion() || "unknown"}. ${vscode ? `Update VS Code to ${vscode} or later.` : "Update VS Code."} No SQLite binary was downloaded.`,
     );
   }
+}
 
-  const packageJsonPath = join(bundledPackagePath, "package.json");
-  if (!existsSync(packageJsonPath)) {
+// glibc prebuilds need a minimum glibc/libstdc++; refuse older hosts before
+// asking for consent or downloading anything.
+function assertHostLibraries(plan: SQLitePackagePlan): void {
+  const error = sqliteHostLibraryRequirementError(
+    currentHost(),
+    plan.libraryRequirements,
+  );
+  if (error) throw error;
+}
+
+// Throws for unsupported hosts; returns null only when the installer has not
+// been configured (development and tests without global storage).
+function currentLayout(): RuntimeLayout | null {
+  if (!installerConfiguration) return null;
+  const target = currentTarget();
+  const plan = sqlitePackagePlan(target);
+  const version = reviewedSQLiteVersion();
+  if (plan.version !== version) {
     throw new Error(
-      "The packaged better-sqlite3 scaffold is missing. Ensure node_modules/better-sqlite3 is included in the VSIX.",
+      "The SQLite artifact manifest changed after it was reviewed; refusing to install.",
     );
   }
-
-  return JSON.parse(
-    readFileSync(packageJsonPath, "utf8"),
-  ) as BetterSqlite3PackageJson;
-}
-
-function expectedManifestFor(baseDir: string): InstalledRuntimeManifest {
-  const pkg = readBundledBetterSqlite3Package(baseDir);
-  if (!pkg.version) {
-    throw new Error("better-sqlite3/package.json does not declare a version.");
-  }
-  return {
-    betterSqlite3Version: pkg.version,
-    runtime: currentRuntime(),
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: detectLinuxLibc(),
-  };
-}
-
-function runtimeRootFor(baseDir: string): string | null {
-  const packageRoot = findPackageRoot(baseDir);
-  if (!packageRoot || !installerConfiguration) {
-    return null;
-  }
-
-  const manifest = expectedManifestFor(baseDir);
-  return join(
+  assertHostNodeApi(plan);
+  assertHostLibraries(plan);
+  const policy = sqliteArtifactPolicyId(target);
+  const runtimeRoot = join(
     installerConfiguration.storageRoot,
     "sqlite-runtime",
     "better-sqlite3",
-    manifest.betterSqlite3Version,
-    currentRuntimeStorageKey(manifest.betterSqlite3Version),
+    version,
+    `${target}-${policy}`,
   );
+  return {
+    plan,
+    policy,
+    runtimeRoot,
+    packagePath: join(runtimeRoot, "node_modules", "better-sqlite3"),
+    manifest: {
+      schemaVersion: SQLITE_RUNTIME_MANIFEST_SCHEMA,
+      betterSqlite3Version: version,
+      target,
+      policy,
+      nodeApiVersion: plan.nodeApiVersion,
+    },
+  };
 }
 
-function installedPackagePathFor(baseDir: string): string | null {
-  const runtimeRoot = runtimeRootFor(baseDir);
-  if (!runtimeRoot) {
+function tryCurrentLayout(): RuntimeLayout | null {
+  try {
+    return currentLayout();
+  } catch {
     return null;
   }
-  return join(runtimeRoot, "node_modules", "better-sqlite3");
-}
-
-function installedBinaryPathFor(baseDir: string): string | null {
-  const installedPackagePath = installedPackagePathFor(baseDir);
-  if (!installedPackagePath) {
-    return null;
-  }
-  return sqliteNativeBindingPath(installedPackagePath);
 }
 
 export function sqliteNativeBindingPath(packagePath: string): string {
-  return join(packagePath, "build", "Release", "better_sqlite3.node");
+  return join(packagePath, ...SQLITE_INSTALLED_BINARY_PATH.split("/"));
 }
 
-function installedManifestPathFor(baseDir: string): string | null {
-  const runtimeRoot = runtimeRootFor(baseDir);
-  if (!runtimeRoot) {
-    return null;
-  }
-  return join(runtimeRoot, "runtime.json");
-}
-
-function manifestMatches(baseDir: string): boolean {
-  const manifestPath = installedManifestPathFor(baseDir);
-  const binaryPath = installedBinaryPathFor(baseDir);
-  const packagePath = installedPackagePathFor(baseDir);
-  if (!manifestPath || !binaryPath || !packagePath) {
-    return false;
-  }
-  if (
-    !existsSync(manifestPath) ||
-    !existsSync(binaryPath) ||
-    !existsSync(join(packagePath, "package.json"))
-  ) {
-    return false;
-  }
-
-  let actual: Partial<InstalledRuntimeManifest> | null;
+function isRealDirectory(path: string): boolean {
   try {
-    actual = JSON.parse(readFileSync(manifestPath, "utf8"));
+    return lstatSync(path).isDirectory();
   } catch {
     return false;
   }
-  if (!actual || typeof actual !== "object") {
-    return false;
-  }
-  const expected = expectedManifestFor(baseDir);
-  return (
-    actual.betterSqlite3Version === expected.betterSqlite3Version &&
-    actual.runtime === expected.runtime &&
-    actual.abi === expected.abi &&
-    actual.platform === expected.platform &&
-    actual.arch === expected.arch &&
-    actual.libc === expected.libc
-  );
 }
 
-// Capture only an existing, manifest-matched managed binary. An installation
-// just attempted by this connection is not eligible for another download.
-export function snapshotSQLiteManagedRuntime(
-  baseDir: string,
-): SQLiteManagedRuntimeSnapshot | null {
+class RuntimeInvalid extends Error {}
+
+// A corrupted or incomplete runtime is reported as invalid; any other I/O
+// error is temporary and propagates as SQLiteRuntimeUnreadableError.
+function runtimeIoFailure(error: unknown, path: string): Error {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return code && SQLITE_RUNTIME_CORRUPTION_ERRORS.has(code)
+    ? new RuntimeInvalid(`${path}: ${code}`)
+    : new SQLiteRuntimeUnreadableError(path, error);
+}
+
+function lstatRuntimePath(path: string): import("node:fs").Stats {
   try {
-    const root = runtimeRootFor(baseDir);
-    const packagePath = installedPackagePathFor(baseDir);
-    if (!root || !packagePath || !installerConfiguration) return null;
-    const binaryPath = sqliteNativeBindingPath(packagePath);
-    const storageRoot = installerConfiguration.storageRoot;
-    let directory = dirname(binaryPath);
-    while (true) {
-      if (!isRealDirectory(directory)) return null;
-      if (directory === storageRoot) break;
-      const parent = dirname(directory);
-      if (parent === directory) return null;
-      directory = parent;
+    return lstatSync(path);
+  } catch (error) {
+    throw runtimeIoFailure(error, path);
+  }
+}
+
+// Every directory below the configured storage root must be a real directory;
+// the root itself is configured by VS Code and may be reached through links.
+function assertRealDirectoryChain(from: string, to: string): void {
+  let directory = to;
+  while (directory !== from) {
+    if (!lstatRuntimePath(directory).isDirectory())
+      throw new RuntimeInvalid(`${directory} is not a real directory`);
+    const parent = dirname(directory);
+    if (parent === directory)
+      throw new RuntimeInvalid(`${to} is outside ${from}`);
+    directory = parent;
+  }
+  let root: import("node:fs").Stats;
+  try {
+    root = statSync(from);
+  } catch (error) {
+    throw runtimeIoFailure(error, from);
+  }
+  if (!root.isDirectory())
+    throw new RuntimeInvalid(`${from} is not a directory`);
+}
+
+function readRuntimeFile(path: string): Buffer {
+  try {
+    return readFileSync(path);
+  } catch (error) {
+    throw runtimeIoFailure(error, path);
+  }
+}
+
+type RuntimeEntryKind = "file" | "directory";
+
+// The complete set of entries a runtime may contain. Installation locks,
+// staging directories and tombstones are siblings of the runtime directory,
+// never inside it.
+function expectedRuntimeTree(
+  layout: RuntimeLayout,
+): Map<string, { kind: RuntimeEntryKind; required: boolean }> {
+  const expected = new Map<
+    string,
+    { kind: RuntimeEntryKind; required: boolean }
+  >([
+    [SQLITE_RUNTIME_MANIFEST_FILE, { kind: "file", required: true }],
+    [SQLITE_RUNTIME_LAST_USED_FILE, { kind: "file", required: false }],
+    ["node_modules", { kind: "directory", required: true }],
+    ["node_modules/better-sqlite3", { kind: "directory", required: true }],
+  ]);
+  for (const file of layout.plan.files) {
+    const parts = `node_modules/better-sqlite3/${file.installPath}`.split("/");
+    for (let depth = 3; depth < parts.length; depth += 1) {
+      expected.set(parts.slice(0, depth).join("/"), {
+        kind: "directory",
+        required: true,
+      });
     }
-    if (
-      !lstatSync(join(root, "runtime.json")).isFile() ||
-      !lstatSync(join(packagePath, "package.json")).isFile() ||
-      !manifestMatches(baseDir)
-    )
-      return null;
-    const binary = lstatSync(binaryPath, { bigint: true });
-    if (!binary.isFile()) return null;
-    return {
-      packagePath,
-      revision: `${binary.dev}:${binary.ino}:${binary.ctimeNs}:${binary.size}`,
-    };
-  } catch {
-    return null;
+    expected.set(parts.join("/"), { kind: "file", required: true });
   }
+  return expected;
 }
 
-function copyDirectory(sourceRoot: string, targetRoot: string): void {
-  cpSync(sourceRoot, targetRoot, {
-    recursive: true,
-    force: true,
-    filter(sourcePath) {
-      const rel = relative(sourceRoot, sourcePath);
-      return rel !== "" || existsSync(sourceRoot);
-    },
-  });
-}
-
-function copyBundledRuntimeScaffold(
-  baseDir: string,
+// Names are compared exactly as readdir returns them, so a case variant
+// (lib/Util next to lib/util.js on a case-insensitive file system) or an
+// extensionless file that require() would resolve is never accepted.
+function assertExactRuntimeTree(
+  layout: RuntimeLayout,
   runtimeRoot: string,
 ): void {
-  const bundledBetterSqlite3Path = bundledPackagePathFor(baseDir);
-  const bundledBindingsPath = bundledHelperPackagePathFor(baseDir, "bindings");
-  const bundledFileUriToPathPath = bundledHelperPackagePathFor(
-    baseDir,
-    "file-uri-to-path",
-  );
-  if (
-    !bundledBetterSqlite3Path ||
-    !bundledBindingsPath ||
-    !bundledFileUriToPathPath ||
-    !existsSync(join(bundledBetterSqlite3Path, "package.json")) ||
-    !existsSync(join(bundledBindingsPath, "package.json")) ||
-    !existsSync(join(bundledFileUriToPathPath, "package.json"))
-  ) {
-    throw new Error(
-      "The packaged better-sqlite3 scaffold is incomplete. Include better-sqlite3, bindings, and file-uri-to-path in the VSIX.",
-    );
+  const expected = expectedRuntimeTree(layout);
+  const seen = new Set<string>();
+  const visit = (relative: string): void => {
+    const directory = relative
+      ? join(runtimeRoot, ...relative.split("/"))
+      : runtimeRoot;
+    let names: string[];
+    try {
+      names = readdirSync(directory);
+    } catch (error) {
+      throw runtimeIoFailure(error, directory);
+    }
+    for (const name of names) {
+      const child = relative ? `${relative}/${name}` : name;
+      const entry = expected.get(child);
+      if (!entry) throw new RuntimeInvalid(`unexpected runtime entry ${child}`);
+      const stats = lstatRuntimePath(join(directory, name));
+      const kind = stats.isFile()
+        ? "file"
+        : stats.isDirectory()
+          ? "directory"
+          : null;
+      if (kind !== entry.kind)
+        throw new RuntimeInvalid(
+          `runtime entry ${child} is not a ${entry.kind}`,
+        );
+      seen.add(child);
+      if (kind === "directory") visit(child);
+    }
+  };
+  visit("");
+  for (const [path, entry] of expected) {
+    if (entry.required && !seen.has(path))
+      throw new RuntimeInvalid(`missing runtime entry ${path}`);
   }
+}
 
-  const nodeModulesRoot = join(runtimeRoot, "node_modules");
-  mkdirSync(nodeModulesRoot, { recursive: true });
-  copyDirectory(
-    bundledBetterSqlite3Path,
-    join(nodeModulesRoot, "better-sqlite3"),
+function assertRuntimeManifest(
+  layout: RuntimeLayout,
+  runtimeRoot: string,
+): void {
+  let actual: Partial<InstalledRuntimeManifest> | null;
+  try {
+    actual = JSON.parse(
+      readRuntimeFile(join(runtimeRoot, SQLITE_RUNTIME_MANIFEST_FILE)).toString(
+        "utf8",
+      ),
+    );
+  } catch (error) {
+    if (error instanceof SQLiteRuntimeUnreadableError) throw error;
+    throw new RuntimeInvalid("unreadable runtime manifest");
+  }
+  const expected = layout.manifest;
+  if (
+    !actual ||
+    typeof actual !== "object" ||
+    actual.schemaVersion !== expected.schemaVersion ||
+    actual.betterSqlite3Version !== expected.betterSqlite3Version ||
+    actual.target !== expected.target ||
+    actual.policy !== expected.policy ||
+    actual.nodeApiVersion !== expected.nodeApiVersion
+  ) {
+    throw new RuntimeInvalid("runtime manifest does not match");
+  }
+}
+
+// A runtime is used only if its manifest matches, it contains exactly the
+// expected entries and every installed file, including the native binary,
+// still matches its reviewed SHA-256 pin. A corrupted or modified cache is
+// never loaded; it is reinstalled after consent instead. Returns false for an
+// invalid runtime and throws SQLiteRuntimeUnreadableError for a temporary I/O
+// error.
+function verifyRuntimeAt(
+  layout: RuntimeLayout,
+  runtimeRoot: string,
+  storageRoot: string,
+): boolean {
+  try {
+    assertRealDirectoryChain(storageRoot, runtimeRoot);
+    assertExactRuntimeTree(layout, runtimeRoot);
+    assertRuntimeManifest(layout, runtimeRoot);
+    const packagePath = join(runtimeRoot, "node_modules", "better-sqlite3");
+    for (const file of layout.plan.files) {
+      const path = join(packagePath, ...file.installPath.split("/"));
+      const data = readRuntimeFile(path);
+      if (data.length !== file.size || !sqliteSha256Matches(data, file.sha256))
+        throw new RuntimeInvalid(`${file.installPath} does not match its pin`);
+    }
+    return true;
+  } catch (error) {
+    if (error instanceof RuntimeInvalid) return false;
+    throw error;
+  }
+}
+
+function installedRuntimeValid(layout: RuntimeLayout): boolean {
+  const configuration = installerConfiguration;
+  return (
+    configuration !== null &&
+    verifyRuntimeAt(layout, layout.runtimeRoot, configuration.storageRoot)
   );
-  copyDirectory(bundledBindingsPath, join(nodeModulesRoot, "bindings"));
-  copyDirectory(
-    bundledFileUriToPathPath,
-    join(nodeModulesRoot, "file-uri-to-path"),
-  );
-  rmSync(join(nodeModulesRoot, "better-sqlite3", "build"), {
-    recursive: true,
-    force: true,
-  });
 }
 
 async function waitFor(milliseconds: number): Promise<void> {
@@ -671,6 +695,7 @@ function removeAbandonedInstallDirectories(runtimeRoot: string): void {
   const parent = dirname(runtimeRoot);
   const temporaryPrefix = `${basename(runtimeRoot)}.tmp-`;
   const tombstonePrefix = `${basename(runtimeRoot)}.lock.stale-`;
+  const trashPrefix = `${basename(runtimeRoot)}.obsolete-`;
   let entries: string[];
   try {
     entries = readdirSync(parent);
@@ -690,6 +715,14 @@ function removeAbandonedInstallDirectories(runtimeRoot: string): void {
       ) {
         continue;
       }
+    } else if (
+      entry.startsWith(trashPrefix) &&
+      SQLITE_RUNTIME_TRASH_PATTERN.test(entry)
+    ) {
+      // Left behind when deleting a replaced runtime failed (for example a
+      // binary still loaded on Windows); this window holds the runtime lock.
+      removeRuntimeTrash(path);
+      continue;
     } else if (entry.startsWith(temporaryPrefix)) {
       const pid = Number(entry.slice(temporaryPrefix.length).split("-")[0]);
       if (
@@ -709,12 +742,38 @@ function removeAbandonedInstallDirectories(runtimeRoot: string): void {
   }
 }
 
-function isRealDirectory(path: string): boolean {
+// Removes a runtime that was already renamed to an installer-owned trash name.
+// A symlink is unlinked, never followed; rmSync does not follow links inside.
+function removeRuntimeTrash(path: string): boolean {
   try {
-    return lstatSync(path).isDirectory();
-  } catch {
+    if (lstatSync(path).isSymbolicLink()) unlinkSync(path);
+    else rmSync(path, { recursive: true, force: true });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    installerLog(
+      `Could not delete replaced SQLite runtime ${path}: ${errorMessage(error)}. It will be removed later.`,
+    );
     return false;
   }
+}
+
+// Moves a runtime that failed verification out of the way with one atomic
+// rename under the runtime lock, then deletes it best effort. If it cannot be
+// moved (on Windows, typically because another window still has its binary
+// loaded) nothing is deleted.
+function moveInvalidRuntimeAside(runtimeRoot: string): void {
+  const trash = `${runtimeRoot}.obsolete-${process.pid}-${randomUUID()}`;
+  try {
+    renameSync(runtimeRoot, trash);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new SQLiteRuntimeInUseError(runtimeRoot, error);
+  }
+  installerLog(
+    `Replacing SQLite runtime ${runtimeRoot}; it failed verification.`,
+  );
+  removeRuntimeTrash(trash);
 }
 
 function refreshRuntimeUse(runtimeRoot: string): boolean {
@@ -741,17 +800,9 @@ function markRuntimeUsed(runtimeRoot: string): void {
   }
 }
 
-function tracksRuntimeUse(name: string): boolean {
-  const policy = SQLITE_USE_TRACKING_POLICY_PATTERN.exec(name);
-  return (
-    policy !== null &&
-    Number(policy[1]) >= SQLITE_USE_TRACKING_MIN_POLICY_VERSION
-  );
-}
-
 function runtimeLastUsedAt(runtimeRoot: string): number | null | undefined {
   try {
-    if (!lstatSync(join(runtimeRoot, "runtime.json")).isFile()) {
+    if (!lstatSync(join(runtimeRoot, SQLITE_RUNTIME_MANIFEST_FILE)).isFile()) {
       return undefined;
     }
   } catch {
@@ -803,9 +854,44 @@ async function isRuntimeUnlocked(runtimeRoot: string): Promise<boolean> {
   return true;
 }
 
+// Newest mtime anywhere in a runtime tree (symlinks are not followed), or
+// null if the tree cannot be read completely or is unexpectedly large.
+function newestTreeModification(root: string): number | null {
+  let newest = Number.NEGATIVE_INFINITY;
+  let entries = 0;
+  const visit = (path: string): boolean => {
+    if (++entries > SQLITE_UNTRACKED_RUNTIME_MAX_ENTRIES) return false;
+    let stats: import("node:fs").Stats;
+    try {
+      stats = lstatSync(path);
+    } catch {
+      return false;
+    }
+    newest = Math.max(newest, stats.mtimeMs);
+    if (!stats.isDirectory()) return true;
+    let names: string[];
+    try {
+      names = readdirSync(path);
+    } catch {
+      return false;
+    }
+    return names.every((name) => visit(join(path, name)));
+  };
+  return visit(root) ? newest : null;
+}
+
+// RapiDB versions that did not record use leave no marker. Such a runtime may
+// still be loaded by an old RapiDB in another window, so it is removed only
+// once nothing in it has changed for the idle period; no marker is created.
+function isIdle(runtimeRoot: string, lastUsedAt: number | null): boolean {
+  if (lastUsedAt !== null) return isIdleSince(lastUsedAt);
+  const modified = newestTreeModification(runtimeRoot);
+  return modified !== null && isIdleSince(modified);
+}
+
 async function removeObsoleteRuntime(runtimeRoot: string): Promise<boolean> {
   const observed = runtimeLastUsedAt(runtimeRoot);
-  if (observed === undefined || (observed !== null && !isIdleSince(observed))) {
+  if (observed === undefined || !isIdle(runtimeRoot, observed)) {
     return false;
   }
   const lockRoot = `${runtimeRoot}.lock`;
@@ -814,15 +900,13 @@ async function removeObsoleteRuntime(runtimeRoot: string): Promise<boolean> {
     return false;
   }
   const trash = `${runtimeRoot}.obsolete-${process.pid}-${randomUUID()}`;
+  let untracked = false;
   try {
     const lastUsedAt = runtimeLastUsedAt(runtimeRoot);
-    if (lastUsedAt === null) {
-      markRuntimeUsed(runtimeRoot);
+    if (lastUsedAt === undefined || !isIdle(runtimeRoot, lastUsedAt)) {
       return false;
     }
-    if (lastUsedAt === undefined || !isIdleSince(lastUsedAt)) {
-      return false;
-    }
+    untracked = lastUsedAt === null;
     renameSync(runtimeRoot, trash);
     // Readers record stale use under this lock; this still catches lock-free
     // use if clocks diverged by more than the recent-use margin.
@@ -839,21 +923,32 @@ async function removeObsoleteRuntime(runtimeRoot: string): Promise<boolean> {
     await releaseInstallLock(lockRoot, token);
   }
   installerLog(
-    `Removing SQLite runtime ${runtimeRoot}; it has not been used for over 30 days.`,
+    untracked
+      ? `Removing SQLite runtime ${runtimeRoot}; it records no use and has not been modified for over 30 days.`
+      : `Removing SQLite runtime ${runtimeRoot}; it has not been used for over 30 days.`,
   );
-  rmSync(trash, { recursive: true, force: true });
+  removeRuntimeTrash(trash);
   return true;
 }
 
-export async function removeObsoleteSQLiteRuntimes(
-  baseDir: string,
-): Promise<string[]> {
+// Removes idle runtimes of other versions, targets or pin policies, including
+// ABI-keyed better-sqlite3 <= 12 runtimes. Only real directories with an
+// installer-created name inside the cache are touched, symlinks are never
+// followed, and a runtime is removed only under its own installation lock
+// once it has not been used for 30 days. Runtimes without a use marker
+// (written by RapiDB versions that did not record use) are removed only once
+// nothing in them has been modified for 30 days. Removal is an atomic rename
+// to an installer-owned trash name followed by a best-effort delete; leftover
+// trash is retried on later runs.
+export async function removeObsoleteSQLiteRuntimes(): Promise<string[]> {
   const removed: string[] = [];
   try {
-    const currentRoot = runtimeRootFor(baseDir);
-    if (!currentRoot) {
+    const layout = currentLayout();
+    if (!layout) {
       return removed;
     }
+    const currentRoot = layout.runtimeRoot;
+    const currentVersion = basename(dirname(currentRoot));
     const cacheRoot = dirname(dirname(currentRoot));
     if (!isRealDirectory(dirname(cacheRoot)) || !isRealDirectory(cacheRoot)) {
       return removed;
@@ -898,20 +993,21 @@ export async function removeObsoleteSQLiteRuntimes(
           return removed;
         }
         const path = join(versionRoot, entry);
-        if (path === currentRoot || !isRealDirectory(path)) {
+        const trash = SQLITE_RUNTIME_TRASH_PATTERN.test(entry);
+        if (path === currentRoot || (!trash && !isRealDirectory(path))) {
           continue;
         }
         try {
-          if (
-            abandoned.has(entry) ||
-            (SQLITE_RUNTIME_TRASH_PATTERN.test(entry) &&
-              (await isRuntimeUnlocked(join(versionRoot, entry.split(".")[0]))))
-          ) {
+          if (abandoned.has(entry)) {
             rmSync(path, { recursive: true, force: true });
             removed.push(path);
           } else if (
+            trash &&
+            (await isRuntimeUnlocked(join(versionRoot, entry.split(".")[0])))
+          ) {
+            if (removeRuntimeTrash(path)) removed.push(path);
+          } else if (
             SQLITE_RUNTIME_DIRECTORY_PATTERN.test(entry) &&
-            tracksRuntimeUse(entry) &&
             !busy.has(entry) &&
             (await removeObsoleteRuntime(path))
           ) {
@@ -923,6 +1019,9 @@ export async function removeObsoleteSQLiteRuntimes(
           );
         }
       }
+      if (version !== currentVersion) {
+        removeEmptyVersionDirectory(versionRoot);
+      }
     }
   } catch (error) {
     installerLog(
@@ -932,48 +1031,54 @@ export async function removeObsoleteSQLiteRuntimes(
   return removed;
 }
 
-async function removeObsoleteSQLiteRuntimesOnce(
-  baseDir: string,
-): Promise<void> {
+function removeEmptyVersionDirectory(versionRoot: string): void {
+  try {
+    if (
+      isRealDirectory(versionRoot) &&
+      isOlderThanIdleLimit(versionRoot) &&
+      readdirSync(versionRoot).length === 0
+    ) {
+      // rmdir never removes a non-empty directory, so a concurrent install
+      // into this version cannot lose files.
+      rmdirSync(versionRoot);
+    }
+  } catch {}
+}
+
+async function removeObsoleteSQLiteRuntimesOnce(): Promise<void> {
   if (!obsoleteRuntimeCleanupDone) {
     obsoleteRuntimeCleanupDone = true;
-    await removeObsoleteSQLiteRuntimes(baseDir);
+    await removeObsoleteSQLiteRuntimes();
   }
 }
 
-function refreshInstalledRuntimeUse(baseDir: string): boolean {
-  const runtimeRoot = runtimeRootFor(baseDir);
+function refreshInstalledRuntimeUse(layout: RuntimeLayout): boolean {
+  const { runtimeRoot } = layout;
   return (
-    runtimeRoot !== null &&
-    manifestMatches(baseDir) &&
+    installedRuntimeValid(layout) &&
     wasUsedRecently(runtimeRoot) &&
     refreshRuntimeUse(runtimeRoot) &&
-    existsSync(join(runtimeRoot, "runtime.json"))
+    existsSync(join(runtimeRoot, SQLITE_RUNTIME_MANIFEST_FILE))
   );
 }
 
 async function recordInstalledRuntimeUse(
-  baseDir: string,
+  layout: RuntimeLayout,
 ): Promise<string | null> {
-  const runtimeRoot = runtimeRootFor(baseDir);
-  const installedPackagePath = installedPackagePathFor(baseDir);
-  if (
-    !runtimeRoot ||
-    !installedPackagePath ||
-    !isRealDirectory(dirname(runtimeRoot))
-  ) {
+  const { runtimeRoot, packagePath } = layout;
+  if (!isRealDirectory(dirname(runtimeRoot))) {
     return null;
   }
   return withInstallLock<string | null>(
     `${runtimeRoot}.lock`,
     async () => {
-      if (!manifestMatches(baseDir)) {
+      if (!installedRuntimeValid(layout)) {
         return null;
       }
       markRuntimeUsed(runtimeRoot);
-      return installedPackagePath;
+      return packagePath;
     },
-    () => (refreshInstalledRuntimeUse(baseDir) ? installedPackagePath : null),
+    () => (refreshInstalledRuntimeUse(layout) ? packagePath : null),
   );
 }
 
@@ -1068,37 +1173,59 @@ async function withInstallLock<T>(
   }
 }
 
-const GITHUB_DOWNLOAD_HOSTS = [
-  "github.com",
-  "release-assets.githubusercontent.com",
-  "objects.githubusercontent.com",
-];
-
 interface DownloadLimits {
   maxBytes?: number;
   allowedHosts?: readonly string[];
+  idleTimeoutMs?: number;
+  onProgress?: (receivedBytes: number) => void;
+  signal?: AbortSignal;
+}
+
+// Every hop, including redirects, must be plain HTTPS to an allowed host on
+// the default port, without credentials.
+function isAllowedDownloadUrl(
+  target: string,
+  allowedHosts: readonly string[],
+): boolean {
+  try {
+    const url = new URL(target);
+    return (
+      url.protocol === "https:" &&
+      allowedHosts.includes(url.hostname) &&
+      (url.port === "" || url.port === "443") &&
+      url.username === "" &&
+      url.password === ""
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function downloadToFile(
   url: string,
   destPath: string,
-  timeoutMs = SQLITE_DOWNLOAD_TIMEOUT_MS,
+  timeoutMs = SQLITE_DOWNLOAD_IDLE_TIMEOUT_MS,
   options: DownloadLimits = {},
 ): Promise<void> {
   const { createWriteStream } = require("node:fs") as typeof import("node:fs");
   const https = require("node:https") as typeof import("node:https");
   const http = require("node:http") as typeof import("node:http");
   const maxBytes = options.maxBytes ?? SQLITE_ARCHIVE_LIMITS.compressedBytes;
+  const idleTimeoutMs = options.idleTimeoutMs ?? timeoutMs;
   const allowLoopbackHttp = url.startsWith("http://") && !options.allowedHosts;
 
   return new Promise<void>((resolvePromise, rejectPromise) => {
     let settled = false;
     let abortActiveRequest: (() => void) | undefined;
     let downloadFile: import("node:fs").WriteStream | undefined;
+    const onAbort = (): void => {
+      rejectOnce(new SQLiteRuntimeInstallCancelledError());
+    };
     const resolveOnce = (): void => {
       if (!settled) {
         settled = true;
         clearTimeout(deadline);
+        options.signal?.removeEventListener("abort", onAbort);
         resolvePromise();
       }
     };
@@ -1106,6 +1233,7 @@ export function downloadToFile(
       if (!settled) {
         settled = true;
         clearTimeout(deadline);
+        options.signal?.removeEventListener("abort", onAbort);
         abortActiveRequest?.();
         const cleanup = (): void => {
           try {
@@ -1142,7 +1270,7 @@ export function downloadToFile(
       }
       if (
         options.allowedHosts &&
-        !options.allowedHosts.includes(new URL(resolvedTarget).hostname)
+        !isAllowedDownloadUrl(resolvedTarget, options.allowedHosts)
       ) {
         rejectOnce(
           new Error(`Refusing untrusted SQLite download host: ${target}`),
@@ -1230,7 +1358,10 @@ export function downloadToFile(
             );
             return;
           }
-          const file = createWriteStream(destPath);
+          const file = createWriteStream(destPath, {
+            flags: "wx",
+            mode: 0o600,
+          });
           downloadFile = file;
           activeFile = file;
           let receivedBytes = 0;
@@ -1242,7 +1373,11 @@ export function downloadToFile(
                   `SQLite download exceeds size limit (${maxBytes} bytes).`,
                 ),
               );
+              return;
             }
+            try {
+              options.onProgress?.(receivedBytes);
+            } catch {}
           });
           response.on("error", (err: Error) => {
             try {
@@ -1284,7 +1419,7 @@ export function downloadToFile(
         } catch {}
         rejectOnce(err);
       });
-      request.setTimeout(timeoutMs, () => {
+      request.setTimeout(idleTimeoutMs, () => {
         const timeoutError = new Error(
           `Timed out downloading ${resolvedTarget}`,
         );
@@ -1297,14 +1432,27 @@ export function downloadToFile(
         request.destroy(timeoutError);
       });
     };
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     follow(url, 0);
   });
 }
 
-export async function downloadPinnedSQLiteArtifact(
-  pin: SQLiteArtifactPin,
+// Decimal megabytes (10^6 bytes), as in the documentation.
+export function formatSQLiteDownloadSize(bytes: number): string {
+  return `${(bytes / 1_000_000).toFixed(1)} MB`;
+}
+
+// Download the integrity-pinned npm tarball. Only HTTPS to the npm registry is
+// allowed, including for every redirect hop; the size must match the pin
+// exactly and the SHA-512 is checked before the archive is opened.
+export async function downloadPinnedSQLiteTarball(
+  pin: SQLiteTarballPin,
   destination: string,
-  allowedHosts: readonly string[],
+  progress?: SQLiteInstallProgress,
 ): Promise<void> {
   if (
     !pin.integrity ||
@@ -1313,10 +1461,30 @@ export async function downloadPinnedSQLiteArtifact(
     pin.size > SQLITE_ARCHIVE_LIMITS.compressedBytes
   )
     throw new Error("Missing/invalid static SQLite artifact pin.");
-  await downloadToFile(pin.url, destination, SQLITE_DOWNLOAD_TIMEOUT_MS, {
-    maxBytes: pin.size,
-    allowedHosts,
-  });
+  let reported = 0;
+  await downloadToFile(
+    pin.url,
+    destination,
+    SQLITE_TARBALL_DOWNLOAD_TIMEOUT_MS,
+    {
+      maxBytes: pin.size,
+      allowedHosts: [SQLITE_REGISTRY_HOST],
+      idleTimeoutMs: SQLITE_DOWNLOAD_IDLE_TIMEOUT_MS,
+      signal: progress?.signal,
+      onProgress: (received) => {
+        try {
+          progress?.report(received, pin.size);
+        } catch {}
+        const quarter = Math.floor((received / pin.size) * 4);
+        if (quarter > reported && quarter < 4) {
+          reported = quarter;
+          installerLog(
+            `Downloaded ${formatSQLiteDownloadSize(received)} of ${formatSQLiteDownloadSize(pin.size)}…`,
+          );
+        }
+      },
+    },
+  );
   try {
     const bytes = readFileSync(destination);
     if (bytes.length !== pin.size)
@@ -1328,492 +1496,84 @@ export async function downloadPinnedSQLiteArtifact(
   }
 }
 
-export async function preparePinnedSQLiteHeaders(
-  runtimeRoot: string,
-  pins: SQLiteHeaderPins,
-  platform: NodeJS.Platform,
-  arch: NodeJS.Architecture,
-): Promise<string> {
-  const headerDir = join(runtimeRoot, "electron-headers");
-  const archivePath = join(runtimeRoot, "electron-headers.tgz");
-  const library =
-    platform === "win32" ? pins.windowsLibraries[arch] : undefined;
-  if (platform === "win32" && !library)
-    throw new Error(
-      `Unsupported pinned SQLite Windows import library: ${arch}.`,
-    );
-  try {
-    await downloadPinnedSQLiteArtifact(pins.archive, archivePath, [
-      "artifacts.electronjs.org",
-    ]);
-    await extractSQLiteArchive(
-      archivePath,
-      headerDir,
-      "headers",
-      pins.archive.integrity,
-      SQLITE_ARCHIVE_LIMITS,
-      pins.archiveRoot,
-    );
-    const versionHeader = readFileSync(
-      join(headerDir, "include/node/node_version.h"),
-      "utf8",
-    );
-    if (
-      !new RegExp(`#define NODE_MODULE_VERSION\\s+${pins.abi}(?:\\s|$)`).test(
-        versionHeader,
-      )
-    )
-      throw new Error(
-        "Pinned Electron headers do not match the expected SQLite ABI.",
-      );
-    if (library) {
-      const releaseDir = join(headerDir, "Release");
-      mkdirSync(releaseDir);
-      await downloadPinnedSQLiteArtifact(
-        library,
-        join(releaseDir, "node.lib"),
-        ["artifacts.electronjs.org"],
-      );
-    }
-    return headerDir;
-  } catch (error) {
-    rmSync(headerDir, { recursive: true, force: true });
-    throw error;
-  } finally {
-    rmSync(archivePath, { force: true });
-  }
-}
-
-export function sqliteNodeGypArguments(
-  toolDir: string,
-  headerDir: string,
-  headerVersion: string,
-  platform: NodeJS.Platform,
-  arch: NodeJS.Architecture,
-  python?: string,
-): string[] {
-  assertSQLiteBuildPath(toolDir, "tools", platform);
-  assertSQLiteBuildPath(headerDir, "headers", platform);
-  return [
-    join(toolDir, "node_modules/node-gyp/bin/node-gyp.js"),
-    "rebuild",
-    `--target=${headerVersion}`,
-    `--arch=${arch}`,
-    `--target_platform=${platform}`,
-    `--nodedir=${headerDir}`,
-    `--devdir=${join(toolDir, "node-gyp-devdir")}`,
-    ...(python ? [`--python=${python}`] : []),
-    "--release",
-  ];
-}
-
-function applyElectron42V8Patch(sourceDir: string): void {
-  const macrosPath = join(sourceDir, "src", "util", "macros.cpp");
-  let macros = readFileSync(macrosPath, "utf8");
-  macros = macros.replace(
-    "#define OnlyAddon static_cast<Addon*>(info.Data().As<v8::External>()->Value())",
-    [
-      "#if defined(NODE_MODULE_VERSION) && NODE_MODULE_VERSION >= 146",
-      "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value), 0)",
-      "#define EXTERNAL_VALUE(value) (value)->Value(0)",
-      "#else",
-      "#define EXTERNAL_NEW(isolate, value) v8::External::New((isolate), (value))",
-      "#define EXTERNAL_VALUE(value) (value)->Value()",
-      "#endif",
-      "#define OnlyAddon static_cast<Addon*>(EXTERNAL_VALUE(info.Data().As<v8::External>()))",
-    ].join("\n"),
-  );
-  writeFileSync(macrosPath, macros, "utf8");
-
-  const mainPath = join(sourceDir, "src", "better_sqlite3.cpp");
-  let mainCpp = readFileSync(mainPath, "utf8");
-  mainCpp = mainCpp.replace(
-    "v8::Local<v8::External> data = v8::External::New(isolate, addon);",
-    "v8::Local<v8::External> data = EXTERNAL_NEW(isolate, addon);",
-  );
-  if (!mainCpp.includes("__builtin_frame_address")) {
-    mainCpp =
-      "#ifdef _MSC_VER\n" +
-      "#define __builtin_frame_address(x) ((void*)0)\n" +
-      "#endif\n" +
-      mainCpp;
-  }
-  writeFileSync(mainPath, mainCpp, "utf8");
-
-  const helpersPath = join(sourceDir, "src", "util", "helpers.cpp");
-  let helpers = readFileSync(helpersPath, "utf8");
-  helpers = helpers.replace(
-    "\t\tfunc,\n\t\t0,\n\t\tdata",
-    "\t\tfunc,\n\t\tnullptr,\n\t\tdata",
-  );
-  writeFileSync(helpersPath, helpers, "utf8");
-}
-
-async function downloadPatchedPrebuilt(
-  runtimeRoot: string,
-  baseDir: string,
+async function stageRuntime(
+  layout: RuntimeLayout,
+  stagingRoot: string,
+  progress?: SQLiteInstallProgress,
 ): Promise<void> {
-  const pkg = readBundledBetterSqlite3Package(baseDir);
-  if (!pkg.version) {
-    throw new Error("Cannot determine better-sqlite3 version.");
-  }
-
-  const fileName = sqlitePrebuiltFileName(
-    "patched",
-    currentArtifactTarget(pkg.version),
-  );
-  const pin = sqlitePrebuiltPin("patched", fileName);
-  const downloadUrl = pin.url;
-  const tarballPath = join(runtimeRoot, fileName);
-
+  const { plan } = layout;
+  const tarballPath = join(stagingRoot, "better-sqlite3.tgz");
   try {
-    installerLog(`Trying patched prebuilt from ${downloadUrl}…`);
-    await downloadPinnedSQLiteArtifact(pin, tarballPath, GITHUB_DOWNLOAD_HOSTS);
-
-    const scaffoldDir = join(runtimeRoot, "node_modules", "better-sqlite3");
-    await extractSQLiteArchive(
-      tarballPath,
-      scaffoldDir,
-      "prebuilt",
-      pin.integrity,
+    installerLog(
+      `Downloading better-sqlite3 ${plan.version} (${formatSQLiteDownloadSize(plan.tarball.size)}) from ${plan.tarball.url}…`,
     );
-
-    const binaryPath = join(
-      scaffoldDir,
-      "build",
-      "Release",
-      "better_sqlite3.node",
-    );
-    if (!existsSync(binaryPath)) {
-      throw new Error(
-        "Patched prebuilt tarball did not contain build/Release/better_sqlite3.node.",
-      );
-    }
-
-    installerLog("Patched prebuilt installed successfully.");
-  } finally {
-    rmSync(tarballPath, { force: true });
-  }
-}
-
-function resolveTrustedSQLiteBuildTools(baseDir: string, buildRoot: string) {
-  const buildTools = resolveSQLiteBuildTools(
-    findPackageRoot(baseDir) ?? baseDir,
-    buildRoot,
-    process.env,
-    installerConfiguration?.workspaceRoots?.() ?? [],
-  );
-  const python = buildTools.python;
-  if (!python) {
-    const candidates =
-      process.platform === "win32" ? "py.exe/python.exe" : "python3/python";
-    throw new Error(
-      `A trusted Python 3 installation is required for the verified SQLite source build. No ${candidates} entry on the sanitized PATH resolved outside the extension package, runtime and all workspace roots. Add the actual Python installation directory to the extension host PATH; workspace-controlled interpreters are never executed.`,
-    );
-  }
-  return { ...buildTools, python };
-}
-
-async function rebuildFromSourceWithPatch(
-  runtimeRoot: string,
-  baseDir: string,
-): Promise<void> {
-  assertSQLiteBuildPath(runtimeRoot, "runtime");
-  const pkg = readBundledBetterSqlite3Package(baseDir);
-  if (!pkg.version) {
-    throw new Error(
-      "Cannot determine better-sqlite3 version for source build.",
-    );
-  }
-
-  const headerPins = sqliteHeaderPins(
-    process.versions.electron ?? "",
-    process.versions.modules,
-    process.platform,
-    process.arch,
-  );
-  const buildRoot = createSQLiteBuildRoot();
-  const sourceDir = join(buildRoot, "better-sqlite3-build-source");
-  const tarballPath = join(buildRoot, "better-sqlite3-source.tgz");
-  const toolDir = join(buildRoot, "sqlite-build-tools");
-
-  try {
-    if (pkg.version !== SQLITE_SOURCE.version) {
-      throw new Error(
-        `No locked SQLite source integrity for better-sqlite3 ${pkg.version}. Update the source pin from package-lock.json.`,
-      );
-    }
-    resolveTrustedSQLiteBuildTools(baseDir, buildRoot);
-    const tarballUrl = SQLITE_SOURCE.url;
-    installerLog(`Downloading better-sqlite3 ${pkg.version} source tarball…`);
-    await downloadToFile(tarballUrl, tarballPath, SQLITE_DOWNLOAD_TIMEOUT_MS, {
-      allowedHosts: ["registry.npmjs.org"],
+    await downloadPinnedSQLiteTarball(plan.tarball, tarballPath, progress);
+    if (progress?.signal.aborted)
+      throw new SQLiteRuntimeInstallCancelledError();
+    mkdirSync(join(stagingRoot, "node_modules"));
+    await extractSQLitePackage({
+      archivePath: tarballPath,
+      destination: join(stagingRoot, "node_modules", "better-sqlite3"),
+      integrity: plan.tarball.integrity,
+      files: plan.files,
     });
-
-    mkdirSync(sourceDir, { recursive: true });
-    await extractSQLiteArchive(
-      tarballPath,
-      sourceDir,
-      "source",
-      SQLITE_SOURCE.integrity,
-    );
-    const buildTools = resolveTrustedSQLiteBuildTools(baseDir, buildRoot);
-    const python = buildTools.python;
-    pinSQLiteSourceNodeActions(sourceDir, buildTools.node);
-    const toolLock = createSQLiteBuildToolLock();
-    for (const directory of [
-      buildTools.env.HOME,
-      buildTools.env.TMPDIR,
-      buildTools.env.APPDATA,
-      buildTools.env.LOCALAPPDATA,
-    ]) {
-      if (directory) mkdirSync(directory, { recursive: true });
-    }
-    mkdirSync(toolDir);
-    writeFileSync(
-      join(toolDir, "package.json"),
-      JSON.stringify(toolLock.manifest),
-    );
-    writeFileSync(
-      join(toolDir, "package-lock.json"),
-      JSON.stringify(toolLock.lock),
-    );
-    const userConfig = join(toolDir, "empty-user.npmrc");
-    const globalConfig = join(toolDir, "empty-global.npmrc");
-    writeFileSync(userConfig, "");
-    writeFileSync(globalConfig, "");
-    installerLog(
-      "Installing lockfile-verified SQLite build tools (no install scripts)…",
-    );
-    await execFileAsync(
-      buildTools.node,
-      [
-        buildTools.npmCli,
-        "ci",
-        "--ignore-scripts",
-        "--no-audit",
-        "--no-fund",
-        "--registry=https://registry.npmjs.org",
-        `--cache=${join(toolDir, "cache")}`,
-        `--userconfig=${userConfig}`,
-        `--globalconfig=${globalConfig}`,
-      ],
-      {
-        cwd: toolDir,
-        timeout: SQLITE_BUILD_STEP_TIMEOUT_MS,
-        env: buildTools.env,
-      },
-    );
-
-    installerLog("Applying Electron 42 V8 API compatibility patch…");
-    applyElectron42V8Patch(sourceDir);
-    const headerDir = await preparePinnedSQLiteHeaders(
-      buildRoot,
-      headerPins,
-      process.platform,
-      process.arch,
-    );
-
-    const electronVersion = process.versions.electron;
-    installerLog(
-      `Building better-sqlite3 from source for Electron ${electronVersion} (ABI ${process.versions.modules}, ${process.platform}-${process.arch})…`,
-    );
-    await execFileAsync(
-      buildTools.node,
-      sqliteNodeGypArguments(
-        toolDir,
-        headerDir,
-        headerPins.version,
-        process.platform,
-        process.arch,
-        python,
-      ),
-      {
-        cwd: sourceDir,
-        timeout: SQLITE_BUILD_STEP_TIMEOUT_MS,
-        env: { ...buildTools.env, NODE_GYP_FORCE_PYTHON: python },
-      },
-    );
-
-    const builtBinary = join(
-      sourceDir,
-      "build",
-      "Release",
-      "better_sqlite3.node",
-    );
-    if (!existsSync(builtBinary)) {
-      throw new Error("Source build did not produce better_sqlite3.node.");
-    }
-
-    const targetDir = join(
-      runtimeRoot,
-      "node_modules",
-      "better-sqlite3",
-      "build",
-      "Release",
-    );
-    mkdirSync(targetDir, { recursive: true });
-    cpSync(builtBinary, join(targetDir, "better_sqlite3.node"));
-
-    installerLog(
-      "Successfully built better-sqlite3 from source with Electron 42 V8 patch.",
-    );
-  } finally {
-    rmSync(buildRoot, { recursive: true, force: true });
-  }
-}
-
-function createSQLiteBuildRoot(): string {
-  const candidates = [tmpdir()];
-  if (process.platform === "win32") {
-    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
-    if (systemRoot) candidates.push(join(systemRoot, "Temp"));
-  } else {
-    candidates.push("/tmp");
-  }
-
-  let lastError: unknown;
-  for (const directory of [...new Set(candidates)]) {
-    const prefix = join(directory, "rapidb-sqlite-build-");
-    let created: string | undefined;
-    try {
-      if (/\s/.test(prefix)) {
-        throw new Error("SQLite temporary build root contains whitespace.");
-      }
-      assertSQLiteBuildPath(prefix, "temporary build root");
-      created = mkdtempSync(prefix);
-      if (process.platform !== "win32") chmodSync(created, 0o700);
-      assertSQLiteBuildPath(created, "temporary build root");
-      return created;
-    } catch (error) {
-      if (created) rmSync(created, { recursive: true, force: true });
-      lastError = error;
-    }
-  }
-
-  throw new Error(
-    `Could not create a private SQLite build directory without spaces. ${errorMessage(lastError ?? "No temporary directory is available.")}`,
-  );
-}
-
-async function downloadPrebuiltBinary(
-  runtimeRoot: string,
-  baseDir: string,
-): Promise<void> {
-  const betterSqlite3PackageRoot = join(
-    runtimeRoot,
-    "node_modules",
-    "better-sqlite3",
-  );
-  const pkg = JSON.parse(
-    readFileSync(join(betterSqlite3PackageRoot, "package.json"), "utf8"),
-  ) as BetterSqlite3PackageJson;
-  if (
-    !pkg.version ||
-    !/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(pkg.version)
-  ) {
-    throw new Error("Invalid better-sqlite3 version for runtime installation.");
-  }
-  const fileName = sqlitePrebuiltFileName(
-    "official",
-    currentArtifactTarget(pkg.version),
-  );
-  const tarballPath = join(runtimeRoot, "official-prebuilt.tar.gz");
-
-  try {
-    const pin = sqlitePrebuiltPin("official", fileName);
-    const downloadUrl = pin.url;
-    installerLog(`Downloading official SQLite prebuilt from ${downloadUrl}…`);
-    await downloadPinnedSQLiteArtifact(pin, tarballPath, GITHUB_DOWNLOAD_HOSTS);
-    await extractSQLiteArchive(
-      tarballPath,
-      betterSqlite3PackageRoot,
-      "prebuilt",
-      pin.integrity,
-    );
-
-    const binaryPath = join(
-      betterSqlite3PackageRoot,
-      "build",
-      "Release",
-      "better_sqlite3.node",
-    );
-    if (!existsSync(binaryPath)) {
-      throw new Error(
-        `Downloaded SQLite runtime did not produce better_sqlite3.node for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
-      );
-    }
-  } catch (prebuiltError) {
-    if (
-      currentRuntime() === "electron" &&
-      Number(process.versions.modules) >= 146
-    ) {
-      let patchedPrebuiltInstalled = false;
-      try {
-        await downloadPatchedPrebuilt(runtimeRoot, baseDir);
-        patchedPrebuiltInstalled = true;
-      } catch (patchedError) {
-        installerLog(
-          `Patched prebuilt not available: ${errorMessage(patchedError)}`,
-        );
-      }
-
-      if (!patchedPrebuiltInstalled) {
-        installerLog("Attempting source build with Electron 42 V8 patch…");
-        try {
-          await rebuildFromSourceWithPatch(runtimeRoot, baseDir);
-        } catch (sourceError) {
-          installerLog(`Source build failed: ${errorMessage(sourceError)}`);
-          throw new Error(
-            `SQLite runtime installation failed. Official prebuilt: ${errorMessage(prebuiltError)}. Verified source build: ${errorMessage(sourceError)}. Patched prebuilts require a published upstream release and reviewed static pins.`,
-          );
-        }
-      }
-    } else {
-      throw prebuiltError;
-    }
   } finally {
     rmSync(tarballPath, { force: true });
   }
-
   writeFileSync(
-    join(runtimeRoot, "runtime.json"),
-    `${JSON.stringify(expectedManifestFor(baseDir), null, 2)}\n`,
+    join(stagingRoot, SQLITE_RUNTIME_MANIFEST_FILE),
+    `${JSON.stringify(layout.manifest, null, 2)}\n`,
     "utf8",
   );
+  writeFileSync(join(stagingRoot, SQLITE_RUNTIME_LAST_USED_FILE), "");
+  const configuration = installerConfiguration;
+  if (
+    !configuration ||
+    !verifyRuntimeAt(layout, stagingRoot, configuration.storageRoot)
+  ) {
+    throw new Error(
+      "The staged SQLite runtime failed verification; it was not installed.",
+    );
+  }
 }
 
-async function installManagedRuntime(baseDir: string): Promise<string | null> {
-  const runtimeRoot = runtimeRootFor(baseDir);
-  const installedPackagePath = installedPackagePathFor(baseDir);
+async function installManagedRuntime(
+  layout: RuntimeLayout,
+): Promise<string | null> {
   const configuration = installerConfiguration;
-  if (!runtimeRoot || !installedPackagePath || !configuration) {
+  if (!configuration) {
     return null;
   }
+  const { runtimeRoot, packagePath } = layout;
 
   mkdirSync(configuration.storageRoot, { recursive: true });
-  if (manifestMatches(baseDir)) {
-    return installedPackagePath;
+  if (installedRuntimeValid(layout)) {
+    return packagePath;
   }
 
   const lockRoot = `${runtimeRoot}.lock`;
   return withInstallLock(
     lockRoot,
     async () => {
-      if (manifestMatches(baseDir)) {
-        return installedPackagePath;
+      if (installedRuntimeValid(layout)) {
+        return packagePath;
       }
 
       removeAbandonedInstallDirectories(runtimeRoot);
+      // An existing runtime here failed verification; never load or reuse it.
+      moveInvalidRuntimeAside(runtimeRoot);
       const tempRoot = `${runtimeRoot}.tmp-${process.pid}-${Date.now()}`;
       rmSync(tempRoot, { recursive: true, force: true });
-      rmSync(runtimeRoot, { recursive: true, force: true });
       mkdirSync(tempRoot, { recursive: true });
 
+      const withProgress =
+        configuration.withInstallProgress ??
+        (<T>(task: (progress: SQLiteInstallProgress) => Promise<T>) =>
+          task({ signal: new AbortController().signal, report: () => {} }));
       try {
-        copyBundledRuntimeScaffold(baseDir, tempRoot);
-        await downloadPrebuiltBinary(tempRoot, baseDir);
-        writeFileSync(join(tempRoot, SQLITE_RUNTIME_LAST_USED_FILE), "");
+        await withProgress((progress) =>
+          stageRuntime(layout, tempRoot, progress),
+        );
         renameSync(tempRoot, runtimeRoot);
       } catch (error) {
         rmSync(tempRoot, { recursive: true, force: true });
@@ -1821,160 +1581,17 @@ async function installManagedRuntime(baseDir: string): Promise<string | null> {
       }
 
       installerLog(
-        `SQLite runtime ready at ${runtimeRoot} for ${currentTargetLabel()} (${currentRuntime()}, ABI ${process.versions.modules}).`,
+        `SQLite runtime better-sqlite3 ${layout.plan.version} (${layout.plan.target}, Node-API ${layout.plan.nodeApiVersion}) is ready at ${runtimeRoot}.`,
       );
-      return installedPackagePath;
+      return packagePath;
     },
-    () => (manifestMatches(baseDir) ? installedPackagePath : null),
+    () => (installedRuntimeValid(layout) ? packagePath : null),
   );
 }
 
-const SQLITE_REPAIR_SMOKE_SCRIPT = `
-  const Database = require(process.argv[1]);
-  const db = new Database(":memory:", { nativeBinding: process.argv[2] });
-  try {
-    if (db.prepare("SELECT 1 AS ok").get().ok !== 1)
-      throw new Error("Unexpected SQLite smoke test result");
-  } finally {
-    db.close();
-  }
-`;
-
-async function smokeTestStagedSQLiteRuntime(
-  tempRoot: string,
-  packagePath: string,
-  binaryPath: string,
-): Promise<void> {
-  try {
-    await execFileAsync(
-      process.execPath,
-      [
-        "--input-type=commonjs",
-        "-e",
-        SQLITE_REPAIR_SMOKE_SCRIPT,
-        packagePath,
-        binaryPath,
-      ],
-      {
-        cwd: tempRoot,
-        env: {
-          ...process.env,
-          ELECTRON_RUN_AS_NODE: "1",
-          NODE_OPTIONS: "",
-          NODE_PATH: "",
-        },
-        timeout: 15_000,
-        killSignal: "SIGKILL",
-        windowsHide: true,
-      },
-    );
-  } catch (error) {
-    throw new Error("The staged SQLite native binary failed its smoke test.", {
-      cause: error,
-    });
-  }
-}
-
-// A connection may report a failure after another window has already repaired
-// that generation. Compare again under the same lock used for installation.
-export async function repairSQLiteManagedRuntime(
-  baseDir: string,
-  failed: SQLiteManagedRuntimeSnapshot,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  if (signal?.aborted) return null;
-  const configuration = installerConfiguration;
-  const runtimeRoot = runtimeRootFor(baseDir);
-  if (
-    !configuration ||
-    !runtimeRoot ||
-    failed.packagePath !== installedPackagePathFor(baseDir)
-  )
-    return null;
-
-  const key = `${failed.packagePath}\0${failed.revision}`;
-  let repair = inFlightRepairs.get(key);
-  if (!repair) {
-    const signals = new Set<AbortSignal | undefined>();
-    const wanted = () => [...signals].some((entry) => !entry?.aborted);
-    const result = Promise.resolve()
-      .then(() =>
-        withInstallLock<string | null>(
-          `${runtimeRoot}.lock`,
-          async () => {
-            const current = snapshotSQLiteManagedRuntime(baseDir);
-            if (
-              !current ||
-              !wanted() ||
-              installerConfiguration !== configuration
-            )
-              return null;
-            if (current.revision !== failed.revision)
-              return current.packagePath;
-            if (
-              configuration.allowInstall &&
-              !(await configuration.allowInstall())
-            )
-              throw new Error("SQLite runtime repair was not authorized.");
-            if (!wanted() || installerConfiguration !== configuration)
-              return null;
-
-            // Stage and verify with the same host executable/mode as the
-            // worker. Once authorized, finish the shared job even if a
-            // connection is cancelled; only active callers will reconnect.
-            const tempRoot = mkdtempSync(`${runtimeRoot}.tmp-${process.pid}-`);
-            try {
-              copyBundledRuntimeScaffold(baseDir, tempRoot);
-              await downloadPrebuiltBinary(tempRoot, baseDir);
-              const stagedPackage = join(
-                tempRoot,
-                "node_modules",
-                "better-sqlite3",
-              );
-              const stagedBinary = sqliteNativeBindingPath(stagedPackage);
-              await smokeTestStagedSQLiteRuntime(
-                tempRoot,
-                stagedPackage,
-                stagedBinary,
-              );
-              const latest = snapshotSQLiteManagedRuntime(baseDir);
-              if (!latest || installerConfiguration !== configuration)
-                return null;
-              if (latest.revision !== failed.revision)
-                return latest.packagePath;
-              // Replace only the installer-owned binary, never the directory.
-              renameSync(
-                stagedBinary,
-                sqliteNativeBindingPath(latest.packagePath),
-              );
-              installerLog(
-                `Repaired the managed SQLite native binary at ${latest.packagePath}.`,
-              );
-              return latest.packagePath;
-            } finally {
-              rmSync(tempRoot, { recursive: true, force: true });
-            }
-          },
-          () => {
-            // withInstallLock uses null for "not completed." Cancellation
-            // while waiting for the lock must not start new work.
-            if (!wanted() || installerConfiguration !== configuration)
-              throw new Error("SQLite runtime repair was cancelled.");
-            const current = snapshotSQLiteManagedRuntime(baseDir);
-            return current && current.revision !== failed.revision
-              ? current.packagePath
-              : null;
-          },
-        ),
-      )
-      .finally(() => inFlightRepairs.delete(key));
-    repair = { signals, result };
-    inFlightRepairs.set(key, repair);
-  }
-  // Distinct callers normally have distinct signals; leave them registered
-  // only for the lifetime of the shared job.
-  repair.signals.add(signal);
-  return repair.result;
+export function sqliteRuntimeDownloadSummary(): string {
+  const { betterSqlite3Version, tarball } = SQLITE_ARTIFACTS;
+  return `better-sqlite3 ${betterSqlite3Version}, ${formatSQLiteDownloadSize(tarball.size)} from ${SQLITE_REGISTRY_HOST}`;
 }
 
 export function configureSQLiteInstaller(
@@ -1984,7 +1601,8 @@ export function configureSQLiteInstaller(
     storageRoot: resolve(configuration.storageRoot),
     log: configuration.log,
     allowInstall: configuration.allowInstall,
-    workspaceRoots: configuration.workspaceRoots,
+    isTrusted: configuration.isTrusted,
+    withInstallProgress: configuration.withInstallProgress,
   };
 }
 
@@ -1993,6 +1611,9 @@ export function resetSQLiteInstallerForTests(): void {
   inFlightInstall = null;
   obsoleteRuntimeCleanupDone = false;
   installLockTimings = { ...DEFAULT_SQLITE_INSTALL_LOCK_TIMINGS };
+  hostProbeOverride = null;
+  nodeApiVersionOverride = undefined;
+  cachedHost = null;
 }
 
 export function setSQLiteInstallLockTimingsForTests(
@@ -2001,21 +1622,30 @@ export function setSQLiteInstallLockTimingsForTests(
   installLockTimings = { ...installLockTimings, ...timings };
 }
 
-export function probeInstalledBetterSqlite3Runtime(
-  baseDir: string,
-): SQLiteInstalledRuntimeProbe {
-  const packageRoot = findPackageRoot(baseDir);
-  const bundledPackagePath = bundledPackagePathFor(baseDir);
-  const installedPackagePath = installedPackagePathFor(baseDir);
-  const installedBinaryPath = installedBinaryPathFor(baseDir);
+export function setSQLiteHostForTests(
+  host: { probe?: SQLiteHostProbe | null; nodeApiVersion?: string } = {},
+): void {
+  hostProbeOverride = host.probe ?? null;
+  nodeApiVersionOverride = host.nodeApiVersion;
+  cachedHost = null;
+}
+
+export function probeInstalledBetterSqlite3Runtime(): SQLiteInstalledRuntimeProbe {
+  let target: string;
+  try {
+    target = currentTarget();
+  } catch (error) {
+    target = `unsupported (${errorMessage(error)})`;
+  }
+  const layout = tryCurrentLayout();
+  const installedPackagePath = layout?.packagePath ?? null;
+  const installedBinaryPath = installedPackagePath
+    ? sqliteNativeBindingPath(installedPackagePath)
+    : null;
   return {
     runtime: currentRuntime(),
-    target: currentTargetLabel(),
-    packageRoot,
-    bundledPackagePath,
-    bundledPackageExists: bundledPackagePath
-      ? existsSync(join(bundledPackagePath, "package.json"))
-      : false,
+    target,
+    nodeApi: hostNodeApiVersion() || "unknown",
     installedPackagePath,
     installedPackageExists: installedPackagePath
       ? existsSync(join(installedPackagePath, "package.json"))
@@ -2027,31 +1657,35 @@ export function probeInstalledBetterSqlite3Runtime(
   };
 }
 
-export async function ensureSQLiteRuntimeInstalled(
-  baseDir: string,
-): Promise<string | null> {
-  const installedPackagePath = installedPackagePathFor(baseDir);
-  if (installedPackagePath && refreshInstalledRuntimeUse(baseDir)) {
-    await removeObsoleteSQLiteRuntimesOnce(baseDir);
-    return installedPackagePath;
-  }
-  if (!installerConfiguration) {
+export async function ensureSQLiteRuntimeInstalled(): Promise<string | null> {
+  const layout = currentLayout();
+  if (!layout) {
     return null;
   }
+  if (refreshInstalledRuntimeUse(layout)) {
+    await removeObsoleteSQLiteRuntimesOnce();
+    return layout.packagePath;
+  }
   if (!inFlightInstall) {
-    const allowInstall = installerConfiguration.allowInstall;
+    const allowInstall = installerConfiguration?.allowInstall;
+    const isTrusted = installerConfiguration?.isTrusted;
     inFlightInstall = (async () => {
-      let installed = await recordInstalledRuntimeUse(baseDir);
+      let installed = await recordInstalledRuntimeUse(layout);
       if (!installed) {
+        if (isTrusted && !isTrusted()) {
+          throw new Error(
+            'SQLite runtime installation is disabled because this workspace is not trusted (Restricted Mode). RapiDB downloads the native SQLite runtime only in trusted workspaces. To allow it, trust this workspace (command "Workspaces: Manage Workspace Trust", or the Restricted Mode indicator in the status bar) and open the database again; once installed, the runtime is also used in untrusted workspaces. The database was not opened.',
+          );
+        }
         if (allowInstall && !(await allowInstall())) {
           throw new Error(
             "SQLite runtime installation was not authorized. The database was not opened.",
           );
         }
-        installed = await installManagedRuntime(baseDir);
+        installed = await installManagedRuntime(layout);
       }
       if (installed) {
-        await removeObsoleteSQLiteRuntimesOnce(baseDir);
+        await removeObsoleteSQLiteRuntimesOnce();
       }
       return installed;
     })().finally(() => {

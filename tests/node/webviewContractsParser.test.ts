@@ -4,6 +4,7 @@ import {
   parseConnectionFormPanelMessage,
   parseErdPanelMessage,
   parseQueryPanelMessage,
+  parseQueryRunStatusReply,
   parseTablePanelMessage,
   parseWebviewInitialState,
 } from "../../src/shared/webviewContracts";
@@ -381,6 +382,91 @@ describe("parseConnectionFormPanelMessage cancellation", () => {
 });
 
 describe("parseQueryPanelMessage", () => {
+  it("correlates run, stop and status with the same panel and pinned target", () => {
+    const connectionId = "conn-1";
+    const operationId = "query-1";
+    const targetSessionKey = "a".repeat(64);
+    const run = {
+      panelId: "panel-1",
+      connectionId,
+      operationId,
+      targetSessionKey,
+      mssqlDatabase: "Pinned",
+    };
+    const execute = {
+      queryText: "SELECT 1",
+      connectionId,
+      operationId,
+      targetSessionKey,
+      run,
+    };
+    expect(
+      parseQueryPanelMessage({ type: "executeQuery", payload: execute }),
+    ).toEqual({
+      type: "executeQuery",
+      payload: { ...execute, sql: "SELECT 1" },
+    });
+    expect(
+      parseQueryPanelMessage({
+        type: "cancelQuery",
+        payload: { connectionId, operationId, run },
+      }),
+    ).toMatchObject({ payload: { run } });
+    const probe = { run, requestId: "probe-1" };
+    expect(
+      parseQueryPanelMessage({ type: "getQueryRunStatus", payload: probe }),
+    ).toEqual({
+      type: "getQueryRunStatus",
+      payload: probe,
+    });
+    expect(parseQueryRunStatusReply({ ...probe, status: "running" })).toEqual({
+      ...probe,
+      status: "running",
+    });
+    expect(
+      parseQueryRunStatusReply({ ...probe, status: "cancelled" }),
+    ).toBeUndefined();
+    expect(
+      parseQueryRunStatusReply({
+        ...probe,
+        requestId: "",
+        status: "completed",
+      }),
+    ).toBeUndefined();
+    for (const other of [
+      { ...run, panelId: "" },
+      { ...run, operationId: "other" },
+      { ...run, targetSessionKey: "b".repeat(64) },
+      { ...run, postgresDatabase: "Ambiguous" },
+    ]) {
+      expect(
+        parseQueryPanelMessage({
+          type: "executeQuery",
+          payload: { ...execute, run: other },
+        }),
+      ).toBeNull();
+    }
+  });
+
+  it("preserves the target-change request ID without requiring it for legacy messages", () => {
+    const type = "activeConnectionChanged";
+    const legacy = { connectionId: "conn-1" };
+    const request = {
+      ...legacy,
+      requestId: "target-change-1",
+      targetSessionKey: "a".repeat(64),
+    };
+    for (const payload of [legacy, request]) {
+      expect(parseQueryPanelMessage({ type, payload })).toEqual({
+        type,
+        payload,
+      });
+    }
+    expect(
+      parseQueryPanelMessage({ type, payload: { ...request, requestId: "" } }),
+    ).toBeNull();
+  });
+
   it("parses executeQuery payloads with canonical queryText and sql alias", () => {
     const parsed = parseQueryPanelMessage({
       type: "executeQuery",
@@ -1233,6 +1319,35 @@ describe("parseWebviewInitialState", () => {
     });
 
     expect(parsed).toBeNull();
+  });
+
+  it("preserves the SQL Server query database without normalizing it", () => {
+    const mssqlDatabase = "  Catalog]Δ  ";
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-1",
+        connectionType: "mssql",
+        mssqlDatabase,
+      }),
+    ).toMatchObject({ mssqlDatabase });
+  });
+
+  it.each([
+    { mssqlDatabase: "" },
+    { mssqlDatabase: null },
+    { mssqlDatabase: "bad\0db" },
+    { mssqlDatabase: "a".repeat(129) },
+    { mssqlDatabase: "sql_server", postgresDatabase: "postgresql" },
+  ])("rejects an invalid SQL Server scope instead of unpinning it: %j", (scope) => {
+    expect(
+      parseWebviewInitialState({
+        view: "query",
+        connectionId: "conn-1",
+        connectionType: "mssql",
+        ...scope,
+      }),
+    ).toBeNull();
   });
 
   it("returns null for invalid connectionType", () => {

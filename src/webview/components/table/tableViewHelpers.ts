@@ -610,6 +610,15 @@ export function stablePrimaryKeyPart(value: unknown): unknown {
 // The committed row object owns its identity. Keeping it off the object avoids
 // exposing it as a database column and keeps old/new pages distinct in recovery.
 const sqlDeleteObservations = new WeakMap<Row, SqlDeleteObservation>();
+const noSqlDeleteObservationIds = new WeakMap<Row, string>();
+
+export function registerNoSqlDeleteObservationId(row: Row, id: string): void {
+  noSqlDeleteObservationIds.set(row, id);
+}
+
+export function readNoSqlDeleteObservationId(row: Row): string | null {
+  return noSqlDeleteObservationIds.get(row) ?? null;
+}
 
 export function registerSqlDeleteObservation(
   row: Row,
@@ -729,6 +738,16 @@ export function rowMutationPrimaryKeys(
         : storedRowKey(row, name),
     ]),
   );
+}
+
+const rowUpdateBlockReasons = new WeakMap<Row, string>();
+
+export function registerRowUpdateBlockReason(row: Row, reason: string): void {
+  rowUpdateBlockReasons.set(row, reason);
+}
+
+export function readRowUpdateBlockReason(row: Row | undefined): string | null {
+  return (row && rowUpdateBlockReasons.get(row)) ?? null;
 }
 
 export function rowMutationBlockReason(

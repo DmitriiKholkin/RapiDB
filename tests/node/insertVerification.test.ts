@@ -15,6 +15,8 @@ import { buildInsertRowOperation } from "../../src/extension/table/insertSql";
 import { prepareInsertVerification } from "../../src/extension/table/insertVerification";
 import { executeAtomicSqlApplyPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
+import { mysqlLockedMutationMetadata } from "../support/mysqlLockedMutationMetadata";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -60,6 +62,7 @@ function harness(
         : engine === "mssql"
           ? new MSSQLDriver(config)
           : new OracleDriver(config);
+  mockPostgresTableScope(driver);
   const events: string[] = [];
   const reads: unknown[][] = [];
   const statements: string[] = [];
@@ -219,7 +222,13 @@ function harness(
     },
   );
   const connection = {
-    query: execute,
+    query:
+      engine === "mysql"
+        ? async (input: string | { sql: string; values?: unknown[] }) =>
+            mysqlLockedMutationMetadata(
+              typeof input === "string" ? input : input.sql,
+            ) ?? execute(input)
+        : execute,
     execute,
     beginTransaction: async () => {
       events.push("BEGIN");

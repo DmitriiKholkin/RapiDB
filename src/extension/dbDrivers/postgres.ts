@@ -57,6 +57,7 @@ import {
   isPostgresStatementRejection,
   PostgresStatementRejectedAndRolledBackError,
 } from "./postgresStatementRejection";
+import { isServerReportedQueryError } from "./queryErrorOutcome";
 import {
   type IndexedPlaceholderOptions,
   indexedPlaceholderOffsets,
@@ -134,6 +135,8 @@ const POSTGRES_SESSION_RESET_UNSUPPORTED_CODES = new Set([
   "42704",
 ]);
 const PG_GENERATED_KIND_EXPRESSION = "NULLIF(to_jsonb(a)->>'attgenerated', '')";
+const PG_TABLE_SCOPE_UNKNOWN =
+  "Could not determine PostgreSQL table inheritance scope. Refresh the table metadata before retrying.";
 
 interface PostgresPoolWaitOperation {
   cancelled: boolean;
@@ -827,6 +830,11 @@ export class PostgresDriver extends BaseDBDriver {
 
   private pool: Pool | null = null;
   private readonly databasePools = new Map<string, Pool>();
+  // Bind scope to the catalog metadata snapshot, not the name alone or the webview.
+  private readonly tableDataReferences = new WeakMap<
+    readonly ColumnTypeMeta[],
+    { database: string; schema: string; table: string; sql: string }
+  >();
   private readonly pendingPools = new Set<Pool>();
   private readonly catalogSessions = new Map<
     Pool,
@@ -1459,8 +1467,66 @@ export class PostgresDriver extends BaseDBDriver {
     schema: string,
     table: string,
   ): Promise<ColumnMeta[]> {
+    return (await this.describeTableRelation(database, schema, table)).columns;
+  }
+
+  override async describeColumns(
+    database: string,
+    schema: string,
+    table: string,
+  ): Promise<ColumnTypeMeta[]> {
+    const relation = await this.describeTableRelation(database, schema, table);
+    const columns = relation.columns.map((column) => this.enrichColumn(column));
+    const name = this.qualifiedTableName(database, schema, table);
+    let sql: string | undefined;
+    switch (relation.kind) {
+      case "r":
+      case "f":
+        // A classical PK only covers the named table. Even a table that has
+        // no children now must not start scanning children after a DDL change.
+        if (relation.isPartition === false) sql = `ONLY ${name}`;
+        else if (relation.isPartition === true) sql = name;
+        break;
+      // 'p' includes subpartitioned tables. PostgreSQL disallows mixing
+      // declarative partitions and classical INHERITS in one hierarchy.
+      case "p":
+      case "v":
+      case "m":
+        sql = name;
+        break;
+    }
+    if (sql !== undefined) {
+      this.tableDataReferences.set(columns, { database, schema, table, sql });
+    }
+    return columns;
+  }
+
+  getTableDataReference(
+    database: string,
+    schema: string,
+    table: string,
+    columns: readonly ColumnTypeMeta[],
+  ): string {
+    const reference = this.tableDataReferences.get(columns);
+    if (
+      reference?.database !== database ||
+      reference.schema !== schema ||
+      reference.table !== table
+    ) {
+      throw new Error(PG_TABLE_SCOPE_UNKNOWN);
+    }
+    return reference.sql;
+  }
+
+  private async describeTableRelation(
+    database: string,
+    schema: string,
+    table: string,
+  ) {
     type DescribeTableRow = {
-      column_name: string;
+      relation_kind: string;
+      is_partition: boolean;
+      column_name: string | null;
       data_type: string;
       is_array_type: boolean | null;
       interval_key_kind?: "scalar" | "array" | null;
@@ -1477,6 +1543,8 @@ export class PostgresDriver extends BaseDBDriver {
     };
     const res = await this.requirePool(database).query<DescribeTableRow>(
       `SELECT
+         c.relkind                                AS relation_kind,
+         c.relispartition                         AS is_partition,
          a.attname                                AS column_name,
          CASE
            WHEN array_type.typcategory = 'A'
@@ -1501,14 +1569,15 @@ export class PostgresDriver extends BaseDBDriver {
          pk.pk_ordinal IS NOT NULL                AS is_pk,
          pk.pk_ordinal                            AS pk_ordinal,
          EXISTS (
-           SELECT 1 FROM pg_constraint con
+           SELECT 1 FROM pg_catalog.pg_constraint con
            WHERE con.conrelid = a.attrelid
              AND con.contype = 'f'
              AND a.attnum = ANY(con.conkey)
          ) AS is_fk
-       FROM pg_attribute a
-       JOIN pg_class     c ON c.oid = a.attrelid
-       JOIN pg_namespace n ON n.oid = c.relnamespace
+       FROM pg_catalog.pg_class c
+       JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+       LEFT JOIN pg_catalog.pg_attribute a
+         ON a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
        LEFT JOIN pg_catalog.pg_type array_type ON array_type.oid = a.atttypid
        LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = array_type.typelem
        LEFT JOIN pg_catalog.pg_namespace element_ns ON element_ns.oid = element_type.typnamespace
@@ -1542,11 +1611,11 @@ export class PostgresDriver extends BaseDBDriver {
          OR (pg_catalog.to_jsonb(range_meta)->>'rngmultitypid') = a.atttypid::text
        LEFT JOIN pg_catalog.pg_type range_subtype_type ON range_subtype_type.oid = range_meta.rngsubtype
        LEFT JOIN pg_catalog.pg_namespace range_subtype_ns ON range_subtype_ns.oid = range_subtype_type.typnamespace
-       LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-       LEFT JOIN LATERAL (
-         SELECT pk_key.ordinality::int AS pk_ordinal
-         FROM pg_constraint con
-           CROSS JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS pk_key(attnum, ordinality)
+        LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        LEFT JOIN LATERAL (
+          SELECT pk_key.ordinality::int AS pk_ordinal
+          FROM pg_catalog.pg_constraint con
+            CROSS JOIN LATERAL pg_catalog.unnest(con.conkey) WITH ORDINALITY AS pk_key(attnum, ordinality)
            WHERE con.conrelid = a.attrelid
              AND con.contype = 'p'
              AND pk_key.attnum = a.attnum
@@ -1566,14 +1635,15 @@ export class PostgresDriver extends BaseDBDriver {
           SELECT CASE WHEN is_array THEN 'array' ELSE 'scalar' END AS key_kind
           FROM key_type WHERE oid = 'pg_catalog.interval'::pg_catalog.regtype
         ) interval_base ON TRUE
-        WHERE n.nspname = $1
-         AND c.relname = $2
-         AND a.attnum > 0
-         AND NOT a.attisdropped
+         WHERE n.nspname = $1
+          AND c.relname = $2
        ORDER BY a.attnum`,
       [schema, table],
     );
-    return res.rows.map((r) => {
+    const columns: ColumnMeta[] = [];
+    for (const r of res.rows) {
+      // The outer join also describes the relation when it has no columns.
+      if (r.column_name === null) continue;
       const rawDefault = r.column_default as string | null | undefined;
       const generatedKind = r.generated_kind as string | null | undefined;
       const identityGeneration = pgIdentityGenerationKind(
@@ -1589,8 +1659,8 @@ export class PostgresDriver extends BaseDBDriver {
       const computedExpression =
         isComputed && typeof rawDefault === "string" ? rawDefault : undefined;
       const defaultValue = !isComputed ? (rawDefault ?? undefined) : undefined;
-      return {
-        name: r.column_name as string,
+      columns.push({
+        name: r.column_name,
         type: r.data_type as string,
         // Domain-over-array elements arrive as nested array literals, so they
         // keep the generic comparison against the column's own type.
@@ -1625,8 +1695,13 @@ export class PostgresDriver extends BaseDBDriver {
           : {}),
         primaryKeyOrdinal: toOptionalNumber(r.pk_ordinal),
         isForeignKey: isPgTrue(r.is_fk),
-      };
-    });
+      });
+    }
+    return {
+      columns,
+      kind: res.rows[0]?.relation_kind,
+      isPartition: res.rows[0]?.is_partition,
+    };
   }
   async query(
     sql: string,
@@ -1644,6 +1719,7 @@ export class PostgresDriver extends BaseDBDriver {
       rowCount?: number | null;
       command?: string;
       truncated?: boolean;
+      truncatedBySize?: boolean;
       partial?: boolean;
     };
     const start = Date.now();
@@ -1693,6 +1769,7 @@ export class PostgresDriver extends BaseDBDriver {
       }
       const queryClient = client;
       let boundedQuery: BoundedPostgresQuery | undefined;
+      let boundedReadTimedOut = false;
       let res: PgArrayQueryResult | PgArrayQueryResult[];
       if (hardCap === undefined) {
         res = await client.query({
@@ -1726,6 +1803,17 @@ export class PostgresDriver extends BaseDBDriver {
           if (operation.cancelled || !boundedQuery?.hasRecoverableResult)
             throw error;
           boundedQuery.markIncompleteResultPartial();
+          // pg's local read timeout calls the callback before ReadyForQuery.
+          // It doesn't stop execution, and cleanup SQL must not be queued on
+          // a still-draining client. Return already collected rows as partial.
+          boundedReadTimedOut =
+            error instanceof Error &&
+            !(error instanceof DatabaseError) &&
+            error.message === "Query read timeout";
+          if (boundedReadTimedOut) {
+            operation.client = undefined;
+            if (this.activeQueryClients.delete(client)) client.release(true);
+          }
           if (
             wasPostgresBatchRolledBack(
               sql,
@@ -1754,6 +1842,7 @@ export class PostgresDriver extends BaseDBDriver {
             rows: resultSet.rows,
             rowCount: resultSet.rowCount,
             truncated: resultSet.truncated,
+            truncatedBySize: resultSet.truncatedBySize,
             partial: resultSet.partial,
           }))
         : Array.isArray(res)
@@ -1788,37 +1877,28 @@ export class PostgresDriver extends BaseDBDriver {
             ),
             rowCount: candidate.rowCount ?? rawRows.length,
             truncated: candidate.truncated === true,
+            ...(candidate.truncatedBySize ? { truncatedBySize: true } : {}),
             ...(candidate.partial ? { partial: true } : {}),
           };
         });
       const primaryResultSet = resultSets[0];
-      const hideOmittedFallback =
-        boundedQuery?.resultSetsTruncated === true && resultSets.length === 0;
-      const fallbackFields = hideOmittedFallback ? [] : (result.fields ?? []);
-      const fallbackColumns = fallbackFields.map((field) => field.name);
-      const fallbackColumnMeta: QueryColumnMeta[] = fallbackFields.map(
-        (field) => postgresQueryColumnMeta(field.dataTypeID),
-      );
-      const fallbackRows: unknown[][] = hideOmittedFallback
-        ? []
-        : (result.rows ?? []);
-      const fallbackFormattedRows = fallbackRows.map((row) =>
-        Object.fromEntries(
-          row.map((val, i) => {
-            const normalized =
-              val !== null &&
-              typeof val === "object" &&
-              !(val instanceof Date) &&
-              isPointValue(val)
-                ? `(${String(val.x)}, ${String(val.y)})`
-                : val;
-            return [`__col_${i}`, normalized];
-          }),
-        ),
-      );
-      const columns = primaryResultSet?.columns ?? fallbackColumns;
-      const columnMeta = primaryResultSet?.columnMeta ?? fallbackColumnMeta;
-      const rows = primaryResultSet?.rows ?? fallbackFormattedRows;
+      const hideOmittedFallback = boundedQuery?.resultSetsTruncated === true;
+      const fallbackFields =
+        primaryResultSet || hideOmittedFallback ? [] : (result.fields ?? []);
+      const columns =
+        primaryResultSet?.columns ?? fallbackFields.map((field) => field.name);
+      const columnMeta =
+        primaryResultSet?.columnMeta ??
+        fallbackFields.map((field) =>
+          postgresQueryColumnMeta(field.dataTypeID),
+        );
+      const fallbackRows =
+        primaryResultSet || hideOmittedFallback ? [] : (result.rows ?? []);
+      const rows =
+        primaryResultSet?.rows ??
+        fallbackRows.map((row) =>
+          Object.fromEntries(row.map((value, i) => [`__col_${i}`, value])),
+        );
       const affectedRows =
         partialQueryError !== undefined
           ? undefined
@@ -1844,6 +1924,7 @@ export class PostgresDriver extends BaseDBDriver {
         ...(resultSets.length > 0
           ? {
               resultSets,
+              ...(boundedQuery ? { rowCountKind: "returned" as const } : {}),
               ...(resultSets.some((resultSet) => resultSet.truncated)
                 ? { truncated: true }
                 : {}),
@@ -1859,7 +1940,11 @@ export class PostgresDriver extends BaseDBDriver {
           : {}),
         ...(partialQueryError !== undefined
           ? {
-              error: `${normalizeUnknownError(partialQueryError, this.config).message}${batchRolledBack ? " The transaction was rolled back; results returned before the error were not committed." : ""}`,
+              error: `${normalizeUnknownError(partialQueryError, this.config).message}${batchRolledBack ? " The transaction was rolled back; results returned before the error were not committed." : boundedReadTimedOut ? " Previously submitted statements may have committed; verify before retrying." : ""}`,
+              ...(!boundedReadTimedOut &&
+              isServerReportedQueryError(partialQueryError)
+                ? { serverReportedError: true }
+                : {}),
             }
           : {}),
       };
@@ -2460,7 +2545,7 @@ export class PostgresDriver extends BaseDBDriver {
        JOIN pg_class     c ON c.oid = a.attrelid
        JOIN pg_namespace n ON n.oid = c.relnamespace
        JOIN pg_type      t ON t.oid = a.atttypid
-       LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+        LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
        LEFT JOIN pg_collation coll
          ON coll.oid = a.attcollation
         AND a.attcollation <> t.typcollation

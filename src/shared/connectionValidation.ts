@@ -996,12 +996,50 @@ export function buildDynamoValidationIssues(
       );
     }
   }
-  if (hasAccessKeyId !== hasSecretAccessKey) {
+  if (
+    hasAccessKeyId !== hasSecretAccessKey ||
+    (config.awsCredentialMode === "static" &&
+      !hasAccessKeyId &&
+      !options.hasStoredAwsKeyPair)
+  ) {
     issues.push(
       createValidationIssue(
         "invalid",
         ["awsAccessKeyId", "awsSecretAccessKey"],
-        "Enter both AWS Access Key ID and Secret Access Key, or leave both blank to use a profile or the default credential chain.",
+        "Static AWS credentials require both an Access Key ID and a Secret Access Key. Re-enter any missing keys in Edit Connection.",
+      ),
+    );
+  }
+  const stsEndpoint = config.awsStsEndpoint;
+  if (typeof stsEndpoint === "string" && stsEndpoint.trim()) {
+    let url: URL | undefined;
+    try {
+      url = new URL(stsEndpoint.trim());
+    } catch {}
+    if (
+      !url?.hostname ||
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.pathname !== "/" ||
+      /[?#@\s]/.test(stsEndpoint.trim())
+    ) {
+      issues.push(
+        createValidationIssue(
+          "invalid",
+          ["awsStsEndpoint"],
+          "STS endpoint must be an HTTPS URL with only a host name (no port, path, query, fragment or credentials), for example https://vpce-….sts.<region>.vpce.amazonaws.com.",
+        ),
+      );
+    }
+  }
+  if (config.awsCredentialMode === "profile" && !hasValue(config.awsProfile)) {
+    issues.push(
+      createValidationIssue(
+        "required",
+        ["awsProfile"],
+        "AWS profile is required.",
       ),
     );
   }

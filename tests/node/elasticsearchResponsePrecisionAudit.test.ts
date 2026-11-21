@@ -6,6 +6,7 @@ import { ElasticsearchSerializer } from "../../src/extension/dbDrivers/elasticse
 import { canonicalizeJsonNumericValues } from "../../src/extension/utils/jsonCanonical";
 import {
   elasticsearchKeys,
+  elasticsearchSourceMetadata,
   elasticsearchTestIndexUuid,
 } from "../support/elasticsearchIdentity";
 
@@ -32,6 +33,8 @@ async function fixture(source: string, mutationResponse?: string) {
       response.end(
         `{"records":{"settings":{"index":{"max_result_window":"100","uuid":"${elasticsearchTestIndexUuid}"}}}}`,
       );
+    else if (request.method === "GET" && path.startsWith("/records?"))
+      response.end(JSON.stringify(elasticsearchSourceMetadata("records")));
     else if (request.method === "POST" && path.startsWith("/records/_pit"))
       response.end('{"id":"precision-pit"}');
     else if (request.method === "DELETE" && path.startsWith("/_pit")) {

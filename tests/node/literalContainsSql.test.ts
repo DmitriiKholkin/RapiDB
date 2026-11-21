@@ -15,6 +15,7 @@ import { resolveFilterOperators } from "../../src/extension/dbDrivers/types";
 import { buildWhere } from "../../src/extension/table/filterSql";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import { defaultFilterOperator } from "../../src/shared/tableTypes";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const config = { id: "h1", name: "H1", database: "db" };
 const drivers = [
@@ -71,6 +72,7 @@ describe.each(drivers)("H1 %s active SQL table read", (name, createDriver) => {
     values,
   )("keeps Contains input %j literal in both count and data queries", async (value) => {
     const driver = createDriver();
+    mockPostgresTableScope(driver);
     const meta = column();
     expect(defaultFilterOperator(meta)).toBe("like");
     expect(meta.filterOperators).toContain("like");

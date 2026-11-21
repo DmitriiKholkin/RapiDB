@@ -53,11 +53,23 @@ function harness(pattern: string, options: string) {
       sort: () => cursor,
       skip: () => cursor,
       limit: () => cursor,
-      toArray: async () => [BSON.deserialize(wire, options)],
+      async *[Symbol.asyncIterator]() {
+        yield options.raw ? wire : BSON.deserialize(wire, options);
+      },
     };
     return cursor;
   };
   Object.assign(driver, {
+    connected: true,
+    client: {
+      db: () => ({
+        command: async () => ({
+          ok: 1,
+          isWritablePrimary: true,
+          maxWireVersion: 21,
+        }),
+      }),
+    },
     requireDb: () => ({
       collection: () => ({
         find,

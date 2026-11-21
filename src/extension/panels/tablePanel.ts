@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { getDbObjectKindDisplayLabel } from "../../shared/dbObjectKinds";
+import { observedNoSqlDeleteBackend } from "../../shared/noSqlDeleteObservation";
 import type { SqlDeleteObservation } from "../../shared/sqlDeleteObservation";
 import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
 import { coerceFilterExpressions } from "../../shared/tableTypes";
@@ -31,6 +33,7 @@ import type {
   DriverTableExportChunk,
   DriverTableExportFormat,
   FilterExpression,
+  NoSqlDeleteObservation,
 } from "../dbDrivers/types";
 import {
   applyRowTypeHints,
@@ -193,6 +196,12 @@ function currentConnectionSessionKey(
   connectionId: string,
 ): string | null | undefined {
   try {
+    if (
+      connectionManager.getConnection(connectionId)?.type === "dynamodb" &&
+      connectionManager.getQueryTargetSessionKey
+    ) {
+      return connectionManager.getQueryTargetSessionKey(connectionId);
+    }
     return connectionSessionKey(
       connectionManager.getConnection(connectionId),
       connectionManager.getConnectionSessionNonce?.(connectionId),
@@ -263,6 +272,7 @@ export class TablePanel {
   private readonly isView: boolean;
   private readonly objectKind: TablePanelObjectKind | undefined;
   private sessionKey: string | null | undefined;
+  private readonly initiallyBoundDynamoTarget: boolean;
   private sessionGeneration: number;
   private readonly previewController: TableMutationPreviewController;
   private disposed = false;
@@ -282,6 +292,11 @@ export class TablePanel {
   private pageReadAbortController = new AbortController();
   private browsingSnapshot?: { key: string; controller: AbortController };
   private readonly inFlightPageRequests = new Map<string, Promise<TablePage>>();
+  // Only opaque handles cross the webview boundary. Keep the current and
+  // preceding page replies so a click racing a new reply keeps its own proof.
+  private readonly noSqlDeletePages: Array<
+    Map<string, NoSqlDeleteObservation>
+  > = [];
   // Export may encounter a selected sparse attribute only in a later chunk.
   // Keep its display descriptor separate from the schema used for mutations.
   private readonly dynamoExportColumns = new Map<string, ColumnTypeMeta>();
@@ -338,6 +353,9 @@ export class TablePanel {
       connectionManager,
       connectionId,
     );
+    this.initiallyBoundDynamoTarget =
+      typeof this.sessionKey === "string" &&
+      connectionManager.getConnection(connectionId)?.type === "dynamodb";
     this.sessionGeneration = this.currentSessionGeneration();
     this.previewController = new TableMutationPreviewController({
       connectionId,
@@ -363,6 +381,7 @@ export class TablePanel {
         this.dynamoExportColumns.clear();
         this.previewController.clear();
         this.pageReadAbortController.abort();
+        this.noSqlDeletePages.length = 0;
         this.resetBrowsingSnapshot();
         this.pageReadAbortController = new AbortController();
         this.inFlightPageRequests.clear();
@@ -401,6 +420,7 @@ export class TablePanel {
       this.disposed = true;
       this.messageEpoch++;
       this.pageReadAbortController.abort();
+      this.noSqlDeletePages.length = 0;
       this.resetBrowsingSnapshot();
       connectSubscription?.dispose();
       metadataInvalidationSubscription?.dispose();
@@ -487,9 +507,16 @@ export class TablePanel {
           connectionManager.getConnection(saved.connectionId)?.type ===
             "sqlite" &&
           sqliteAttachmentSchema(saved.database, saved.schema) !== undefined;
+        const restoredDynamoTargetMismatch =
+          connectionManager.getConnection(saved.connectionId)?.type ===
+            "dynamodb" &&
+          (!credentialsVerified ||
+            !saved.connectionSessionKey ||
+            saved.connectionSessionKey !== currentSessionKey);
         if (
           currentSessionKey === undefined ||
           restoredAttachmentDraft ||
+          restoredDynamoTargetMismatch ||
           (hasDraft &&
             (!credentialsVerified ||
               (saved.connectionSessionKey === undefined
@@ -658,7 +685,11 @@ export class TablePanel {
     const warning = this.sessionChangeWarning();
     if (warning === null) return false;
     const hasRetainedWork = this.hasUnsavedChanges || this.hasDeleteRecovery();
-    if (!hasRetainedWork && !this.initialized) {
+    if (
+      !hasRetainedWork &&
+      !this.initialized &&
+      !this.initiallyBoundDynamoTarget
+    ) {
       const key = currentConnectionSessionKey(
         this.connectionManager,
         this.connectionId,
@@ -844,6 +875,15 @@ export class TablePanel {
       await this.postMessage("tableMutationPreview", preview);
       return;
     }
+    if (preview.confirmationWarning) {
+      await this.postMessage("tableMutationPreview", {
+        ...preview,
+        text: "",
+        sql: "",
+        confirmationOnly: true,
+      } satisfies TableMutationPreviewPayload);
+      return;
+    }
 
     await this._handleConfirmMutationPreview(preview);
   }
@@ -858,6 +898,8 @@ export class TablePanel {
       throw new Error(
         `Schema metadata refresh failed: ${this.schemaRefreshError}`,
       );
+    const verification = this.verifyDynamoDBTarget();
+    if (verification) await verification;
     return this.schemaSnapshot;
   }
 
@@ -891,6 +933,8 @@ export class TablePanel {
     return (
       !this.disposed &&
       generation === this.connectionGeneration &&
+      (!this.initiallyBoundDynamoTarget ||
+        this.sessionChangeWarning() === null) &&
       this.connectionManager.isConnected?.(this.connectionId) !== false &&
       this.connectionManager.isConnecting?.(this.connectionId) !== true
     );
@@ -1222,6 +1266,8 @@ export class TablePanel {
   }
 
   private async loadTableColumns(): Promise<ColumnTypeMeta[]> {
+    const verification = this.verifyDynamoDBTarget();
+    if (verification) await verification;
     const schema = this.getSQLiteAttachmentSchema();
     if (schema && !this.sqliteAttachmentTarget) {
       const target = await this.connectionManager
@@ -1239,6 +1285,28 @@ export class TablePanel {
       this.schema,
       this.table,
     );
+  }
+
+  private verifyDynamoDBTarget(): Promise<void> | undefined {
+    if (
+      !this.connectionManager.verifyLiveDynamoDBTarget ||
+      this.connectionManager.getConnection(this.connectionId)?.type !==
+        "dynamodb"
+    )
+      return;
+    const driver = this.connectionManager.getDriver(this.connectionId);
+    if (!driver?.verifyDynamoDBTarget) return;
+    if (this.closeIfSessionChanged())
+      throw new Error(MUTATION_SESSION_CONFLICT);
+    return this.connectionManager
+      .verifyLiveDynamoDBTarget(this.connectionId, driver)
+      .then(() => {
+        if (
+          this.connectionManager.getDriver(this.connectionId) !== driver ||
+          this.closeIfSessionChanged()
+        )
+          throw new Error(MUTATION_SESSION_CONFLICT);
+      });
   }
 
   private getSQLiteAttachmentScope() {
@@ -1322,27 +1390,46 @@ export class TablePanel {
     intent: TableInitPayload["intent"] = "initialize",
   ): void {
     if (this.closeIfSessionChanged()) return;
+    // Preserve the driver's catalog scope attached to this metadata array.
+    const reference = this.connectionManager
+      .getDriver(this.connectionId)
+      ?.getTableDataReference?.(
+        this.database,
+        this.schema,
+        this.table,
+        columns,
+      );
     this.initialized = true;
     this.metadataInvalidated = false;
-    const snapshotColumns = structuredClone(columns);
+    const snapshotColumns =
+      reference === undefined ? structuredClone(columns) : columns;
     this.schemaSnapshot = {
       generation: this.schemaRefreshGeneration,
       connectionGeneration: this.connectionGeneration,
       columns: snapshotColumns,
-      signature: JSON.stringify(snapshotColumns),
+      signature: JSON.stringify(
+        reference === undefined
+          ? snapshotColumns
+          : [snapshotColumns, reference],
+      ),
     };
     const primaryKeyColumns = columns
       .filter((column) => column.isPrimaryKey)
       .map((column) => column.name);
+    const noSqlDeleteBackend = this.noSqlDeleteBackend();
+    const connectionReadOnly = this.isConnectionReadOnly();
     const payload: TableInitPayload = {
       intent,
       columns,
       primaryKeyColumns,
       isView: this.isView,
-      connectionReadOnly: this.isConnectionReadOnly(),
+      connectionReadOnly,
       connectionSessionKey: this.sessionKey ?? undefined,
       ...(this.canObserveSqlDelete()
         ? { requiresSqlDeleteObservation: true }
+        : {}),
+      ...(noSqlDeleteBackend && !connectionReadOnly && !this.isView
+        ? { noSqlDeleteBackend }
         : {}),
     };
     void this.postMessage("tableInit", payload);
@@ -1484,12 +1571,35 @@ export class TablePanel {
           (column) => !snapshotColumnNames.has(column.name),
         );
       }
+      let noSqlDeleteObservationIds: Array<string | null> | undefined;
+      if (result.noSqlDeleteObservations) {
+        const pageObservations = new Map<string, NoSqlDeleteObservation>();
+        noSqlDeleteObservationIds = result.noSqlDeleteObservations.map(
+          (observation) => {
+            if (!observation) return null;
+            const id = randomUUID();
+            pageObservations.set(id, observation);
+            return id;
+          },
+        );
+        this.noSqlDeletePages.unshift(pageObservations);
+        this.noSqlDeletePages.length = Math.min(
+          this.noSqlDeletePages.length,
+          2,
+        );
+      }
       this.postMessage("tableData", {
         fetchId,
         ...(extraColumns.length > 0 ? { extraColumns } : {}),
         ...(pageScopedExtraColumns ? { pageScopedExtraColumns } : {}),
         rows: result.rows,
+        ...(result.rowUpdateBlockReasons
+          ? { rowUpdateBlockReasons: result.rowUpdateBlockReasons }
+          : {}),
         mongoIdTypes: result.mongoIdTypes,
+        ...(result.mongoRowMutationBlockReason
+          ? { mongoRowMutationBlockReason: result.mongoRowMutationBlockReason }
+          : {}),
         mongoValueTypes: result.mongoValueTypes,
         rowValueTypes: result.rowValueTypes ?? result.mongoValueTypes,
         ...(result.sqliteRowIdentities
@@ -1518,6 +1628,7 @@ export class TablePanel {
         ...(result.sqlDeleteObservations
           ? { sqlDeleteObservations: result.sqlDeleteObservations }
           : {}),
+        ...(noSqlDeleteObservationIds ? { noSqlDeleteObservationIds } : {}),
         totalCount: result.totalCount,
         executionTimeMs: result.executionTimeMs,
       });
@@ -1555,6 +1666,14 @@ export class TablePanel {
         return;
       }
       const driver = this.connectionManager.getDriver(this.connectionId);
+      if (updates?.length && driver?.assertTableRowMutationIdentity) {
+        await driver.assertTableRowMutationIdentity(
+          this.database,
+          this.schema,
+          this.table,
+        );
+        this.assertMutationSession(connectionGeneration);
+      }
       if (
         this.connectionManager.getConnection(this.connectionId)?.type ===
         "sqlite"
@@ -1789,6 +1908,12 @@ export class TablePanel {
     );
   }
 
+  private noSqlDeleteBackend() {
+    return observedNoSqlDeleteBackend(
+      this.connectionManager.getConnection(this.connectionId)?.type,
+    );
+  }
+
   private canObserveSqlDelete(): boolean {
     return (
       this.requiresSqlDeleteObservation() &&
@@ -1801,6 +1926,7 @@ export class TablePanel {
     operationId: string;
     primaryKeysList?: Array<Record<string, unknown>>;
     sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
+    noSqlDeleteObservationIds?: Array<string | null>;
   }): Promise<void> {
     const { operationId, primaryKeysList = [] } = payload;
     const connectionGeneration = this.connectionGeneration;
@@ -1820,15 +1946,30 @@ export class TablePanel {
         assertSQLitePanelIdentities(primaryKeysList);
       }
       const attachmentScope = this.getSQLiteAttachmentScope();
+      const noSqlBackend = this.noSqlDeleteBackend();
+      const noSqlObservations = noSqlBackend
+        ? (payload.noSqlDeleteObservationIds ?? []).map((id) =>
+            id
+              ? (this.noSqlDeletePages.find((page) => page.has(id))?.get(id) ??
+                null)
+              : null,
+          )
+        : undefined;
+      const observations: [
+        sql?: readonly (SqlDeleteObservation | null)[],
+        noSql?: readonly (NoSqlDeleteObservation | null)[],
+      ] = noSqlObservations
+        ? [undefined, noSqlObservations]
+        : this.requiresSqlDeleteObservation()
+          ? [payload.sqlDeleteObservations ?? []]
+          : [];
       const plan = await this.svc.prepareDeleteRowsPlan(
         this.connectionId,
         this.database,
         this.schema,
         this.table,
         primaryKeysList,
-        ...(this.requiresSqlDeleteObservation()
-          ? [payload.sqlDeleteObservations ?? []]
-          : []),
+        ...observations,
       );
 
       this.assertMutationSession(connectionGeneration);
@@ -1923,7 +2064,7 @@ export class TablePanel {
       ? `${this.schema}_${displayTable}`
       : displayTable;
     const filterExpressions = coerceFilterExpressions(filters);
-    const loadChunks = (signal: AbortSignal) => {
+    const loadBoundChunks = (signal: AbortSignal) => {
       this.getSQLiteAttachmentScope();
       const assertSession = () => {
         signal.throwIfAborted();
@@ -1965,6 +2106,15 @@ export class TablePanel {
         assertSession,
       );
     };
+    const verifyTarget = () => this.verifyDynamoDBTarget();
+    const loadChunks =
+      connectionType === "dynamodb"
+        ? async function* (signal: AbortSignal) {
+            const verification = verifyTarget();
+            if (verification) await verification;
+            yield* loadBoundChunks(signal);
+          }
+        : loadBoundChunks;
 
     if (format === "csv") {
       await exportTableDataAsCsv({

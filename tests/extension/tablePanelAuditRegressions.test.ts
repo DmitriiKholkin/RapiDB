@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DeleteExecutionError } from "../../src/extension/dbDrivers/deleteOutcomes";
+import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
+import { DynamoDBTargetChangedError } from "../../src/extension/dbDrivers/dynamodbTarget";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
+import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import type { IDBDriver } from "../../src/extension/dbDrivers/types";
 import { DriverUpdateRowsError } from "../../src/extension/dbDrivers/updateRowOutcomes";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
@@ -10,6 +13,7 @@ import {
   TableDataService,
 } from "../../src/extension/tableDataService";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 import type { FakeWebviewPanelHandle } from "../workflow/bridge/fakeWebviewPanel";
 
 const state = vi.hoisted(() => ({
@@ -87,6 +91,7 @@ async function setup(
   driver: IDBDriver,
   config: { id: string; name: string; type: string; password?: string },
   skipPreview = false,
+  verifyLiveDynamoDBTarget?: () => Promise<void>,
 ) {
   let connected = true;
   let generation = 0;
@@ -98,12 +103,14 @@ async function setup(
   const refreshListeners = new Set<(id?: string) => void>();
   const manager = {
     getDriver: () => driver,
+    verifyLiveDynamoDBTarget,
     getConnection: () => (removed ? undefined : config),
     getConnectionDiagnosticContext: () => config,
     getConnectionSessionGeneration: () => generation,
     getDefaultPageSize: () => 25,
     getSkipTableMutationPreview: () => skipPreview,
-    getQueryEditorPresentation: () => undefined,
+    getQueryEditorPresentation: () =>
+      config.type === "redis" ? { editorLanguage: "plaintext" } : undefined,
     isConnected: () => connected,
     onDidInvalidateConnectionMetadata: (listener: (id: string) => void) => {
       invalidateListeners.add(listener);
@@ -166,6 +173,274 @@ async function setup(
   };
 }
 
+it("reverifies the DynamoDB target before confirming an open Table Viewer mutation preview", async () => {
+  const config = {
+    id: "ddb-audit",
+    name: "DynamoDB",
+    type: "dynamodb",
+  } as const;
+  const driver = new DynamoDBDriver(config);
+  const verifyTarget = vi.fn(async () => undefined);
+  const insert = vi.spyOn(driver, "insertRow");
+  vi.spyOn(driver, "describeColumns").mockResolvedValue(pgColumns);
+  vi.spyOn(driver, "buildMutationPreviewStatements").mockResolvedValue([
+    '{"PutItem":{"TableName":"items"}}',
+  ]);
+  const { panel } = await setup(driver, config, false, verifyTarget);
+  await panel.dispatchMessage({
+    type: "insertRow",
+    payload: { operationId: "ddb-insert", values: { id: 1, name: "fixture" } },
+  });
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)?.type).toBe("tableMutationPreview"),
+  );
+  const preview = panel.hostMessages().at(-1);
+  expect(preview).toMatchObject({
+    type: "tableMutationPreview",
+    payload: { previewToken: expect.any(String) },
+  });
+  verifyTarget.mockRejectedValueOnce(new DynamoDBTargetChangedError());
+  await panel.dispatchMessage({
+    type: "confirmMutationPreview",
+    payload: {
+      operationId: "ddb-insert",
+      previewToken: (preview?.payload as { previewToken: string }).previewToken,
+    },
+  });
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)?.type).toBe("insertResult"),
+  );
+  expect(verifyTarget).toHaveBeenCalledTimes(3);
+  expect(insert).not.toHaveBeenCalled();
+  expect(panel.hostMessages().at(-1)).toMatchObject({
+    type: "insertResult",
+    payload: { operationId: "ddb-insert", success: false },
+  });
+});
+
+it.each([
+  false,
+  true,
+])("requires a page-issued delete observation with skipPreview=%s", async (skipPreview) => {
+  const config = {
+    id: "mongo-delete-proof",
+    name: "Mongo",
+    type: "mongodb",
+  } as const;
+  const driver = new MongoDBDriver(config);
+  const observation = { backend: "mongodb" } as const;
+  const key = { _id: { $rapidbMongoId: { type: "string", value: "fixture" } } };
+  const columns = [column("_id", { nativeType: "string", isPrimaryKey: true })];
+  vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
+  vi.spyOn(driver, "assertTableRowMutationIdentity").mockResolvedValue();
+  const read = vi.spyOn(driver, "readTablePage").mockResolvedValue({
+    columns,
+    rows: [{ _id: "fixture" }],
+    totalCount: 1,
+    mongoIdTypes: ["string"],
+    noSqlDeleteObservations: [observation],
+  });
+  const execute = vi.fn(async () => ({
+    affectedRows: 1,
+    rowOutcomes: [
+      {
+        rowIndex: 0,
+        primaryKeys: key,
+        success: true,
+        status: "deleted" as const,
+      },
+    ],
+  }));
+  const prepare = vi.spyOn(driver, "prepareObservedDelete").mockReturnValue({
+    previewStatements: ["guarded fixture"],
+    execute,
+  });
+  const keyOnly = vi.spyOn(driver, "deleteRows");
+  const { panel } = await setup(driver, config, skipPreview);
+  const request = (operationId: string, ids?: string[]) =>
+    panel.dispatchMessage({
+      type: "deleteRows",
+      payload: {
+        operationId,
+        primaryKeysList: [key],
+        ...(ids && { noSqlDeleteObservationIds: ids }),
+      },
+    });
+  await request("missing-proof");
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)).toMatchObject({
+      type: "deleteResult",
+      payload: { outcomeUnknown: false, rowOutcomes: [{ status: "skipped" }] },
+    }),
+  );
+  await request("unknown-proof", ["00000000-0000-0000-0000-000000000000"]);
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)).toMatchObject({
+      type: "deleteResult",
+      payload: {
+        operationId: "unknown-proof",
+        rowOutcomes: [{ status: "skipped" }],
+      },
+    }),
+  );
+  expect(prepare).not.toHaveBeenCalled();
+  await panel.dispatchMessage({ type: "fetchPage", payload: { fetchId: 1 } });
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)?.type).toBe("tableData"),
+  );
+  expect(read).toHaveBeenCalledWith(
+    expect.objectContaining({ observeNoSqlDelete: true }),
+  );
+  const reply = panel.hostMessages().at(-1)?.payload as {
+    noSqlDeleteObservationIds: string[];
+    noSqlDeleteObservations?: unknown;
+  };
+  expect(reply.noSqlDeleteObservations).toBeUndefined();
+  await request("guarded", reply.noSqlDeleteObservationIds);
+  await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+  expect(prepare).toHaveBeenCalledExactlyOnceWith(
+    {
+      database: "db",
+      schema: "public",
+      table: "items",
+      primaryKeyValuesList: [{ _id: "fixture" }],
+    },
+    [observation],
+  );
+  if (!skipPreview) {
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)?.type).toBe("tableMutationPreview"),
+    );
+    expect(execute).not.toHaveBeenCalled();
+    const { previewToken } = panel.hostMessages().at(-1)?.payload as {
+      previewToken: string;
+    };
+    await panel.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId: "guarded", previewToken },
+    });
+  }
+  await vi.waitFor(() => expect(execute).toHaveBeenCalledOnce());
+  expect(read).toHaveBeenCalledOnce();
+  expect(keyOnly).not.toHaveBeenCalled();
+});
+
+it.each([
+  { skipPreview: false, cancel: false, batch: true },
+  { skipPreview: true, cancel: true, batch: true },
+  { skipPreview: true, cancel: false, batch: true },
+  { skipPreview: true, cancel: false, batch: false },
+])("confirms non-atomic Redis deletes only for a batch: %j", async ({
+  skipPreview,
+  cancel,
+  batch,
+}) => {
+  const config = {
+    id: "redis-delete-preview",
+    name: "Redis",
+    type: "redis",
+  } as const;
+  const driver = new RedisDriver(config);
+  const keys = [{ key: "a" }, { key: "b" }].slice(0, batch ? 2 : 1);
+  const columns = [column("key", { isPrimaryKey: true, nullable: false })];
+  const observations = keys.map(() => ({ backend: "redis" as const }));
+  vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
+  vi.spyOn(driver, "readTablePage").mockResolvedValue({
+    columns,
+    rows: keys,
+    totalCount: keys.length,
+    noSqlDeleteObservations: observations,
+  });
+  const execute = vi.fn(async () => ({
+    affectedRows: keys.length,
+    rowOutcomes: keys.map((primaryKeys, rowIndex) => ({
+      rowIndex,
+      primaryKeys,
+      success: true,
+      status: "deleted" as const,
+    })),
+  }));
+  const prepare = vi.spyOn(driver, "prepareObservedDelete").mockReturnValue({
+    previewStatements: keys.map(({ key }) => `EVAL "guard" "1" "${key}"`),
+    execute,
+  });
+  const keyOnly = vi.spyOn(driver, "deleteRows");
+  const { panel } = await setup(driver, config, skipPreview);
+  await panel.dispatchMessage({ type: "fetchPage", payload: { fetchId: 1 } });
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)?.type).toBe("tableData"),
+  );
+  const { noSqlDeleteObservationIds: ids } = panel.hostMessages().at(-1)
+    ?.payload as {
+    noSqlDeleteObservationIds: string[];
+  };
+  const operationId = "redis-delete";
+  await panel.dispatchMessage({
+    type: "deleteRows",
+    payload: {
+      operationId,
+      // The repeated selection must not inflate the planned operation count.
+      primaryKeysList: [...keys, keys[0]],
+      noSqlDeleteObservationIds: [...ids, ids[0]],
+    },
+  });
+  if (batch) {
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)).toMatchObject({
+        type: "tableMutationPreview",
+        payload: {
+          operationId,
+          statementCount: 2,
+          confirmationWarning: expect.stringMatching(
+            /one at a time.*partial.*not rolled back/,
+          ),
+          text: skipPreview
+            ? ""
+            : 'EVAL "guard" "1" "a"\n\nEVAL "guard" "1" "b"',
+        },
+      }),
+    );
+    const { previewToken, confirmationOnly } = panel.hostMessages().at(-1)
+      ?.payload as {
+      previewToken: string;
+      confirmationOnly?: boolean;
+    };
+    expect(confirmationOnly === true).toBe(skipPreview);
+    expect(execute).not.toHaveBeenCalled();
+    if (cancel) {
+      await panel.dispatchMessage({
+        type: "cancelMutationPreview",
+        payload: { operationId, previewToken },
+      });
+    }
+    await panel.dispatchMessage({
+      type: "confirmMutationPreview",
+      payload: { operationId, previewToken },
+    });
+  }
+  await vi.waitFor(() =>
+    expect(panel.hostMessages().at(-1)).toMatchObject({
+      type: "deleteResult",
+      payload: {
+        operationId,
+        success: !cancel,
+        affectedRows: cancel ? 0 : keys.length,
+      },
+    }),
+  );
+  expect(prepare).toHaveBeenCalledExactlyOnceWith(
+    {
+      database: "db",
+      schema: "public",
+      table: "items",
+      primaryKeyValuesList: keys,
+    },
+    observations,
+  );
+  expect(execute).toHaveBeenCalledTimes(cancel ? 0 : 1);
+  expect(keyOnly).not.toHaveBeenCalled();
+});
+
 async function setupPostgres(
   columns = pgColumns,
   password?: string,
@@ -173,11 +448,26 @@ async function setupPostgres(
 ) {
   const config = { id: "pg-audit", name: "PG", type: "pg", password };
   const driver = new PostgresDriver(config as never);
+  mockPostgresTableScope(driver);
   const describeColumns = vi
     .spyOn(driver, "describeColumns")
     .mockResolvedValue(columns);
-  return { ...(await setup(driver, config, skipPreview)), describeColumns };
+  return {
+    ...(await setup(driver, config, skipPreview)),
+    describeColumns,
+    driver,
+  };
 }
+
+const standaloneMongoClient = {
+  db: () => ({
+    command: async () => ({
+      ok: 1,
+      isWritablePrimary: true,
+      maxWireVersion: 21,
+    }),
+  }),
+};
 
 function deletePlan(): PreparedDeletePlan {
   return {
@@ -201,7 +491,11 @@ it.each([
 ] as const)("only signals confirmed no-write conflicts in an Apply reply (%s)", async (kind) => {
   const config = { id: "mongo-m6", name: "MongoDB", type: "mongodb" };
   const driver = new MongoDBDriver(config as never);
-  Object.assign(driver, { connected: true, supportsAtomicUpdateRows: true });
+  Object.assign(driver, {
+    connected: true,
+    client: standaloneMongoClient,
+    supportsAtomicUpdateRows: true,
+  });
   const columns = [
     column("_id", {
       nativeType: "string",
@@ -653,6 +947,7 @@ describe("PNL-4 clipboard write acknowledgement", () => {
 describe("PNL-7 unrelated schema refresh during mutation preparation", () => {
   async function prepareDeleteAcrossRefresh(
     refreshedColumns: ColumnTypeMeta[],
+    changedScope = false,
   ) {
     const s = await setupPostgres();
     let resolvePlan!: (plan: PreparedDeletePlan) => void;
@@ -670,6 +965,11 @@ describe("PNL-7 unrelated schema refresh during mutation preparation", () => {
     });
     await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
     s.describeColumns.mockResolvedValue(refreshedColumns);
+    if (changedScope) {
+      vi.mocked(s.driver.getTableDataReference).mockReturnValue(
+        '"public"."items"',
+      );
+    }
     s.refreshSchemas();
     await vi.waitFor(() =>
       expect(s.panel.hostMessages().at(-1)).toMatchObject({
@@ -712,6 +1012,21 @@ describe("PNL-7 unrelated schema refresh during mutation preparation", () => {
       pgColumns[0],
       column("renamed"),
     ]);
+    expect(s.panel.hostMessages().at(-1)).toMatchObject({
+      type: "deleteResult",
+      payload: {
+        operationId: "del-1",
+        success: false,
+        error: expect.stringContaining("Schema metadata changed"),
+      },
+    });
+  });
+
+  it("reports a schema conflict when the relation scope changes with identical columns", async () => {
+    const s = await prepareDeleteAcrossRefresh(
+      structuredClone(pgColumns),
+      true,
+    );
     expect(s.panel.hostMessages().at(-1)).toMatchObject({
       type: "deleteResult",
       payload: {
@@ -777,7 +1092,7 @@ describe("AUD-028 table panel applies per-row Mongo type hints before prevalidat
   it("previews a non-hex string edit for a row whose field is a string", async () => {
     const config = { id: "mongo-audit", name: "Mongo", type: "mongodb" };
     const driver = new MongoDBDriver(config as never);
-    Object.assign(driver, { connected: true });
+    Object.assign(driver, { connected: true, client: standaloneMongoClient });
     vi.spyOn(driver, "describeColumns").mockResolvedValue([
       column("_id", {
         nativeType: "string",

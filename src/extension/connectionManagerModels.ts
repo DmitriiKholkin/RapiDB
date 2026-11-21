@@ -1,6 +1,7 @@
 import type { ConnectionConfig } from "../shared/connectionConfig";
 import type { ConnectionValidationResult } from "../shared/connectionValidation";
 import type { DataDbObjectKind, DbObjectKind } from "../shared/dbObjectKinds";
+import type { QueryDatabaseFields } from "../shared/queryDatabaseTarget";
 import type {
   ColumnTypeMeta,
   DriverTableSectionKind,
@@ -16,19 +17,17 @@ export interface TestConnectionResult {
   error?: string;
   validation?: ConnectionValidationResult;
 }
-export interface HistoryEntry {
+export interface HistoryEntry extends QueryDatabaseFields {
   id: string;
   sql: string;
   connectionId: string;
-  postgresDatabase?: string;
   targetSessionKey?: string;
   executedAt: string;
 }
-export interface BookmarkEntry {
+export interface BookmarkEntry extends QueryDatabaseFields {
   id: string;
   sql: string;
   connectionId: string;
-  postgresDatabase?: string;
   targetSessionKey?: string;
   savedAt: string;
 }

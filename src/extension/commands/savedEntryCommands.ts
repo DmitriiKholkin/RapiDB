@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
-import { isPostgresQueryDatabase } from "../../shared/postgresQueryDatabase";
+import { readQueryDatabaseScope } from "../../shared/queryDatabaseTarget";
 import { parseQueryTargetBinding } from "../../shared/webviewContracts/query";
 import type {
   BookmarkEntry,
@@ -20,7 +20,11 @@ async function showSavedQuery(
   connectionManager: ConnectionManager,
   entry: Pick<
     HistoryEntry,
-    "connectionId" | "sql" | "postgresDatabase" | "targetSessionKey"
+    | "connectionId"
+    | "sql"
+    | "postgresDatabase"
+    | "mssqlDatabase"
+    | "targetSessionKey"
   >,
   options?: {
     forceNew?: boolean;
@@ -31,12 +35,12 @@ async function showSavedQuery(
   if (!entry.connectionId || !entry.sql) {
     return;
   }
-  if (
-    entry.postgresDatabase !== undefined &&
-    !isPostgresQueryDatabase(entry.postgresDatabase)
-  ) {
+  const databaseScope = readQueryDatabaseScope(entry);
+  if (databaseScope === null) {
+    const label =
+      entry.mssqlDatabase === undefined ? "PostgreSQL" : "SQL Server";
     vscode.window.showErrorMessage(
-      "[RapiDB] Cannot open this saved query: its PostgreSQL database is invalid.",
+      `[RapiDB] Cannot open this saved query: its ${label} database is invalid.`,
     );
     return;
   }
@@ -60,7 +64,7 @@ async function showSavedQuery(
     options?.formatOnOpen,
     options?.isBookmarked,
     undefined,
-    entry.postgresDatabase,
+    databaseScope,
     // Legacy entries still open, but cannot inherit the current target until
     // the user explicitly confirms it in the query panel.
     parseQueryTargetBinding({

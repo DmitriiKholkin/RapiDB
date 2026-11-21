@@ -2,12 +2,11 @@ import { type ChildProcess, fork } from "node:child_process";
 import { join } from "node:path";
 import type { OperationCancellationContext } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
+import { ensureSQLiteRuntimeInstalled } from "../utils/sqliteInstaller";
 import {
-  ensureSQLiteRuntimeInstalled,
-  repairSQLiteManagedRuntime,
-  snapshotSQLiteManagedRuntime,
-} from "../utils/sqliteInstaller";
-import { resolveBetterSqlite3LoadTargets } from "./sqliteRuntime";
+  resolveBetterSqlite3LoadTargets,
+  sqliteDevelopmentRuntimeAllowed,
+} from "./sqliteRuntime";
 import {
   type SQLiteWorkerRequest,
   type SQLiteWorkerResponse,
@@ -67,8 +66,6 @@ export class SQLiteWorkerNotExecutedError extends Error {
   }
 }
 
-class SQLiteWorkerManagedNativeError extends Error {}
-
 function connectionCancelled(): Error {
   return new Error("[RapiDB] SQLite connection attempt cancelled");
 }
@@ -97,37 +94,21 @@ function watchConnectionDeadline(
   return () => clearTimeout(timer);
 }
 
+// A cancelled connection stops waiting, but a shared installation that the
+// user already authorized still completes for other waiters and windows.
 async function waitForRuntime<T>(
-  start: (signal: AbortSignal) => Promise<T>,
+  start: () => Promise<T>,
   signal: AbortSignal,
-  timeout?: { deadline: number; timeoutMs: number },
 ): Promise<T> {
   if (signal.aborted) throw connectionCancelled();
-  let cancelTimer: (() => void) | undefined;
   let abort: () => void = () => {};
   try {
     return await new Promise<T>((resolve, reject) => {
       abort = () => reject(connectionCancelled());
       signal.addEventListener("abort", abort, { once: true });
-      let runtimeSignal = signal;
-      if (timeout && Number.isFinite(timeout.deadline)) {
-        if (sqliteConnectionNow() >= timeout.deadline) {
-          reject(connectionTimedOut(timeout.timeoutMs));
-          return;
-        }
-        const interest = new AbortController();
-        runtimeSignal = AbortSignal.any([signal, interest.signal]);
-        cancelTimer = watchConnectionDeadline(timeout.deadline, () => {
-          reject(connectionTimedOut(timeout.timeoutMs));
-          // Drop only this caller's interest. The installer can still finish
-          // an authorized repair or serve its other waiters.
-          interest.abort();
-        });
-      }
-      start(runtimeSignal).then(resolve, reject);
+      start().then(resolve, reject);
     });
   } finally {
-    cancelTimer?.();
     signal.removeEventListener("abort", abort);
   }
 }
@@ -167,62 +148,21 @@ export class SQLiteWorkerClient {
           "[RapiDB] SQLite in-memory database was lost when execution was stopped. Create a new connection explicitly to start a new empty database.",
         );
       }
-      const snapshot = snapshotSQLiteManagedRuntime(__dirname);
       const managedPackage = await waitForRuntime(
-        () => ensureSQLiteRuntimeInstalled(__dirname),
+        () => ensureSQLiteRuntimeInstalled(),
         opening.signal,
       );
       checkAttempt();
       // Keep the existing cold-install authorization outside this budget.
       const deadline =
         timeoutMs > 0 ? sqliteConnectionNow() + timeoutMs : Infinity;
-      try {
-        await this.connectWorker(
-          config,
-          timeoutMs,
-          deadline,
-          resolveBetterSqlite3LoadTargets(managedPackage),
-          managedPackage,
-        );
-      } catch (error) {
-        checkAttempt();
-        if (
-          !(error instanceof SQLiteWorkerManagedNativeError) ||
-          !snapshot ||
-          snapshot.packagePath !== managedPackage
-        )
-          throw error;
-
-        let repaired: string | null;
-        try {
-          repaired = await waitForRuntime(
-            (signal) => repairSQLiteManagedRuntime(__dirname, snapshot, signal),
-            opening.signal,
-            { deadline, timeoutMs },
-          );
-        } catch (repairError) {
-          checkAttempt();
-          if (sqliteConnectionNow() >= deadline)
-            throw connectionTimedOut(timeoutMs);
-          throw new Error(
-            `${error.message} SQLite runtime repair failed: ${repairError instanceof Error ? repairError.message : String(repairError)}`,
-            { cause: repairError },
-          );
-        }
-        checkAttempt();
-        if (sqliteConnectionNow() >= deadline)
-          throw connectionTimedOut(timeoutMs);
-        if (!repaired) throw error;
-        // The original worker tested all fallbacks before opening a file.
-        // Retry only the replaced binary, in a fresh worker, without looping.
-        await this.connectWorker(
-          config,
-          timeoutMs,
-          deadline,
-          [repaired],
-          repaired,
-        );
-      }
+      await this.connectWorker(
+        config,
+        timeoutMs,
+        deadline,
+        resolveBetterSqlite3LoadTargets(managedPackage),
+        managedPackage,
+      );
       checkAttempt();
       if (!this.child) throw connectionCancelled();
       if (sqliteConnectionNow() >= deadline) {
@@ -247,7 +187,12 @@ export class SQLiteWorkerClient {
     targets: readonly string[],
     managedPackage: string | null,
   ): Promise<unknown> {
+    // The managed target is an absolute, verified package directory. Only
+    // development and tests pass the bare package name, which is resolved
+    // here because the worker has no node_modules of its own.
     const runtimeTargets = targets.map((target) => {
+      if (target === managedPackage || !sqliteDevelopmentRuntimeAllowed())
+        return target;
       try {
         return require.resolve(target);
       } catch {
@@ -430,7 +375,9 @@ export class SQLiteWorkerClient {
 
   private start(pending: Pending): void {
     const workerPath =
-      process.env.NODE_ENV === "test" && process.env.RAPIDB_SQLITE_WORKER_PATH
+      sqliteDevelopmentRuntimeAllowed() &&
+      process.env.NODE_ENV === "test" &&
+      process.env.RAPIDB_SQLITE_WORKER_PATH
         ? process.env.RAPIDB_SQLITE_WORKER_PATH
         : join(__dirname, "sqliteWorker.js");
     const child = fork(workerPath, [], {
@@ -457,11 +404,7 @@ export class SQLiteWorkerClient {
         return;
       }
       if (response.error && current.request.method === "connect") {
-        void this.stop(
-          response.error.managedNativeFailure === true
-            ? new SQLiteWorkerManagedNativeError(response.error.message)
-            : new Error(response.error.message),
-        );
+        void this.stop(new Error(response.error.message));
         return;
       }
       this.active = undefined;

@@ -171,8 +171,9 @@ export function TableView({
   };
 
   const hasPrimaryKey = data.pkCols.length > 0;
-  const canEditRows = !data.readOnlyTable && hasPrimaryKey;
-  const canSelectAndDeleteRows = !data.readOnlyTable && hasPrimaryKey;
+  const canEditRows =
+    !data.readOnlyTable && hasPrimaryKey && !data.mongoRowMutationBlockReason;
+  const canSelectAndDeleteRows = canEditRows;
 
   const mutation = useTableMutationController({
     pasteStructureEpochRef,
@@ -296,6 +297,7 @@ export function TableView({
   const showMissingPrimaryKeyNotice =
     data.hasCommittedData &&
     !data.readOnlyTable &&
+    !data.mongoRowMutationBlockReason &&
     data.isInitialized &&
     !hasPrimaryKey;
   const mutationBusy = data.loading || mutation.applying || mutation.deleting;
@@ -395,6 +397,11 @@ export function TableView({
 
       <TableStatusBanners
         schemaWarning={data.schemaWarning}
+        rowMutationBlockReason={
+          data.hasCommittedData && !data.readOnlyTable
+            ? data.mongoRowMutationBlockReason
+            : null
+        }
         filterError={data.filterError}
         readError={data.readError}
         showMissingPrimaryKeyNotice={showMissingPrimaryKeyNotice}
@@ -508,6 +515,7 @@ export function TableView({
         canPasteIntoPersistedRows={canEditRows && unresolvedPendingCount === 0}
         getPasteBlockReason={mutation.getPasteBlockReason}
         getRowMutationBlockReason={mutation.getRowMutationBlockReason}
+        getRowUpdateBlockReason={mutation.getRowUpdateBlockReason}
         canSelectAndDeleteRows={
           canSelectAndDeleteRows &&
           !data.schemaWarning &&

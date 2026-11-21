@@ -84,6 +84,40 @@ describe("Redis empty key identity", () => {
     ).toContain('""');
   });
 
+  it("previews one ordinary delete per key in execution order", async () => {
+    const { driver, client } = setup();
+    const data = {
+      primaryKeyValuesList: [{ key: "some-prefix:a" }, { key: "" }],
+    };
+    const statements = ['DEL "some-prefix:a"', 'DEL ""'];
+    expect(
+      await driver.buildMutationPreviewStatements(
+        "delete",
+        "db0",
+        "",
+        "",
+        data,
+      ),
+    ).toEqual(statements);
+    expect(
+      driver.buildMutationPreviewStatement("delete", "db0", "", "", data),
+    ).toBe(statements.join("\n"));
+    await driver.deleteRows({ ...scope, ...data });
+    expect(client.del.mock.calls).toEqual([["some-prefix:a"], [""]]);
+  });
+
+  it("rejects an invalid later delete key before any ordinary delete", async () => {
+    const { driver, client } = setup();
+    const data = { primaryKeyValuesList: [{ key: "valid" }, {}] };
+    await expect(
+      driver.buildMutationPreviewStatements("delete", "db0", "", "", data),
+    ).rejects.toThrow("Redis delete requires a string key.");
+    await expect(driver.deleteRows({ ...scope, ...data })).rejects.toThrow(
+      "Redis delete requires a string key.",
+    );
+    expect(client.del).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["", "other"],
     ["other", ""],

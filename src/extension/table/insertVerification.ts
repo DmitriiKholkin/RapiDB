@@ -10,6 +10,7 @@ import {
   oracleCapturedIdentityComparison,
 } from "./insertIdentitySql";
 import { buildInsertRowOperation } from "./insertSql";
+import { tableDataReference } from "./tableDataReference";
 import { writableEntries } from "./updateSql";
 
 export function prepareInsertVerification(
@@ -53,7 +54,13 @@ export function prepareInsertVerification(
       "INSERT verification requires a reliable primary key; no data was written.",
     );
   }
-  const qualified = driver.qualifiedTableName(database, schema, table);
+  const qualified = tableDataReference(
+    driver,
+    database,
+    schema,
+    table,
+    columns,
+  );
   const keyValues = keys.map((column) =>
     requested[column.name] === undefined
       ? null

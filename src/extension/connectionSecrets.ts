@@ -1,3 +1,4 @@
+import { resolveAwsCredentialMode } from "../shared/connectionConfig";
 import {
   AMBIGUOUS_URI_CREDENTIALS_MESSAGE,
   hasAmbiguousUriCredentials,
@@ -279,17 +280,23 @@ function extractConnectionSecrets(
         ? (trimOptionalSecretValue(config.apiKey) ?? previousSecrets?.apiKey)
         : undefined,
     awsAccessKeyId:
-      config.type === "dynamodb"
+      config.type === "dynamodb" &&
+      config.awsCredentialMode !== "profile" &&
+      config.awsCredentialMode !== "default"
         ? (trimOptionalSecretValue(config.awsAccessKeyId) ??
           previousSecrets?.awsAccessKeyId)
         : undefined,
     awsSecretAccessKey:
-      config.type === "dynamodb"
+      config.type === "dynamodb" &&
+      config.awsCredentialMode !== "profile" &&
+      config.awsCredentialMode !== "default"
         ? (trimOptionalSecretValue(config.awsSecretAccessKey) ??
           previousSecrets?.awsSecretAccessKey)
         : undefined,
     awsSessionToken:
-      config.type === "dynamodb"
+      config.type === "dynamodb" &&
+      config.awsCredentialMode !== "profile" &&
+      config.awsCredentialMode !== "default"
         ? (trimOptionalSecretValue(config.awsSessionToken) ??
           previousSecrets?.awsSessionToken)
         : undefined,
@@ -371,7 +378,19 @@ export function sanitizePersistedConnectionConfig(
   config: ConnectionConfig,
 ): ConnectionConfig {
   if (shouldForceSecretStorage(config)) {
-    return sanitizeConnectionConfigForResponse(config);
+    return sanitizeConnectionConfigForResponse(
+      config.type === "dynamodb" &&
+        resolveAwsCredentialMode(config) === "static"
+        ? {
+            ...config,
+            awsCredentialMode: "static",
+            awsSessionTokenRequired:
+              config.awsSessionTokenRequired === true ||
+              trimOptionalSecretValue(config.awsSessionToken) !== undefined ||
+              undefined,
+          }
+        : config,
+    );
   }
 
   return shouldKeepHandWrittenSecretsInSettings(config)
@@ -435,6 +454,8 @@ export function hasPersistedConnectionConfigChanges(
     persisted.color !== original.color ||
     persisted.password !== original.password ||
     persisted.apiKey !== original.apiKey ||
+    persisted.awsCredentialMode !== original.awsCredentialMode ||
+    persisted.awsSessionTokenRequired !== original.awsSessionTokenRequired ||
     persisted.awsAccessKeyId !== original.awsAccessKeyId ||
     persisted.awsSecretAccessKey !== original.awsSecretAccessKey ||
     persisted.awsSessionToken !== original.awsSessionToken ||
@@ -541,6 +562,7 @@ export function restoreCredentialBearingUri(
 ): string | undefined {
   const submitted = trimOptionalUriValue(value);
   if (!submitted || !previous || !keep) return submitted;
+  if (extractCredentialBearingUriSecret(submitted)) return submitted;
   const pattern = /^([a-z][a-z\d+.-]*:\/\/)([^/?#]+)(.*)$/i;
   const oldParts = pattern.exec(previous);
   const parts = pattern.exec(submitted);

@@ -11,6 +11,7 @@ import {
   loadConnectionRootCatalog,
   loadDatabaseScope,
 } from "../../src/extension/schema/schemaLoaders";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 import { withRedisReplyMapping } from "../support/redisReplyMapping";
 
 vi.mock("redis", async (importOriginal) => {
@@ -69,7 +70,12 @@ describe("driver schema discovery error boundaries", () => {
         db: () => ({
           listCollections: () => ({ toArray: collections }),
           collection: () => ({
-            find: () => ({ limit: () => ({ toArray: documents }) }),
+            find: () => ({
+              limit: () => ({
+                [Symbol.asyncIterator]: mockMongoCursorIterator,
+                toArray: documents,
+              }),
+            }),
           }),
         }),
       },

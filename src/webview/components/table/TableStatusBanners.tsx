@@ -61,6 +61,7 @@ function BannerDismissButton({ ariaLabel, onClick }: BannerDismissButtonProps) {
 
 interface TableStatusBannersProps {
   schemaWarning?: string | null;
+  rowMutationBlockReason?: string | null;
   filterError: string | null;
   readError: string | null;
   showMissingPrimaryKeyNotice: boolean;
@@ -70,6 +71,7 @@ interface TableStatusBannersProps {
 
 export function TableStatusBanners({
   schemaWarning,
+  rowMutationBlockReason,
   filterError,
   readError,
   showMissingPrimaryKeyNotice,
@@ -113,15 +115,15 @@ export function TableStatusBanners({
           />
         </div>
       )}
-      {showMissingPrimaryKeyNotice && (
+      {(rowMutationBlockReason || showMissingPrimaryKeyNotice) && (
         <div
           role="alert"
           style={{ ...bannerLayoutStyle, ...warningBannerToneStyle }}
         >
           <Icon name="warning" size={13} style={{ flexShrink: 0 }} />
           <span>
-            Reduced table mode: no unique key was detected for row binding, so
-            editing fields and deleting rows are disabled.
+            {rowMutationBlockReason ??
+              "Reduced table mode: no unique key was detected for row binding, so editing fields and deleting rows are disabled."}
           </span>
         </div>
       )}

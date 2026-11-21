@@ -1,9 +1,13 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { resolveAwsCredentialMode } from "../../shared/connectionConfig";
 import {
+  buildMongoFieldsUri,
   getMongoConnectionUri,
+  getMongoFormHost,
   getMongoFormUri,
   normalizeMongoConnectionConfig,
+  resolveMongoConnectionMode,
 } from "../../shared/mongoConnection";
 import {
   type ConnectionFormBrowseTarget,
@@ -14,8 +18,16 @@ import {
 import {
   type ConnectionSavePrecondition,
   connectionEditState,
+  connectionEditStatesMatch,
+  preserveTrustedSshFingerprint,
 } from "../connectionEditState";
 import type { ConnectionConfig, ConnectionManager } from "../connectionManager";
+import { readConnectionSecret } from "../connectionManagerStore";
+import {
+  assertConnectionSecretBinding,
+  connectionSecretTarget,
+  sameConnectionTofuPin,
+} from "../connectionSecretBinding";
 import {
   type ConnectionSecretClearOptions,
   connectionTypeUsesPassword,
@@ -28,11 +40,13 @@ import {
   restoreMongoUriCredentials,
   sanitizeConnectionConfigForResponse,
   sanitizeCredentialBearingUri,
+  shouldKeepHandWrittenSecretsInSettings,
   trimOptionalSecretValue,
   trimOptionalUriValue,
 } from "../connectionSecrets";
 import {
   parseStoredConnectionSecrets,
+  readConnectionCredentialRevision,
   type StoredConnectionSecrets,
 } from "../connectionSecretsData";
 import { ConnectionValidationService } from "../services/connectionValidationService";
@@ -105,7 +119,8 @@ function usesStoredSecrets(config: ConnectionConfig | undefined): boolean {
   return (
     config !== undefined &&
     config.useSecretStorage !== false &&
-    config.type !== "sqlite"
+    config.type !== "sqlite" &&
+    !shouldKeepHandWrittenSecretsInSettings(config)
   );
 }
 
@@ -197,6 +212,7 @@ function sanitizeExistingForForm(
     awsEndpoint,
     ...rest
   } = existing;
+  delete rest.secretStorageProfile;
   const existingRedisUri =
     existing.type === "redis"
       ? getExistingRedisUri(existing, storedSecrets)
@@ -232,6 +248,17 @@ function sanitizeExistingForForm(
 
   return {
     ...rest,
+    ...(existing.type === "dynamodb"
+      ? {
+          awsCredentialMode: resolveAwsCredentialMode({
+            ...existing,
+            awsAccessKeyId: storedSecrets.awsAccessKeyId ?? _awsAccessKeyId,
+            awsSecretAccessKey:
+              storedSecrets.awsSecretAccessKey ?? _awsSecretAccessKey,
+            awsSessionToken: storedSecrets.awsSessionToken ?? _awsSessionToken,
+          }),
+        }
+      : {}),
     ssh: sanitizedSsh,
     tls,
     connectionUri: sanitizeCredentialBearingUri(
@@ -294,6 +321,83 @@ function sanitizeExistingForForm(
       trimOptionalSecretValue(existing.tls?.keyPassphrase) !== undefined ||
       undefined,
   };
+}
+
+function formCredentialTarget(
+  config: ConnectionConfig,
+  fromSettings = false,
+): string {
+  if (config.type === "redis" && config.connectionUri) {
+    return connectionSecretTarget(
+      fromSettings
+        ? {
+            ...config,
+            host: undefined,
+            port: undefined,
+            database: undefined,
+            username: undefined,
+          }
+        : config,
+    );
+  }
+  if (config.type === "mongodb") {
+    const mode = resolveMongoConnectionMode(config);
+    // Compare the form's canonical URI/field representations, not legacy
+    // alias placement. The database override is not an auth DB in URI mode.
+    const uri =
+      mode === "uri"
+        ? fromSettings
+          ? getMongoConnectionUri(config)
+          : getMongoFormUri(config, getMongoConnectionUri(config))
+        : buildMongoFieldsUri({
+            ...config,
+            host: getMongoFormHost(config),
+            username: undefined,
+            password: undefined,
+          });
+    return connectionSecretTarget({
+      ...config,
+      host: undefined,
+      port: undefined,
+      database: undefined,
+      username: mode === "fields" ? config.username : undefined,
+      connectionUri: uri,
+      uri: undefined,
+      mongoConnectionMode: mode,
+      mongoScheme: undefined,
+      mongoAuthMethod:
+        mode === "fields"
+          ? (config.mongoAuthMethod ?? (config.username ? "password" : "none"))
+          : undefined,
+      authSource: undefined,
+      authMechanism: undefined,
+      replicaSet: undefined,
+      directConnection: undefined,
+    });
+  }
+  if (
+    config.type === "elasticsearch" &&
+    (config.connectionUri || config.endpoint || config.cloudId)
+  ) {
+    return connectionSecretTarget({
+      ...config,
+      connectionUri: undefined,
+      endpoint: config.connectionUri ?? config.endpoint,
+      host: undefined,
+      port: undefined,
+    });
+  }
+  if (config.type === "dynamodb") {
+    return connectionSecretTarget({
+      ...config,
+      endpoint: config.endpoint ?? config.awsEndpoint,
+      awsEndpoint: undefined,
+      // Legacy static profiles could also carry an inactive profile name.
+      awsProfile:
+        config.awsCredentialMode === "static" ? undefined : config.awsProfile,
+    });
+  }
+  return connectionSecretTarget(config);
 }
 
 export class ConnectionFormPanel {
@@ -371,11 +475,13 @@ export class ConnectionFormPanel {
       existing = structuredClone(existing);
       let storedSecrets: StoredConnectionSecrets = {};
       let secretsRead = true;
+      let revision: string | undefined;
       if (existing.id && usesStoredSecrets(existing)) {
         try {
-          storedSecrets = parseStoredConnectionSecrets(
-            await context.secrets.get(existing.id),
-          );
+          const raw = await readConnectionSecret(context.secrets, existing.id);
+          assertConnectionSecretBinding(existing, raw);
+          storedSecrets = parseStoredConnectionSecrets(raw);
+          revision = readConnectionCredentialRevision(raw);
         } catch {
           secretsRead = false;
         }
@@ -385,7 +491,7 @@ export class ConnectionFormPanel {
         kind: "edit",
         id: existing.id,
         state: secretsRead
-          ? connectionEditState(existing, storedSecrets)
+          ? connectionEditState(existing, storedSecrets, revision)
           : undefined,
       };
       existingForForm = {
@@ -420,34 +526,27 @@ export class ConnectionFormPanel {
     });
   }
 
-  private async resolveSubmittedPassword(
+  private resolveSubmittedPassword(
     payload: ConnectionFormSubmission,
     storedSecrets: StoredConnectionSecrets,
-    useSecretStorage: boolean,
-  ): Promise<string> {
+    existing?: ConnectionConfig,
+  ): string {
     if (payload.password !== undefined && payload.password !== "") {
       return payload.password;
     }
-    if (payload.clearPassword || this.changesStoredConnectionType(payload)) {
+    if (payload.clearPassword) {
       return "";
     }
 
-    if (useSecretStorage && storedSecrets.password !== undefined) {
-      return storedSecrets.password;
-    }
-
-    if (payload.hasStoredSecret && storedSecrets.password !== undefined) {
-      return storedSecrets.password;
-    }
-
-    const existing = this.getStoredConnection(payload.id);
-    return existing?.password ?? payload.password ?? "";
+    return (
+      storedSecrets.password ?? existing?.password ?? payload.password ?? ""
+    );
   }
 
   private getStoredConnection(id: string): ConnectionConfig | undefined {
     return this.savePrecondition.kind === "edit" &&
       id === this.savePrecondition.id
-      ? this.connectionManager.getConnection(id)
+      ? this.connectionManager.getConnection(id, true)
       : undefined;
   }
 
@@ -476,36 +575,54 @@ export class ConnectionFormPanel {
     );
   }
 
-  private async readStoredSecretsSnapshot(id: string): Promise<{
-    parsed: StoredConnectionSecrets;
-    readError?: string;
-  }> {
-    try {
-      const serialized = await this.context.secrets.get(id);
-      return {
-        parsed: parseStoredConnectionSecrets(serialized),
-      };
-    } catch (err: unknown) {
-      return {
-        parsed: {},
-        readError: normalizeUnknownError(err).message,
-      };
-    }
-  }
-
-  private async resolveSubmittedConfig(
+  private resolveSubmittedConfig(
     payload: ConnectionFormSubmission,
-    storedSecrets?: StoredConnectionSecrets,
-  ): Promise<ConnectionConfig> {
-    const storedExisting = this.getStoredConnection(payload.id);
-    const resolvedStoredSecrets = !usesStoredSecrets(storedExisting)
-      ? {}
-      : (storedSecrets ??
-        parseStoredConnectionSecrets(
-          await this.context.secrets.get(payload.id),
-        ));
-    const existing =
+    storedExisting: ConnectionConfig | undefined,
+    storedSecrets: StoredConnectionSecrets,
+  ): ConnectionConfig {
+    if (
+      storedExisting &&
+      this.savePrecondition.kind === "edit" &&
+      this.savePrecondition.state
+    ) {
+      const { ssh } = preserveTrustedSshFingerprint(
+        payload,
+        this.savePrecondition.state,
+        storedExisting,
+      );
+      payload = { ...payload, ssh };
+    }
+    const safeExisting =
       storedExisting && omitAmbiguousCredentialBearingUris(storedExisting);
+    const existingForForm =
+      safeExisting && sanitizeExistingForForm(safeExisting, storedSecrets);
+    const draftTarget =
+      existingForForm &&
+      formCredentialTarget({
+        ...payload,
+        ...(payload.type === "dynamodb" &&
+        payload.awsCredentialMode === undefined &&
+        existingForForm?.type === "dynamodb" &&
+        payload.awsProfile === existingForForm.awsProfile
+          ? {
+              awsCredentialMode: payload.clearAwsCredentials
+                ? payload.awsProfile
+                  ? "profile"
+                  : existingForForm.awsCredentialMode === undefined
+                    ? undefined
+                    : "default"
+                : existingForForm.awsCredentialMode,
+            }
+          : {}),
+      });
+    const mayInherit =
+      storedExisting !== undefined &&
+      getAmbiguousCredentialBearingUriFields(storedExisting).length === 0 &&
+      sameConnectionTofuPin(storedExisting, payload) &&
+      existingForForm !== undefined &&
+      draftTarget === formCredentialTarget(existingForForm, true);
+    const existing = mayInherit ? safeExisting : undefined;
+    const resolvedStoredSecrets = mayInherit ? storedSecrets : {};
     const useSecretStorage = payload.useSecretStorage !== false;
     const isRedisUriSubmission =
       payload.type === "redis" &&
@@ -513,10 +630,10 @@ export class ConnectionFormPanel {
     const password =
       isRedisUriSubmission || !connectionTypeUsesPassword(payload)
         ? undefined
-        : await this.resolveSubmittedPassword(
+        : this.resolveSubmittedPassword(
             payload,
             resolvedStoredSecrets,
-            useSecretStorage,
+            existing,
           );
     const {
       hasStoredSecret: _hasStoredSecret,
@@ -625,11 +742,14 @@ export class ConnectionFormPanel {
     const hasChangedAwsProfile =
       (payload.awsProfile?.trim() ?? "") !==
       (existing?.awsProfile?.trim() ?? "");
-    const effectiveAwsProfile =
-      useAwsProfile &&
-      (payload.clearAwsCredentials === true ||
-        !hasExistingAwsKeyPair ||
-        hasChangedAwsProfile);
+    const ignoreStaticAwsCredentials =
+      payload.type === "dynamodb" &&
+      (payload.awsCredentialMode !== undefined
+        ? payload.awsCredentialMode !== "static"
+        : useAwsProfile &&
+          (payload.clearAwsCredentials === true ||
+            !hasExistingAwsKeyPair ||
+            hasChangedAwsProfile));
     const existingRedisUri =
       existing?.type === "redis"
         ? getExistingRedisUri(existing, resolvedStoredSecrets)
@@ -685,7 +805,7 @@ export class ConnectionFormPanel {
               : resolvedStoredSecrets.endpoint,
             usesLegacyAwsEndpoint ? existing?.awsEndpoint : existing?.endpoint,
           );
-    return normalizeMongoConnectionConfig({
+    const resolved = normalizeMongoConnectionConfig({
       ...rest,
       tls,
       useSecretStorage,
@@ -717,28 +837,53 @@ export class ConnectionFormPanel {
         (!payload.clearApiKey && !prefersElasticsearchBasicAuth
           ? existing?.apiKey
           : undefined),
-      awsAccessKeyId: effectiveAwsProfile
+      awsAccessKeyId: ignoreStaticAwsCredentials
         ? undefined
         : (trimOptionalSecretValue(payload.awsAccessKeyId) ??
           (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
             ? (resolvedStoredSecrets.awsAccessKeyId ?? existing?.awsAccessKeyId)
             : undefined)),
-      awsSecretAccessKey: effectiveAwsProfile
+      awsSecretAccessKey: ignoreStaticAwsCredentials
         ? undefined
         : (trimOptionalSecretValue(payload.awsSecretAccessKey) ??
           (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
             ? (resolvedStoredSecrets.awsSecretAccessKey ??
               existing?.awsSecretAccessKey)
             : undefined)),
-      awsSessionToken: effectiveAwsProfile
+      awsSessionToken: ignoreStaticAwsCredentials
         ? undefined
         : (trimOptionalSecretValue(payload.awsSessionToken) ??
           (!payload.clearAwsCredentials && !hasSubmittedAwsKeyMaterial
             ? (resolvedStoredSecrets.awsSessionToken ??
               existing?.awsSessionToken)
             : undefined)),
+      awsSessionTokenRequired:
+        !ignoreStaticAwsCredentials &&
+        !hasSubmittedAwsKeyMaterial &&
+        !payload.clearAwsCredentials &&
+        existing?.awsSessionTokenRequired === true
+          ? true
+          : undefined,
       ssh,
     });
+    if (
+      resolved.type === "dynamodb" &&
+      resolved.awsCredentialMode === undefined
+    ) {
+      // Older form messages can still make an explicit switch via the former
+      // removal control or by entering a different profile name.
+      resolved.awsCredentialMode =
+        (ignoreStaticAwsCredentials && hasChangedAwsProfile
+          ? "profile"
+          : undefined) ??
+        (payload.clearAwsCredentials
+          ? hasAwsProfile
+            ? "profile"
+            : "default"
+          : undefined) ??
+        resolveAwsCredentialMode(resolved);
+    }
+    return resolved;
   }
 
   private async handleMessage(msg: unknown): Promise<void> {
@@ -774,29 +919,55 @@ export class ConnectionFormPanel {
         }
         this.saveInProgress = true;
         try {
-          const previousSecretSnapshot: {
-            parsed: StoredConnectionSecrets;
-            readError?: string;
-          } = usesStoredSecrets(this.getStoredConnection(payload.id))
-            ? await this.readStoredSecretsSnapshot(payload.id)
-            : { parsed: {} };
-          if (this.disposed) return;
           const existing = this.getStoredConnection(payload.id);
-          if (previousSecretSnapshot.readError && usesStoredSecrets(existing)) {
+          let storedSecrets: StoredConnectionSecrets = {};
+          let revision: string | undefined;
+          try {
+            if (existing && usesStoredSecrets(existing)) {
+              const raw = await readConnectionSecret(
+                this.context.secrets,
+                payload.id,
+              );
+              assertConnectionSecretBinding(existing, raw);
+              storedSecrets = parseStoredConnectionSecrets(raw);
+              revision = readConnectionCredentialRevision(raw);
+            }
+          } catch (error) {
+            if (this.disposed) return;
             this.panel.webview.postMessage({
               type: "saveResult",
               payload: {
                 success: false,
-                error: `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing connection data was not changed.`,
+                error: `SecretStorage unavailable: ${normalizeUnknownError(error).message}. Existing connection data was not changed.`,
               },
             });
             return;
           }
-          const raw = await this.resolveSubmittedConfig(
-            payload,
-            previousSecretSnapshot.parsed,
-          );
           if (this.disposed) return;
+          if (
+            existing &&
+            this.savePrecondition.kind === "edit" &&
+            this.savePrecondition.state &&
+            !connectionEditStatesMatch(
+              this.savePrecondition.state,
+              connectionEditState(existing, storedSecrets, revision),
+            )
+          ) {
+            this.panel.webview.postMessage({
+              type: "saveResult",
+              payload: {
+                success: false,
+                error:
+                  "This connection changed since the editor was opened. Reopen Edit Connection before saving.",
+              },
+            });
+            return;
+          }
+          const raw = this.resolveSubmittedConfig(
+            payload,
+            existing,
+            storedSecrets,
+          );
           if (
             hasUnresolvedAmbiguousStoredUri(
               existing,
@@ -841,15 +1012,14 @@ export class ConnectionFormPanel {
           if (
             requiresStoredPasswordRecovery &&
             inlinePassword === undefined &&
-            previousSecretSnapshot.parsed.password === undefined
+            storedSecrets.password === undefined
           ) {
             this.panel.webview.postMessage({
               type: "saveResult",
               payload: {
                 success: false,
-                error: previousSecretSnapshot.readError
-                  ? `SecretStorage unavailable: ${previousSecretSnapshot.readError}. Existing credentials were preserved; re-enter password to continue.`
-                  : "Existing stored password could not be loaded. Existing credentials were preserved; re-enter password to continue.",
+                error:
+                  "Existing stored password could not be loaded. Existing credentials were preserved; re-enter password to continue.",
               },
             });
             return;
@@ -902,6 +1072,8 @@ export class ConnectionFormPanel {
                 payload.clearAwsCredentials === true ||
                 (raw.type === "dynamodb" &&
                   (hasSubmittedAwsKeyMaterial ||
+                    raw.awsCredentialMode === "profile" ||
+                    raw.awsCredentialMode === "default" ||
                     (Boolean(raw.awsProfile?.trim()) &&
                       !(
                         trimOptionalSecretValue(raw.awsAccessKeyId) &&
@@ -963,11 +1135,50 @@ export class ConnectionFormPanel {
         this.testAbortController = controller;
         const { signal } = controller;
         try {
-          const raw = await this.resolveSubmittedConfig(payload);
+          const initial = this.getStoredConnection(payload.id);
+          const serialized =
+            initial && usesStoredSecrets(initial)
+              ? await readConnectionSecret(this.context.secrets, payload.id)
+              : undefined;
           if (signal.aborted) break;
+          const current = this.getStoredConnection(payload.id);
+          const storedSecrets = parseStoredConnectionSecrets(serialized);
+          let raw: ConnectionConfig;
+          if (this.savePrecondition.kind === "edit") {
+            const expected = this.savePrecondition.state;
+            if (!expected || !initial || !current) {
+              throw new Error(
+                "Could not verify the saved connection. Reopen Edit Connection before testing.",
+              );
+            }
+            if (usesStoredSecrets(initial)) {
+              assertConnectionSecretBinding(initial, serialized);
+            }
+            if (usesStoredSecrets(current)) {
+              assertConnectionSecretBinding(current, serialized);
+            }
+            const revision = readConnectionCredentialRevision(serialized);
+            if (
+              !connectionEditStatesMatch(
+                expected,
+                connectionEditState(initial, storedSecrets, revision),
+              ) ||
+              !connectionEditStatesMatch(
+                expected,
+                connectionEditState(current, storedSecrets, revision),
+              )
+            ) {
+              throw new Error(
+                "This connection changed since the editor was opened. Reopen Edit Connection before testing.",
+              );
+            }
+            raw = this.resolveSubmittedConfig(payload, current, storedSecrets);
+          } else {
+            raw = this.resolveSubmittedConfig(payload, undefined, {});
+          }
           if (
             hasUnresolvedAmbiguousStoredUri(
-              this.getStoredConnection(payload.id),
+              current,
               raw,
               payload.clearAmbiguousStoredUri,
             )

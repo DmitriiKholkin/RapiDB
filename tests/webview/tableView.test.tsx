@@ -619,7 +619,9 @@ async function initializeCommittedTableData(overrides?: {
   columnDefs?: ColumnTypeMeta[];
   primaryKeyColumns?: string[];
   dataRows?: readonly Record<string, unknown>[];
+  rowUpdateBlockReasons?: Array<string | null>;
   mongoIdTypes?: Array<"objectId" | "string" | null | undefined> | null;
+  mongoRowMutationBlockReason?: string;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   renderOverrides?: {
     mongoRowIdentity?: boolean;
@@ -661,7 +663,11 @@ async function initializeCommittedTableData(overrides?: {
     dispatchIncomingMessage("tableData", {
       fetchId: initialFetch.fetchId,
       rows: committedRows,
+      rowUpdateBlockReasons: overrides?.rowUpdateBlockReasons,
       totalCount: committedCount,
+      ...(overrides?.mongoRowMutationBlockReason
+        ? { mongoRowMutationBlockReason: overrides.mongoRowMutationBlockReason }
+        : {}),
       ...(overrides?.rowValueTypes
         ? { rowValueTypes: overrides.rowValueTypes }
         : {}),
@@ -1113,6 +1119,42 @@ describe("TableView", () => {
     expect(getPostedMessages()).toEqual([]);
   });
 
+  it("disables Mongo edit and delete controls on a blocked page but leaves inserts available", async () => {
+    const user = userEvent.setup();
+    const reason =
+      "MongoDB Table Viewer cannot edit or delete rows: no shard-key routing.";
+    await initializeCommittedTableData({
+      renderOverrides: { mongoRowIdentity: true },
+      columnDefs: [
+        {
+          ...columns[0],
+          name: "_id",
+          type: "string",
+          nativeType: "string",
+          category: "text",
+        },
+        columns[1],
+      ],
+      primaryKeyColumns: ["_id"],
+      dataRows: [{ _id: "one", name: "Visible" }],
+      mongoIdTypes: ["string"],
+      mongoRowMutationBlockReason: reason,
+    });
+    clearPostedMessages();
+    expect(screen.getByRole("alert").textContent).toContain(reason);
+    expect(screen.queryByLabelText("Select row 1")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Delete/ })).toBeNull();
+    await user.dblClick(getBodyCell("name"));
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    await user.click(screen.getByRole("button", { name: "Add Row" }));
+    expect(screen.getByRole("button", { name: "Apply Changes" })).toBeTruthy();
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+    expect(postedMessagesOfType("applyChanges")).toHaveLength(0);
+  });
+
   it("allows a SQL _id string without Mongo metadata or type guessing", async () => {
     const user = userEvent.setup();
     const hex = "507f1f77bcf86cd799439011";
@@ -1206,6 +1248,62 @@ describe("TableView", () => {
         },
       });
     }
+  });
+
+  it("opens unverified Elasticsearch source read-only without blocking full rows or deletion", async () => {
+    const user = userEvent.setup();
+    const reason = "Elasticsearch updates require a complete stored _source.";
+    await initializeCommittedTableData({
+      columnDefs: [
+        {
+          ...columns[0],
+          name: "_id",
+          nativeType: "text",
+          type: "text",
+          category: "text",
+        },
+        {
+          ...columns[0],
+          name: "_identity",
+          nativeType: "text",
+          type: "text",
+          category: "text",
+          isReadOnly: true,
+        },
+        {
+          ...columns[1],
+          name: "_source",
+          nativeType: "json",
+          type: "json",
+          category: "json",
+        },
+      ],
+      primaryKeyColumns: ["_id", "_identity"],
+      dataRows: [
+        { _id: "first", _identity: "first-key", _source: '{"visible":1}' },
+        { _id: "second", _identity: "second-key", _source: '{"full":2}' },
+      ],
+      rowUpdateBlockReasons: [reason, null],
+    });
+    clearPostedMessages();
+    await user.dblClick(getBodyCell("_source", 0));
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(true);
+    expect(screen.getByText(/complete stored _source/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Apply" }));
+    expect(getPostedMessages()).toEqual([]);
+    await user.dblClick(getBodyCell("_source", 1));
+    expect(
+      (screen.getByLabelText("Cell data") as HTMLTextAreaElement).readOnly,
+    ).toBe(false);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("checkbox", { name: "Select row 1" }));
+    await user.click(screen.getByRole("button", { name: /Delete/ }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "deleteRows",
+      payload: { primaryKeysList: [{ _id: "first", _identity: "first-key" }] },
+    });
   });
 
   it("blocks a NULL component of a composite row key", async () => {
@@ -8327,6 +8425,52 @@ describe("TableView", () => {
     });
   });
 
+  it.each([
+    "mongodb",
+    "redis",
+    "dynamodb",
+  ] as const)("sends only the selected row's issued observation for %s grid delete", async (noSqlDeleteBackend) => {
+    const user = userEvent.setup();
+    renderTableView();
+    dispatchIncomingMessage("tableInit", {
+      columns,
+      primaryKeyColumns: ["id"],
+      noSqlDeleteBackend,
+    });
+    await waitFor(() =>
+      expect(postedMessagesOfType("fetchPage")).toHaveLength(1),
+    );
+    const id = "00000000-0000-0000-0000-000000000001";
+    await act(async () => {
+      dispatchIncomingMessage("tableData", {
+        fetchId: lastFetchPayload().fetchId,
+        rows,
+        totalCount: rows.length,
+        noSqlDeleteObservationIds: [null, id],
+      });
+    });
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByLabelText("Select row 2"));
+    await user.click(screen.getByRole("button", { name: "Delete (1)" }));
+    if (noSqlDeleteBackend === "dynamodb") {
+      expect(postedMessagesOfType("deleteRows")).toHaveLength(0);
+    } else {
+      expect(postedMessagesOfType("deleteRows")).toEqual([
+        {
+          type: "deleteRows",
+          payload: {
+            operationId: expect.any(String),
+            primaryKeysList: [{ id: 2 }],
+            noSqlDeleteObservationIds: [id],
+          },
+        },
+      ]);
+    }
+  });
+
   it("sends MongoDB _id types from the selected rows, not the sampled column type", async () => {
     const user = userEvent.setup();
     renderTableView({ mongoRowIdentity: true });
@@ -8364,6 +8508,60 @@ describe("TableView", () => {
           { _id: { $rapidbMongoId: { type: "string", value: id } } },
         ],
       },
+    });
+  });
+
+  it.each([
+    false,
+    true,
+  ])("warns before confirming separate Redis deletes (confirmationOnly=%s)", async (confirmationOnly) => {
+    const user = userEvent.setup();
+    await initializeCommittedTableData();
+    await user.click(screen.getByLabelText("Select row 1"));
+    await user.click(screen.getByLabelText("Select row 2"));
+    await user.click(screen.getByRole("button", { name: "Delete (2)" }));
+    const text = confirmationOnly
+      ? ""
+      : 'EVAL "guard" "1" "a"\n\nEVAL "guard" "1" "b"';
+    await act(async () => {
+      dispatchIncomingMessage("tableMutationPreview", {
+        previewToken: "redis-delete-preview",
+        kind: "deleteRows",
+        title: "Apply changes to items",
+        text,
+        contentType: "text/plain",
+        sql: text,
+        statementCount: 2,
+        confirmationWarning:
+          "Redis deletes keys one at a time. If a key has changed or an operation fails, the result may be partial. Successful deletions are not rolled back.",
+        ...(confirmationOnly && { confirmationOnly }),
+      });
+    });
+    const dialog = screen.getByRole("dialog", {
+      description:
+        /2 planned operations.*one at a time.*partial.*not rolled back/,
+    });
+    if (confirmationOnly) {
+      expect(within(dialog).queryByLabelText("Mutation preview")).toBeNull();
+      expect(
+        within(dialog).getByText("Command preview is disabled in settings."),
+      ).toBeTruthy();
+    } else {
+      expect(
+        (
+          within(dialog).getByLabelText(
+            "Mutation preview",
+          ) as HTMLTextAreaElement
+        ).value,
+      ).toBe(text);
+    }
+    expect(postedMessagesOfType("confirmMutationPreview")).toHaveLength(0);
+    await user.click(
+      within(dialog).getByRole("button", { name: "Delete Keys" }),
+    );
+    expect(getLastPostedMessage()).toEqual({
+      type: "confirmMutationPreview",
+      payload: { previewToken: "redis-delete-preview" },
     });
   });
 

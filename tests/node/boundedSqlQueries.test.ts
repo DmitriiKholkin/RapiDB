@@ -61,6 +61,65 @@ function postgresHarness(run: (query: WireQuery) => void) {
 }
 
 describe("driver-owned result budgets", () => {
+  it("PG drains a size-truncated RETURNING set and preserves a completed write", async () => {
+    const { driver, client } = postgresHarness((query) => {
+      query.handleCommandComplete({ text: "BEGIN" }, {});
+      query.handleRowDescription({
+        fields: [{ ...field("label"), dataTypeID: 25 }],
+      });
+      query.handleDataRow({ fields: ["ok"] });
+      query.handleDataRow({ fields: ["x".repeat(128 * 1024)] });
+      query.handleCommandComplete({ text: "UPDATE 2" }, {});
+      query.handleCommandComplete({ text: "COMMIT" }, {});
+      query.handleReadyForQuery({});
+    });
+    Reflect.set(client, "getTransactionStatus", () => "I");
+    const result = await driver.query(
+      "BEGIN; UPDATE items RETURNING id; COMMIT",
+      undefined,
+      {
+        requestToken: 22,
+        hardCap: 10,
+      },
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.affectedRows).toBe(2);
+    expect(result.resultSets?.[0]).toMatchObject({
+      rows: [{ __col_0: "ok" }],
+      rowCount: 2,
+      truncated: true,
+      truncatedBySize: true,
+    });
+    expect(result.resultSets?.[0].partial).toBeUndefined();
+    expect(client.query).not.toHaveBeenCalledWith("ROLLBACK");
+    expect(client.query).toHaveBeenCalledWith("DISCARD ALL");
+    expect(client.release).toHaveBeenCalledExactlyOnceWith();
+  });
+
+  it("PG discards the client after a local read timeout while draining a size-truncated result", async () => {
+    const { driver, client } = postgresHarness((query) => {
+      query.handleRowDescription({
+        fields: [{ ...field("label"), dataTypeID: 25 }],
+      });
+      query.handleDataRow({ fields: ["ok"] });
+      query.handleDataRow({ fields: ["x".repeat(128 * 1024)] });
+      query.handleError(new Error("Query read timeout"), {});
+    });
+    const result = await driver.query("SELECT id FROM items", undefined, {
+      requestToken: 22,
+      hardCap: 10,
+    });
+    expect(result.error).toContain("may have committed");
+    expect(result.resultSets?.[0]).toMatchObject({
+      rows: [{ __col_0: "ok" }],
+      rowCount: 2,
+      partial: true,
+      truncatedBySize: true,
+    });
+    expect(client.query).toHaveBeenCalledOnce();
+    expect(client.release).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
   it("PG waits for rollback after ErrorResponse before releasing a previously idle client", async () => {
     const client = new Client();
     Reflect.set(client, "readyForQuery", true);

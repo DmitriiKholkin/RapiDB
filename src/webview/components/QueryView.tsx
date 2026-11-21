@@ -1,4 +1,5 @@
 import type React from "react";
+import type { QueryDatabaseFields } from "../../shared/queryDatabaseTarget";
 import type {
   QueryEditorLanguage,
   QueryEditorPresentation,
@@ -9,11 +10,11 @@ import { QueryToolbar } from "./query/QueryToolbar";
 import { queryViewRootStyle } from "./query/queryViewHelpers";
 import { useQueryViewController } from "./query/useQueryViewController";
 
-interface Props {
+interface Props extends QueryDatabaseFields {
   panelId?: string;
   connectionId: string;
-  postgresDatabase?: string;
   targetBinding?: QueryTargetBinding;
+  queryRunStatus?: boolean;
   initialQueryText: string;
   formatOnOpen?: boolean;
   connectionType?: string;
@@ -26,7 +27,9 @@ export function QueryView({
   panelId = "query",
   connectionId,
   postgresDatabase,
+  mssqlDatabase,
   targetBinding,
+  queryRunStatus,
   initialQueryText,
   formatOnOpen,
   connectionType: _connectionType = "",
@@ -34,11 +37,15 @@ export function QueryView({
   editorLanguage,
   editorPresentation,
 }: Props): React.ReactElement {
+  const pinnedDatabase = postgresDatabase ?? mssqlDatabase;
   const view = useQueryViewController({
     panelId,
     connectionId,
+    pinned: pinnedDatabase !== undefined,
     postgresDatabase,
+    mssqlDatabase,
     initialTargetBinding: targetBinding,
+    queryRunStatus,
     editorLanguage,
     editorPresentation,
     formatOnOpen,
@@ -53,15 +60,20 @@ export function QueryView({
         bookmarking={view.bookmarking}
         canFormat={view.editorState.canFormat}
         connectionId={connectionId}
-        postgresDatabase={postgresDatabase}
+        pinnedDatabase={pinnedDatabase}
         pinnedTargetUnavailable={view.pinnedTargetUnavailable}
-        targetReviewRequired={view.targetReviewRequired || view.targetChecking}
+        targetReviewRequired={
+          view.targetReviewRequired ||
+          view.targetChecking ||
+          view.targetChangePending
+        }
         connections={view.connections}
         formatButtonTitle={view.editorState.formatButtonTitle}
         schemaError={view.schemaError}
         schemaLoading={view.schemaLoading}
-        selectedConnectionId={view.activeConnectionId}
+        selectedConnectionId={view.selectedConnectionId}
         status={view.status}
+        runReviewRequired={!!view.unknownRun}
         onBookmark={view.handleBookmark}
         onCancel={view.cancelQuery}
         onClear={view.clearQuery}
@@ -70,26 +82,77 @@ export function QueryView({
         onRun={view.executeQuery}
       />
 
-      {view.targetReviewRequired && !view.targetChecking && (
-        <div role="alert" style={{ padding: "6px 12px", flexShrink: 0 }}>
-          {view.currentTargetAvailable
-            ? "This draft's target changed or could not be verified. Review the connection settings and confirm the target before running."
-            : postgresDatabase !== undefined
-              ? "The pinned target is unavailable. Your draft is preserved."
-              : "The previous target is unavailable. Select a connection to use this draft."}
-          {view.currentTargetAvailable && (
-            <button
-              type="button"
-              style={{ marginLeft: 8 }}
-              onClick={() =>
-                view.handleConnectionChange(view.activeConnectionId)
-              }
-            >
-              Use current target
-            </button>
-          )}
+      {view.unknownRun && (
+        <div
+          role="alert"
+          aria-label="Previous query outcome"
+          style={{ padding: "6px 12px", flexShrink: 0 }}
+        >
+          Previous query outcome is unknown. It may still be running or may
+          already have changed the original database. Verify the original target
+          ({view.unknownRun.connectionId}
+          {view.unknownRun.postgresDatabase !== undefined
+            ? ` / ${JSON.stringify(view.unknownRun.postgresDatabase)} (PostgreSQL)`
+            : view.unknownRun.mssqlDatabase !== undefined
+              ? ` / ${JSON.stringify(view.unknownRun.mssqlDatabase)} (SQL Server)`
+              : ""}
+          ) before running again. No query was retried.
+          <button
+            type="button"
+            style={{ marginLeft: 8 }}
+            onClick={view.acknowledgeUnknown}
+          >
+            I checked the previous query
+          </button>
         </div>
       )}
+      {view.runNotice && (
+        <div role="status" style={{ padding: "6px 12px", flexShrink: 0 }}>
+          {view.runNotice}
+        </div>
+      )}
+
+      {view.targetChangePending && (
+        <div role="status" style={{ padding: "6px 12px", flexShrink: 0 }}>
+          Verifying selected target…
+        </div>
+      )}
+      {view.targetChangeError && (
+        <div
+          role="alert"
+          aria-label="Target change error"
+          style={{ padding: "6px 12px", flexShrink: 0 }}
+        >
+          Could not verify the selected target. Review the active connection or
+          select again.
+        </div>
+      )}
+      {view.targetReviewRequired &&
+        !view.targetChecking &&
+        !view.targetChangePending && (
+          <div
+            role="alert"
+            aria-label="Query target review"
+            style={{ padding: "6px 12px", flexShrink: 0 }}
+          >
+            {view.currentTargetAvailable
+              ? "This draft's target changed or could not be verified. Review the connection settings and confirm the target before running."
+              : pinnedDatabase !== undefined
+                ? "The pinned target is unavailable. Your draft is preserved."
+                : "The previous target is unavailable. Select a connection to use this draft."}
+            {view.currentTargetAvailable && (
+              <button
+                type="button"
+                style={{ marginLeft: 8 }}
+                onClick={() =>
+                  view.handleConnectionChange(view.activeConnectionId)
+                }
+              >
+                Use current target
+              </button>
+            )}
+          </div>
+        )}
 
       {view.bookmarkError && (
         <div

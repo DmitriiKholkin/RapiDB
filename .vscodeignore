@@ -15,12 +15,11 @@
 # Preserve the existing external dependency/runtime closure, including any
 # package-owned certificates or keys. These are trusted dependency roots, not
 # locations for local credentials. Do not broaden the application paths above.
+# The native SQLite runtime (better-sqlite3) is not packaged: it is downloaded
+# on demand from the npm registry and verified against reviewed pins.
 # vsce negations override exclusions regardless of order: a broad !dist/** or
 # !media/** cannot be made safe by appending .env / *.key exclusion patterns.
 !node_modules/oracledb/**
-!.rapidb-runtime/node_modules/better-sqlite3/**
-!.rapidb-runtime/node_modules/bindings/**
-!.rapidb-runtime/node_modules/file-uri-to-path/**
 !node_modules/ssh2/package.json
 !node_modules/ssh2/LICENSE
 !node_modules/ssh2/lib/*.js

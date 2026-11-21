@@ -12,25 +12,38 @@ describe("credential-bearing connection URI editing", () => {
     );
   });
 
-  it("does not append a duplicate secret query option with different key casing", () => {
+  it("does not carry old userinfo or secret query options to a changed destination", () => {
+    const submitted =
+      "https://elastic.local/other?mode=fast&API_KEY=new-secret";
     expect(
       restoreCredentialBearingUri(
-        "https://elastic.local/other?API_KEY=new-secret",
-        "https://u:p@elastic.local/base?api_key=old-secret",
+        submitted,
+        "https://u:p@elastic.local/base?mode=slow&api_key=old-secret&token=old-token",
         true,
       ),
-    ).toBe("https://u:p@elastic.local/other?API_KEY=new-secret");
+    ).toBe(submitted);
   });
 
-  it("keeps query secrets before a URI fragment when editing the endpoint", () => {
+  it("keeps one explicit secret query option regardless of key casing at the same destination", () => {
+    const submitted = "https://elastic.local/base?mode=fast&API_KEY=new-secret";
     expect(
       restoreCredentialBearingUri(
-        "https://elastic.local/edited?mode=fast#dashboard",
-        "https://u:p@elastic.local/base?api_key=old-secret&keep=yes#section",
+        submitted,
+        "https://u:p@elastic.local/base?mode=fast&api_key=old-secret",
+        true,
+      ),
+    ).toBe(submitted);
+  });
+
+  it("restores a query secret before the URI fragment at the same destination", () => {
+    expect(
+      restoreCredentialBearingUri(
+        "https://elastic.local/base?mode=fast#dashboard",
+        "https://u:p@elastic.local/base?mode=fast&api_key=old-secret#dashboard",
         true,
       ),
     ).toBe(
-      "https://u:p@elastic.local/edited?mode=fast&api_key=old-secret#dashboard",
+      "https://u:p@elastic.local/base?mode=fast&api_key=old-secret#dashboard",
     );
   });
 });

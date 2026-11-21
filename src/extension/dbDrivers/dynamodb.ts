@@ -67,9 +67,14 @@ import {
 import { allowReadOnlyQuery, denyReadOnlyQuery } from "../utils/readOnlyGuards";
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import {
-  buildDynamoDBClientConfig,
   DynamoDBSshRequestHandler,
+  resolveDynamoDBEndpoint,
+  routeDynamoDBStsThroughSsh,
 } from "./dynamodbConnection";
+import {
+  type DynamoDBTarget,
+  DynamoDBTargetChangedError,
+} from "./dynamodbTarget";
 import { getMetadataContext } from "./metadataCancellation";
 import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
@@ -81,6 +86,10 @@ import {
   pageRows,
   splitInFilterValues,
 } from "./nosqlUtils";
+import {
+  isServerReportedQueryError,
+  markQueryNotSent,
+} from "./queryErrorOutcome";
 import { throwIfQueryCancelled } from "./timeout";
 import type {
   ColumnMeta,
@@ -516,6 +525,8 @@ export class DynamoDBDriver implements IDBDriver {
   private publishedConnectionAttempt: Promise<void> | null = null;
   private connectionAbortController?: AbortController;
   private pendingClient: DynamoDBClient | null = null;
+  private target?: DynamoDBTarget;
+  private pendingTarget?: DynamoDBTarget;
   private readonly destroyedClients = new WeakSet<DynamoDBClient>();
   private readonly cursorCache = new Map<string, DynamoCursorSession>();
   private readonly describedColumnsCache = new Map<string, ColumnTypeMeta[]>();
@@ -525,7 +536,9 @@ export class DynamoDBDriver implements IDBDriver {
 
   connect(): Promise<void> {
     if (this.connected) {
-      return Promise.resolve();
+      return this.isConnected()
+        ? Promise.resolve()
+        : Promise.reject(new DynamoDBTargetChangedError());
     }
     if (this.connectionAttempt) return this.connectionAttempt;
     const epoch = ++this.connectionEpoch;
@@ -569,45 +582,61 @@ export class DynamoDBDriver implements IDBDriver {
       );
     }
 
-    const client = new DynamoDBClient({
-      ...buildDynamoDBClientConfig(this.config),
-      ...sshEndpoint?.clientConfig,
-      requestHandler:
-        sshEndpoint && sshTcpTransport
-          ? new DynamoDBSshRequestHandler(
-              sshEndpoint,
-              sshTcpTransport,
-              tlsServername,
-            )
-          : sshAgentTransport
-            ? new NodeHttpHandler({
-                httpAgent: sshAgentTransport.httpAgent,
-                httpsAgent: sshAgentTransport.httpsAgent,
-              })
-            : tlsServername
-              ? new NodeHttpHandler({
-                  httpsAgent: new https.Agent({
-                    keepAlive: true,
-                    servername: tlsServername,
-                  }),
-                })
-              : undefined,
-    });
-
-    this.pendingClient = client;
+    const resolved =
+      sshEndpoint ?? (await resolveDynamoDBEndpoint(this.config, signal));
+    this.assertConnectionEpoch(epoch);
+    const { target } = resolved;
+    this.pendingTarget = target;
+    let client: DynamoDBClient | undefined;
     try {
+      if (sshEndpoint && sshTcpTransport) {
+        routeDynamoDBStsThroughSsh(sshEndpoint, sshTcpTransport);
+      }
+      await target.initialize();
+      this.assertConnectionEpoch(epoch);
+      client = new DynamoDBClient({
+        maxAttempts: 1,
+        ...resolved.clientConfig,
+        credentials: target.credentials,
+        requestHandler:
+          sshEndpoint && sshTcpTransport
+            ? new DynamoDBSshRequestHandler(
+                sshEndpoint,
+                sshTcpTransport,
+                tlsServername,
+              )
+            : sshAgentTransport
+              ? new NodeHttpHandler({
+                  httpAgent: sshAgentTransport.httpAgent,
+                  httpsAgent: sshAgentTransport.httpsAgent,
+                })
+              : tlsServername || target.isAws
+                ? new NodeHttpHandler({
+                    httpsAgent: new https.Agent({
+                      keepAlive: true,
+                      servername: tlsServername,
+                      ...(target.isAws ? { rejectUnauthorized: true } : {}),
+                    }),
+                  })
+                : undefined,
+      });
+
+      this.pendingClient = client;
       await client.send(new ListTablesCommand({ Limit: 1 }), {
         abortSignal: signal,
       });
       this.assertConnectionEpoch(epoch);
     } catch (error) {
-      this.destroyClient(client);
+      target.dispose();
+      if (client) this.destroyClient(client);
       throw error;
     } finally {
       if (this.pendingClient === client) this.pendingClient = null;
+      if (this.pendingTarget === target) this.pendingTarget = undefined;
     }
 
     this.client = client;
+    this.target = target;
     this.publishedConnectionAttempt = attempt;
     this.connected = true;
     this.cursorCache.clear();
@@ -635,6 +664,10 @@ export class DynamoDBDriver implements IDBDriver {
     this.connectionAbortController = undefined;
     this.connectionAttempt = null;
     this.publishedConnectionAttempt = null;
+    this.pendingTarget?.dispose();
+    this.target?.dispose();
+    this.pendingTarget = undefined;
+    this.target = undefined;
     const client = this.client;
     const pendingClient = this.pendingClient;
     this.client = null;
@@ -647,7 +680,17 @@ export class DynamoDBDriver implements IDBDriver {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    return this.connected && this.target?.fingerprint !== undefined;
+  }
+
+  getDynamoDBTargetFingerprint(): string | undefined {
+    return this.target?.fingerprint;
+  }
+
+  async verifyDynamoDBTarget(): Promise<void> {
+    if (!this.target)
+      throw new Error("[RapiDB] DynamoDB target is unavailable.");
+    await this.target.verify();
   }
 
   getEntityManifest(): DriverEntityManifest {
@@ -965,11 +1008,15 @@ export class DynamoDBDriver implements IDBDriver {
     options?: QueryExecutionOptions,
   ): Promise<QueryResult> {
     throwIfQueryCancelled(options);
-    const inputs = parseDynamoDbNativeQueryInputs(queryText);
-    const operation = this.resolveNativeOperation(inputs);
-    const preparedInputs = inputs.map((input) =>
-      this.requireInputRecord(input),
-    );
+    let operation: DynamoDbNativeOperationName;
+    let preparedInputs: Record<string, unknown>[];
+    try {
+      const inputs = parseDynamoDbNativeQueryInputs(queryText);
+      operation = this.resolveNativeOperation(inputs);
+      preparedInputs = inputs.map((input) => this.requireInputRecord(input));
+    } catch (error: unknown) {
+      throw markQueryNotSent(error);
+    }
     const startedAt = Date.now();
     const rawRows: Record<string, unknown>[] = [];
     const responseMetadata: Record<string, unknown>[] = [];
@@ -977,6 +1024,7 @@ export class DynamoDBDriver implements IDBDriver {
     let sawMutation = false;
     let affectedRowsUnknown = false;
     let partialError: string | undefined;
+    let serverReportedError = false;
 
     const isMutation = !READ_ONLY_DYNAMODB_OPERATIONS.has(operation);
     const total = preparedInputs.length;
@@ -1001,6 +1049,8 @@ export class DynamoDBDriver implements IDBDriver {
         }
         const message = error instanceof Error ? error.message : String(error);
         const request = `request ${index + 1} of ${total}`;
+        serverReportedError =
+          !options?.signal?.aborted && isServerReportedQueryError(error);
         partialError = options?.signal?.aborted
           ? `DynamoDB ${operation} script was cancelled during ${request} after ${completedText(index)}. The outcome of ${request} is unknown and the remaining requests were not sent.`
           : this.isConditionalCheckFailure(error) ||
@@ -1077,6 +1127,9 @@ export class DynamoDBDriver implements IDBDriver {
           : {}),
       executionTimeMs: Date.now() - startedAt,
       ...(partialError !== undefined ? { error: partialError } : {}),
+      ...(partialError !== undefined && serverReportedError
+        ? { serverReportedError: true }
+        : {}),
     };
   }
 

@@ -1,8 +1,11 @@
 import { Query, type QueryArrayConfig, type QueryArrayResult } from "pg";
 import pgPackage from "pg/package.json";
 import { BoundedQueryRows } from "./boundedQueryRows";
+import { PostgresQueryResultBudget } from "./postgresQueryResultBudget";
 
-type Result = QueryArrayResult<unknown[]>;
+type Result = QueryArrayResult<unknown[]> & {
+  parseRow(fields: readonly unknown[]): unknown[];
+};
 type Completion = (error: Error | null, result?: Result) => void;
 export type BoundedPgResultField = {
   name: string;
@@ -13,6 +16,7 @@ export type BoundedPgResultSet = {
   rows: unknown[][];
   rowCount: number;
   truncated: boolean;
+  truncatedBySize?: boolean;
   completed: boolean;
   partial?: boolean;
 };
@@ -127,10 +131,6 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
   readonly resultSets: BoundedPgResultSet[] = [];
   resultSetsTruncated = false;
   affectedRows: number | undefined;
-  private readonly resultSetByBuilder = new WeakMap<
-    object,
-    BoundedPgResultSet
-  >();
   private activeResultSet: BoundedPgResultSet | undefined;
   private activeResultSetCompleted = false;
   private retainedRowCount = 0;
@@ -142,23 +142,45 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
     values: unknown[],
     limit: number,
     complete: Completion,
+    private readonly budget = new PostgresQueryResultBudget(),
   ) {
     super({ text, values, rowMode: "array" }, complete);
     assertStreamingCompatibility(this);
     this.retained = new BoundedQueryRows(limit);
-    this.on("row", (row, result) => {
-      const output = this.resultSetByBuilder.get(result as object);
-      if (!output) return;
-      output.rowCount++;
-      if (this.retainedRowCount < this.retained.limit) {
-        this.retained.add(row);
-        this.retainedRowCount++;
+  }
+
+  override handleDataRow(message: { fields: unknown[] }): void {
+    const output = this.activeResultSet;
+    if (!output || this._canceledDueToError !== false) return;
+    let row: unknown[] | undefined;
+    if (!output.truncated && this.retainedRowCount < this.retained.limit) {
+      const wireBytes = this.budget.wireRowSize(message.fields);
+      if (wireBytes === undefined) {
+        output.truncatedBySize = true;
       } else {
-        this.retained.rowCount++;
-        output.truncated = true;
+        // Match pg's parser-error handling, which reports the error at
+        // ReadyForQuery. A size limit is NOT a parser/execution error.
+        let decoded: unknown[];
+        try {
+          decoded = this._result.parseRow(message.fields);
+        } catch (error) {
+          this._canceledDueToError = error as Error;
+          return;
+        }
+        if (this.budget.retainRow(decoded, wireBytes)) row = decoded;
+        else output.truncatedBySize = true;
       }
-      output.rows = this.retained.rows;
-    });
+    }
+    output.rowCount++;
+    if (row) {
+      this.retained.add(row);
+      this.retainedRowCount++;
+    } else {
+      // Keep a prefix in each set. Drain/count subsequent rows and continue
+      // executing the script without decoding data that won't be displayed.
+      this.retained.rowCount++;
+      output.truncated = true;
+    }
   }
 
   override _checkForMultirow(): void {
@@ -173,7 +195,6 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
   }
 
   override handleRowDescription(message: unknown): void {
-    super.handleRowDescription(message);
     const fields =
       (message as { fields?: BoundedPgResultField[] }).fields ?? [];
     this.seenResultSetCount++;
@@ -182,14 +203,17 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
     if (
       this.seenResultSetCount > POSTGRES_MAX_RETAINED_RESULT_SETS ||
       this.retainedColumnCount + fields.length >
-        POSTGRES_MAX_RETAINED_RESULT_COLUMNS
+        POSTGRES_MAX_RETAINED_RESULT_COLUMNS ||
+      !this.budget.retainFields(fields)
     ) {
+      this._checkForMultirow();
       this.resultSetsTruncated = true;
       this._accumulateRows = false;
       return;
     }
+    super.handleRowDescription(message);
     const output: BoundedPgResultSet = {
-      fields: fields.map((field) => ({ ...field })),
+      fields: fields.map(({ name, dataTypeID }) => ({ name, dataTypeID })),
       rows: this.retained.rows,
       rowCount: 0,
       truncated: false,
@@ -197,7 +221,6 @@ export class BoundedPostgresQuery extends StreamingQueryBase {
     };
     this.resultSets.push(output);
     this.retainedColumnCount += fields.length;
-    this.resultSetByBuilder.set(this._result, output);
     this.activeResultSet = output;
     this.activeResultSetCompleted = false;
     this._accumulateRows = false;

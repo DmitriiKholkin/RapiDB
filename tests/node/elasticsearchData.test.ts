@@ -6,6 +6,7 @@ import { ELASTICSEARCH_READ_BUDGET } from "../../src/shared/safetyContracts";
 import {
   elasticsearchIndexSettings,
   elasticsearchKeys,
+  elasticsearchSourceMetadata,
 } from "../support/elasticsearchIdentity";
 
 const elasticDatetimeColumn: ColumnTypeMeta = {
@@ -83,7 +84,9 @@ function createDriver() {
       getMapping,
       getSettings,
       create: createIndex,
-      get: get.mockResolvedValue({}),
+      get: vi.fn(async ({ index }: { index: string }) =>
+        elasticsearchSourceMetadata(index),
+      ),
       delete: vi.fn().mockResolvedValue({ acknowledged: true }),
       putMapping: vi.fn().mockResolvedValue({ acknowledged: true }),
       putSettings: vi.fn().mockResolvedValue({ acknowledged: true }),
@@ -773,52 +776,58 @@ describe("ElasticsearchDriver — metadata and pages", () => {
       undefined,
     );
     expect(
-      driver.buildMutationPreviewStatement(
-        "insert",
-        "default",
-        "indices",
-        "users",
-        {
-          values: {
-            _id: "doc-3",
-            email: "charlie@example.com",
-            active: true,
+      (
+        await driver.buildMutationPreviewStatements(
+          "insert",
+          "default",
+          "indices",
+          "users",
+          {
+            values: {
+              _id: "doc-3",
+              email: "charlie@example.com",
+              active: true,
+            },
           },
-        },
-      ),
+        )
+      )[0],
     ).toBe(
       'PUT /users/_doc/doc-3?op_type=create&refresh=wait_for\n{\n  "email": "charlie@example.com",\n  "active": true\n}',
     );
     expect(
-      driver.buildMutationPreviewStatement(
-        "update",
-        "default",
-        "indices",
-        "users",
-        {
-          primaryKeys: elasticsearchKeys(driver, "doc-3"),
-          changes: { active: false },
-        },
-      ),
+      (
+        await driver.buildMutationPreviewStatements(
+          "update",
+          "default",
+          "indices",
+          "users",
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
+            changes: { active: false },
+          },
+        )
+      )[0],
     ).toBe(
       'POST /users/_update/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for\n{\n  "doc": {\n    "active": false\n  }\n}',
     );
     expect(
-      driver.buildMutationPreviewStatement(
-        "delete",
-        "default",
-        "indices",
-        "users",
-        {
-          primaryKeys: elasticsearchKeys(driver, "doc-3"),
-        },
-      ),
+      (
+        await driver.buildMutationPreviewStatements(
+          "delete",
+          "default",
+          "indices",
+          "users",
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
+          },
+        )
+      )[0],
     ).toBe(
       "DELETE /users/_doc/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for",
     );
   });
 
-  it("normalizes viewer-formatted datetime edits back to REST payload syntax", () => {
+  it("normalizes viewer-formatted datetime edits back to REST payload syntax", async () => {
     const { driver } = createDriver();
 
     const coerced = driver.coerceInputValue(
@@ -828,16 +837,18 @@ describe("ElasticsearchDriver — metadata and pages", () => {
 
     expect(coerced).toBe("2026-04-01T09:00:00.123+00:00");
     expect(
-      driver.buildMutationPreviewStatement(
-        "update",
-        "default",
-        "indices",
-        "users",
-        {
-          primaryKeys: elasticsearchKeys(driver, "doc-3"),
-          changes: { created_at: coerced },
-        },
-      ),
+      (
+        await driver.buildMutationPreviewStatements(
+          "update",
+          "default",
+          "indices",
+          "users",
+          {
+            primaryKeys: elasticsearchKeys(driver, "doc-3"),
+            changes: { created_at: coerced },
+          },
+        )
+      )[0],
     ).toBe(
       'POST /users/_update/doc-3?if_seq_no=3&if_primary_term=1&refresh=wait_for\n{\n  "doc": {\n    "created_at": "2026-04-01T09:00:00.123+00:00"\n  }\n}',
     );

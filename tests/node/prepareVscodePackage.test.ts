@@ -73,15 +73,11 @@ describe("VS Code package preparation", () => {
     }
   });
 
-  it("refreshes the SQLite scaffold and prunes only the intended Oracle artifacts", async () => {
+  it("removes the former SQLite scaffold and prunes only the intended Oracle artifacts", async () => {
     const { root, workspace, script } = await fixture();
-    const sqliteFiles = [
-      "better-sqlite3/package.json",
-      "better-sqlite3/lib/index.js",
-      "bindings/bindings.js",
-      "file-uri-to-path/index.js",
-    ];
     const unwanted = [
+      ".rapidb-runtime/node_modules/better-sqlite3/lib/index.js",
+      ".rapidb-runtime/node_modules/better-sqlite3/build/Release/better_sqlite3.node",
       stagedFile,
       runtimeFile,
       oracleReadme,
@@ -90,15 +86,13 @@ describe("VS Code package preparation", () => {
       "node_modules/oracledb/lib/native-buildinfo.txt",
     ];
     const kept = [
-      "node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+      "node_modules/better-sqlite3/lib/index.js",
+      "node_modules/better-sqlite3/prebuilds/darwin-arm64.node",
       "node_modules/oracledb/lib/thin/index.js",
       "node_modules/unrelated/README.md",
     ];
     for (const file of [...unwanted, ...kept]) {
       await put(workspace, file);
-    }
-    for (const file of sqliteFiles) {
-      await put(workspace, `node_modules/${file}`, file);
     }
     const foreign = join(root, "unrelated");
     const foreignFile = "outside-buildinfo.txt";
@@ -119,19 +113,7 @@ describe("VS Code package preparation", () => {
     for (const file of kept) {
       expect(await readFile(join(workspace, file), "utf8")).toBe(sentinel);
     }
-    for (const file of sqliteFiles) {
-      expect(
-        await readFile(
-          join(workspace, ".rapidb-runtime/node_modules", file),
-          "utf8",
-        ),
-      ).toBe(file);
-    }
-    expect(
-      existsSync(
-        join(workspace, ".rapidb-runtime/node_modules/better-sqlite3/build"),
-      ),
-    ).toBe(false);
+    expect(existsSync(join(workspace, ".rapidb-runtime"))).toBe(false);
     expect(await readFile(join(foreign, foreignFile), "utf8")).toBe(sentinel);
   });
 

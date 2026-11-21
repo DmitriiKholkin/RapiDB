@@ -13,6 +13,7 @@ import {
   compareNumericTokens,
   NUMERIC_COMPARISON_LIMITS,
 } from "../../src/shared/numericNormalization";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 const numeric = [{ name: "value", category: "decimal" as const }];
 const request: DriverTablePageRequest = {
@@ -465,6 +466,7 @@ function mongo(documents: Record<string, unknown>[], emptySchema = false) {
     const cursor = {
       limit: vi.fn(() => cursor),
       sort: vi.fn(() => cursor),
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
       toArray: vi.fn(async () =>
         emptySchema && find.mock.calls.length === 1 ? [] : documents,
       ),

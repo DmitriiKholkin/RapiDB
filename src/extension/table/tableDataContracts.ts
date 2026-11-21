@@ -9,8 +9,11 @@ import type { ApplyResultPayload } from "../../shared/webviewContracts";
 import type { SQLiteAttachmentTarget } from "../dbDrivers/sqliteAttachmentTarget";
 import type {
   ColumnTypeMeta,
+  IDBDriver,
   MongoValueTypeHint,
   MutationSqlExpression,
+  NoSqlDeleteObservation,
+  PreparedObservedDelete,
   TransactionOperation,
   TransactionVerification,
 } from "../dbDrivers/types";
@@ -23,7 +26,9 @@ export interface SortConfig {
 export interface TablePage {
   columns: ColumnTypeMeta[];
   rows: Record<string, unknown>[];
+  rowUpdateBlockReasons?: Array<string | null>;
   mongoIdTypes?: Array<"objectId" | "string" | null>;
+  mongoRowMutationBlockReason?: string;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   sqliteRowIdentities?: SQLiteRowIdentity[];
@@ -33,6 +38,7 @@ export interface TablePage {
   mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[];
   oracleTemporalRowIdentities?: OracleTemporalRowIdentity[];
   sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
+  noSqlDeleteObservations?: Array<NoSqlDeleteObservation | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -69,10 +75,12 @@ export interface PreparedDeletePlan {
   mode?: "sql" | "driver";
   executionMode: "sequential" | "transaction";
   primaryKeyValuesList?: Record<string, unknown>[];
+  observedDelete?: { driver: IDBDriver; plan: PreparedObservedDelete };
   rowIdentities?: Record<string, unknown>[];
   operations: TransactionOperation[];
   previewStatements: string[];
   verificationCriteriaList: Record<string, unknown>[];
+  sqlTableReference?: string;
 }
 
 export interface VerificationTarget {

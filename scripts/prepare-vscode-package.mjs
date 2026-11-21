@@ -1,8 +1,6 @@
 import {
-  cpSync,
   existsSync,
   lstatSync,
-  mkdirSync,
   readdirSync,
   realpathSync,
   rmSync,
@@ -48,53 +46,6 @@ function removeMatchingFiles(directoryPath, matcher) {
   }
 }
 
-function copyIfExists(sourcePath, targetPath) {
-  if (!existsSync(sourcePath)) {
-    return;
-  }
-  mkdirSync(path.dirname(targetPath), { recursive: true });
-  cpSync(sourcePath, targetPath, {
-    recursive: true,
-    force: true,
-  });
-}
-
-function copyPackageFiles(
-  sourceNodeModules,
-  runtimeNodeModules,
-  packageName,
-  files,
-) {
-  for (const relativePath of files) {
-    copyIfExists(
-      path.join(sourceNodeModules, packageName, relativePath),
-      path.join(runtimeNodeModules, packageName, relativePath),
-    );
-  }
-}
-
-function prepareSqliteRuntimeScaffold(sourceNodeModules, runtimeRoot) {
-  const runtimeNodeModules = path.join(runtimeRoot, "node_modules");
-  removeIfExists(runtimeRoot);
-  mkdirSync(runtimeNodeModules, { recursive: true });
-
-  copyPackageFiles(sourceNodeModules, runtimeNodeModules, "better-sqlite3", [
-    "package.json",
-    "LICENSE",
-    "lib",
-  ]);
-  copyPackageFiles(sourceNodeModules, runtimeNodeModules, "bindings", [
-    "package.json",
-    "bindings.js",
-    "LICENSE.md",
-  ]);
-  copyPackageFiles(sourceNodeModules, runtimeNodeModules, "file-uri-to-path", [
-    "package.json",
-    "index.js",
-    "LICENSE",
-  ]);
-}
-
 function pruneOracleRuntime(oracledbRoot) {
   if (!existsSync(oracledbRoot)) {
     return;
@@ -129,6 +80,8 @@ if (realpathSync(process.cwd()) !== workspaceRoot) {
 }
 
 const stagingRoot = path.join(workspaceRoot, ".rapidb-vscode");
+// Former packaged better-sqlite3 scaffold. The SQLite runtime is now
+// downloaded on demand from the npm registry, so no part of it is packaged.
 const runtimeRoot = path.join(workspaceRoot, ".rapidb-runtime");
 const sourceNodeModules = path.join(workspaceRoot, "node_modules");
 const oracledbRoot = path.join(sourceNodeModules, "oracledb");
@@ -143,9 +96,9 @@ for (const directory of [
 }
 
 removeIfExists(stagingRoot);
-prepareSqliteRuntimeScaffold(sourceNodeModules, runtimeRoot);
+removeIfExists(runtimeRoot);
 pruneOracleRuntime(oracledbRoot);
 
 console.log(
-  "[RapiDB Package] Prepared the packaged SQLite scaffold, cleaned staged SQLite artifacts, and pruned Oracle thick-mode packaging leftovers.",
+  "[RapiDB Package] Removed staged SQLite artifacts and pruned Oracle thick-mode packaging leftovers.",
 );

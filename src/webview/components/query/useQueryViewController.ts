@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { QueryDatabaseFields } from "../../../shared/queryDatabaseTarget";
 import {
   isRecord,
   parseBookmarkSavedPayload,
+  parseQueryRunIdentity,
+  parseQueryRunOutcome,
   parseQueryTargetBinding,
+  parseQueryTargetChangeResult,
   type QueryBookmarkPayload,
   type QueryEditorLanguage,
   type QueryEditorPresentation,
+  type QueryRunIdentity,
   type QuerySchemaPayload,
   type QueryTargetBinding,
+  sameQueryRun,
 } from "../../../shared/webviewContracts";
 import {
   type ConnectionEntry,
@@ -30,6 +36,7 @@ import {
   resolveQueryEditorState,
   TOOLBAR_H,
 } from "./queryViewHelpers";
+import { useQueryRunRecovery } from "./useQueryRunRecovery";
 
 const BLANK_QUERY_VALIDATION_MESSAGE =
   "Select or enter a query before running.";
@@ -84,11 +91,12 @@ function isQueryResult(
   );
 }
 
-interface QueryViewControllerParams {
+interface QueryViewControllerParams extends QueryDatabaseFields {
   panelId: string;
   connectionId: string;
-  postgresDatabase?: string;
+  pinned?: boolean;
   initialTargetBinding?: QueryTargetBinding;
+  queryRunStatus?: boolean;
   editorLanguage?: QueryEditorLanguage;
   editorPresentation?: QueryEditorPresentation;
   formatOnOpen?: boolean;
@@ -126,8 +134,11 @@ function readQueryDraft(
 export function useQueryViewController({
   panelId,
   connectionId,
+  pinned = false,
   postgresDatabase,
+  mssqlDatabase,
   initialTargetBinding,
+  queryRunStatus = false,
   editorLanguage,
   editorPresentation,
   formatOnOpen,
@@ -138,7 +149,6 @@ export function useQueryViewController({
     readQueryDraft(panelId, initialQueryText),
   );
   const editorInitialValue = queryDraft.text;
-  const pinned = postgresDatabase !== undefined;
   const initialActiveConnectionId =
     initialTargetBinding?.connectionId ??
     (pinned ? connectionId : (queryDraft.activeConnectionId ?? connectionId));
@@ -150,9 +160,27 @@ export function useQueryViewController({
   const containerRef = useRef<HTMLDivElement>(null);
   const [targetBinding, setTargetBinding] = useState(initialTargetBinding);
   const targetBindingRef = useRef(targetBinding);
+  // Shortcuts and button handlers must see a selection before React renders it.
+  const pendingTargetChangeRef = useRef<{
+    requestId: string;
+    connectionId: string;
+    sessionKey?: string | null;
+  } | null>(null);
+  const requestedTargetChangeRef = useRef(false);
+  const [pendingTargetId, setPendingTargetId] = useState<string | null>(null);
+  const [targetChangeError, setTargetChangeError] = useState(false);
 
   const { status, result, setRunning, setResult, setError, reset } =
     useQueryStore();
+  const {
+    marker,
+    markerRef,
+    notice: runNotice,
+    prepareRun,
+    settle,
+    markUnknown,
+    acknowledgeUnknown,
+  } = useQueryRunRecovery(panelId);
   const {
     connections,
     activeConnectionId,
@@ -264,6 +292,50 @@ export function useQueryViewController({
     postMessage("getConnections");
   }, [initialActiveConnectionId, setActiveConnection]);
 
+  const matchesCurrentRunTarget = useCallback(
+    (run: QueryRunIdentity) => {
+      const binding = targetBindingRef.current;
+      return (
+        run.postgresDatabase === postgresDatabase &&
+        run.mssqlDatabase === mssqlDatabase &&
+        run.connectionId ===
+          (binding?.connectionId ??
+            (pinned
+              ? connectionId
+              : useConnectionStore.getState().activeConnectionId)) &&
+        run.targetSessionKey === (binding?.sessionKey ?? null)
+      );
+    },
+    [connectionId, mssqlDatabase, pinned, postgresDatabase],
+  );
+
+  useEffect(() => {
+    const current = markerRef.current;
+    if (current?.phase !== "pending") return;
+    // HTML can still name the old binding on a document-only reload. Wait
+    // for the host snapshot rather than discarding a run from a newer binding.
+    if (
+      current.run.postgresDatabase !== postgresDatabase ||
+      current.run.mssqlDatabase !== mssqlDatabase ||
+      (pinned && current.run.connectionId !== connectionId)
+    ) {
+      markUnknown();
+      return;
+    }
+    setRunning({
+      operationId: current.run.operationId,
+      connectionId: current.run.connectionId,
+    });
+  }, [
+    connectionId,
+    markUnknown,
+    markerRef,
+    mssqlDatabase,
+    pinned,
+    postgresDatabase,
+    setRunning,
+  ]);
+
   useEffect(() => {
     if (!resolvedConnectionId) {
       return;
@@ -290,18 +362,31 @@ export function useQueryViewController({
   const handleConnectionChange = useCallback(
     (nextConnectionId: string) => {
       if (targetBindingRef.current) {
-        const target = useConnectionStore
+        if (!nextConnectionId) return;
+        const sessionKey = useConnectionStore
           .getState()
-          .connections.find(({ id }) => id === nextConnectionId);
-        if (target?.targetSessionKey) {
-          postMessage("activeConnectionChanged", {
-            connectionId: nextConnectionId,
-            targetSessionKey: target.targetSessionKey,
-          });
-        }
+          .connections.find(
+            ({ id }) => id === nextConnectionId,
+          )?.targetSessionKey;
+        const requestId = crypto.randomUUID();
+        requestedTargetChangeRef.current = true;
+        pendingTargetChangeRef.current = {
+          requestId,
+          connectionId: nextConnectionId,
+          sessionKey,
+        };
+        setPendingTargetId(nextConnectionId);
+        setTargetChangeError(false);
+        postMessage("activeConnectionChanged", {
+          connectionId: nextConnectionId,
+          requestId,
+          ...(sessionKey ? { targetSessionKey: sessionKey } : {}),
+        });
         return;
       }
       if (pinned) return;
+      if (markerRef.current?.run.connectionId !== nextConnectionId)
+        markUnknown();
       updateWebviewState((state) => ({
         ...state,
         queryDraft: {
@@ -334,6 +419,8 @@ export function useQueryViewController({
     [
       editorInitialValue,
       invalidateBookmark,
+      markerRef,
+      markUnknown,
       panelId,
       pinned,
       reset,
@@ -342,37 +429,83 @@ export function useQueryViewController({
   );
 
   useEffect(() => {
+    const applyTargetBinding = (binding: QueryTargetBinding) => {
+      const previousBinding = targetBindingRef.current;
+      const checkRunTarget = () => {
+        const current = markerRef.current;
+        if (
+          current?.phase === "pending" &&
+          !matchesCurrentRunTarget(current.run)
+        ) {
+          markUnknown();
+        }
+      };
+      if (
+        !previousBinding ||
+        (previousBinding.connectionId === binding.connectionId &&
+          previousBinding.sessionKey === binding.sessionKey)
+      ) {
+        checkRunTarget();
+        return false;
+      }
+      targetBindingRef.current = binding;
+      setTargetBinding(binding);
+      checkRunTarget();
+      didAutoFormat.current = true;
+      updateWebviewState((state) => ({
+        ...state,
+        queryDraft: {
+          panelId,
+          text: editorRef.current?.getValue() ?? editorInitialValue,
+          activeConnectionId: binding.connectionId,
+          targetBinding: binding,
+        },
+      }));
+      bookmarkConnectionRef.current = binding.connectionId;
+      invalidateBookmark();
+      blankQueryValidationRef.current = false;
+      if (markerRef.current?.phase !== "pending") reset();
+      setActiveConnection(binding.connectionId);
+      schemaFetchedRef.current.delete(binding.connectionId);
+      setSchema(binding.connectionId, []);
+      return true;
+    };
     const unsubscribeTarget = onMessage<unknown>(
       "queryTargetBinding",
       (payload) => {
-        const previousBinding = targetBindingRef.current;
+        // Unsolicited snapshots also reach newly loaded documents. Once this
+        // document selects a target, only its matching reply can update it.
+        if (requestedTargetChangeRef.current) return;
         const binding = parseQueryTargetBinding(payload);
+        if (binding) applyTargetBinding(binding);
+      },
+    );
+    const unsubscribeTargetChange = onMessage<unknown>(
+      "queryTargetChangeResult",
+      (input) => {
+        const reply = parseQueryTargetChangeResult(input);
+        const pending = pendingTargetChangeRef.current;
         if (
-          !previousBinding ||
-          !binding ||
-          (previousBinding.connectionId === binding.connectionId &&
-            previousBinding.sessionKey === binding.sessionKey)
+          !reply ||
+          !pending ||
+          reply.requestId !== pending.requestId ||
+          (reply.accepted &&
+            (reply.binding.connectionId !== pending.connectionId ||
+              reply.binding.sessionKey !== pending.sessionKey))
         ) {
           return;
         }
-        targetBindingRef.current = binding;
-        setTargetBinding(binding);
-        didAutoFormat.current = true;
-        updateWebviewState((state) => ({
-          ...state,
-          queryDraft: {
-            panelId,
-            text: editorRef.current?.getValue() ?? editorInitialValue,
-            activeConnectionId: binding.connectionId,
-            targetBinding: binding,
-          },
-        }));
-        invalidateBookmark();
-        blankQueryValidationRef.current = false;
-        reset();
-        setActiveConnection(binding.connectionId);
-        schemaFetchedRef.current.delete(binding.connectionId);
-        setSchema(binding.connectionId, []);
+        const bindingChanged = applyTargetBinding(reply.binding);
+        if (!reply.accepted && bindingChanged) {
+          // An earlier choice may have committed in the host before its reply
+          // was superseded here. Refresh the schema for that effective target.
+          postMessage("getSchema", {
+            connectionId: reply.binding.connectionId,
+          });
+        }
+        pendingTargetChangeRef.current = null;
+        setPendingTargetId(null);
+        setTargetChangeError(!reply.accepted);
       },
     );
     const unsubscribeResult = onMessage<unknown>(
@@ -380,30 +513,42 @@ export function useQueryViewController({
       // Check attribution before treating a malformed reply as terminal.
       (payload) => {
         const { activeOperation, status } = useQueryStore.getState();
+        const current = markerRef.current;
+        const operation =
+          current?.run ??
+          (status === "running" && !queryRunStatus ? activeOperation : null);
         if (
-          status !== "running" ||
-          !activeOperation ||
+          !operation ||
+          current?.phase === "unknown" ||
           !isRecord(payload) ||
-          payload.operationId !== activeOperation.operationId ||
-          payload.connectionId !== activeOperation.connectionId
+          payload.operationId !== operation.operationId ||
+          payload.connectionId !== operation.connectionId
         ) {
           return;
         }
+        if (current && !matchesCurrentRunTarget(current.run)) return;
+        const receivedRun = parseQueryRunIdentity(payload.run);
+        const outcome = parseQueryRunOutcome(payload.runOutcome);
+        if (
+          queryRunStatus &&
+          current &&
+          (!receivedRun || !sameQueryRun(receivedRun, current.run) || !outcome)
+        )
+          return;
         blankQueryValidationRef.current = false;
-        if (!isQueryResult(payload)) {
+        try {
+          if (!isQueryResult(payload)) throw new Error(INVALID_QUERY_RESULT);
+          if (payload.error && !hasQueryResultDetails(payload))
+            setError(payload.error);
+          else setResult(payload);
+        } catch {
+          // With status support, a separate probe can still recover the summary.
+          if (queryRunStatus && current) return;
           setError(INVALID_QUERY_RESULT);
+          markUnknown();
           return;
         }
-        if (payload.error) {
-          if (hasQueryResultDetails(payload)) {
-            setResult(payload);
-            return;
-          }
-          setError(payload.error);
-          return;
-        }
-
-        setResult(payload);
+        if (current) settle(outcome ?? "completed");
       },
     );
 
@@ -411,6 +556,17 @@ export function useQueryViewController({
       "connections",
       (payload) => {
         const binding = targetBindingRef.current;
+        const current = markerRef.current;
+        if (
+          current?.phase === "pending" &&
+          !payload.some(
+            ({ id, targetSessionKey }) =>
+              id === current.run.connectionId &&
+              (current.run.targetSessionKey === null ||
+                targetSessionKey === current.run.targetSessionKey),
+          )
+        )
+          markUnknown();
         if (
           binding &&
           (!binding.sessionKey ||
@@ -419,7 +575,7 @@ export function useQueryViewController({
         ) {
           invalidateBookmark();
           const queryState = useQueryStore.getState();
-          if (queryState.status === "running") {
+          if (!current && queryState.status === "running") {
             setError(
               "The target changed during the query. If the query reached the previous target, it may have executed there.",
             );
@@ -493,6 +649,7 @@ export function useQueryViewController({
 
     return () => {
       unsubscribeTarget();
+      unsubscribeTargetChange();
       unsubscribeResult();
       unsubscribeConnections();
       unsubscribeSchema();
@@ -502,14 +659,19 @@ export function useQueryViewController({
     editorInitialValue,
     handleConnectionChange,
     invalidateBookmark,
+    markerRef,
+    markUnknown,
+    matchesCurrentRunTarget,
     panelId,
     pinned,
+    queryRunStatus,
     reset,
     setActiveConnection,
     setConnections,
     setError,
     setResult,
     setSchema,
+    settle,
   ]);
 
   useEffect(() => {
@@ -557,17 +719,35 @@ export function useQueryViewController({
     });
   }, [editorState.shouldFormatOnOpen]);
 
+  const canUseTarget = useCallback(
+    (binding: QueryTargetBinding | undefined) => {
+      if (pendingTargetChangeRef.current) return false;
+      if (!binding) return !pinnedTargetUnavailable;
+      return (
+        connectionsLoaded &&
+        !!binding.sessionKey &&
+        useConnectionStore
+          .getState()
+          .connections.find(({ id }) => id === binding.connectionId)
+          ?.targetSessionKey === binding.sessionKey
+      );
+    },
+    [connectionsLoaded, pinnedTargetUnavailable],
+  );
+
   const executeQuery = useCallback(() => {
+    const binding = targetBindingRef.current;
     if (
-      pinnedTargetUnavailable ||
-      targetReviewRequired ||
-      (targetBindingRef.current && !connectionsLoaded) ||
+      markerRef.current ||
+      !canUseTarget(binding) ||
       useQueryStore.getState().status === "running"
     )
       return;
-    const queryConnectionId = pinned
-      ? connectionId
-      : useConnectionStore.getState().activeConnectionId;
+    const queryConnectionId =
+      binding?.connectionId ??
+      (pinned
+        ? connectionId
+        : useConnectionStore.getState().activeConnectionId);
     if (!queryConnectionId) return;
     const selectedText = editorRef.current?.getSelectionOrValue();
     if (selectedText === null) {
@@ -588,31 +768,65 @@ export function useQueryViewController({
       operationId: crypto.randomUUID(),
       connectionId: queryConnectionId,
     };
-    setRunning(operation);
-    postMessage("executeQuery", {
+    const run: QueryRunIdentity = {
       ...operation,
-      queryText,
-      ...(targetBindingRef.current?.sessionKey
-        ? { targetSessionKey: targetBindingRef.current.sessionKey }
-        : {}),
-    });
+      panelId,
+      targetSessionKey: binding?.sessionKey ?? null,
+      ...(postgresDatabase === undefined ? {} : { postgresDatabase }),
+      ...(mssqlDatabase === undefined ? {} : { mssqlDatabase }),
+    };
+    if (!prepareRun(run)) return;
+    setRunning(operation);
+    try {
+      postMessage("executeQuery", {
+        ...operation,
+        queryText,
+        ...(binding?.sessionKey
+          ? { targetSessionKey: binding.sessionKey }
+          : {}),
+        ...(queryRunStatus ? { run } : {}),
+      });
+    } catch {
+      markUnknown();
+    }
   }, [
     connectionId,
-    connectionsLoaded,
+    canUseTarget,
+    markerRef,
+    markUnknown,
+    mssqlDatabase,
+    panelId,
     pinned,
-    pinnedTargetUnavailable,
+    postgresDatabase,
+    prepareRun,
+    queryRunStatus,
     setError,
     setRunning,
-    targetReviewRequired,
   ]);
 
   const cancelQuery = useCallback(() => {
+    const current = markerRef.current;
     const { activeOperation, status } = useQueryStore.getState();
-    if (!activeOperation || status !== "running") {
+    const operation =
+      current?.run ??
+      (status === "running" && !queryRunStatus ? activeOperation : null);
+    if (
+      !operation ||
+      (current &&
+        (current.phase !== "pending" || !matchesCurrentRunTarget(current.run)))
+    )
       return;
+    const { connectionId, operationId } = operation;
+    try {
+      postMessage("cancelQuery", {
+        connectionId,
+        operationId,
+        ...(queryRunStatus && current ? { run: current.run } : {}),
+      });
+    } catch {
+      // Do not report cancellation without a terminal response; status polling continues.
     }
-    postMessage("cancelQuery", activeOperation);
-  }, []);
+  }, [markerRef, matchesCurrentRunTarget, queryRunStatus]);
 
   const clearQuery = useCallback(() => {
     editorRef.current?.clearValue();
@@ -636,10 +850,9 @@ export function useQueryViewController({
   ]);
 
   const handleBookmark = useCallback(() => {
+    const binding = targetBindingRef.current;
     if (
-      pinnedTargetUnavailable ||
-      targetReviewRequired ||
-      (targetBindingRef.current && !connectionsLoaded) ||
+      !canUseTarget(binding) ||
       bookmarkedRef.current ||
       pendingBookmarkRef.current
     ) {
@@ -647,9 +860,11 @@ export function useQueryViewController({
     }
 
     const queryText = bookmarkTextRef.current;
-    const bookmarkConnectionId = pinned
-      ? connectionId
-      : useConnectionStore.getState().activeConnectionId;
+    const bookmarkConnectionId =
+      binding?.connectionId ??
+      (pinned
+        ? connectionId
+        : useConnectionStore.getState().activeConnectionId);
     if (!queryText || !bookmarkConnectionId) {
       return;
     }
@@ -658,22 +873,13 @@ export function useQueryViewController({
       requestId: `${panelId}:bookmark:${++bookmarkSequenceRef.current}`,
       queryText,
       connectionId: bookmarkConnectionId,
-      ...(targetBindingRef.current?.sessionKey
-        ? { targetSessionKey: targetBindingRef.current.sessionKey }
-        : {}),
+      ...(binding?.sessionKey ? { targetSessionKey: binding.sessionKey } : {}),
     };
     pendingBookmarkRef.current = pending;
     setBookmarkError(null);
     setBookmarking(true);
     postMessage("addBookmark", pending satisfies QueryBookmarkPayload);
-  }, [
-    connectionId,
-    connectionsLoaded,
-    panelId,
-    pinned,
-    pinnedTargetUnavailable,
-    targetReviewRequired,
-  ]);
+  }, [connectionId, canUseTarget, panelId, pinned]);
 
   const handleEditorChange = useCallback(
     (value: string) => {
@@ -748,6 +954,9 @@ export function useQueryViewController({
 
   return {
     activeConnectionId: resolvedConnectionId,
+    selectedConnectionId: pendingTargetId ?? resolvedConnectionId,
+    targetChangePending: pendingTargetId !== null,
+    targetChangeError,
     pinnedTargetUnavailable,
     targetReviewRequired,
     targetChecking: !!targetBinding && !connectionsLoaded,
@@ -775,7 +984,10 @@ export function useQueryViewController({
       connections.length > 0 &&
       schemaByConnection[resolvedConnectionId] === undefined,
     startResizing,
-    status,
+    status: marker?.phase === "pending" ? ("running" as const) : status,
+    unknownRun: marker?.phase === "unknown" ? marker.run : null,
+    runNotice,
+    acknowledgeUnknown,
     clearQuery,
     cancelQuery,
     editorInitialValue,

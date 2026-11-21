@@ -59,7 +59,7 @@ export async function confirmConnectionRemoval(
 ): Promise<boolean> {
   const connection = connectionManager.getConnection(connectionId);
   const answer = await confirmDestructiveAction(
-    `Delete connection "${connection?.name ?? connectionId}"?`,
+    `Delete connection "${connection?.name ?? connectionId}"? Credentials in Secret Storage will be retained.`,
     "Delete",
   );
 

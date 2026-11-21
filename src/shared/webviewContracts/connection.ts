@@ -191,6 +191,15 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
   const name = readOptionalString(input, "name");
   const type = readConnectionType(input.type);
   const tls = readConnectionTlsConfig(input.tls);
+  const awsCredentialMode = input.awsCredentialMode;
+  if (
+    awsCredentialMode !== undefined &&
+    awsCredentialMode !== "static" &&
+    awsCredentialMode !== "profile" &&
+    awsCredentialMode !== "default"
+  ) {
+    return null;
+  }
   if (tls === null) {
     return null;
   }
@@ -232,6 +241,7 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
       readOptionalString(input, "uri"),
     replicaSet: readOptionalString(input, "replicaSet"),
     directConnection: readOptionalBoolean(input, "directConnection"),
+    awsCredentialMode,
     awsProfile: readOptionalString(input, "awsProfile"),
     endpoint:
       readOptionalString(input, "endpoint") ??
@@ -268,7 +278,12 @@ function parseConnectionBase(input: unknown): SanitizedConnectionConfig | null {
     awsAccessKeyId: readOptionalString(input, "awsAccessKeyId"),
     awsSecretAccessKey: readOptionalString(input, "awsSecretAccessKey"),
     awsSessionToken: readOptionalString(input, "awsSessionToken"),
+    awsSessionTokenRequired: readOptionalBoolean(
+      input,
+      "awsSessionTokenRequired",
+    ),
     awsEndpoint: readOptionalString(input, "awsEndpoint"),
+    awsStsEndpoint: readOptionalString(input, "awsStsEndpoint"),
     ssh: parseConnectionSshConfig(input.ssh),
     useSecretStorage: readOptionalBoolean(input, "useSecretStorage"),
     color: readOptionalString(input, "color"),

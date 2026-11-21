@@ -68,6 +68,8 @@ export interface TableMutationPreviewPayload {
   contentType: "application/sql" | "application/json" | "text/plain";
   sql: string;
   statementCount: number;
+  confirmationWarning?: string;
+  confirmationOnly?: boolean;
 }
 
 export interface TableSortPayload {
@@ -216,6 +218,7 @@ export type TablePanelMessage =
         operationId: string;
         primaryKeysList?: Array<Record<string, unknown>>;
         sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
+        noSqlDeleteObservationIds?: Array<string | null>;
       }
     >
   | WebviewMessageEnvelope<
@@ -453,11 +456,22 @@ export function parseTablePanelMessage(
         return null;
       }
       const sqlDeleteObservations = payload.sqlDeleteObservations;
+      const noSqlDeleteObservationIds = payload.noSqlDeleteObservationIds;
       if (
         sqlDeleteObservations !== undefined &&
         (!Array.isArray(sqlDeleteObservations) ||
           ![...sqlDeleteObservations].every(
             (value) => value === null || isSqlDeleteObservation(value),
+          ))
+      ) {
+        return null;
+      }
+      if (
+        noSqlDeleteObservationIds !== undefined &&
+        (!Array.isArray(noSqlDeleteObservationIds) ||
+          noSqlDeleteObservationIds.length !== primaryKeysList?.length ||
+          ![...noSqlDeleteObservationIds].every(
+            (value) => value === null || isNoSqlDeleteObservationId(value),
           ))
       ) {
         return null;
@@ -469,6 +483,9 @@ export function parseTablePanelMessage(
           primaryKeysList,
           ...(sqlDeleteObservations !== undefined
             ? { sqlDeleteObservations }
+            : {}),
+          ...(noSqlDeleteObservationIds !== undefined
+            ? { noSqlDeleteObservationIds }
             : {}),
         },
       };
@@ -568,4 +585,10 @@ export interface TableInitPayload {
   connectionReadOnly?: boolean;
   connectionSessionKey?: string;
   requiresSqlDeleteObservation?: boolean;
+  noSqlDeleteBackend?: ObservedNoSqlDeleteBackend;
 }
+
+import {
+  isNoSqlDeleteObservationId,
+  type ObservedNoSqlDeleteBackend,
+} from "../noSqlDeleteObservation";

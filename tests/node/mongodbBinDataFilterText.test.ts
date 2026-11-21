@@ -6,6 +6,7 @@ import type {
   DriverTablePageRequest,
   FilterExpression,
 } from "../../src/extension/dbDrivers/types";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 const binaryColumn: ColumnTypeMeta = {
   name: "payload",
@@ -36,6 +37,7 @@ function setup(documents: Record<string, unknown>[]) {
         return cursor;
       }),
       toArray: vi.fn(async () => documents.slice(0, limit)),
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
     };
     return cursor;
   });

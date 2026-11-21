@@ -1,13 +1,11 @@
-import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
 import {
-  chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
-  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -15,1353 +13,1074 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { hostname } from "node:os";
-import { delimiter, dirname, join } from "node:path";
-import { Readable } from "node:stream";
-import { promisify } from "node:util";
+import { basename, dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { formatSQLiteRuntimeLoadErrorMessage } from "../../src/extension/dbDrivers/sqliteRuntime";
 import {
-  extractSQLiteArchive,
+  extractSQLitePackage,
   SQLITE_ARCHIVE_LIMITS,
-  SQLITE_SOURCE,
-  verifySQLiteIntegrity,
 } from "../../src/extension/utils/sqliteArchive";
 import {
   SQLITE_ARTIFACTS,
-  type SQLiteHeaderPins,
-  sqliteArtifactPolicyId,
-  sqliteHeaderPins,
+  type SQLiteInstallFile,
+  sqlitePackagePlan,
 } from "../../src/extension/utils/sqliteArtifactPins";
 import {
-  createSQLiteBuildToolLock,
-  pinSQLiteSourceNodeActions,
-  resolveSQLiteBuildTools,
-  sqliteBuildEnvironment,
-} from "../../src/extension/utils/sqliteBuildTools";
-import {
   configureSQLiteInstaller,
-  downloadToFile,
   ensureSQLiteRuntimeInstalled,
-  preparePinnedSQLiteHeaders,
+  formatSQLiteDownloadSize,
   probeInstalledBetterSqlite3Runtime,
   resetSQLiteInstallerForTests,
+  type SQLiteInstallProgress,
+  SQLiteRuntimeInstallCancelledError,
+  SQLiteRuntimeInUseError,
+  SQLiteRuntimeUnreadableError,
+  setSQLiteHostForTests,
   setSQLiteInstallLockTimingsForTests,
-  sqliteNodeGypArguments,
+  sqliteRuntimeDownloadSummary,
 } from "../../src/extension/utils/sqliteInstaller";
+import {
+  detectSQLiteLinuxLibc,
+  resolveSQLiteNativeTarget,
+  SQLITE_NATIVE_TARGETS,
+  type SQLiteHostProbe,
+  SQLiteUnsupportedTargetError,
+} from "../../src/extension/utils/sqliteNativeTarget";
 import { createProjectTempDir } from "../runtime/tempDirectories";
-
-const require = createRequire(import.meta.url);
-const https = require("node:https") as typeof import("node:https");
-const versions = Object.getOwnPropertyDescriptors(process.versions);
-const originalPrebuilts = { ...SQLITE_ARTIFACTS.prebuilts };
-const originalHeaders = { ...SQLITE_ARTIFACTS.headers };
+import {
+  FIXTURE_TARGET,
+  gzipTar,
+  hostProbe,
+  https,
+  mockRegistry,
+  pinFixturePackage,
+  pinTarball,
+  restoreSQLiteArtifacts,
+  sha256Hex,
+  sha512Integrity,
+  TARBALL_URL,
+  type TarEntry,
+  tar,
+  unexpectedDownload,
+} from "./sqliteRuntimeFixtures";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+  return {
+    ...actual,
+    renameSync: vi.fn(actual.renameSync),
+    readFileSync: vi.fn(actual.readFileSync),
+  };
 });
 
 afterEach(() => {
   vi.mocked(renameSync).mockReset();
+  vi.mocked(readFileSync).mockReset();
   vi.restoreAllMocks();
-  Object.defineProperties(process.versions, versions);
-  if (!versions.electron)
-    delete (process.versions as { electron?: string }).electron;
+  vi.unstubAllEnvs();
   resetSQLiteInstallerForTests();
-  SQLITE_ARTIFACTS.prebuilts = { ...originalPrebuilts };
-  SQLITE_ARTIFACTS.headers = { ...originalHeaders };
+  restoreSQLiteArtifacts();
 });
 
-type Entry = {
-  name: string;
-  data?: string | Buffer;
-  type?: string;
-  linkname?: string;
-  size?: number;
-};
-
-function tar(entries: Entry[]): Buffer {
-  const chunks: Buffer[] = [];
-  for (const entry of entries) {
-    const header = Buffer.alloc(512);
-    const data = Buffer.from(entry.data ?? "");
-    header.write(entry.name, 0, 100);
-    header.write("0000600\0", 100);
-    header.write("0000000\0", 108);
-    header.write("0000000\0", 116);
-    header.write(
-      `${(entry.size ?? data.length).toString(8).padStart(11, "0")}\0`,
-      124,
-    );
-    header.write("00000000000\0", 136);
-    header.fill(32, 148, 156);
-    header.write(entry.type ?? "0", 156);
-    if (entry.linkname) header.write(entry.linkname, 157, 100);
-    header.write("ustar\0", 257);
-    header.write("00", 263);
-    const checksum = header.reduce((sum, byte) => sum + byte, 0);
-    header.write(`${checksum.toString(8).padStart(6, "0")}\0 `, 148);
-    chunks.push(header, data, Buffer.alloc((512 - (data.length % 512)) % 512));
-  }
-  return Buffer.concat([...chunks, Buffer.alloc(1024)]);
-}
-
-function archive(entries: Entry[]): Buffer {
-  return gzipSync(tar(entries));
-}
-function integrity(data: Buffer): string {
-  return `sha512-${createHash("sha512").update(data).digest("base64")}`;
-}
-
-async function fixture(entries: Entry[]) {
-  const root = await createProjectTempDir("sqlite-security");
-  const archivePath = join(root, "archive.tgz");
-  const data = archive(entries);
-  writeFileSync(archivePath, data);
-  return { root, archivePath, data, destination: join(root, "extract") };
-}
-
-describe("SQLite archive integrity and filesystem boundaries", () => {
-  it("pins npm source to the repository lockfile, including version and URL", () => {
-    const lock = JSON.parse(
-      readFileSync(new URL("../../package-lock.json", import.meta.url), "utf8"),
-    );
-    expect(SQLITE_SOURCE).toEqual({
-      version: lock.packages["node_modules/better-sqlite3"].version,
-      url: lock.packages["node_modules/better-sqlite3"].resolved,
-      integrity: lock.packages["node_modules/better-sqlite3"].integrity,
-    });
-  });
-
-  it("checks a trusted digest before even decompressing, without writing files", async () => {
-    const f = await fixture([{ name: "package/package.json", data: "{}" }]);
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        SQLITE_SOURCE.integrity,
-      ),
-    ).rejects.toThrow("integrity mismatch");
-    expect(existsSync(f.destination)).toBe(false);
-    expect(() => verifySQLiteIntegrity(f.data, "sha512-not-a-digest")).toThrow(
-      "Invalid pinned",
-    );
-    await extractSQLiteArchive(
-      f.archivePath,
-      f.destination,
-      "source",
-      integrity(f.data),
-    );
-    expect(readFileSync(join(f.destination, "package.json"), "utf8")).toBe(
-      "{}",
-    );
-  });
-
-  it("requires a trusted source pin and rejects a mismatching prebuilt pin before writes", async () => {
-    const f = await fixture([
-      { name: "build/Release/better_sqlite3.node", data: "addon" },
-    ]);
-    await expect(
-      extractSQLiteArchive(f.archivePath, f.destination, "source", ""),
-    ).rejects.toThrow("Trusted static integrity is required");
-    await expect(
-      extractSQLiteArchive(f.archivePath, f.destination, "prebuilt", ""),
-    ).rejects.toThrow("Trusted static integrity is required");
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "prebuilt",
-        integrity(Buffer.from("different archive")),
-      ),
-    ).rejects.toThrow("integrity mismatch");
-    expect(existsSync(f.destination)).toBe(false);
+describe("SQLite native target selection", () => {
+  it.each([
+    ["darwin", "x64", "darwin-x64"],
+    ["darwin", "arm64", "darwin-arm64"],
+    ["win32", "x64", "win32-x64"],
+    ["win32", "arm64", "win32-arm64"],
+  ])("maps %s-%s to %s without probing libc", (platform, arch, expected) => {
+    const readProcessMaps = vi.fn(() => "");
+    expect(
+      resolveSQLiteNativeTarget({
+        platform: platform as NodeJS.Platform,
+        arch,
+        readProcessMaps,
+      }),
+    ).toBe(expected);
+    expect(readProcessMaps).not.toHaveBeenCalled();
   });
 
   it.each([
-    "../escape",
-    "package/../../escape",
-    "/absolute",
-    "package/C:/escape",
-    "package/..\\escape",
-    "package/NUL.js",
-    "package/folder./escape",
-  ])("rejects traversal/absolute/platform-ambiguous path %s before writes", async (name) => {
-    const f = await fixture([
-      { name: "package/first", data: "safe" },
-      { name, data: "bad" },
-    ]);
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(f.data),
-      ),
-    ).rejects.toThrow(/Unsafe|only package/);
-    expect(existsSync(f.destination)).toBe(false);
+    "linux-x64",
+    "linux-arm64",
+    "linuxmusl-x64",
+    "linuxmusl-arm64",
+  ])("selects %s when the loaded C library and the process report agree", (target) => {
+    expect(resolveSQLiteNativeTarget(hostProbe(target))).toBe(target);
   });
 
   it.each([
-    "1",
-    "2",
-    "3",
-    "4",
-    "6",
-  ])("rejects links, devices, and FIFOs (tar type %s)", async (type) => {
-    const f = await fixture([
-      { name: "package/link", type, linkname: "../../escape" },
-    ]);
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(f.data),
-      ),
-    ).rejects.toThrow("Unsupported");
-    expect(existsSync(f.destination)).toBe(false);
-  });
-
-  it("validates effective PAX and GNU long paths, not only the next raw header", async () => {
-    const recordBody = "path=package/../../escape\n";
-    let record = `0 ${recordBody}`;
-    while (record.length !== Number(record.split(" ")[0]))
-      record = `${record.length} ${recordBody}`;
-    for (const metadata of [
-      { name: "PaxHeader", type: "x", data: record },
-      { name: "././@LongLink", type: "L", data: "package/../../escape\0" },
-    ]) {
-      const f = await fixture([
-        metadata,
-        { name: "package/safe", data: "bad" },
-      ]);
-      await expect(
-        extractSQLiteArchive(
-          f.archivePath,
-          f.destination,
-          "source",
-          integrity(f.data),
-        ),
-      ).rejects.toThrow("Unsafe");
-      expect(existsSync(f.destination)).toBe(false);
-    }
-  });
-
-  it.each(
+    ["loader map unavailable, glibc reported", null, "2.31", "glibc"],
     [
-      [
-        { name: "package/a", data: "1" },
-        { name: "package/a", data: "2" },
-      ],
-      [
-        { name: "package/a", data: "1" },
-        { name: "package/A", data: "2" },
-      ],
-      [
-        { name: "package/a", data: "1" },
-        { name: "package/A/child", data: "2" },
-      ],
-    ].map((entries) => ({ entries })),
-  )("rejects duplicates and file/directory conflicts before writes", async ({
-    entries,
-  }) => {
-    const f = await fixture(entries);
+      "glibc loader, report unavailable",
+      "/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+      undefined,
+      "glibc",
+    ],
+    [
+      "musl loader, report unavailable",
+      "/lib/ld-musl-aarch64.so.1",
+      undefined,
+      "musl",
+    ],
+    ["no signal at all", null, undefined, null],
+    [
+      "unrecognized loader, no glibc reported",
+      "/system/bin/linker64",
+      null,
+      null,
+    ],
+    ["no loader map, no glibc reported", null, null, null],
+    [
+      "both loaders mapped",
+      "/lib/ld-musl-x86_64.so.1\n/lib/x86_64-linux-gnu/libc.so.6",
+      undefined,
+      null,
+    ],
+    [
+      "musl loader but glibc reported",
+      "/lib/ld-musl-x86_64.so.1",
+      "2.39",
+      null,
+    ],
+    [
+      "glibc loader but no glibc reported",
+      "/lib64/ld-linux-x86-64.so.2",
+      null,
+      null,
+    ],
+  ])("detects libc for %s", (_name, maps, report, expected) => {
+    expect(
+      detectSQLiteLinuxLibc({
+        platform: "linux",
+        arch: "x64",
+        readProcessMaps: () => {
+          if (maps === null) throw new Error("ENOENT");
+          return maps;
+        },
+        glibcVersionRuntime: () => report,
+      }),
+    ).toBe(expected);
+  });
+
+  it("fails closed instead of guessing an ambiguous Linux C library", () => {
+    expect(() =>
+      resolveSQLiteNativeTarget({
+        platform: "linux",
+        arch: "x64",
+        readProcessMaps: () => {
+          throw new Error("EACCES");
+        },
+        glibcVersionRuntime: () => null,
+      }),
+    ).toThrow(
+      /could not reliably determine whether this process uses glibc or musl/,
+    );
+  });
+
+  it.each([
+    ["linux", "ia32"],
+    ["linux", "arm"],
+    ["win32", "ia32"],
+    ["darwin", "ppc64"],
+    ["freebsd", "x64"],
+    ["openbsd", "arm64"],
+    ["sunos", "x64"],
+    ["aix", "ppc64"],
+  ])("rejects unsupported %s-%s with a clear error", (platform, arch) => {
+    let error: unknown;
+    try {
+      resolveSQLiteNativeTarget({
+        platform: platform as NodeJS.Platform,
+        arch,
+        readProcessMaps: () => "/lib/x86_64-linux-gnu/libc.so.6",
+        glibcVersionRuntime: () => "2.39",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(SQLiteUnsupportedTargetError);
+    expect((error as Error).message).toContain(`${platform}-${arch}`);
+    expect((error as Error).message).toContain("No binary was downloaded");
+  });
+
+  it.skipIf(!["darwin", "linux", "win32"].includes(process.platform))(
+    "resolves the current test host to a pinned target",
+    () => {
+      expect(SQLITE_NATIVE_TARGETS).toContain(resolveSQLiteNativeTarget());
+    },
+  );
+});
+
+async function extractionFixture(entries: TarEntry[], pinnedFiles?: string[]) {
+  const root = await createProjectTempDir("sqlite-archive");
+  const archivePath = join(root, "package.tgz");
+  const data = gzipTar(entries);
+  writeFileSync(archivePath, data);
+  const contents = new Map<string, Buffer>();
+  for (const entry of entries) {
+    if ((entry.type ?? "0") === "0" && entry.name.startsWith("package/"))
+      contents.set(entry.name.slice(8), Buffer.from(entry.data ?? ""));
+  }
+  const files: SQLiteInstallFile[] = (
+    pinnedFiles ?? ["package.json", "lib/index.js", "prebuilds/linux-x64.node"]
+  ).map((path) => {
+    const data = contents.get(path) ?? Buffer.from("missing");
+    return {
+      archivePath: path,
+      installPath: path.startsWith("prebuilds/")
+        ? "build/Release/better_sqlite3.node"
+        : path,
+      sha256: sha256Hex(data),
+      size: data.length,
+    };
+  });
+  return {
+    root,
+    archivePath,
+    data,
+    files,
+    destination: join(root, "extract"),
+    extract: (
+      overrides: Partial<Parameters<typeof extractSQLitePackage>[0]> = {},
+    ) =>
+      extractSQLitePackage({
+        archivePath,
+        destination: join(root, "extract"),
+        integrity: sha512Integrity(data),
+        files,
+        ...overrides,
+      }),
+  };
+}
+
+const PACKAGE_ENTRIES: TarEntry[] = [
+  { name: "package/package.json", data: '{"name":"better-sqlite3"}' },
+  { name: "package/lib/index.js", data: "module.exports = 1;" },
+  { name: "package/prebuilds/linux-x64.node", data: "linux addon" },
+];
+
+describe("SQLite package archive extraction", () => {
+  it("checks the pinned digest before decompressing and writes nothing on mismatch", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
     await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(f.data),
-      ),
-    ).rejects.toThrow(/Duplicate|Conflicting/);
+      f.extract({ integrity: sha512Integrity(Buffer.from("other")) }),
+    ).rejects.toThrow("integrity mismatch");
+    await expect(f.extract({ integrity: "" })).rejects.toThrow(
+      "Trusted static integrity is required",
+    );
     expect(existsSync(f.destination)).toBe(false);
   });
 
-  it("restricts prebuilts to the expected addon, never scaffold JavaScript", async () => {
-    const f = await fixture([
-      { name: "build/Release/better_sqlite3.node", data: "addon" },
-      { name: "lib/index.js", data: "evil" },
+  it("extracts only reviewed files and installs the selected prebuild as the managed binary", async () => {
+    const f = await extractionFixture([
+      ...PACKAGE_ENTRIES,
+      { name: "package/prebuilds/linuxmusl-x64.node", data: "musl addon" },
+      { name: "package/src/better_sqlite3.cpp", data: "source" },
+      { name: "package/deps/download.sh", data: "#!/bin/sh\nexit 1" },
+      { name: "package/binding.gyp", data: "{}" },
     ]);
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "prebuilt",
-        integrity(f.data),
-      ),
-    ).rejects.toThrow("Unexpected");
-    expect(existsSync(f.destination)).toBe(false);
-  });
-
-  it("accepts normal prebuilt directories and only writes the addon", async () => {
-    const f = await fixture([
-      { name: "build/", type: "5" },
-      { name: "build/Release/", type: "5" },
-      { name: "./build/Release/better_sqlite3.node", data: "addon" },
-    ]);
-    await extractSQLiteArchive(
-      f.archivePath,
-      f.destination,
-      "prebuilt",
-      integrity(f.data),
+    await f.extract();
+    const listing = (dir: string, prefix = ""): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+        entry.isDirectory()
+          ? listing(join(dir, entry.name), `${prefix}${entry.name}/`)
+          : [`${prefix}${entry.name}`],
+      );
+    expect(listing(f.destination).sort()).toEqual(
+      [
+        "build/Release/better_sqlite3.node",
+        "lib/index.js",
+        "package.json",
+      ].sort(),
     );
     expect(
       readFileSync(
         join(f.destination, "build/Release/better_sqlite3.node"),
         "utf8",
       ),
-    ).toBe("addon");
+    ).toBe("linux addon");
+    if (process.platform !== "win32")
+      expect(statSync(join(f.destination, "lib/index.js")).mode & 0o077).toBe(
+        0,
+      );
   });
 
-  it("does not follow preexisting extraction symlinks", async () => {
-    const f = await fixture([{ name: "package/build/escape", data: "bad" }]);
-    mkdirSync(f.destination);
-    const outside = join(f.root, "outside");
-    mkdirSync(outside);
-    symlinkSync(outside, join(f.destination, "build"), "dir");
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(f.data),
-      ),
-    ).rejects.toThrow("Unsafe SQLite extraction directory");
-    expect(existsSync(join(outside, "escape"))).toBe(false);
-  });
-
-  it.each([
-    "compressedBytes",
-    "expandedBytes",
-    "fileBytes",
-    "entries",
-  ] as const)("bounds %s before writes", async (limit) => {
-    const f = await fixture([
-      { name: "package/a", data: "a".repeat(8192) },
-      { name: "package/b", data: "b" },
-    ]);
-    await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(f.data),
-        { ...SQLITE_ARCHIVE_LIMITS, [limit]: 1 },
-      ),
-    ).rejects.toThrow();
+  it("rejects a reviewed file whose SHA-256 differs even if the archive digest was re-pinned", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
+    f.files[2] = { ...f.files[2], sha256: sha256Hex("expected addon") };
+    await expect(f.extract()).rejects.toThrow(
+      "prebuilds/linux-x64.node does not match its reviewed SHA-256 pin",
+    );
+    f.files[2] = { ...f.files[2], sha256: sha256Hex("linux addon"), size: 999 };
+    await expect(f.extract()).rejects.toThrow("reviewed SHA-256 pin");
     expect(existsSync(f.destination)).toBe(false);
   });
 
-  it("rejects truncated tar payloads before writes", async () => {
-    const f = await fixture([]);
+  it("rejects an archive that lacks a reviewed file", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES.slice(0, 2));
+    await expect(f.extract()).rejects.toThrow(
+      "missing reviewed file prebuilds/linux-x64.node",
+    );
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it.each([
+    "../escape",
+    "package/../../escape",
+    "package/lib/../../../escape",
+    "/package/lib/index.js",
+    "package\\lib\\evil.js",
+    "C:package/evil.js",
+    "package/con.js",
+    "package/lib/CONIN$",
+    "package/lib/conout$.js",
+    "package/lib/COM¹",
+    "package/lib/lpt³.txt",
+    "package/lib/Com0.js",
+    "package/lib/LPT0",
+    "package/lib/nul .js",
+    "package/lib/evil. ",
+    "package/lib/evil\u0001.js",
+  ])("rejects unsafe path %j even when it would be skipped", async (name) => {
+    const f = await extractionFixture([
+      ...PACKAGE_ENTRIES,
+      { name, data: "x" },
+    ]);
+    await expect(f.extract()).rejects.toThrow("Unsafe SQLite archive path");
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it.each([
+    ["symlink", "2", "../../outside"],
+    ["hard link", "1", "package/lib/index.js"],
+    ["character device", "3", undefined],
+    ["block device", "4", undefined],
+    ["FIFO", "6", undefined],
+    ["contiguous file", "7", undefined],
+  ])("rejects a %s entry", async (_name, type, linkname) => {
+    const f = await extractionFixture([
+      ...PACKAGE_ENTRIES,
+      { name: "package/lib/linked.js", type, linkname },
+    ]);
+    await expect(f.extract()).rejects.toThrow(
+      /Unsupported SQLite archive entry type|links are not allowed/,
+    );
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it("rejects a reviewed path delivered as a symlink", async () => {
+    const f = await extractionFixture([
+      PACKAGE_ENTRIES[0],
+      { name: "package/lib/index.js", type: "2", linkname: "/etc/passwd" },
+      PACKAGE_ENTRIES[2],
+    ]);
+    await expect(f.extract()).rejects.toThrow(
+      /Unsupported SQLite archive entry type/,
+    );
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it.each([
+    [
+      "entries outside the package root",
+      [{ name: "other/file.js", data: "x" }],
+    ],
+    ["a root-level file", [{ name: "evil.js", data: "x" }]],
+    [
+      "a duplicate reviewed path",
+      [{ name: "package/lib/index.js", data: "module.exports = 2;" }],
+    ],
+    ["a case-folded duplicate", [{ name: "package/LIB/index.js", data: "x" }]],
+    [
+      "a file shadowing a reviewed directory",
+      [{ name: "package/LIB", data: "x" }],
+    ],
+  ])("rejects %s", async (_name, extra) => {
+    const f = await extractionFixture([...PACKAGE_ENTRIES, ...extra]);
+    await expect(f.extract()).rejects.toThrow(
+      /must contain only package\/|Duplicate or conflicting|Conflicting/,
+    );
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it("rejects truncated payloads before writing", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
     const truncated = gzipSync(
-      tar([{ name: "package/file", data: "abc", size: 4096 }]),
+      tar([...PACKAGE_ENTRIES, { name: "package/x", data: "abc", size: 4096 }]),
     );
     writeFileSync(f.archivePath, truncated);
     await expect(
-      extractSQLiteArchive(
-        f.archivePath,
-        f.destination,
-        "source",
-        integrity(truncated),
-      ),
+      f.extract({ integrity: sha512Integrity(truncated) }),
     ).rejects.toThrow();
     expect(existsSync(f.destination)).toBe(false);
   });
+
+  it.each([
+    ["compressed size", { compressedBytes: 64 }, "compressed size limit"],
+    ["expanded size", { expandedBytes: 2048 }, /./],
+    ["entry count", { entries: 2 }, "entry limit"],
+    ["file size", { fileBytes: 8 }, "file size limit"],
+  ])("enforces the %s limit", async (_name, limit, message) => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
+    await expect(
+      f.extract({ limits: { ...SQLITE_ARCHIVE_LIMITS, ...limit } }),
+    ).rejects.toThrow(message);
+    expect(existsSync(f.destination)).toBe(false);
+  });
+
+  it("does not follow a preexisting symlink inside the destination", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
+    const outside = join(f.root, "outside");
+    mkdirSync(outside);
+    mkdirSync(f.destination);
+    symlinkSync(outside, join(f.destination, "lib"), "junction");
+    await expect(f.extract()).rejects.toThrow(
+      "Unsafe SQLite extraction directory",
+    );
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it("refuses to overwrite a preexisting file or symlink at a destination path", async () => {
+    const f = await extractionFixture(PACKAGE_ENTRIES);
+    const outside = join(f.root, "outside.json");
+    writeFileSync(outside, "outside");
+    mkdirSync(f.destination);
+    symlinkSync(outside, join(f.destination, "package.json"));
+    await expect(f.extract()).rejects.toThrow(/EEXIST|ELOOP/);
+    expect(readFileSync(outside, "utf8")).toBe("outside");
+  });
 });
 
-function mockDownloads(
-  respond: (url: string) => {
-    data?: Buffer;
-    status?: number;
-    location?: string;
-  },
-  delayMs = 0,
-) {
-  const urls: string[] = [];
-  vi.spyOn(https, "get").mockImplementation(((
-    url: string,
-    callback: (response: Readable) => void,
-  ) => {
-    urls.push(url);
-    const request = Object.assign(new EventEmitter(), {
-      setTimeout: () => request,
-      destroy: () => request,
-    });
-    const deliver = () => {
-      const reply = respond(String(url));
-      const response = Object.assign(
-        Readable.from(reply.data ? [reply.data] : []),
-        {
-          statusCode: reply.status ?? 200,
-          headers: reply.location ? { location: reply.location } : {},
-        },
-      );
-      callback(response);
-    };
-    if (delayMs > 0) setTimeout(deliver, delayMs);
-    else queueMicrotask(deliver);
-    return request;
-  }) as unknown as typeof https.get);
-  return urls;
-}
-
-async function runtimeFixture() {
+async function runtimeFixture({
+  allowInstall = () => true,
+  target = FIXTURE_TARGET,
+}: {
+  allowInstall?: () => boolean | Promise<boolean>;
+  target?: string;
+} = {}) {
   const root = await createProjectTempDir("sqlite-install-security");
-  writeFileSync(join(root, "package.json"), "{}");
-  for (const name of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-    const packagePath = join(root, "node_modules", name);
-    mkdirSync(packagePath, { recursive: true });
-    writeFileSync(
-      join(packagePath, "package.json"),
-      JSON.stringify({
-        name,
-        version: "12.10.0",
-        repository: "https://evil.invalid/fake",
-      }),
-    );
-  }
   const logs: string[] = [];
   configureSQLiteInstaller({
     storageRoot: join(root, "storage"),
-    allowInstall: () => true,
+    allowInstall,
     log: (line) => logs.push(line),
   });
+  setSQLiteHostForTests({ probe: hostProbe(target) });
   return { root, logs };
 }
 
-function currentPolicyId() {
-  return sqliteArtifactPolicyId({
-    betterSqlite3Version: "12.10.0",
-    runtime: process.versions.electron ? "electron" : "node",
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: "",
-    electronVersion: process.versions.electron,
-  });
+const INSTALLED_FIXTURE_TREE = [
+  ".rapidb-last-used",
+  "node_modules/",
+  "node_modules/better-sqlite3/",
+  "node_modules/better-sqlite3/LICENSE",
+  "node_modules/better-sqlite3/build/",
+  "node_modules/better-sqlite3/build/Release/",
+  "node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+  "node_modules/better-sqlite3/lib/",
+  "node_modules/better-sqlite3/lib/index.js",
+  "node_modules/better-sqlite3/package.json",
+  "runtime.json",
+];
+
+function runtimeTree(root: string, prefix = ""): string[] {
+  return readdirSync(join(root, prefix))
+    .sort()
+    .flatMap((name) => {
+      const path = `${prefix}${name}`;
+      return lstatSync(join(root, path)).isDirectory()
+        ? [`${path}/`, ...runtimeTree(root, `${path}/`)]
+        : [path];
+    });
 }
 
-function fixturePrebuiltPin(kind: "official" | "patched", data: Buffer) {
-  const runtime = process.versions.electron ? "electron" : "node";
-  const filename = `better-sqlite3-v12.10.0-${runtime}-v${process.versions.modules}-${process.platform}-${process.arch}.tar.gz`;
-  const repo =
-    kind === "official" ? "WiseLibs/better-sqlite3" : "DmitriiKholkin/RapiDB";
-  const tag = kind === "official" ? "v12.10.0" : "rapidb-patched-sqlite";
-  const url = `https://github.com/${repo}/releases/download/${tag}/${filename}`;
-  SQLITE_ARTIFACTS.prebuilts[`${kind}/${filename}`] = {
-    url,
-    integrity: integrity(data),
-    size: data.length,
-    releaseId: 1,
-    assetId: 1,
-    apiDigest: `sha256:${createHash("sha256").update(data).digest("hex")}`,
+function installedPaths() {
+  const probe = probeInstalledBetterSqlite3Runtime();
+  const packagePath = probe.installedPackagePath as string;
+  return {
+    packagePath,
+    binaryPath: probe.installedBinaryPath as string,
+    runtimeRoot: dirname(dirname(packagePath)),
   };
-  return url;
 }
 
-describe("SQLite installer security across callers and fallback paths", () => {
-  it("downloads only the official source, ignores mirror variables, and never loads the addon during installation", async () => {
-    const f = await runtimeFixture();
-    const data = archive([
-      { name: "build/Release/better_sqlite3.node", data: "not executable" },
-    ]);
-    fixturePrebuiltPin("official", data);
-    const urls = mockDownloads(() => ({ data }));
-    vi.stubEnv("npm_config_better_sqlite3_binary_host", "https://evil.invalid");
-    try {
-      const installed = await ensureSQLiteRuntimeInstalled(
-        join(f.root, "dist"),
-      );
-      expect(installed).toBeTruthy();
-      expect(urls).toHaveLength(1);
-      expect(urls[0]).toMatch(
-        /^https:\/\/github.com\/WiseLibs\/better-sqlite3\/releases\/download\/v12\.10\.0\//,
-      );
-      expect(
-        readFileSync(
-          join(installed as string, "build/Release/better_sqlite3.node"),
-          "utf8",
-        ),
-      ).toBe("not executable");
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-
-  it("rejects official prebuilt traversal without installing or publishing runtime.json", async () => {
-    const f = await runtimeFixture();
-    const data = archive([{ name: "../escape", data: "bad" }]);
-    fixturePrebuiltPin("official", data);
-    mockDownloads(() => ({ data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).rejects.toThrow("Unsafe");
-    expect(
-      existsSync(
-        join(
-          f.root,
-          "storage/sqlite-runtime/better-sqlite3/12.10.0",
-          `node-abi-${process.versions.modules}-${process.platform}-${process.arch}-${currentPolicyId()}`,
-          "runtime.json",
-        ),
-      ),
-    ).toBe(false);
-  });
-
-  it("does not fetch unpinned patched binaries and rejects altered npm source with an actionable error", async () => {
-    Object.defineProperty(process.versions, "modules", {
-      value: "146",
-      configurable: true,
-    });
-    Object.defineProperty(process.versions, "electron", {
-      value: "42.0.0",
-      configurable: true,
-    });
-    const f = await runtimeFixture();
-    const urls = mockDownloads((url) =>
-      url.startsWith("https://github.com/")
-        ? { status: 404 }
-        : { data: archive([{ name: "package/binding.gyp", data: "evil" }]) },
-    );
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).rejects.toThrow(/integrity mismatch.*reviewed static pins/);
-    expect(urls).toHaveLength(1);
-    expect(urls[0]).toBe(SQLITE_SOURCE.url);
-    expect(urls.some((url) => url.includes("rapidb-patched-sqlite"))).toBe(
-      false,
-    );
-    expect(f.logs.join("\n")).toContain("no reviewed static integrity pin");
-  });
-
+describe("SQLite runtime installer", () => {
   it.each([
-    "",
-    "-archive-v1",
-    `-${currentPolicyId().replace("pins-v5-", "pins-v2-")}`,
-    `-${currentPolicyId().replace("pins-v5-", "pins-v3-")}`,
-    `-${currentPolicyId().replace("pins-v5-", "pins-v4-")}`,
-  ])("does not reuse a cache suffix '%s' from an older integrity/execution policy", async (legacySuffix) => {
-    const f = await runtimeFixture();
-    const probe = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
-    const legacyPackage = (probe.installedPackagePath as string).replace(
-      `-${currentPolicyId()}`,
-      legacySuffix,
+    false,
+    true,
+  ])("downloads the pinned npm tarball once, only after authorization (%s)", async (authorized) => {
+    const allowInstall = vi.fn(() => authorized);
+    const f = await runtimeFixture({ allowInstall });
+    const pkg = pinFixturePackage();
+    const urls = mockRegistry(() => ({ data: pkg.data }));
+    const paths = installedPaths();
+    expect(paths.runtimeRoot).toMatch(
+      new RegExp(
+        `sqlite-runtime[\\\\/]better-sqlite3[\\\\/]${SQLITE_ARTIFACTS.betterSqlite3Version.replaceAll(".", "\\.")}[\\\\/]${FIXTURE_TARGET}-pins-v6-[0-9a-f]{16}$`,
+      ),
     );
-    mkdirSync(join(legacyPackage, "build/Release"), { recursive: true });
-    writeFileSync(join(legacyPackage, "package.json"), "{}");
-    writeFileSync(
-      join(legacyPackage, "build/Release/better_sqlite3.node"),
-      "legacy",
-    );
-    const data = archive([
-      { name: "build/Release/better_sqlite3.node", data: "new" },
-    ]);
-    fixturePrebuiltPin("official", data);
-    const urls = mockDownloads(() => ({ data }));
-    const installed = await ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
-    expect(urls).toHaveLength(1);
-    expect(installed).toBe(probe.installedPackagePath);
-    expect(
-      readFileSync(
-        join(installed as string, "build/Release/better_sqlite3.node"),
-        "utf8",
-      ),
-    ).toBe("new");
-    expect(
-      existsSync(
-        join(dirname(dirname(installed as string)), ".rapidb-last-used"),
-      ),
-    ).toBe(true);
-    expect(
-      existsSync(join(dirname(dirname(legacyPackage)), ".rapidb-last-used")),
-    ).toBe(false);
-    expect(
-      readFileSync(
-        join(legacyPackage, "build/Release/better_sqlite3.node"),
-        "utf8",
-      ),
-    ).toBe("legacy");
-  });
-
-  it("rejects same-size official binary substitution before extraction/publication", async () => {
-    const f = await runtimeFixture();
-    const good = archive([
-      { name: "build/Release/better_sqlite3.node", data: "good" },
-    ]);
-    fixturePrebuiltPin("official", good);
-    const altered = Buffer.from(good);
-    altered[altered.length - 1] ^= 1;
-    const urls = mockDownloads(() => ({ data: altered }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).rejects.toThrow("integrity mismatch");
-    expect(urls).toHaveLength(1);
-    expect(
-      probeInstalledBetterSqlite3Runtime(join(f.root, "dist"))
-        .installedBinaryExists,
-    ).toBe(false);
-  });
-
-  it("never downloads unpinned executable inputs for an unsupported runtime", async () => {
-    Object.defineProperty(process.versions, "modules", {
-      value: "999",
-      configurable: true,
-    });
-    Object.defineProperty(process.versions, "electron", {
-      value: "99.0.0",
-      configurable: true,
-    });
-    const f = await runtimeFixture();
-    const urls = mockDownloads(() => {
-      throw new Error("Unexpected unpinned download");
-    });
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).rejects.toThrow("Unsupported SQLite source-build target");
-    expect(urls).toEqual([]);
-  });
-
-  it("keeps the no-toolchain patched path when a reviewed target pin is present", async () => {
-    Object.defineProperty(process.versions, "modules", {
-      value: "146",
-      configurable: true,
-    });
-    Object.defineProperty(process.versions, "electron", {
-      value: "42.0.0",
-      configurable: true,
-    });
-    const f = await runtimeFixture();
-    const data = archive([
-      { name: "build/Release/better_sqlite3.node", data: "patched" },
-    ]);
-    const expected = fixturePrebuiltPin("patched", data);
-    const urls = mockDownloads(() => ({ data }));
-    vi.stubEnv("PATH", "");
-    try {
-      const installed = await ensureSQLiteRuntimeInstalled(
-        join(f.root, "dist"),
-      );
-      expect(urls).toEqual([expected]);
+    if (authorized) {
+      const installed = await ensureSQLiteRuntimeInstalled();
+      expect(installed).toBe(paths.packagePath);
+      expect(readFileSync(paths.binaryPath, "utf8")).toBe("fixture addon");
+      expect(urls).toEqual([TARBALL_URL]);
       expect(
-        readFileSync(
-          join(installed as string, "build/Release/better_sqlite3.node"),
-          "utf8",
+        JSON.parse(
+          readFileSync(join(paths.runtimeRoot, "runtime.json"), "utf8"),
         ),
-      ).toBe("patched");
-    } finally {
-      vi.unstubAllEnvs();
-    }
-  });
-
-  it.skipIf(process.platform === "win32").each([
-    [true, false],
-    [false, false],
-    [true, true],
-    [false, true],
-  ])(
-    "passes only verified private headers and a controlled environment through the complete source fallback (workspace getter: %s, spaced TMPDIR: %s)",
-    async (withWorkspaceGetter, spacedTmpdir) => {
-      Object.defineProperty(process.versions, "modules", {
-        value: "146",
-        configurable: true,
+      ).toMatchObject({
+        schemaVersion: 3,
+        betterSqlite3Version: SQLITE_ARTIFACTS.betterSqlite3Version,
+        target: FIXTURE_TARGET,
+        nodeApiVersion: SQLITE_ARTIFACTS.nodeApiVersion,
       });
-      Object.defineProperty(process.versions, "electron", {
-        value: "42.1.0",
-        configurable: true,
-      });
-      const f = await runtimeFixture();
-      const installation = await createProjectTempDir(
-        "sqlite-source-tool-fixture",
-      );
-      const bin = join(installation, "bin");
-      const npmBin = join(installation, "lib/node_modules/npm/bin");
-      mkdirSync(bin, { recursive: true });
-      mkdirSync(npmBin, { recursive: true });
-      writeFileSync(join(bin, "node"), "test interpreter, never executed");
-      chmodSync(join(bin, "node"), 0o700);
-      writeFileSync(join(npmBin, "npm-cli.js"), "test npm, never executed");
-      symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
-      writeFileSync(join(bin, "python3"), "test python, never executed");
-      chmodSync(join(bin, "python3"), 0o700);
-      const workspaceRoots = [
-        join(installation, "workspace-first"),
-        join(installation, "workspace-second"),
-      ];
-      const workspaceBins = workspaceRoots.map((workspace) => {
-        const workspaceBin = join(workspace, "bin");
-        const workspaceNpm = join(workspace, "lib/node_modules/npm/bin");
-        mkdirSync(workspaceBin, { recursive: true });
-        mkdirSync(workspaceNpm, { recursive: true });
-        writeFileSync(join(workspaceBin, "node"), "never executed");
-        chmodSync(join(workspaceBin, "node"), 0o700);
-        writeFileSync(join(workspaceNpm, "npm-cli.js"), "never executed");
-        symlinkSync(
-          join(workspaceNpm, "npm-cli.js"),
-          join(workspaceBin, "npm"),
-        );
-        return workspaceBin;
-      });
-      const source = archive([
-        { name: "package/src/util/macros.cpp", data: "fixture" },
-        { name: "package/src/util/helpers.cpp", data: "fixture" },
-        { name: "package/src/better_sqlite3.cpp", data: "fixture" },
-        {
-          name: "package/deps/sqlite3.gyp",
-          data: readFileSync(
-            new URL(
-              "../../node_modules/better-sqlite3/deps/sqlite3.gyp",
-              import.meta.url,
-            ),
-          ),
-        },
+      expect(readdirSync(dirname(paths.runtimeRoot))).toEqual([
+        `${FIXTURE_TARGET}-${paths.runtimeRoot.split(`${FIXTURE_TARGET}-`).pop()}`,
       ]);
-      const headers = headerFixture();
-      if (spacedTmpdir) {
-        const temporaryDirectory = join(f.root, "temporary directory");
-        mkdirSync(temporaryDirectory, { recursive: true });
-        vi.stubEnv("TMPDIR", temporaryDirectory);
-      }
-      let currentWorkspaceRoots: readonly string[] = [];
-      const workspaceRootsGetter = vi.fn(() => currentWorkspaceRoots);
-      const urls = mockDownloads((url) => {
-        if (url === SQLITE_SOURCE.url) currentWorkspaceRoots = workspaceRoots;
-        return { data: url === SQLITE_SOURCE.url ? source : headers.data };
-      });
-      const calls: Array<{
-        file: string;
-        args: string[];
-        cwd: string;
-        env: NodeJS.ProcessEnv;
-        actions?: string;
-      }> = [];
-      vi.resetModules();
-      vi.doMock("node:child_process", async () => {
-        const actual =
-          await vi.importActual<typeof import("node:child_process")>(
-            "node:child_process",
-          );
-        return {
-          ...actual,
-          execFile: (
-            file: string,
-            args: string[],
-            options: { cwd: string; env: NodeJS.ProcessEnv },
-            callback: (
-              error: Error | null,
-              stdout: string,
-              stderr: string,
-            ) => void,
-          ) => {
-            calls.push({ file, args, cwd: options.cwd, env: options.env });
-            queueMicrotask(() => {
-              if (args[0].endsWith("node-gyp.js")) {
-                calls[calls.length - 1].actions = readFileSync(
-                  join(options.cwd, "deps/sqlite3.gyp"),
-                  "utf8",
-                );
-                mkdirSync(join(options.cwd, "build/Release"), {
-                  recursive: true,
-                });
-                writeFileSync(
-                  join(options.cwd, "build/Release/better_sqlite3.node"),
-                  "verified source build fixture",
-                );
-              }
-              callback(null, "", "");
-            });
-            return new EventEmitter();
-          },
-        };
-      });
-      const freshArchive = await import(
-        "../../src/extension/utils/sqliteArchive"
+      await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(installed);
+      expect(urls).toHaveLength(1);
+      expect(f.logs.join("\n")).toContain(
+        `Downloading better-sqlite3 ${SQLITE_ARTIFACTS.betterSqlite3Version}`,
       );
-      const sourceIntegrity = freshArchive.SQLITE_SOURCE.integrity;
-      Object.defineProperty(freshArchive.SQLITE_SOURCE, "integrity", {
-        value: integrity(source),
-        configurable: true,
-      });
-      SQLITE_ARTIFACTS.headers["42-146"] = headers.pins;
-      vi.stubEnv(
-        "PATH",
-        (withWorkspaceGetter ? [...workspaceBins, bin] : [bin]).join(delimiter),
+    } else {
+      await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+        "SQLite runtime installation was not authorized",
       );
-      vi.stubEnv("npm_config_nodedir", "/evil/headers");
-      vi.stubEnv("npm_package_config_node_gyp_directory", "/evil/source");
-      vi.stubEnv("PYTHONPATH", "/evil/python");
-      const fresh = await import("../../src/extension/utils/sqliteInstaller");
-      try {
-        fresh.configureSQLiteInstaller({
-          storageRoot: join(f.root, "fresh storage"),
-          allowInstall: () => true,
-          log: () => {},
-          ...(withWorkspaceGetter
-            ? { workspaceRoots: workspaceRootsGetter }
-            : {}),
-        });
-        expect(workspaceRootsGetter).not.toHaveBeenCalled();
-        const installed = await fresh.ensureSQLiteRuntimeInstalled(
-          join(f.root, "dist"),
-        );
-        expect(installed).toBeTruthy();
-        expect(installed).toContain("fresh storage");
-        expect(workspaceRootsGetter).toHaveBeenCalledTimes(
-          withWorkspaceGetter ? 2 : 0,
-        );
-        expect(urls).toEqual([SQLITE_SOURCE.url, headers.pins.archive.url]);
-        expect(calls).toHaveLength(2);
-        expect(calls[0].args).toContain("--ignore-scripts");
-        const build = calls[1];
-        expect(build.file).toBe(realpathSync(join(bin, "node")));
-        expect(build.env.PATH).toBe(bin);
-        expect(build.actions).toContain(
-          `'action': [${JSON.stringify(build.file)}, 'copy.js'`,
-        );
-        expect(build.actions).not.toContain("'action': ['node'");
-        expect(build.args).toContain("--target=42.0.0");
-        const python = realpathSync(join(bin, "python3"));
-        expect(build.args).toContain(`--python=${python}`);
-        expect(build.env.NODE_GYP_FORCE_PYTHON).toBe(python);
-        const nodedir = build.args
-          .find((arg) => arg.startsWith("--nodedir="))
-          ?.slice("--nodedir=".length);
-        expect(nodedir).toContain("electron-headers");
-        expect(build.args.some((arg) => arg.includes("dist-url"))).toBe(false);
-        expect(build.cwd).toContain("better-sqlite3-build-source");
-        expect(build.cwd).not.toMatch(/\s/);
-        expect(build.env.npm_config_nodedir).toBeUndefined();
-        expect(build.env.npm_package_config_node_gyp_directory).toBeUndefined();
-        expect(build.env.PYTHONPATH).toBeUndefined();
-        expect(build.env.HOME).toContain("build-home");
-        expect(build.env.HOME).not.toMatch(/\s/);
-        expect(existsSync(nodedir as string)).toBe(false);
-      } finally {
-        fresh.resetSQLiteInstallerForTests();
-        Object.defineProperty(freshArchive.SQLITE_SOURCE, "integrity", {
-          value: sourceIntegrity,
-          configurable: true,
-        });
-        vi.unstubAllEnvs();
-        vi.doUnmock("node:child_process");
-        vi.resetModules();
-      }
-    },
-  );
-
-  it.skipIf(process.platform === "win32")(
-    "fails the source fallback before any download when no trusted Python is on PATH",
-    async () => {
-      Object.defineProperty(process.versions, "modules", {
-        value: "146",
-        configurable: true,
-      });
-      Object.defineProperty(process.versions, "electron", {
-        value: "42.1.0",
-        configurable: true,
-      });
-      const f = await runtimeFixture();
-      const installation = await createProjectTempDir(
-        "sqlite-source-no-python",
-      );
-      const bin = join(installation, "bin");
-      const npmBin = join(installation, "lib/node_modules/npm/bin");
-      mkdirSync(bin, { recursive: true });
-      mkdirSync(npmBin, { recursive: true });
-      writeFileSync(join(bin, "node"), "test interpreter, never executed");
-      chmodSync(join(bin, "node"), 0o700);
-      writeFileSync(join(npmBin, "npm-cli.js"), "test npm, never executed");
-      symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
-      SQLITE_ARTIFACTS.headers["42-146"] = headerFixture().pins;
-      const urls = mockDownloads(() => ({ data: Buffer.alloc(0) }));
-      vi.stubEnv("PATH", bin);
-      try {
-        await expect(
-          ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-        ).rejects.toThrow("trusted Python 3 installation");
-        expect(urls).toEqual([]);
-      } finally {
-        vi.unstubAllEnvs();
-      }
-    },
-  );
-
-  it.each([
-    "https://evil.invalid/asset",
-    "http://127.0.0.1/asset",
-  ])("rejects an untrusted/downgrade release redirect: %s", async (location) => {
-    const f = await fixture([]);
-    const urls = mockDownloads(() => ({ status: 302, location }));
-    await expect(
-      downloadToFile(
-        "https://github.com/asset",
-        join(f.root, "download"),
-        1000,
-        { allowedHosts: ["github.com"] },
-      ),
-    ).rejects.toThrow(/Refusing/);
-    expect(urls).toHaveLength(1);
-  });
-});
-
-describe("SQLite source build tool discovery", () => {
-  it.skipIf(process.platform === "win32")(
-    "binds real copy.js actions to the selected Node even when a rejected external candidate leads PATH",
-    async () => {
-      const root = await createProjectTempDir("sqlite-nested-node");
-      const workspace = join(root, "workspace");
-      const rejected = join(root, "rejected-external-bin");
-      const installation = join(root, "trusted installation with spaces");
-      const bin = join(installation, "bin");
-      const npmBin = join(installation, "lib/node_modules/npm/bin");
-      const source = join(root, "source with spaces");
-      for (const directory of [
-        workspace,
-        rejected,
-        bin,
-        npmBin,
-        join(source, "deps/sqlite3"),
-      ])
-        mkdirSync(directory, { recursive: true });
-      const marker = join(workspace, "malicious-node-ran");
-      const malicious = join(workspace, "node");
-      writeFileSync(
-        malicious,
-        `#!/bin/sh\n/usr/bin/touch '${marker.replaceAll("'", "'\\''")}'\nexit 73\n`,
-      );
-      chmodSync(malicious, 0o700);
-      symlinkSync(malicious, join(rejected, "node"));
-      const selectedNode = join(installation, "selected Node's executable");
-      symlinkSync(process.execPath, selectedNode);
-      symlinkSync(selectedNode, join(bin, "node"));
-      writeFileSync(
-        join(npmBin, "npm-cli.js"),
-        "trusted npm discovery fixture",
-      );
-      symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
-      const tools = resolveSQLiteBuildTools(
-        workspace,
-        join(root, "runtime"),
-        { PATH: [rejected, bin].join(delimiter) },
-        [workspace],
-      );
-      expect(tools.node).toBe(realpathSync(selectedNode));
-      expect(tools.env.PATH?.split(delimiter)[0]).toBe(bin);
-      expect(tools.env.PATH?.split(delimiter)).not.toContain(rejected);
-      writeFileSync(
-        join(source, "deps/sqlite3.gyp"),
-        readFileSync(
-          new URL(
-            "../../node_modules/better-sqlite3/deps/sqlite3.gyp",
-            import.meta.url,
-          ),
-        ),
-      );
-      writeFileSync(
-        join(source, "deps/copy.js"),
-        readFileSync(
-          new URL(
-            "../../node_modules/better-sqlite3/deps/copy.js",
-            import.meta.url,
-          ),
-        ),
-      );
-      for (const filename of ["sqlite3.c", "sqlite3.h", "sqlite3ext.h"])
-        writeFileSync(
-          join(source, "deps/sqlite3", filename),
-          `actual ${filename}`,
-        );
-      pinSQLiteSourceNodeActions(source, tools.node);
-      const gyp = readFileSync(join(source, "deps/sqlite3.gyp"), "utf8");
-      const interpreters = [
-        ...gyp.matchAll(
-          /'action'\s*:\s*\[\s*("(?:[^"\\]|\\.)*")(?=\s*,\s*'copy\.js')/g,
-        ),
-      ].map((match) => JSON.parse(match[1]) as string);
-      expect(interpreters).toEqual([tools.node, tools.node]);
-      const env = { ...tools.env, PATH: [rejected, bin].join(delimiter) };
-      expect(existsSync(marker)).toBe(false);
-      for (const [index, interpreter] of interpreters.entries()) {
-        const destination = join(root, `actual output ${index}`);
-        await promisify(execFile)(
-          interpreter,
-          [
-            "copy.js",
-            destination,
-            index === 0 ? "" : join(source, "deps/sqlite3"),
-          ],
-          { cwd: join(source, "deps"), env },
-        );
-        expect(readFileSync(join(destination, "sqlite3.c"), "utf8")).toBe(
-          "actual sqlite3.c",
-        );
-        expect(readFileSync(join(destination, "sqlite3.h"), "utf8")).toBe(
-          "actual sqlite3.h",
-        );
-      }
-      expect(existsSync(marker)).toBe(false);
-    },
-  );
-
-  it.each([
-    "C:\\Program Files\\Node's installation\\node.exe",
-    "C:\\Program Files (x86)\\Node's installation\\node.exe",
-    "C:\\Node\\node.exe",
-  ])("escapes Windows Node paths as GYP-compatible literals: %s", async (node) => {
-    const root = await createProjectTempDir("sqlite-gyp-windows-path");
-    mkdirSync(join(root, "deps"));
-    writeFileSync(
-      join(root, "deps/sqlite3.gyp"),
-      "{'actions': [{'action': ['node', 'copy.js', 'out', '']}, {'action': ['node', 'copy.js', 'out', 'custom']}]}\n",
-    );
-    pinSQLiteSourceNodeActions(root, node, "win32");
-    const gyp = readFileSync(join(root, "deps/sqlite3.gyp"), "utf8");
-    const encoded = [...gyp.matchAll(/'action': \[("(?:[^"\\]|\\.)*")/g)].map(
-      (match) => match[1],
-    );
-    expect(encoded).toEqual([JSON.stringify(node), JSON.stringify(node)]);
-    expect(encoded.map((literal) => JSON.parse(literal))).toEqual([node, node]);
-  });
-
-  it("fails closed if the pinned source action shape changes", async () => {
-    const root = await createProjectTempDir("sqlite-gyp-action-change");
-    mkdirSync(join(root, "deps"));
-    const gyp = "{'action': ['node', 'different.js']}\n";
-    writeFileSync(join(root, "deps/sqlite3.gyp"), gyp);
-    expect(() => pinSQLiteSourceNodeActions(root, process.execPath)).toThrow(
-      "actions changed",
-    );
-    expect(readFileSync(join(root, "deps/sqlite3.gyp"), "utf8")).toBe(gyp);
-    expect(() => pinSQLiteSourceNodeActions(root, "node")).toThrow(
-      "absolute selected Node",
-    );
-  });
-  it("does not permit environment config to override node-gyp argv or inject interpreters/loaders", async () => {
-    const root = await createProjectTempDir("sqlite-controlled-env");
-    const hostile = {
-      ...process.env,
-      npm_config_dist_url: "https://evil.invalid",
-      npm_config_nodedir: "/evil/headers",
-      NPM_CONFIG_DIRECTORY: "/evil/source",
-      npm_config_python: "/evil/python",
-      npm_package_config_node_gyp_dist_url: "https://evil.invalid",
-      npm_package_config_node_gyp_nodedir: "/evil/headers",
-      npm_package_config_node_gyp_directory: "/evil/source",
-      NPM_PACKAGE_CONFIG_NODE_GYP_PYTHON: "/evil/python",
-      PYTHONPATH: "/evil/sitecustomize",
-      PYTHONHOME: "/evil/python-home",
-      PYTHONSTARTUP: "/evil/startup.py",
-      PYTHON: "/evil/python",
-      NODE_GYP_FORCE_PYTHON: "/evil/python",
-      NODE_OPTIONS: "--require=/evil/hook.js",
-      NODE_PATH: "/evil/modules",
-      LD_PRELOAD: "/evil/loader.so",
-      DYLD_INSERT_LIBRARIES: "/evil/loader.dylib",
-      BASH_ENV: "/evil/shell-hook",
-      COMSPEC: "/evil/shell",
-      PATHEXT: ".EVIL",
-      GYP_DEFINES: "node_root_dir=/evil/headers",
-      CC: "/evil/compiler",
-      CXXFLAGS: "-include /evil/payload.h",
-      HOME: "/evil/home",
-      TMPDIR: "/evil/tmp",
-    };
-    const env = sqliteBuildEnvironment(hostile, process.env.PATH ?? "", root);
-    for (const key of Object.keys(hostile)) {
-      if (
-        /^(npm_|python(?:path|home|startup)?$|node_options|node_path|node_gyp|ld_|dyld_|bash_env|gyp_|cc$|cxxflags$)/i.test(
-          key,
-        )
-      )
-        expect(env[key]).toBeUndefined();
+      expect(urls).toEqual([]);
+      expect(existsSync(paths.runtimeRoot)).toBe(false);
     }
-    expect(env.HOME).toBe(join(root, "build-home"));
-    expect(env.TMPDIR).toBe(join(root, "build-home/tmp"));
-    expect(env.PYTHONNOUSERSITE).toBe("1");
-    expect(env.PYTHONSAFEPATH).toBe("1");
-    expect(env.COMSPEC).not.toBe("/evil/shell");
-    expect(env.PATHEXT).not.toBe(".EVIL");
-    const headerDir = join(root, "verified-headers");
-    const args = sqliteNodeGypArguments(
-      join(root, "tools"),
-      headerDir,
-      "42.0.0",
-      process.platform,
-      process.arch,
-    );
-    expect(args.some((arg) => /dist-url|tarball/.test(arg))).toBe(false);
-    const script = `const gyp = require(${JSON.stringify(require.resolve("node-gyp"))})(); gyp.parseArgv([process.execPath, "node-gyp", ...${JSON.stringify(args.slice(1))}]); console.log(JSON.stringify(gyp.opts));`;
-    const { stdout } = await promisify(execFile)(
-      process.execPath,
-      ["-e", script],
-      { env },
-    );
-    const opts = JSON.parse(stdout);
-    expect(opts.nodedir).toBe(headerDir);
-    expect(opts.devdir).toBe(join(root, "tools/node-gyp-devdir"));
-    expect(opts.target).toBe("42.0.0");
-    expect(opts.directory).toBeUndefined();
-    expect(opts.python).toBeUndefined();
-    expect(opts["dist-url"]).toBeUndefined();
-  });
-  it("retains lockfile integrity for every node-gyp dependency and excludes unrelated packages", () => {
-    const tool = createSQLiteBuildToolLock();
-    const repository = JSON.parse(
-      readFileSync(new URL("../../package-lock.json", import.meta.url), "utf8"),
-    );
-    expect(tool.manifest.dependencies["node-gyp"]).toBe(
-      repository.packages["node_modules/node-gyp"].version,
-    );
-    expect(Object.keys(tool.lock.packages).length).toBeGreaterThan(20);
-    expect(tool.lock.packages["node_modules/better-sqlite3"]).toBeUndefined();
-    for (const [path, entry] of Object.entries(tool.lock.packages)) {
-      if (!path) continue;
-      expect((entry as { integrity: string }).integrity).toBe(
-        repository.packages[path].integrity,
-      );
-      expect((entry as { dev?: boolean }).dev).toBeUndefined();
-    }
-  });
-  it("rejects relative, workspace, and non-npm PATH shims without executing them", async () => {
-    const root = await createProjectTempDir("sqlite-build-path");
-    mkdirSync(join(root, "bin"));
-    writeFileSync(join(root, "bin/npx"), "malicious");
-    expect(() =>
-      resolveSQLiteBuildTools(
-        root,
-        join(root, "storage"),
-        { PATH: `.:bin:${join(root, "bin")}` },
-        [root],
-      ),
-    ).toThrow("trusted Node.js/npm");
+    expect(allowInstall).toHaveBeenCalledOnce();
   });
 
-  it.skipIf(process.platform === "win32")(
-    "uses absolute Node/npm paths, sanitized PATH, and no NODE_OPTIONS injection",
-    async () => {
-      const root = await createProjectTempDir("sqlite-build-tools");
-      const bin = join(root, "installation/bin");
-      const npmBin = join(root, "installation/lib/node_modules/npm/bin");
-      mkdirSync(bin, { recursive: true });
-      mkdirSync(npmBin, { recursive: true });
-      writeFileSync(join(bin, "node"), "local node");
-      chmodSync(join(bin, "node"), 0o700);
-      writeFileSync(join(npmBin, "npm-cli.js"), "local npm");
-      symlinkSync(join(npmBin, "npm-cli.js"), join(bin, "npm"));
-      const tools = resolveSQLiteBuildTools(
-        join(root, "workspace"),
-        join(root, "storage"),
-        {
-          PATH: `.:relative:${bin}`,
-          NODE_OPTIONS: "--require=evil",
-          NODE_PATH: "evil",
-          node_options: "--require=evil-lowercase",
-          node_path: "evil-lowercase",
-        },
-        [join(root, "workspace")],
-      );
-      expect(tools.node).toBe(realpathSync(join(bin, "node")));
-      expect(tools.npmCli).toBe(realpathSync(join(npmBin, "npm-cli.js")));
-      expect(tools.env.PATH).toBe(bin);
-      expect(tools.env.NODE_OPTIONS).toBeUndefined();
-      expect(tools.env.NODE_PATH).toBeUndefined();
-      expect(tools.env.node_options).toBeUndefined();
-      expect(tools.env.node_path).toBeUndefined();
-    },
-  );
-});
+  it("reuses an installed runtime in a new window without network or a prompt", async () => {
+    const f = await runtimeFixture();
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    const installed = await ensureSQLiteRuntimeInstalled();
+    vi.restoreAllMocks();
 
-function headerFixture(entries: Entry[] = []) {
-  const data = archive([
-    { name: "node_headers/include/node/common.gypi", data: "{}" },
-    { name: "node_headers/include/node/config.gypi", data: "{}" },
-    {
-      name: "node_headers/include/node/node_version.h",
-      data: "#define NODE_MODULE_VERSION 146\n",
-    },
-    ...entries,
-  ]);
-  const library = Buffer.from("verified Windows import library");
-  const baseline = originalHeaders["42-146"];
-  const pins: SQLiteHeaderPins = {
-    ...baseline,
-    archive: {
-      ...baseline.archive,
-      integrity: integrity(data),
-      size: data.length,
-    },
-    windowsLibraries: {
-      x64: {
-        ...baseline.windowsLibraries.x64,
-        integrity: integrity(library),
-        size: library.length,
-      },
-    },
-  };
-  return { data, library, pins };
-}
-
-describe("Pinned executable-input manifest and private Electron headers", () => {
-  it("records bootstrap release/asset IDs and API digests for every official/patched executable pin", () => {
-    expect(SQLITE_ARTIFACTS.betterSqlite3Version).toBe(SQLITE_SOURCE.version);
-    const electronAbis = [
-      121, 123, 125, 128, 130, 132, 133, 135, 136, 139, 140, 143, 145,
-    ];
-    const nodeAbis = [127, 137, 141, 147];
-    const electronTargets = [
-      "darwin-arm64",
-      "darwin-x64",
-      "linux-arm64",
-      "linux-x64",
-      "win32-arm64",
-      "win32-ia32",
-      "win32-x64",
-    ];
-    const nodeTargets = [
-      ...electronTargets.filter((target) => target !== "win32-ia32"),
-      "linux-arm",
-      "linuxmusl-arm",
-      "linuxmusl-arm64",
-      "linuxmusl-x64",
-    ];
-    const expected = [
-      ...electronAbis.flatMap((abi) =>
-        electronTargets.map(
-          (target) =>
-            `official/better-sqlite3-v12.10.0-electron-v${abi}-${target}.tar.gz`,
-        ),
-      ),
-      ...nodeAbis.flatMap((abi) =>
-        nodeTargets.map(
-          (target) =>
-            `official/better-sqlite3-v12.10.0-node-v${abi}-${target}.tar.gz`,
-        ),
-      ),
-    ];
-    expect(Object.keys(originalPrebuilts).sort()).toEqual(expected.sort());
-    for (const [key, pin] of Object.entries(originalPrebuilts)) {
-      expect(key).toMatch(
-        /^(?:official|patched)\/better-sqlite3-v12\.10\.0-(?:node|electron)-v\d+-(?:darwin|linux|linuxmusl|win32)-(?:arm64|x64|ia32|arm)\.tar\.gz$/,
-      );
-      expect(pin.assetId).toBeGreaterThan(0);
-      expect(pin.releaseId).toBeGreaterThan(0);
-      expect(pin.apiDigest).toMatch(/^sha256:[a-f0-9]{64}$/);
-      expect(pin.integrity).toBe(
-        `sha256-${Buffer.from(pin.apiDigest.slice(7), "hex").toString("base64")}`,
-      );
-      expect(pin.size).toBeGreaterThan(0);
-      expect(pin.size).toBeLessThanOrEqual(
-        SQLITE_ARCHIVE_LIMITS.compressedBytes,
-      );
-    }
-    for (const pins of Object.values(originalHeaders)) {
-      expect(pins.releaseId).toBeGreaterThan(0);
-      expect(pins.checksumIntegrity).toMatch(/^sha256-/);
-      expect(pins.archive.integrity).toMatch(/^sha256-/);
-      expect(pins.windowsLibraries.x64.integrity).toMatch(/^sha256-/);
-      expect(pins.windowsLibraries.arm64.integrity).toMatch(/^sha256-/);
-    }
-  });
-
-  it("chooses an explicit ABI-compatible baseline, rejects unpinned major/ABI/import-library targets", () => {
-    expect(sqliteHeaderPins("42.9.9", "146", "darwin", "arm64").version).toBe(
-      "42.0.0",
-    );
-    expect(sqliteHeaderPins("43.0.0", "148", "linux", "x64").version).toBe(
-      "43.0.0",
-    );
-    expect(sqliteHeaderPins("44.5.1", "149", "win32", "arm64").version).toBe(
-      "44.0.0",
-    );
-    expect(() => sqliteHeaderPins("42.0.0", "999", "darwin", "arm64")).toThrow(
-      "Unsupported",
-    );
-    expect(() => sqliteHeaderPins("45.0.0", "150", "darwin", "arm64")).toThrow(
-      "Unsupported",
-    );
-    expect(() => sqliteHeaderPins("42.0.0", "146", "win32", "ia32")).toThrow(
-      "Unsupported",
-    );
-  });
-
-  it("verifies common.gypi/config.gypi and Windows node.lib in a private directory without SHASUMS/global cache", async () => {
-    const root = await createProjectTempDir("sqlite-private-headers");
-    const f = headerFixture();
-    const urls = mockDownloads((url) => ({
-      data: url.endsWith("node.lib") ? f.library : f.data,
-    }));
-    const nodedir = await preparePinnedSQLiteHeaders(
-      root,
-      f.pins,
-      "win32",
-      "x64",
-    );
-    expect(nodedir).toBe(join(root, "electron-headers"));
-    expect(
-      readFileSync(join(nodedir, "include/node/common.gypi"), "utf8"),
-    ).toBe("{}");
-    expect(
-      readFileSync(join(nodedir, "include/node/config.gypi"), "utf8"),
-    ).toBe("{}");
-    expect(readFileSync(join(nodedir, "Release/node.lib"))).toEqual(f.library);
-    expect(urls).toEqual([f.pins.archive.url, f.pins.windowsLibraries.x64.url]);
-    expect(urls.some((url) => /SHASUMS/.test(url))).toBe(false);
-    expect(existsSync(join(root, "electron-headers.tgz"))).toBe(false);
-  });
-
-  it.each([
-    "headers",
-    "library",
-  ])("rejects substituted %s bytes and removes all staged headers", async (target) => {
-    const root = await createProjectTempDir("sqlite-header-substitution");
-    const f = headerFixture();
-    const urls = mockDownloads((url) => {
-      const isLibrary = url.endsWith("node.lib");
-      const bytes = Buffer.from(isLibrary ? f.library : f.data);
-      if ((target === "library") === isLibrary) bytes[bytes.length - 1] ^= 1;
-      return { data: bytes };
+    resetSQLiteInstallerForTests();
+    const allowInstall = vi.fn(() => true);
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall,
     });
-    await expect(
-      preparePinnedSQLiteHeaders(root, f.pins, "win32", "x64"),
-    ).rejects.toThrow("integrity mismatch");
-    expect(existsSync(join(root, "electron-headers"))).toBe(false);
-    expect(urls.length).toBe(target === "headers" ? 1 : 2);
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(installed);
+    expect(urls).toEqual([]);
+    expect(allowInstall).not.toHaveBeenCalled();
+  });
+
+  it("accepts a runtime copied from another computer's storage for offline use", async () => {
+    const f = await runtimeFixture();
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    await ensureSQLiteRuntimeInstalled();
+    vi.restoreAllMocks();
+    const offlineStorage = join(f.root, "offline-storage");
+    cpSync(
+      join(f.root, "storage", "sqlite-runtime"),
+      join(offlineStorage, "sqlite-runtime"),
+      { recursive: true },
+    );
+
+    resetSQLiteInstallerForTests();
+    const allowInstall = vi.fn(() => true);
+    configureSQLiteInstaller({ storageRoot: offlineStorage, allowInstall });
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const urls = mockRegistry(unexpectedDownload);
+    const installed = await ensureSQLiteRuntimeInstalled();
+    expect(installed?.startsWith(offlineStorage)).toBe(true);
+    expect(urls).toEqual([]);
+    expect(allowInstall).not.toHaveBeenCalled();
+  });
+
+  it("ignores npm registry, mirror and proxy environment variables", async () => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    for (const name of [
+      "npm_config_registry",
+      "NPM_CONFIG_REGISTRY",
+      "npm_config_better_sqlite3_binary_host",
+      "npm_config_proxy",
+      "npm_config_https_proxy",
+      "npm_config_noproxy",
+      "HTTPS_PROXY",
+      "https_proxy",
+      "HTTP_PROXY",
+    ])
+      vi.stubEnv(name, "https://evil.invalid:8080/");
+    vi.stubEnv("npm_config_strict_ssl", "false");
+    vi.stubEnv("NODE_TLS_REJECT_UNAUTHORIZED", "1");
+    const urls = mockRegistry(() => ({ data: pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
+    expect(urls).toEqual([TARBALL_URL]);
+    // The request carries no agent/proxy/TLS options of its own: only the URL
+    // and the response callback (VS Code's own proxy support still applies).
+    const calls = vi.mocked(https.get).mock.calls as unknown[][];
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toHaveLength(2);
+    expect(calls[0][0]).toBe(TARBALL_URL);
+    expect(typeof calls[0][1]).toBe("function");
+  });
+
+  it("explains that installation is disabled in an untrusted workspace and how to allow it", async () => {
+    const allowInstall = vi.fn(() => true);
+    const f = await runtimeFixture({ allowInstall });
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall,
+      isTrusted: () => false,
+    });
+    const urls = mockRegistry(unexpectedDownload);
+    const error = await ensureSQLiteRuntimeInstalled().catch((e) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toMatch(/not trusted \(Restricted Mode\)/);
+    expect(error.message).toContain("Manage Workspace Trust");
+    expect(error.message).not.toContain("was not authorized");
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+  });
+
+  it("uses an already installed runtime in an untrusted workspace without asking", async () => {
+    const f = await runtimeFixture();
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    const installed = await ensureSQLiteRuntimeInstalled();
+    vi.restoreAllMocks();
+    resetSQLiteInstallerForTests();
+    const allowInstall = vi.fn(() => true);
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall,
+      isTrusted: () => false,
+    });
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(installed);
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+  });
+
+  it("labels download sizes in decimal megabytes", () => {
+    expect(formatSQLiteDownloadSize(11_623_888)).toBe("11.6 MB");
+    expect(sqliteRuntimeDownloadSummary()).toBe(
+      `better-sqlite3 ${SQLITE_ARTIFACTS.betterSqlite3Version}, ${(SQLITE_ARTIFACTS.tarball.size / 1_000_000).toFixed(1)} MB from registry.npmjs.org`,
+    );
   });
 
   it.each([
-    { name: "node_headers/../../escape", data: "payload" },
-    { name: "node_headers/include/node/link", type: "2", linkname: "/escape" },
-  ])("rejects hostile header archive paths/links before extraction", async (entry) => {
-    const root = await createProjectTempDir("sqlite-header-traversal");
-    const f = headerFixture([entry]);
-    mockDownloads(() => ({ data: f.data }));
-    await expect(
-      preparePinnedSQLiteHeaders(root, f.pins, "linux", "x64"),
-    ).rejects.toThrow(/Unsafe|Unsupported/);
-    expect(existsSync(join(root, "electron-headers"))).toBe(false);
+    ["linux-ia32", hostProbe("linux-ia32")],
+    ["freebsd-x64", { platform: "freebsd" as NodeJS.Platform, arch: "x64" }],
+    [
+      "linux-x64 with an undeterminable C library",
+      {
+        platform: "linux" as NodeJS.Platform,
+        arch: "x64",
+        readProcessMaps: () => null,
+        glibcVersionRuntime: () => undefined,
+      },
+    ],
+  ])("refuses %s before asking or downloading", async (_name, probe) => {
+    const allowInstall = vi.fn(() => true);
+    await runtimeFixture({ allowInstall });
+    setSQLiteHostForTests({ probe });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      /SQLite is not available on .*No binary was downloaded/,
+    );
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+    expect(probeInstalledBetterSqlite3Runtime()).toMatchObject({
+      target: expect.stringContaining("unsupported"),
+      installedPackagePath: null,
+    });
   });
 
-  it("requires pinned header ABI and a Windows library before permitting a build", async () => {
-    const root = await createProjectTempDir("sqlite-header-abi");
-    const f = headerFixture();
-    const urls = mockDownloads(() => ({ data: f.data }));
-    await expect(
-      preparePinnedSQLiteHeaders(root, f.pins, "win32", "arm64"),
-    ).rejects.toThrow("Unsupported pinned");
+  it.each([
+    "9",
+    "",
+    "not-a-number",
+  ])("refuses a host with Node-API %j before asking or downloading", async (napi) => {
+    const allowInstall = vi.fn(() => true);
+    await runtimeFixture({ allowInstall });
+    setSQLiteHostForTests({
+      probe: hostProbe(FIXTURE_TARGET),
+      nodeApiVersion: napi,
+    });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      `SQLite requires Node-API ${SQLITE_ARTIFACTS.nodeApiVersion}`,
+    );
+    expect(allowInstall).not.toHaveBeenCalled();
     expect(urls).toEqual([]);
-    await expect(
-      preparePinnedSQLiteHeaders(
-        root,
-        { ...f.pins, abi: "999" },
-        "linux",
-        "x64",
+  });
+
+  it("fails closed for a target without a reviewed prebuild pin", async () => {
+    await runtimeFixture();
+    delete SQLITE_ARTIFACTS.prebuilds[FIXTURE_TARGET];
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      `no reviewed prebuild pin for ${FIXTURE_TARGET}`,
+    );
+    expect(urls).toEqual([]);
+  });
+
+  it.each([
+    [
+      "a different version",
+      () => {
+        SQLITE_ARTIFACTS.betterSqlite3Version = "13.9.9";
+      },
+    ],
+    [
+      "a non-registry tarball URL",
+      () => {
+        SQLITE_ARTIFACTS.tarball.url =
+          "https://evil.invalid/better-sqlite3.tgz";
+      },
+    ],
+    [
+      "a weak tarball digest",
+      () => {
+        SQLITE_ARTIFACTS.tarball.integrity = `sha1-${Buffer.alloc(20).toString("base64")}`;
+      },
+    ],
+    [
+      "a remapped prebuild path",
+      () => {
+        SQLITE_ARTIFACTS.prebuilds[FIXTURE_TARGET].path =
+          "prebuilds/linuxmusl-x64.node";
+      },
+    ],
+    [
+      "an unexpected pinned file",
+      () => {
+        SQLITE_ARTIFACTS.files["deps/download.sh"] = {
+          sha256: "0".repeat(64),
+          size: 1,
+        };
+      },
+    ],
+    [
+      "a glibc prebuild without its minimum glibc",
+      () => {
+        delete SQLITE_ARTIFACTS.prebuilds[FIXTURE_TARGET].minGlibc;
+      },
+    ],
+    [
+      "a glibc prebuild without its minimum libstdc++",
+      () => {
+        delete SQLITE_ARTIFACTS.prebuilds[FIXTURE_TARGET].minGlibcxx;
+      },
+    ],
+    [
+      "a malformed minimum glibc",
+      () => {
+        SQLITE_ARTIFACTS.prebuilds[FIXTURE_TARGET].minGlibc = "2.34 or so";
+      },
+    ],
+  ])("refuses a manifest with %s without downloading", async (_name, mutate) => {
+    await runtimeFixture();
+    mutate();
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      /manifest|refusing to install/,
+    );
+    expect(urls).toEqual([]);
+  });
+
+  it("rejects same-size tarball substitution before extraction or publication", async () => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    const altered = Buffer.from(pkg.data);
+    altered[altered.length - 1] ^= 1;
+    const urls = mockRegistry(() => ({ data: altered }));
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      "integrity mismatch",
+    );
+    expect(urls).toHaveLength(1);
+    expect(existsSync(installedPaths().runtimeRoot)).toBe(false);
+    expect(readdirSync(dirname(installedPaths().runtimeRoot))).toEqual([]);
+  });
+
+  it("rejects a binary substitution inside a re-pinned tarball", async () => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    const evil = gzipTar(
+      Object.entries(pkg.files).map(([path, data]) => ({
+        name: `package/${path}`,
+        data: path.endsWith(".node") ? Buffer.from("evil addon!!!") : data,
+      })),
+    );
+    pinTarball(evil);
+    mockRegistry(() => ({ data: evil }));
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      "does not match its reviewed SHA-256 pin",
+    );
+    expect(existsSync(installedPaths().runtimeRoot)).toBe(false);
+  });
+
+  it("rejects traversal and symlink entries inside the tarball without publishing", async () => {
+    await runtimeFixture();
+    for (const extra of [
+      { name: "package/../../escape", data: "bad" },
+      { name: "package/lib/link.js", type: "2", linkname: "/etc/passwd" },
+    ]) {
+      const pkg = pinFixturePackage({ extraEntries: [extra] });
+      mockRegistry(() => ({ data: pkg.data }));
+      await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+        /Unsafe|Unsupported/,
+      );
+      vi.restoreAllMocks();
+    }
+    expect(existsSync(installedPaths().runtimeRoot)).toBe(false);
+  });
+
+  it.each([
+    [
+      "an oversized Content-Length",
+      (data: Buffer) => ({
+        data,
+        headers: { "content-length": String(data.length + 1) },
+      }),
+      "size limit",
+    ],
+    [
+      "a body larger than the pin",
+      (data: Buffer) => ({ data: Buffer.concat([data, Buffer.from("x")]) }),
+      "size limit",
+    ],
+    [
+      "a body smaller than the pin",
+      (data: Buffer) => ({ data: data.subarray(0, data.length - 1) }),
+      "does not match its reviewed pin",
+    ],
+    ["an HTTP error", () => ({ status: 404 }), "HTTP 404"],
+  ])("rejects %s", async (_name, reply, message) => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    mockRegistry(() => reply(pkg.data));
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(message);
+    expect(existsSync(installedPaths().runtimeRoot)).toBe(false);
+  });
+
+  it.each([
+    "https://evil.invalid/better-sqlite3.tgz",
+    "http://registry.npmjs.org/better-sqlite3/-/better-sqlite3.tgz",
+    "https://registry.npmjs.org.evil.invalid/better-sqlite3.tgz",
+    "https://user@evil.invalid/",
+    "https://registry.npmjs.org:8443/better-sqlite3/-/better-sqlite3.tgz",
+    "https://registry.npmjs.org:80/better-sqlite3/-/better-sqlite3.tgz",
+    "https://user:secret@registry.npmjs.org/better-sqlite3/-/better-sqlite3.tgz",
+    "https://token@registry.npmjs.org/better-sqlite3/-/better-sqlite3.tgz",
+  ])("refuses a redirect to %s", async (location) => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    const urls = mockRegistry((url) =>
+      url === TARBALL_URL ? { status: 302, location } : { data: pkg.data },
+    );
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      "Refusing untrusted SQLite download host",
+    );
+    expect(urls).toEqual([TARBALL_URL]);
+  });
+
+  it.each([
+    "https://registry.npmjs.org/better-sqlite3/-/redirected.tgz",
+    "https://registry.npmjs.org:443/better-sqlite3/-/redirected.tgz",
+  ])("follows a redirect that stays on the npm registry over HTTPS (%s)", async (mirror) => {
+    await runtimeFixture();
+    const pkg = pinFixturePackage();
+    const urls = mockRegistry((url) =>
+      url === TARBALL_URL
+        ? { status: 307, location: mirror }
+        : { data: pkg.data },
+    );
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
+    expect(urls).toEqual([TARBALL_URL, new URL(mirror).toString()]);
+  });
+
+  it.each([
+    [
+      "a modified binary",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(paths.binaryPath, "fixture addoN"),
+    ],
+    [
+      "a modified JavaScript file",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(join(paths.packagePath, "lib/index.js"), "evil()"),
+    ],
+    [
+      "a missing file",
+      (paths: ReturnType<typeof installedPaths>) =>
+        rmSync(join(paths.packagePath, "package.json")),
+    ],
+    [
+      "a binary replaced by a symlink to identical bytes",
+      (paths: ReturnType<typeof installedPaths>) => {
+        const copy = join(dirname(paths.runtimeRoot), "copy.node");
+        cpSync(paths.binaryPath, copy);
+        rmSync(paths.binaryPath);
+        symlinkSync(copy, paths.binaryPath);
+      },
+    ],
+    [
+      "a corrupted runtime.json",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(join(paths.runtimeRoot, "runtime.json"), "{not json"),
+    ],
+    [
+      "a better-sqlite3 12.x runtime.json",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(
+          join(paths.runtimeRoot, "runtime.json"),
+          JSON.stringify({
+            betterSqlite3Version: "12.11.1",
+            runtime: "electron",
+            abi: "146",
+            platform: "linux",
+            arch: "x64",
+            libc: "",
+          }),
+        ),
+    ],
+    [
+      "a runtime for another target",
+      (paths: ReturnType<typeof installedPaths>) => {
+        const manifestPath = join(paths.runtimeRoot, "runtime.json");
+        const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+        writeFileSync(
+          manifestPath,
+          JSON.stringify({ ...manifest, target: "linuxmusl-x64" }),
+        );
+      },
+    ],
+    [
+      "an extra extensionless lib/util that require('./util') would load",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(join(paths.packagePath, "lib", "util"), "evil()"),
+    ],
+    [
+      "a case variant lib/Util",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(join(paths.packagePath, "lib", "Util"), "evil()"),
+    ],
+    [
+      "a pinned file renamed to a case variant",
+      (paths: ReturnType<typeof installedPaths>) =>
+        renameSync(
+          join(paths.packagePath, "lib", "index.js"),
+          join(paths.packagePath, "lib", "Index.js"),
+        ),
+    ],
+    [
+      "an extra directory",
+      (paths: ReturnType<typeof installedPaths>) =>
+        mkdirSync(join(paths.packagePath, "lib", "util")),
+    ],
+    [
+      "an extra package in node_modules",
+      (paths: ReturnType<typeof installedPaths>) =>
+        mkdirSync(join(paths.runtimeRoot, "node_modules", "bindings")),
+    ],
+    [
+      "an extra file in the runtime root",
+      (paths: ReturnType<typeof installedPaths>) =>
+        writeFileSync(join(paths.runtimeRoot, "notes.txt"), ""),
+    ],
+    [
+      "a symlink inside the package",
+      (paths: ReturnType<typeof installedPaths>) =>
+        symlinkSync(
+          join(paths.packagePath, "lib", "index.js"),
+          join(paths.packagePath, "lib", "alias.js"),
+        ),
+    ],
+    [
+      "the use marker replaced by a directory",
+      (paths: ReturnType<typeof installedPaths>) => {
+        rmSync(join(paths.runtimeRoot, ".rapidb-last-used"));
+        mkdirSync(join(paths.runtimeRoot, ".rapidb-last-used"));
+      },
+    ],
+    [
+      "a runtime directory replaced by a symlink",
+      (paths: ReturnType<typeof installedPaths>) => {
+        const moved = `${paths.runtimeRoot}-moved`;
+        renameSync(paths.runtimeRoot, moved);
+        symlinkSync(moved, paths.runtimeRoot, "junction");
+      },
+    ],
+  ])("never loads a cache with %s and reinstalls it only after authorization", async (_name, tamper) => {
+    const allowInstall = vi.fn(() => true);
+    const f = await runtimeFixture({ allowInstall });
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    const installed = await ensureSQLiteRuntimeInstalled();
+    vi.restoreAllMocks();
+    const paths = installedPaths();
+    tamper(paths);
+
+    resetSQLiteInstallerForTests();
+    const deny = vi.fn(() => false);
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall: deny,
+    });
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const denied = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      "not authorized",
+    );
+    expect(deny).toHaveBeenCalledOnce();
+    expect(denied).toEqual([]);
+    vi.restoreAllMocks();
+
+    resetSQLiteInstallerForTests();
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall,
+    });
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const urls = mockRegistry(() => ({ data: pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(installed);
+    expect(urls).toEqual([TARBALL_URL]);
+    expect(readFileSync(paths.binaryPath, "utf8")).toBe("fixture addon");
+    expect(lstatSync(paths.runtimeRoot).isDirectory()).toBe(true);
+    expect(runtimeTree(paths.runtimeRoot)).toEqual(INSTALLED_FIXTURE_TREE);
+    expect(
+      readdirSync(dirname(paths.runtimeRoot)).filter((entry) =>
+        entry.includes(".obsolete-"),
       ),
-    ).rejects.toThrow("expected SQLite ABI");
-    expect(existsSync(join(root, "electron-headers"))).toBe(false);
+    ).toEqual([]);
+  });
+
+  it("keys the cache by version, target and pins, not by the host ABI", async () => {
+    await runtimeFixture();
+    const before = installedPaths().runtimeRoot;
+    const modules = Object.getOwnPropertyDescriptor(
+      process.versions,
+      "modules",
+    );
+    try {
+      Object.defineProperty(process.versions, "modules", {
+        value: "999",
+        configurable: true,
+      });
+      expect(installedPaths().runtimeRoot).toBe(before);
+    } finally {
+      if (modules) Object.defineProperty(process.versions, "modules", modules);
+    }
+    setSQLiteHostForTests({ probe: hostProbe("linuxmusl-x64") });
+    expect(installedPaths().runtimeRoot).not.toBe(before);
+    expect(installedPaths().runtimeRoot).toContain("linuxmusl-x64-pins-v6-");
+    expect(() => sqlitePackagePlan("linuxmusl-x64")).not.toThrow();
   });
 });
 
@@ -1379,14 +1098,10 @@ function sleep(milliseconds: number) {
 
 async function lockFixture() {
   const f = await runtimeFixture();
-  const probe = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
-  const runtimeRoot = dirname(dirname(probe.installedPackagePath as string));
+  const { runtimeRoot } = installedPaths();
   const lockRoot = `${runtimeRoot}.lock`;
-  const data = archive([
-    { name: "build/Release/better_sqlite3.node", data: "fresh" },
-  ]);
-  fixturePrebuiltPin("official", data);
-  return { ...f, runtimeRoot, lockRoot, data };
+  const pkg = pinFixturePackage({ binary: "fresh" });
+  return { ...f, runtimeRoot, lockRoot, data: pkg.data };
 }
 
 function writeLock(
@@ -1419,9 +1134,9 @@ describe("SQLite runtime installation lock recovery", () => {
       createdAt: Date.now(),
       token: "crashed",
     });
-    const urls = mockDownloads(() => ({ data: f.data }));
+    const urls = mockRegistry(() => ({ data: f.data }));
     const started = Date.now();
-    const installed = await ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const installed = await ensureSQLiteRuntimeInstalled();
     expect(Date.now() - started).toBeLessThan(5_000);
     expect(urls).toHaveLength(1);
     expect(
@@ -1438,10 +1153,8 @@ describe("SQLite runtime installation lock recovery", () => {
     mkdirSync(f.lockRoot, { recursive: true });
     const past = new Date(Date.now() - 60_000);
     utimesSync(f.lockRoot, past, past);
-    const urls = mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    const urls = mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(urls).toHaveLength(1);
     expect(existsSync(f.lockRoot)).toBe(false);
   });
@@ -1449,8 +1162,8 @@ describe("SQLite runtime installation lock recovery", () => {
   it("waits on an ownerless lock directory that is still within the initialization grace period", async () => {
     const f = await lockFixture();
     mkdirSync(f.lockRoot, { recursive: true });
-    const urls = mockDownloads(() => ({ data: f.data }));
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(400);
     expect(urls).toHaveLength(0);
     expect(existsSync(f.lockRoot)).toBe(true);
@@ -1465,8 +1178,8 @@ describe("SQLite runtime installation lock recovery", () => {
     writeLock(f.lockRoot, liveOwner("asleep"));
     const past = new Date(Date.now() - 10 * 60_000);
     utimesSync(join(f.lockRoot, "owner.json"), past, past);
-    const urls = mockDownloads(() => ({ data: f.data }));
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(300);
     expect(urls).toHaveLength(0);
     expect(lockToken(f.lockRoot)).toBe("asleep");
@@ -1486,9 +1199,9 @@ describe("SQLite runtime installation lock recovery", () => {
       const now = new Date();
       utimesSync(join(f.lockRoot, "owner.json"), now, now);
     }, 50);
-    const urls = mockDownloads(() => ({ data: f.data }));
+    const urls = mockRegistry(() => ({ data: f.data }));
     try {
-      const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+      const installation = ensureSQLiteRuntimeInstalled();
       await sleep(900);
       expect(urls).toHaveLength(0);
       expect(lockToken(f.lockRoot)).toBe("long");
@@ -1503,8 +1216,8 @@ describe("SQLite runtime installation lock recovery", () => {
   it("refreshes its own heartbeat while installing", async () => {
     const f = await lockFixture();
     setSQLiteInstallLockTimingsForTests({ heartbeatMs: 50 });
-    mockDownloads(() => ({ data: f.data }), 500);
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    mockRegistry(() => ({ data: f.data }), 500);
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(100);
     const ownerPath = join(f.lockRoot, "owner.json");
     const first = statSync(ownerPath).mtimeMs;
@@ -1517,18 +1230,16 @@ describe("SQLite runtime installation lock recovery", () => {
   it("reclaims a lock whose creation time is implausibly far in the future", async () => {
     const f = await lockFixture();
     writeLock(f.lockRoot, liveOwner("future", Date.now() + 24 * 60 * 60_000));
-    const urls = mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    const urls = mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(urls).toHaveLength(1);
   });
 
   it("waits for a live owner instead of failing or stealing its lock", async () => {
     const f = await lockFixture();
     writeLock(f.lockRoot, liveOwner("live"));
-    const urls = mockDownloads(() => ({ data: f.data }));
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(500);
     expect(urls).toHaveLength(0);
     expect(lockToken(f.lockRoot)).toBe("live");
@@ -1542,22 +1253,23 @@ describe("SQLite runtime installation lock recovery", () => {
 
   it("returns as soon as another installer finishes, even while its lock remains", async () => {
     const f = await lockFixture();
-    const urls = mockDownloads(() => ({ data: f.data }));
-    await ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    await ensureSQLiteRuntimeInstalled();
     resetSQLiteInstallerForTests();
     configureSQLiteInstaller({
       storageRoot: join(f.root, "second-storage"),
       allowInstall: () => true,
     });
-    const target = probeInstalledBetterSqlite3Runtime(join(f.root, "dist"));
-    const targetRoot = dirname(dirname(target.installedPackagePath as string));
-    writeLock(`${targetRoot}.lock`, liveOwner("other-window"));
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    const target = installedPaths();
+    mkdirSync(dirname(target.runtimeRoot), { recursive: true });
+    writeLock(`${target.runtimeRoot}.lock`, liveOwner("other-window"));
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(300);
-    cpSync(f.runtimeRoot, targetRoot, { recursive: true });
-    await expect(installation).resolves.toBe(target.installedPackagePath);
+    cpSync(f.runtimeRoot, target.runtimeRoot, { recursive: true });
+    await expect(installation).resolves.toBe(target.packagePath);
     expect(urls).toHaveLength(1);
-    expect(lockToken(`${targetRoot}.lock`)).toBe("other-window");
+    expect(lockToken(`${target.runtimeRoot}.lock`)).toBe("other-window");
   });
 
   it("reports a successful install even when releasing the lock keeps failing", async () => {
@@ -1575,10 +1287,8 @@ describe("SQLite runtime installation lock recovery", () => {
       }
       rename(from, to);
     });
-    mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(
       f.logs.some((line) =>
         line.includes("Could not release SQLite runtime installation lock"),
@@ -1606,10 +1316,8 @@ describe("SQLite runtime installation lock recovery", () => {
       }
       rename(from, to);
     });
-    const urls = mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    const urls = mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(failures).toBe(2);
     expect(urls).toHaveLength(1);
     expect(f.logs.filter((line) => line.includes("is busy"))).toHaveLength(1);
@@ -1640,8 +1348,8 @@ describe("SQLite runtime installation lock recovery", () => {
       }
       rename(from, to);
     });
-    const urls = mockDownloads(() => ({ data: f.data }));
-    const installation = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    const installation = ensureSQLiteRuntimeInstalled();
     await sleep(400);
     expect(takeovers).toBe(1);
     expect(urls).toHaveLength(0);
@@ -1675,10 +1383,8 @@ describe("SQLite runtime installation lock recovery", () => {
       }
       rename(from, to);
     });
-    mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(lockToken(tombstone)).toBe("replacement");
     expect(f.logs.some((line) => line.includes("Leaving it in place"))).toBe(
       true,
@@ -1688,26 +1394,19 @@ describe("SQLite runtime installation lock recovery", () => {
   it("does not release a lock that another installer re-created after a takeover", async () => {
     const f = await lockFixture();
     const foreign = liveOwner("foreign");
-    mockDownloads(() => {
+    mockRegistry(() => {
       renameSync(f.lockRoot, `${f.lockRoot}-taken`);
       writeLock(f.lockRoot, foreign);
       return { data: f.data };
     });
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(
       JSON.parse(readFileSync(join(f.lockRoot, "owner.json"), "utf8")),
     ).toEqual(foreign);
   });
 
-  it("lets only one of two concurrent installers download while the other waits", async () => {
+  it("lets only one of two concurrent installers (windows) download while the other waits", async () => {
     const f = await lockFixture();
-    vi.resetModules();
-    const freshPins = await import(
-      "../../src/extension/utils/sqliteArtifactPins"
-    );
-    freshPins.SQLITE_ARTIFACTS.prebuilts = { ...SQLITE_ARTIFACTS.prebuilts };
     const installerPath = "../../src/extension/utils/sqliteInstaller";
     const instances = [
       await import(installerPath),
@@ -1719,17 +1418,22 @@ describe("SQLite runtime installation lock recovery", () => {
         storageRoot: join(f.root, "storage"),
         allowInstall: () => true,
       });
+      instance.setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
     }
-    const urls = mockDownloads(() => ({ data: f.data }), 200);
+    const urls = mockRegistry(() => ({ data: f.data }), 200);
     const [first, second] = await Promise.all(
-      instances.map((instance) =>
-        instance.ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-      ),
+      instances.map((instance) => instance.ensureSQLiteRuntimeInstalled()),
     );
+    instances[1].resetSQLiteInstallerForTests();
     expect(urls).toHaveLength(1);
     expect(first).toBeTruthy();
     expect(second).toBe(first);
     expect(existsSync(`${dirname(dirname(first as string))}.lock`)).toBe(false);
+    expect(
+      readdirSync(dirname(dirname(dirname(first as string)))).filter((entry) =>
+        entry.includes(".tmp-"),
+      ),
+    ).toEqual([]);
   });
 
   it("asks for installation consent once for concurrent first-time connects", async () => {
@@ -1745,15 +1449,22 @@ describe("SQLite runtime installation lock recovery", () => {
       storageRoot: join(f.root, "storage"),
       allowInstall,
     });
-    const urls = mockDownloads(() => ({ data: f.data }));
-    const first = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
-    const second = ensureSQLiteRuntimeInstalled(join(f.root, "dist"));
+    const urls = mockRegistry(() => ({ data: f.data }));
+    const first = ensureSQLiteRuntimeInstalled();
+    const second = ensureSQLiteRuntimeInstalled();
     await sleep(50);
     approve(true);
     const [firstPath, secondPath] = await Promise.all([first, second]);
     expect(allowInstall).toHaveBeenCalledTimes(1);
     expect(urls).toHaveLength(1);
     expect(secondPath).toBe(firstPath);
+  });
+
+  it("publishes atomically: a failed download leaves neither a runtime nor a staging directory", async () => {
+    const f = await lockFixture();
+    mockRegistry(() => ({ status: 503 }));
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow("HTTP 503");
+    expect(readdirSync(dirname(f.runtimeRoot))).toEqual([]);
   });
 
   it("removes abandoned temporary installs and lock tombstones but keeps ones owned by live processes", async () => {
@@ -1769,14 +1480,333 @@ describe("SQLite runtime installation lock recovery", () => {
     const past = new Date(Date.now() - 60_000);
     utimesSync(abandonedTombstone, past, past);
     writeLock(activeTombstone, liveOwner("misplaced"));
-    mockDownloads(() => ({ data: f.data }));
-    await expect(
-      ensureSQLiteRuntimeInstalled(join(f.root, "dist")),
-    ).resolves.toBeTruthy();
+    mockRegistry(() => ({ data: f.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
     expect(existsSync(abandonedTemp)).toBe(false);
     expect(existsSync(abandonedTombstone)).toBe(false);
     expect(existsSync(activeTemp)).toBe(true);
     expect(existsSync(activeTombstone)).toBe(true);
     expect(existsSync(f.lockRoot)).toBe(false);
+  });
+});
+
+function glibcHost(
+  target: string,
+  glibc: string | null | undefined,
+  libstdcxx?: string,
+): SQLiteHostProbe {
+  const base = hostProbe(target);
+  return {
+    ...base,
+    readProcessMaps: () =>
+      `7f00-7f01 r-xp 0 0:0 0 /usr/lib/x86_64-linux-gnu/libc.so.6\n${
+        libstdcxx
+          ? `7f02-7f03 r-xp 0 0:0 0 /usr/lib/x86_64-linux-gnu/libstdc++.so.${libstdcxx}\n`
+          : ""
+      }`,
+    glibcVersionRuntime: () => glibc,
+  };
+}
+
+describe("SQLite Linux C/C++ runtime requirements", () => {
+  it.each([
+    ["linux-x64", "2.28"],
+    ["linux-x64", "2.31"],
+    ["linux-x64", "2.33"],
+    ["linux-arm64", "2.31"],
+  ] as const)("refuses %s with glibc %s before asking or downloading", async (target, glibc) => {
+    const allowInstall = vi.fn(() => true);
+    const f = await runtimeFixture({ allowInstall, target });
+    setSQLiteHostForTests({ probe: glibcHost(target, glibc) });
+    const urls = mockRegistry(unexpectedDownload);
+    const error = await ensureSQLiteRuntimeInstalled().catch((e) => e);
+    expect(error).toBeInstanceOf(SQLiteUnsupportedTargetError);
+    expect(error.message).toContain(
+      `SQLite runtime requires glibc 2.34 or newer (found ${glibc})`,
+    );
+    expect(error.message).toContain("Ubuntu 20.04");
+    expect(error.message).toContain("GLIBCXX_3.4.29");
+    expect(error.message).toContain("No binary was downloaded");
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+    expect(existsSync(join(f.root, "storage", "sqlite-runtime"))).toBe(false);
+  });
+
+  it.each(["2.34", "2.35.1", "2.39"])("installs on glibc %s", async (glibc) => {
+    const allowInstall = vi.fn(() => true);
+    await runtimeFixture({ allowInstall });
+    setSQLiteHostForTests({
+      probe: glibcHost(FIXTURE_TARGET, glibc, "6.0.30"),
+    });
+    const pkg = pinFixturePackage();
+    const urls = mockRegistry(() => ({ data: pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(
+      installedPaths().packagePath,
+    );
+    expect(urls).toEqual([TARBALL_URL]);
+  });
+
+  it.each([
+    ["no process report", undefined],
+    ["an empty version", ""],
+    ["a word", "unknown"],
+    ["a single number", "2"],
+    ["a prefixed version", "glibc 2.39"],
+  ])("fails closed on a glibc host with %s", async (_name, glibc) => {
+    const allowInstall = vi.fn(() => true);
+    await runtimeFixture({ allowInstall });
+    setSQLiteHostForTests({ probe: glibcHost(FIXTURE_TARGET, glibc) });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      /requires glibc 2\.34 or newer, but RapiDB could not determine the glibc version.*No binary was downloaded/,
+    );
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+  });
+
+  it("refuses a process that already loaded an older libstdc++", async () => {
+    const allowInstall = vi.fn(() => true);
+    await runtimeFixture({ allowInstall });
+    setSQLiteHostForTests({
+      probe: glibcHost(FIXTURE_TARGET, "2.35", "6.0.28"),
+    });
+    const urls = mockRegistry(unexpectedDownload);
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
+      "SQLite runtime requires libstdc++ with GLIBCXX_3.4.29 or newer (found GLIBCXX_3.4.28)",
+    );
+    expect(allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+  });
+
+  it("does not apply glibc requirements to musl, macOS or Windows", async () => {
+    for (const target of ["linuxmusl-x64", "darwin-arm64", "win32-x64"]) {
+      expect(sqlitePackagePlan(target as never).libraryRequirements).toEqual(
+        {},
+      );
+    }
+    expect(sqlitePackagePlan("linux-arm64").libraryRequirements).toEqual({
+      minGlibc: "2.34",
+      minGlibcxx: "3.4.29",
+    });
+  });
+
+  it.each([
+    "Error: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found (required by /x/better_sqlite3.node)",
+    "/lib64/libstdc++.so.6: version `GLIBCXX_3.4.29' not found",
+    "/usr/lib/libstdc++.so.6: version `CXXABI_1.3.13' not found",
+  ])("explains the glibc/libstdc++ requirement when loading fails with %j", (message) => {
+    const formatted = formatSQLiteRuntimeLoadErrorMessage(
+      new Error(message),
+      [],
+      null,
+    );
+    expect(formatted).toContain("requires glibc 2.34 or newer");
+    expect(formatted).toContain("GLIBCXX_3.4.29");
+    expect(formatted).toContain("Debian 10 and 11");
+    expect(formatted).toContain(message);
+  });
+
+  it("adds no glibc hint to unrelated load failures", () => {
+    expect(
+      formatSQLiteRuntimeLoadErrorMessage(
+        new Error("Cannot find module 'x'"),
+        [],
+        null,
+      ),
+    ).not.toContain("glibc");
+  });
+});
+
+describe("SQLite runtime replacement", () => {
+  async function installed() {
+    const allowInstall = vi.fn(() => true);
+    const f = await runtimeFixture({ allowInstall });
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    const packagePath = await ensureSQLiteRuntimeInstalled();
+    vi.restoreAllMocks();
+    resetSQLiteInstallerForTests();
+    const prompt = vi.fn(() => true);
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall: prompt,
+      log: (line) => f.logs.push(line),
+    });
+    setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+    return { ...f, pkg, packagePath, prompt, paths: installedPaths() };
+  }
+
+  it.each([
+    "EBUSY",
+    "EPERM",
+    "EACCES",
+    "EMFILE",
+  ])("treats %s while reading the runtime as temporary: no prompt, no replacement", async (code) => {
+    const f = await installed();
+    const actual = (await vi.importActual<typeof import("node:fs")>("node:fs"))
+      .readFileSync;
+    vi.mocked(readFileSync).mockImplementation(((
+      path: Parameters<typeof actual>[0],
+      ...rest: unknown[]
+    ) => {
+      if (String(path) === f.paths.binaryPath)
+        throw Object.assign(new Error(`${code}: busy`), { code });
+      return (actual as (...args: unknown[]) => unknown)(path, ...rest);
+    }) as typeof readFileSync);
+    const urls = mockRegistry(unexpectedDownload);
+
+    const error = await ensureSQLiteRuntimeInstalled().catch((e) => e);
+    expect(error).toBeInstanceOf(SQLiteRuntimeUnreadableError);
+    expect(error.message).toContain(`could not be read right now (${code})`);
+    expect(f.prompt).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
+    expect(runtimeTree(f.paths.runtimeRoot)).toEqual(INSTALLED_FIXTURE_TREE);
+    expect(readdirSync(dirname(f.paths.runtimeRoot))).toEqual([
+      basename(f.paths.runtimeRoot),
+    ]);
+
+    vi.mocked(readFileSync).mockReset();
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(f.packagePath);
+    expect(urls).toEqual([]);
+  });
+
+  it("keeps a damaged runtime intact and explains why when it cannot be moved aside", async () => {
+    const f = await installed();
+    writeFileSync(f.paths.binaryPath, "tampered");
+    const actual = await actualRenameSync();
+    vi.mocked(renameSync).mockImplementation((from, to) => {
+      if (String(to).includes(".obsolete-"))
+        throw Object.assign(new Error("in use"), { code: "EPERM" });
+      actual(from, to);
+    });
+    const urls = mockRegistry(unexpectedDownload);
+
+    const error = await ensureSQLiteRuntimeInstalled().catch((e) => e);
+    expect(error).toBeInstanceOf(SQLiteRuntimeInUseError);
+    expect(error.message).toContain(
+      "Close SQLite connections in other VS Code windows",
+    );
+    expect(f.prompt).toHaveBeenCalledOnce();
+    expect(urls).toEqual([]);
+    expect(runtimeTree(f.paths.runtimeRoot)).toEqual(INSTALLED_FIXTURE_TREE);
+    expect(readFileSync(f.paths.binaryPath, "utf8")).toBe("tampered");
+    expect(readdirSync(dirname(f.paths.runtimeRoot))).toEqual([
+      basename(f.paths.runtimeRoot),
+    ]);
+  });
+
+  it("moves a damaged runtime aside atomically before replacing it", async () => {
+    const f = await installed();
+    writeFileSync(f.paths.binaryPath, "tampered");
+    const urls = mockRegistry(() => ({ data: f.pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(f.packagePath);
+    expect(urls).toEqual([TARBALL_URL]);
+    expect(
+      vi
+        .mocked(renameSync)
+        .mock.calls.some(
+          ([from, to]) =>
+            from === f.paths.runtimeRoot &&
+            new RegExp(
+              `^${basename(f.paths.runtimeRoot)}\\.obsolete-${process.pid}-[0-9a-f-]{36}$`,
+            ).test(basename(String(to))),
+        ),
+    ).toBe(true);
+    expect(readFileSync(f.paths.binaryPath, "utf8")).toBe("fixture addon");
+    expect(f.logs.join("\n")).toContain("it failed verification");
+  });
+
+  it("removes leftover replaced runtimes on the next installation without following links", async () => {
+    const f = await runtimeFixture();
+    const { runtimeRoot } = installedPaths();
+    const leftover = `${runtimeRoot}.obsolete-123-${"a".repeat(8)}-${"b".repeat(4)}-${"c".repeat(4)}-${"d".repeat(4)}-${"e".repeat(12)}`;
+    mkdirSync(join(leftover, "node_modules"), { recursive: true });
+    writeFileSync(join(leftover, "runtime.json"), "{}");
+    const outside = join(f.root, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "keep.txt"), "keep");
+    const linked = `${runtimeRoot}.obsolete-124-${"1".repeat(8)}-${"2".repeat(4)}-${"3".repeat(4)}-${"4".repeat(4)}-${"5".repeat(12)}`;
+    symlinkSync(outside, linked, "dir");
+    const unrelated = `${runtimeRoot}.obsolete-notes`;
+    mkdirSync(unrelated);
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
+    expect(existsSync(leftover)).toBe(false);
+    expect(() => lstatSync(linked)).toThrow();
+    expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep");
+    expect(existsSync(unrelated)).toBe(true);
+  });
+});
+
+describe("SQLite runtime download progress and cancellation", () => {
+  function progressController() {
+    const reports: [number, number][] = [];
+    let controller = new AbortController();
+    const calls = { count: 0 };
+    const withInstallProgress = <T>(
+      task: (progress: SQLiteInstallProgress) => Promise<T>,
+    ): Promise<T> => {
+      calls.count += 1;
+      controller = new AbortController();
+      return task({
+        signal: controller.signal,
+        report: (received, total) => reports.push([received, total]),
+      });
+    };
+    return {
+      reports,
+      calls,
+      withInstallProgress,
+      cancel: () => controller.abort(),
+    };
+  }
+
+  it("reports progress by bytes for an installation", async () => {
+    const f = await runtimeFixture();
+    const progress = progressController();
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      withInstallProgress: progress.withInstallProgress,
+    });
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBeTruthy();
+    expect(progress.calls.count).toBe(1);
+    expect(progress.reports.at(-1)).toEqual([pkg.data.length, pkg.data.length]);
+  });
+
+  it("aborts the download on explicit cancellation, cleans up and allows a retry", async () => {
+    const f = await runtimeFixture();
+    const progress = progressController();
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      allowInstall: () => true,
+      withInstallProgress: progress.withInstallProgress,
+    });
+    const pkg = pinFixturePackage();
+    mockRegistry(() => ({ data: pkg.data }), 200);
+    const { runtimeRoot } = installedPaths();
+
+    const first = ensureSQLiteRuntimeInstalled();
+    const second = ensureSQLiteRuntimeInstalled();
+    await sleep(50);
+    expect(existsSync(`${runtimeRoot}.lock`)).toBe(true);
+    progress.cancel();
+    await expect(first).rejects.toBeInstanceOf(
+      SQLiteRuntimeInstallCancelledError,
+    );
+    await expect(second).rejects.toThrow("download was cancelled");
+    await sleep(250);
+    expect(readdirSync(dirname(runtimeRoot))).toEqual([]);
+
+    vi.restoreAllMocks();
+    const urls = mockRegistry(() => ({ data: pkg.data }));
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(
+      installedPaths().packagePath,
+    );
+    expect(urls).toEqual([TARBALL_URL]);
+    expect(progress.calls.count).toBe(2);
   });
 });

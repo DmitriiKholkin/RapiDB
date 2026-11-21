@@ -1,6 +1,11 @@
+import {
+  ConditionalCheckFailedException,
+  InternalServerError,
+} from "@aws-sdk/client-dynamodb";
 import { marshall, NumberValueImpl, unmarshall } from "@aws-sdk/util-dynamodb";
 import { describe, expect, it, vi } from "vitest";
 import { DynamoDBDriver } from "../../src/extension/dbDrivers/dynamodb";
+import { isServerReportedQueryError } from "../../src/extension/dbDrivers/queryErrorOutcome";
 import type {
   ColumnTypeMeta,
   FilterExpression,
@@ -3939,13 +3944,15 @@ describe("DynamoDB driver review regressions", () => {
     expect(result.error).toMatch(
       /PutItem request 2 of 3 failed after 1 of 3 requests was applied\. Its outcome is unknown and the remaining requests were not sent\. ProvisionedThroughputExceededException/,
     );
+    expect(result.serverReportedError).toBeUndefined();
   });
 
   it("reports a rejected later write request as not applied", async () => {
     const { driver, clientSend } = createDriver();
     clientSend.mockResolvedValueOnce({}).mockRejectedValueOnce(
-      Object.assign(new Error("The conditional request failed"), {
-        name: "ConditionalCheckFailedException",
+      new ConditionalCheckFailedException({
+        message: "The conditional request failed",
+        $metadata: { httpStatusCode: 400, attempts: 1 },
       }),
     );
     const put = (id: string) =>
@@ -3960,6 +3967,34 @@ describe("DynamoDB driver review regressions", () => {
     expect(result.error).toMatch(
       /request 2 of 2 failed after 1 of 2 requests was applied\. It was not applied/,
     );
+    // The completed response is a known outcome for the query run.
+    expect(result.serverReportedError).toBe(true);
+  });
+
+  it("marks a later server fault as unknown and a malformed script as not sent", async () => {
+    const { driver, clientSend } = createDriver();
+    clientSend.mockResolvedValueOnce({}).mockRejectedValueOnce(
+      new InternalServerError({
+        message: "Internal server error",
+        $metadata: { httpStatusCode: 500, attempts: 1 },
+      }),
+    );
+    const put = (id: string) =>
+      JSON.stringify({
+        TableName: "users",
+        Item: marshall({ tenant_id: "t", user_id: id }),
+      });
+    const result = await driver.query([put("1"), put("2")].join("\n"));
+    expect(result.error).toMatch(/Its outcome is unknown/);
+    expect(result.serverReportedError).toBeUndefined();
+
+    clientSend.mockClear();
+    const malformed = await driver
+      .query('{"TableName":"users","Item":')
+      .catch((caught: unknown) => caught);
+    expect(malformed).toBeInstanceOf(Error);
+    expect(isServerReportedQueryError(malformed)).toBe(true);
+    expect(clientSend).not.toHaveBeenCalled();
   });
 
   it("returns applied requests when a write script is cancelled midway", async () => {

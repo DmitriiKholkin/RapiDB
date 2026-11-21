@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 import type { FakeWebviewPanelHandle } from "../workflow/bridge/fakeWebviewPanel";
 
 const state = vi.hoisted(() => ({
@@ -72,6 +74,7 @@ async function setup(skipPreview: boolean) {
     type: "pg" as const,
   };
   const driver = new PostgresDriver(config);
+  mockPostgresTableScope(driver);
   vi.spyOn(driver, "describeColumns").mockResolvedValue(columns);
   const query = vi.spyOn(driver, "query");
   const transaction = vi.spyOn(driver, "runTransaction");
@@ -211,5 +214,101 @@ describe("B01 real TablePanel and mutation services", () => {
     });
     for (const spy of [s.query, s.transaction, s.insertPreview])
       expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("MongoDB TablePanel row identity preflight", () => {
+  it.each([
+    false,
+    true,
+  ])("suppresses update/delete previews and writes on a router (skip preview %s)", async (skipPreview) => {
+    const config = {
+      id: "mongo-panel",
+      name: "Mongo",
+      type: "mongodb",
+    } as const;
+    const driver = new MongoDBDriver(config);
+    const command = vi.fn().mockResolvedValue({ ok: 1, msg: "isdbgrid" });
+    const collection = vi.fn();
+    Object.assign(driver, {
+      connected: true,
+      client: { db: () => ({ command, collection }) },
+    });
+    vi.spyOn(driver, "describeColumns").mockResolvedValue([
+      {
+        ...columns[0],
+        name: "_id",
+        nativeType: "string",
+        type: "string",
+        category: "text",
+      },
+      {
+        ...columns[1],
+        name: "label",
+        nativeType: "string",
+        type: "string",
+        category: "text",
+      },
+    ]);
+    const statement = vi.spyOn(driver, "buildMutationPreviewStatement");
+    const manager = {
+      getDriver: () => driver,
+      getConnection: () => config,
+      getDefaultPageSize: () => 25,
+      getSkipTableMutationPreview: () => skipPreview,
+      onDidDisconnect: () => ({ dispose() {} }),
+    };
+    TablePanel.createOrShow(
+      {} as never,
+      manager as never,
+      config.id,
+      "db",
+      "",
+      "items",
+    );
+    const panel = state.panel;
+    if (!panel) throw new Error("Missing panel");
+    await panel.dispatchMessage({ type: "ready" });
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)?.type).toBe("tableInit"),
+    );
+    const primaryKeys = {
+      _id: { $rapidbMongoId: { type: "string", value: "one" } },
+    };
+    await panel.dispatchMessage({
+      type: "applyChanges",
+      payload: {
+        operationId: "update",
+        updates: [{ primaryKeys, changes: { label: "New value" } }],
+      },
+    });
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)).toMatchObject({
+        type: "applyResult",
+        payload: {
+          success: false,
+          error: expect.stringContaining("shard-key routing"),
+        },
+      }),
+    );
+    await panel.dispatchMessage({
+      type: "deleteRows",
+      payload: { operationId: "delete", primaryKeysList: [primaryKeys] },
+    });
+    await vi.waitFor(() =>
+      expect(panel.hostMessages().at(-1)).toMatchObject({
+        type: "deleteResult",
+        payload: {
+          success: false,
+          outcomeUnknown: false,
+          error: expect.stringContaining("shard-key routing"),
+        },
+      }),
+    );
+    expect(
+      panel.hostMessages().some(({ type }) => type === "tableMutationPreview"),
+    ).toBe(false);
+    expect(statement).not.toHaveBeenCalled();
+    expect(collection).not.toHaveBeenCalled();
   });
 });

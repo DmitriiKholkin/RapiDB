@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectionConfig } from "../../src/extension/connectionManager";
+import { bindConnectionSecret } from "../../src/extension/connectionSecretBinding";
+import { withConnectionCredentialRevision } from "../../src/extension/connectionSecretsData";
 import type { IDBDriver } from "../../src/extension/dbDrivers/types";
 import {
   createExtensionContextStub,
@@ -247,12 +249,15 @@ async function definitionCommands(
       return { dispose: vi.fn() };
     },
   );
-  return (command: "showDDL" | "openRoutine") => {
+  return (
+    command: "showDDL" | "openRoutine",
+    database = definitionDatabase,
+  ) => {
     const registered = commands.get(`rapidb.${command}`);
     if (!registered) throw new Error(`Missing ${command}`);
     return registered({
       connectionId: originalTarget.id,
-      database: definitionDatabase,
+      database,
       schema: definitionSchema,
       kind: command === "showDDL" ? "table" : "function",
       objectName: "selected",
@@ -446,11 +451,16 @@ describe("Explorer definition source binding", () => {
       const key = manager.getQueryTargetSessionKey(id);
       const pending = run("showDDL");
       await started.promise;
-      const { withConnectionCredentialRevision } = await import(
-        "../../src/extension/connectionSecretsData"
-      );
+      const persisted = store
+        .getConnections()
+        .find((config) => config.id === id);
+      if (!persisted?.secretStorageProfile)
+        throw new Error("Expected a bound Secret Storage profile");
       const rotated = withConnectionCredentialRevision(
-        JSON.stringify({ password: "rotated-synthetic-password" }),
+        bindConnectionSecret(
+          persisted,
+          JSON.stringify({ password: "rotated-synthetic-password" }),
+        ),
         "00000000-0000-4000-8000-000000000002",
       );
       store.setSecret(id, rotated);
@@ -471,8 +481,16 @@ describe("Explorer definition source binding", () => {
       store.notifySecretChange(id);
       await readStarted.promise;
       finish.resolve();
-      await Promise.race([recheckStarted.promise, pending]);
+      expect(
+        await Promise.race([
+          recheckStarted.promise.then(() => "rechecking"),
+          Promise.resolve(pending).then(() => "finished"),
+        ]),
+      ).toBe("rechecking");
       expect(vscodeMock.createWebviewPanel).not.toHaveBeenCalled();
+      expect(
+        vscodeMock.module.window.showWarningMessage,
+      ).not.toHaveBeenCalled();
       finishRead.resolve();
       await pending;
 
@@ -548,9 +566,11 @@ describe("Explorer definition source binding", () => {
   });
 
   it.each([
-    "showDDL",
-    "openRoutine",
-  ] as const)("opens and restores a verified %s on its exact PostgreSQL database after a presentation edit", async (command) => {
+    ["showDDL", "pg"],
+    ["openRoutine", "pg"],
+    ["showDDL", "mssql"],
+    ["openRoutine", "mssql"],
+  ] as const)("opens and restores a verified %s on its exact %s database after a presentation edit", async (command, type) => {
     const { QueryPanel, manager, context, drivers } =
       await queryTargetFixture();
     const run = await definitionCommands(manager, context);
@@ -558,7 +578,10 @@ describe("Explorer definition source binding", () => {
       "../../src/extension/panels/webviewShell"
     );
     const id = originalTarget.id;
-    const text = "select current_database()";
+    const profile = { ...originalTarget, type };
+    const text =
+      type === "pg" ? "select current_database()" : "select DB_NAME()";
+    const dbField = type === "pg" ? "postgresDatabase" : "mssqlDatabase";
     const started = deferred();
     const finish = deferred();
     const driver = definitionDriver(text, async () => {
@@ -567,13 +590,13 @@ describe("Explorer definition source binding", () => {
     });
     drivers.mockReturnValue(driver as unknown as IDBDriver);
     try {
-      await manager.saveConnection(originalTarget);
+      await manager.saveConnection(profile);
       // Open Routine's ordinary cold path should connect and then read.
       if (command === "showDDL") await manager.connectTo(id);
       const key = manager.getQueryTargetSessionKey(id);
       const pending = run(command);
       await started.promise;
-      await manager.saveConnection({ ...originalTarget, name: "Renamed" });
+      await manager.saveConnection({ ...profile, name: "Renamed" });
       finish.resolve();
       await pending;
       expect(
@@ -596,7 +619,8 @@ describe("Explorer definition source binding", () => {
       const initialState =
         vi.mocked(createWebviewShell).mock.lastCall?.[0].initialState;
       expect(initialState).toMatchObject({
-        postgresDatabase: definitionDatabase,
+        [dbField]: definitionDatabase,
+        connectionType: type,
         queryText: text,
         targetBinding: { connectionId: id, sessionKey: key },
       });
@@ -624,12 +648,118 @@ describe("Explorer definition source binding", () => {
       await manager.dispose();
     }
   });
+
+  it("refuses an unscoped SQL Server definition before reading the catalog", async () => {
+    const { QueryPanel, manager, context, drivers } =
+      await queryTargetFixture();
+    const run = await definitionCommands(manager, context);
+    const driver = definitionDriver("select DB_NAME()");
+    drivers.mockReturnValue(driver as unknown as IDBDriver);
+    try {
+      await manager.saveConnection({ ...originalTarget, type: "mssql" });
+      await manager.connectTo(originalTarget.id);
+      await run("showDDL", "");
+      await run("openRoutine", "");
+      expect(driver.getCreateTableDDL).not.toHaveBeenCalled();
+      expect(driver.getRoutineDefinition).not.toHaveBeenCalled();
+      expect(vscodeMock.createWebviewPanel).not.toHaveBeenCalled();
+      expect(vscodeMock.module.window.showErrorMessage).toHaveBeenCalledWith(
+        expect.stringContaining("SQL Server object's database is unknown"),
+      );
+    } finally {
+      QueryPanel.disposeAll();
+      await manager.dispose();
+    }
+  });
 });
 
 describe("QueryPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vscodeMock.serializers.clear();
+  });
+
+  it("keeps SQL Server database names in history and bookmarks when reopened", async () => {
+    const { QueryPanel, manager, context, drivers } =
+      await queryTargetFixture();
+    const { registerSavedEntryCommands } = await import(
+      "../../src/extension/commands/savedEntryCommands"
+    );
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const commands = new Map<string, (...args: unknown[]) => unknown>();
+    registerSavedEntryCommands(
+      { context, connectionManager: manager },
+      (name, run) => {
+        commands.set(name, run as (...args: unknown[]) => unknown);
+        return { dispose: vi.fn() };
+      },
+    );
+    const id = originalTarget.id;
+    const database = "  Case]Δ  ";
+    const text = "select DB_NAME()";
+    const driver = queryDriver(database);
+    drivers.mockReturnValue(driver as unknown as IDBDriver);
+    try {
+      await manager.saveConnection({ ...originalTarget, type: "mssql" });
+      await manager.connectTo(id);
+      const key = manager.getQueryTargetSessionKey(id) ?? undefined;
+      expect(key).toMatch(/^[0-9a-f]{64}$/);
+      await manager.addToHistory(id, text, undefined, key);
+      await manager.addToHistory(id, text, { mssqlDatabase: database }, key);
+      await manager.addToHistory(id, text, { mssqlDatabase: database }, key);
+      expect(manager.getHistory(id)).toHaveLength(2);
+      const bookmark = await manager.addBookmark(
+        id,
+        text,
+        { mssqlDatabase: database },
+        key,
+      );
+      for (const [command, entry] of [
+        ["rapidb.openHistoryEntry", manager.getHistory(id)[0]],
+        ["rapidb.openBookmarkEntry", manager.getBookmark(bookmark.id)],
+      ] as const) {
+        expect(entry).toMatchObject({ sql: text, mssqlDatabase: database });
+        const open = commands.get(command);
+        if (!open) throw new Error(`Missing ${command}`);
+        await open(entry);
+        const panel = vscodeMock.createWebviewPanel.mock.results.at(-1)?.value;
+        if (!panel) throw new Error("Missing saved query panel");
+        expect(vscodeMock.createWebviewPanel).toHaveBeenLastCalledWith(
+          "rapidb.queryPanel",
+          expect.stringContaining(JSON.stringify(database)),
+          expect.anything(),
+          expect.anything(),
+        );
+        expect(createWebviewShell).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            initialState: expect.objectContaining({
+              mssqlDatabase: database,
+              targetBinding: { connectionId: id, sessionKey: key },
+            }),
+          }),
+        );
+        await panel.webview.dispatchMessage({
+          type: "executeQuery",
+          payload: { connectionId: id, queryText: text, targetSessionKey: key },
+        });
+        expect(driver.query).toHaveBeenLastCalledWith(
+          text,
+          undefined,
+          expect.objectContaining({ database }),
+        );
+        panel.dispose();
+      }
+      expect(driver.query).toHaveBeenCalledTimes(2);
+      const open = commands.get("rapidb.openHistoryEntry");
+      await open?.({ ...bookmark, mssqlDatabase: "" });
+      await open?.({ ...bookmark, postgresDatabase: "conflicting" });
+      expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+    } finally {
+      QueryPanel.disposeAll();
+      await manager.dispose();
+    }
   });
 
   it("requires explicit confirmation for a repointed saved query or a legacy entry", async () => {
@@ -732,6 +862,81 @@ describe("QueryPanel", () => {
           manager.getHistory().map((entry) => entry.targetSessionKey),
         ).toEqual([newKey, targetSessionKey]),
       );
+    } finally {
+      QueryPanel.disposeAll();
+      await manager.dispose();
+    }
+  });
+
+  it("recovers from a false postMessage result until the host panel is recreated", async () => {
+    const { QueryPanel, manager, context, drivers } =
+      await queryTargetFixture();
+    const { createWebviewShell } = await import(
+      "../../src/extension/panels/webviewShell"
+    );
+    const driver = queryDriver("original");
+    drivers.mockReturnValue(driver as unknown as IDBDriver);
+    try {
+      await manager.saveConnection(originalTarget);
+      const connectionId = originalTarget.id;
+      QueryPanel.createOrShow(context, manager, connectionId, "SELECT 1", true);
+      const panel = createdPanel();
+      const initialState =
+        vi.mocked(createWebviewShell).mock.lastCall?.[0].initialState;
+      const targetSessionKey = manager.getQueryTargetSessionKey(connectionId);
+      if (
+        !panel ||
+        initialState?.view !== "query" ||
+        !initialState.panelId ||
+        !targetSessionKey
+      )
+        throw new Error("Missing query identity");
+      expect(initialState).toHaveProperty("queryRunStatus", true);
+      const run = {
+        panelId: initialState.panelId,
+        connectionId,
+        targetSessionKey,
+        operationId: "dropped",
+      };
+      panel.webview.postMessage.mockImplementation(
+        async (message: { type: string }) => message.type !== "queryResult",
+      );
+      await panel.webview.dispatchMessage({
+        type: "executeQuery",
+        payload: {
+          connectionId,
+          targetSessionKey,
+          operationId: run.operationId,
+          run,
+          queryText: "SELECT 1",
+        },
+      });
+      const probe = {
+        type: "getQueryRunStatus",
+        payload: { run, requestId: "after-result" },
+      };
+      await panel.webview.dispatchMessage(probe);
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "queryRunStatus",
+        payload: { ...probe.payload, status: "completed" },
+      });
+      panel.dispose();
+
+      QueryPanel.registerSerializer(context, manager);
+      const serializer = vscodeMock.serializers.get("rapidb.queryPanel") as {
+        deserializeWebviewPanel(panel: unknown, state: unknown): Promise<void>;
+      };
+      const restored = vscodeMock.createWebviewPanel();
+      await serializer.deserializeWebviewPanel(restored, {
+        initialState,
+        queryRun: { phase: "pending", run },
+      });
+      await restored.webview.dispatchMessage(probe);
+      expect(restored.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "queryRunStatus",
+        payload: { ...probe.payload, status: "unknown" },
+      });
+      expect(driver.query).toHaveBeenCalledOnce();
     } finally {
       QueryPanel.disposeAll();
       await manager.dispose();
@@ -1294,7 +1499,10 @@ describe("QueryPanel", () => {
     QueryPanel.disposeAll();
   });
 
-  it("restores the exact PostgreSQL target without accepting another profile from the draft or webview", async () => {
+  it.each([
+    "pg",
+    "mssql",
+  ] as const)("restores the exact %s target without accepting another profile from the draft or webview", async (type) => {
     const { QueryPanel } = await import(
       "../../src/extension/panels/queryPanel"
     );
@@ -1302,15 +1510,24 @@ describe("QueryPanel", () => {
       "../../src/extension/panels/webviewShell"
     );
     QueryPanel.disposeAll();
-    const postgresDatabase = '  Case:"δοκιμή"/?%  ';
-    const primary = { id: "conn-1", name: "Primary", type: "pg" };
-    const secondary = { id: "conn-2", name: "Secondary", type: "pg" };
+    const database = type === "pg" ? '  Case:"δοκιμή"/?%  ' : "  Case]δοκιμή  ";
+    const dbField = type === "pg" ? "postgresDatabase" : "mssqlDatabase";
+    const databaseScope =
+      type === "pg" ? database : { mssqlDatabase: database };
+    const text =
+      type === "pg" ? "select current_database()" : "select DB_NAME()";
+    const primary: Pick<ConnectionConfig, "id" | "name" | "type"> = {
+      id: "conn-1",
+      name: "Primary",
+      type,
+    };
+    const secondary = { id: "conn-2", name: "Secondary", type };
     const finishQuery = deferred();
     const query = vi.fn(async () => {
       await finishQuery.promise;
       return {
         columns: ["database"],
-        rows: [{ __col_0: postgresDatabase }],
+        rows: [{ __col_0: database }],
         rowCount: 1,
         executionTimeMs: 1,
       };
@@ -1337,7 +1554,7 @@ describe("QueryPanel", () => {
       getSchema: vi.fn(),
       getSchemaAsync: vi.fn(async () => [
         {
-          database: postgresDatabase,
+          database,
           schema: "public",
           object: "scoped",
           columns: [],
@@ -1355,23 +1572,21 @@ describe("QueryPanel", () => {
         view: "query",
         panelId: "qp_103",
         connectionId: primary.id,
-        postgresDatabase,
-        queryText: "select current_database()",
+        [dbField]: database,
+        queryText: text,
       },
       queryDraft: {
         panelId: "qp_103",
-        text: "select current_database()",
+        text,
         activeConnectionId: secondary.id,
       },
     });
-    expect(panel.title).toBe(
-      `Query — Primary / ${JSON.stringify(postgresDatabase)}`,
-    );
+    expect(panel.title).toBe(`Query — Primary / ${JSON.stringify(database)}`);
     expect(createWebviewShell).toHaveBeenLastCalledWith(
       expect.objectContaining({
         initialState: expect.objectContaining({
           connectionId: primary.id,
-          postgresDatabase,
+          [dbField]: database,
         }),
       }),
     );
@@ -1386,7 +1601,25 @@ describe("QueryPanel", () => {
       ([message]) => message.type === "connections",
     )?.[0].payload[0].targetSessionKey;
     expect(targetSessionKey).toMatch(/^[0-9a-f]{64}$/);
-    await send("activeConnectionChanged", { connectionId: secondary.id });
+    const { currentQueryTargetSessionKey } = await import(
+      "../../src/extension/panels/queryPanelController"
+    );
+    await send("activeConnectionChanged", {
+      connectionId: secondary.id,
+      targetSessionKey: currentQueryTargetSessionKey(
+        connectionManager as never,
+        secondary.id,
+      ),
+      requestId: "other-profile",
+    });
+    expect(panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "queryTargetChangeResult",
+      payload: {
+        requestId: "other-profile",
+        accepted: false,
+        binding: { connectionId: primary.id, sessionKey: null },
+      },
+    });
     await send("getSchema", { connectionId: secondary.id });
     expect(connectionManager.getSchemaAsync).not.toHaveBeenCalled();
     await send("activeConnectionChanged", {
@@ -1395,20 +1628,20 @@ describe("QueryPanel", () => {
     });
     expect(connectionManager.getSchemaAsync).toHaveBeenCalledExactlyOnceWith(
       primary.id,
-      postgresDatabase,
+      database,
     );
     expect(connectionManager.getSchemaSnapshotState).toHaveBeenCalledWith(
       primary.id,
       {
         kind: "database",
-        database: postgresDatabase,
+        database,
       },
     );
     schemaLoad.fire(primary.id);
     expect(connectionManager.getSchema).not.toHaveBeenCalled();
     const execute = (connectionId?: string) =>
       send("executeQuery", {
-        queryText: "select current_database()",
+        queryText: text,
         connectionId,
         operationId: "qp_103:1",
         targetSessionKey,
@@ -1426,9 +1659,9 @@ describe("QueryPanel", () => {
     try {
       await vi.waitFor(() =>
         expect(query).toHaveBeenCalledExactlyOnceWith(
-          "select current_database()",
+          text,
           undefined,
-          expect.objectContaining({ database: postgresDatabase }),
+          expect.objectContaining({ database }),
         ),
       );
       const operationId = "qp_103:1";
@@ -1446,31 +1679,56 @@ describe("QueryPanel", () => {
       await running;
     }
     await send("addBookmark", {
-      queryText: "select current_database()",
+      queryText: text,
       connectionId: secondary.id,
     });
     expect(connectionManager.addBookmark).not.toHaveBeenCalled();
     await send("addBookmark", {
-      queryText: "select current_database()",
+      queryText: text,
       connectionId: primary.id,
       targetSessionKey,
     });
     expect(connectionManager.addBookmark).toHaveBeenCalledExactlyOnceWith(
       primary.id,
-      "select current_database()",
-      postgresDatabase,
+      text,
+      databaseScope,
       targetSessionKey,
     );
     expect(connectionManager.addToHistory).toHaveBeenCalledExactlyOnceWith(
       primary.id,
-      "select current_database()",
-      postgresDatabase,
+      text,
+      databaseScope,
       targetSessionKey,
     );
 
     QueryPanel.createOrShow(context, connectionManager as never, primary.id);
     expect(panel.reveal).not.toHaveBeenCalled();
     expect(vscodeMock.createWebviewPanel).toHaveBeenCalledTimes(2);
+
+    if (type === "mssql") {
+      const readOnlyProfile = { ...primary, readOnly: true };
+      connectionManager.getConnection.mockReturnValue(readOnlyProfile);
+      const key = currentQueryTargetSessionKey(
+        connectionManager as never,
+        primary.id,
+      );
+      await send("activeConnectionChanged", {
+        connectionId: primary.id,
+        targetSessionKey: key,
+      });
+      await send("executeQuery", {
+        connectionId: primary.id,
+        targetSessionKey: key,
+        queryText: text,
+      });
+      expect(query).toHaveBeenCalledOnce();
+      expect(panel.webview.postMessage).toHaveBeenLastCalledWith({
+        type: "queryResult",
+        payload: expect.objectContaining({
+          error: expect.stringContaining("database-enforced read permissions"),
+        }),
+      });
+    }
 
     connectionManager.getConnection.mockReturnValue({
       ...primary,

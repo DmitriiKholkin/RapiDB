@@ -133,8 +133,8 @@ describe("Elasticsearch negative zero", () => {
     });
   });
 
-  it("keeps -0 in REST mutation previews", () => {
-    const preview = driver.buildMutationPreviewStatement(
+  it("keeps -0 in REST mutation previews", async () => {
+    const [preview] = await driver.buildMutationPreviewStatements(
       "insert",
       "",
       "",

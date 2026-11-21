@@ -389,6 +389,14 @@ export class TableMutationPreviewController {
       editorPresentation,
     );
     const contentType = resolvePreviewContentType(editorPresentation);
+    const confirmationWarning =
+      preview.kind === "deleteRows" &&
+      preview.plan.executionMode === "sequential" &&
+      preview.plan.verificationCriteriaList.length > 1 &&
+      this.connectionManager.getConnection?.(this.connectionId)?.type ===
+        "redis"
+        ? "Redis deletes keys one at a time. If a key has changed or an operation fails, the result may be partial. Successful deletions are not rolled back."
+        : undefined;
 
     return {
       operationId: preview.operationId,
@@ -399,6 +407,7 @@ export class TableMutationPreviewController {
       contentType,
       sql: text,
       statementCount: previewStatements.length,
+      ...(confirmationWarning && { confirmationWarning }),
     };
   }
 }

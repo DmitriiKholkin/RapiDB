@@ -1,27 +1,25 @@
-import { execFile } from "node:child_process";
-import {
-  chmodSync,
-  mkdirSync,
-  realpathSync,
-  symlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { delimiter, dirname, join, relative } from "node:path";
-import { promisify } from "node:util";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SQLiteWorkerClient } from "../../src/extension/dbDrivers/sqliteWorkerClient";
 import { sqlReadOnlyQueryGuard } from "../../src/extension/utils/readOnlyGuards";
-import { resolveSQLiteBuildTools } from "../../src/extension/utils/sqliteBuildTools";
 import {
   configureSQLiteInstaller,
   ensureSQLiteRuntimeInstalled,
   probeInstalledBetterSqlite3Runtime,
   resetSQLiteInstallerForTests,
-  sqliteNodeGypArguments,
+  setSQLiteHostForTests,
 } from "../../src/extension/utils/sqliteInstaller";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { createProjectTempDir } from "../runtime/tempDirectories";
+import {
+  FIXTURE_TARGET,
+  hostProbe,
+  mockRegistry,
+  pinFixturePackage,
+  restoreSQLiteArtifacts,
+} from "./sqliteRuntimeFixtures";
 
 const clients = new Set<SQLiteWorkerClient>();
 
@@ -338,170 +336,54 @@ describe("SQLite read-only PRAGMA classification", () => {
 
 async function installerFixture() {
   const root = await createProjectTempDir("g8-sqlite-installer-manifest");
-  writeFileSync(join(root, "package.json"), "{}");
-  const bundled = join(root, "node_modules", "better-sqlite3");
-  mkdirSync(bundled, { recursive: true });
-  writeFileSync(
-    join(bundled, "package.json"),
-    JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
-  );
+  const storageRoot = join(root, "storage");
+  configureSQLiteInstaller({ storageRoot, allowInstall: () => true });
+  setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+  const pkg = pinFixturePackage();
+  mockRegistry(() => ({ data: pkg.data }));
+  const installedPackagePath = (await ensureSQLiteRuntimeInstalled()) as string;
+  vi.restoreAllMocks();
+  resetSQLiteInstallerForTests();
   const allowInstall = vi.fn(() => false);
-  configureSQLiteInstaller({
-    storageRoot: join(root, "storage"),
-    allowInstall,
-  });
-  const baseDir = join(root, "dist");
-  const probe = probeInstalledBetterSqlite3Runtime(baseDir);
-  if (!probe.installedPackagePath || !probe.installedBinaryPath)
-    throw new Error("Expected managed runtime paths");
-  mkdirSync(dirname(probe.installedBinaryPath), { recursive: true });
-  writeFileSync(
-    join(probe.installedPackagePath, "package.json"),
-    JSON.stringify({ name: "better-sqlite3", version: "12.10.0" }),
-  );
-  writeFileSync(probe.installedBinaryPath, "cached binary");
-  const manifestPath = join(
-    dirname(dirname(probe.installedPackagePath)),
-    "runtime.json",
-  );
+  configureSQLiteInstaller({ storageRoot, allowInstall });
+  setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+  const probe = probeInstalledBetterSqlite3Runtime();
+  expect(probe.installedPackagePath).toBe(installedPackagePath);
   return {
-    baseDir,
     allowInstall,
-    installedPackagePath: probe.installedPackagePath,
-    manifestPath,
+    installedPackagePath,
+    manifestPath: join(dirname(dirname(installedPackagePath)), "runtime.json"),
   };
-}
-
-function expectedManifest(overrides: Record<string, string> = {}) {
-  return JSON.stringify({
-    betterSqlite3Version: "12.10.0",
-    runtime: process.versions.electron ? "electron" : "node",
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: "",
-    ...overrides,
-  });
 }
 
 describe("SQLite cached runtime manifest validation", () => {
+  afterEach(restoreSQLiteArtifacts);
+
   it.each([
     ["corrupted", "{not json"],
     ["null", "null"],
-    ["mismatched", expectedManifest({ abi: "0" })],
+    [
+      "for another version",
+      JSON.stringify({ betterSqlite3Version: "12.10.0" }),
+    ],
   ])("reinstalls through the authorization gate when runtime.json is %s", async (_name, manifest) => {
     const f = await installerFixture();
     writeFileSync(f.manifestPath, manifest);
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).rejects.toThrow(
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
       "SQLite runtime installation was not authorized",
     );
     expect(f.allowInstall).toHaveBeenCalledOnce();
   });
 
-  it("reinstalls when runtime.json is missing", async () => {
+  it("uses the verified cached runtime without prompting", async () => {
     const f = await installerFixture();
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).rejects.toThrow(
-      "SQLite runtime installation was not authorized",
+    const urls = mockRegistry(() => {
+      throw new Error("Unexpected download");
+    });
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(
+      f.installedPackagePath,
     );
-    expect(f.allowInstall).toHaveBeenCalledOnce();
+    expect(f.allowInstall).not.toHaveBeenCalled();
+    expect(urls).toEqual([]);
   });
-
-  it.skipIf(process.platform === "linux")(
-    "uses the cached runtime without prompting when the manifest matches",
-    async () => {
-      const f = await installerFixture();
-      writeFileSync(f.manifestPath, expectedManifest());
-      await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).resolves.toBe(
-        f.installedPackagePath,
-      );
-      expect(f.allowInstall).not.toHaveBeenCalled();
-    },
-  );
 });
-
-function executable(path: string, content: string) {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, content);
-  chmodSync(path, 0o700);
-}
-
-function nodeInstallation(root: string) {
-  const bin = join(root, "bin");
-  const npmCli = join(root, "lib/node_modules/npm/bin/npm-cli.js");
-  executable(join(bin, "node"), "fixture node, never executed");
-  mkdirSync(dirname(npmCli), { recursive: true });
-  writeFileSync(npmCli, "fixture npm, never executed");
-  symlinkSync(relative(bin, npmCli), join(bin, "npm"));
-  return bin;
-}
-
-async function buildToolsFixture() {
-  const root = await createProjectTempDir("g8-sqlite-build-python");
-  const packageRoot = join(root, "extension");
-  const runtimeRoot = join(root, "runtime");
-  const workspace = join(root, "workspace");
-  for (const path of [packageRoot, runtimeRoot, workspace]) mkdirSync(path);
-  return {
-    root,
-    workspace,
-    nodeBin: nodeInstallation(join(root, "node-installation")),
-    resolve(path: string[]) {
-      return resolveSQLiteBuildTools(
-        packageRoot,
-        runtimeRoot,
-        { PATH: path.join(delimiter) },
-        [workspace],
-      );
-    },
-  };
-}
-
-describe.skipIf(process.platform === "win32")(
-  "SQLite source build Python resolution",
-  () => {
-    it("rejects a PATH python3 that resolves into the workspace and selects a trusted one", async () => {
-      const f = await buildToolsFixture();
-      const workspacePython = join(f.workspace, ".venv/bin/python3");
-      executable(workspacePython, "workspace python, never executed");
-      const aliasBin = join(f.root, "alias-bin");
-      mkdirSync(aliasBin);
-      symlinkSync(workspacePython, join(aliasBin, "python3"));
-      const trusted = join(f.root, "python-installation/bin/python3.12");
-      executable(trusted, "trusted python, never executed");
-      const trustedBin = join(f.root, "python-bin");
-      mkdirSync(trustedBin);
-      symlinkSync(trusted, join(trustedBin, "python3"));
-      const tools = f.resolve([f.nodeBin, aliasBin, trustedBin]);
-      expect(tools.python).toBe(realpathSync(trusted));
-      expect(f.resolve([f.nodeBin, aliasBin]).python).toBeUndefined();
-    });
-
-    it("falls back to python and leaves python undefined when none is trusted", async () => {
-      const f = await buildToolsFixture();
-      expect(f.resolve([f.nodeBin]).python).toBeUndefined();
-      const python = join(f.nodeBin, "python");
-      executable(python, "python, never executed");
-      expect(f.resolve([f.nodeBin]).python).toBe(realpathSync(python));
-    });
-
-    it("passes the selected python to node-gyp explicitly", async () => {
-      const root = await createProjectTempDir("g8-sqlite-gyp-python");
-      const python = join(root, "python", "bin", "python3");
-      const args = sqliteNodeGypArguments(
-        join(root, "tools"),
-        join(root, "headers"),
-        "42.0.0",
-        process.platform,
-        process.arch,
-        python,
-      );
-      expect(args).toContain(`--python=${python}`);
-      const script = `const gyp = require(${JSON.stringify(require.resolve("node-gyp"))})(); gyp.parseArgv([process.execPath, "node-gyp", ...${JSON.stringify(args.slice(1))}]); console.log(JSON.stringify(gyp.opts));`;
-      const { stdout } = await promisify(execFile)(process.execPath, [
-        "-e",
-        script,
-      ]);
-      expect(JSON.parse(stdout).python).toBe(python);
-    });
-  },
-);

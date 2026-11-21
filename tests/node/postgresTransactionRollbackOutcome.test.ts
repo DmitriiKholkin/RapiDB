@@ -6,6 +6,7 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -50,6 +51,7 @@ function setup(affected: number[], rollbackFails = false) {
   });
   const release = vi.fn();
   const driver = new PostgresDriver(config);
+  mockPostgresTableScope(driver);
   Object.assign(driver, {
     pool: {
       connect: async () => ({ query, release }),

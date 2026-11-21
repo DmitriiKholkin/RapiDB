@@ -13,6 +13,7 @@ import {
   executePreparedApplyPlan,
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
+import { mockStandaloneMongoClient } from "../support/mockStandaloneMongoClient";
 
 const config = { id: "regression", name: "Regression", type: "pg" as const };
 const column = (
@@ -449,7 +450,8 @@ describe("review mutation regressions", () => {
       .mockResolvedValueOnce({ matchedCount: 1, modifiedCount: 1 })
       .mockRejectedValueOnce(new Error("connection lost after first write"));
     Object.assign(driver, {
-      requireDb: () => ({ collection: () => ({ updateOne }) }),
+      connected: true,
+      client: mockStandaloneMongoClient({ updateOne }),
     });
     const mongoColumns = [
       { ...column("string", "text"), name: "_id", isPrimaryKey: true },

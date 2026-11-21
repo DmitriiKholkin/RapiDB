@@ -11,7 +11,10 @@ import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ChunkedExportData } from "../../src/extension/utils/exportService";
 import { serializeJsonExportRecord } from "../../src/extension/utils/exportValueFormat";
 import type { TableMutationPreviewPayload } from "../../src/shared/webviewContracts";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchKeys,
+  elasticsearchSourceMetadata,
+} from "../support/elasticsearchIdentity";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
@@ -3432,6 +3435,7 @@ describe("TablePanel", () => {
         type,
         readOnly: true,
       })),
+      getDriver: vi.fn(() => ({})),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       getDefaultPageSize: vi.fn(() => 50),
     };
@@ -3512,6 +3516,7 @@ describe("TablePanel", () => {
         type: "pg",
         readOnly: false,
       })),
+      getDriver: vi.fn(() => ({})),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       onDidRefreshSchemas: vi.fn(
         (listener: (connectionId?: string) => void) => {
@@ -3570,6 +3575,7 @@ describe("TablePanel", () => {
         type: "pg",
         readOnly,
       })),
+      getDriver: vi.fn(() => ({})),
       onDidDisconnect: vi.fn(() => ({ dispose: vi.fn() })),
       getDefaultPageSize: vi.fn(() => 25),
     };
@@ -3719,6 +3725,7 @@ describe("TablePanel", () => {
   it("scopes Elasticsearch pages per viewer and resets on query changes, refresh and disposal", async () => {
     const connectionManager = {
       getConnection: () => ({ name: "ES", type: "elasticsearch" }),
+      getDriver: vi.fn(() => ({})),
       getDefaultPageSize: () => 25,
       onDidDisconnect: () => ({ dispose: vi.fn() }),
     };
@@ -3737,6 +3744,11 @@ describe("TablePanel", () => {
       await panel.webview.dispatchMessage({
         type: "fetchPage",
         payload: { fetchId: ++fetchId, page: 1, pageSize: 25, ...options },
+      });
+      expect(getPageMock).toHaveBeenCalledTimes(fetchId);
+      expect(panel.webview.postMessage).toHaveBeenCalledWith({
+        type: "tableData",
+        payload: expect.objectContaining({ fetchId }),
       });
       const args: unknown[] = getPageMock.mock.lastCall ?? [];
       const scope = args.at(-1);
@@ -4067,6 +4079,8 @@ describe("TablePanel", () => {
 
   it("builds an Elasticsearch update preview with the driver instance", async () => {
     const driver = new ElasticsearchDriver({ type: "elasticsearch" } as never);
+    const get = vi.fn(async () => elasticsearchSourceMetadata("users"));
+    Object.assign(driver, { connected: true, client: { indices: { get } } });
     const primaryKeys = elasticsearchKeys(driver, "doc-1");
     const connectionManager = {
       getConnection: vi.fn(() => ({ name: "Elastic", type: "elasticsearch" })),
@@ -4103,6 +4117,15 @@ describe("TablePanel", () => {
       },
     });
 
+    expect(get).toHaveBeenCalledExactlyOnceWith(
+      {
+        index: "users",
+        include_defaults: true,
+        flat_settings: true,
+        local: false,
+      },
+      undefined,
+    );
     expect(createApplyChangesPreviewMock).toHaveBeenCalledWith(
       "op-1",
       expect.objectContaining({

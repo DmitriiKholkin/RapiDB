@@ -3,12 +3,16 @@ import { errors } from "@elastic/elasticsearch";
 import { describe, expect, it } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
 import { ElasticsearchSerializer } from "../../src/extension/dbDrivers/elasticsearchSerializer";
+import { isServerReportedQueryError } from "../../src/extension/dbDrivers/queryErrorOutcome";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import {
   isRoundTripJsonNumberToken,
   parseJsonForWrite,
 } from "../../src/extension/utils/jsonWriteSafety";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchKeys,
+  elasticsearchSourceMetadata,
+} from "../support/elasticsearchIdentity";
 
 type Reply = { status?: number; body: unknown };
 
@@ -213,13 +217,19 @@ describe("ES-3: server-generated metadata numbers", () => {
 });
 
 describe("ES-2: conditional _source update script", () => {
-  it("compares mixed and large numbers exactly instead of a 2^53 cutoff", () => {
+  it("compares mixed and large numbers exactly instead of a 2^53 cutoff", async () => {
     const driver = new ElasticsearchDriver({
       id: "es",
       name: "es",
       type: "elasticsearch",
     });
-    const preview = driver.buildMutationPreviewStatement(
+    Object.assign(driver, {
+      connected: true,
+      client: {
+        indices: { get: async () => elasticsearchSourceMetadata("records") },
+      },
+    });
+    const [preview] = await driver.buildMutationPreviewStatements(
       "update",
       "default",
       "indices",
@@ -387,6 +397,7 @@ describe("ES-5: multi-statement partial completion", () => {
         /^Elasticsearch statement 2 of 3 failed after 1 of 3 statements was completed and earlier writes were applied\. It was not applied and the remaining statements were not sent\. .*index_not_found/,
       );
       expect(result.affectedRows).toBe(1);
+      expect(result.serverReportedError).toBe(true);
       const results = JSON.parse(
         String((result.rows[0] as Record<string, unknown>).__col_0),
       );
@@ -412,6 +423,47 @@ describe("ES-5: multi-statement partial completion", () => {
       );
       expect(result.error).toMatch(
         /statement 2 of 2 failed after 1 of 2 statements was completed and earlier writes were applied\. Its outcome is unknown/,
+      );
+      expect(result.serverReportedError).toBeUndefined();
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each([
+    [400, "parsing_exception", true],
+    [404, "index_not_found_exception", true],
+    [409, "version_conflict_engine_exception", true],
+    [408, "timeout", false],
+    [429, "es_rejected_execution_exception", false],
+    [500, "search_phase_execution_exception", false],
+    [503, "unavailable_shards_exception", false],
+  ] as const)("classifies a %i %s response as a server-reported outcome: %s", async (status, type, known) => {
+    const f = await fixture(() => ({
+      status,
+      body: { error: { type, reason: "rejected" }, status },
+    }));
+    try {
+      const error = await f.driver
+        .query('PUT /a/_doc/1\n{"x":1}')
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(Error);
+      expect(isServerReportedQueryError(error)).toBe(known);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("treats a request rejected before sending as finished", async () => {
+    const f = await fixture(() => ({ body: {} }));
+    try {
+      const invalid = await f.driver
+        .query('PUT /a/_doc/1\n{"x":1')
+        .catch((caught: unknown) => caught);
+      expect(invalid).toBeInstanceOf(Error);
+      expect(isServerReportedQueryError(invalid)).toBe(true);
+      expect(f.requests.filter((request) => request.method !== "HEAD")).toEqual(
+        [],
       );
     } finally {
       await f.close();

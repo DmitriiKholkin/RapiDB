@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import * as vscode from "vscode";
 import type {
   ConnectionTlsConfig,
@@ -13,24 +15,44 @@ import type {
 } from "./connectionManagerModels";
 import {
   sanitizeConnectionConfigForResponse,
+  sanitizePersistedConnectionConfig,
   shouldKeepHandWrittenSecretsInSettings,
 } from "./connectionSecrets";
+import {
+  type ConnectionSettingsFence,
+  readOrCreateStorageOwnerToken,
+  withConnectionSettingsLock,
+} from "./connectionSettingsCoordinator";
 import {
   CONNECTION_TIMEOUT_SECONDS_DEFAULT,
   createDriverTimeoutSettingsSnapshot,
   DB_OPERATION_TIMEOUT_SECONDS_DEFAULT,
   type DriverTimeoutSettingsSnapshot,
 } from "./dbDrivers/timeout";
+import { logger } from "./utils/logger";
 
 const HISTORY_STATE_KEY = "rapidb.queryHistory";
 const BOOKMARKS_STATE_KEY = "rapidb.bookmarks";
-const ORPHANED_SECRETS_STATE_KEY = "rapidb.orphanedUserConnectionSecrets";
-const LEGACY_ORPHANED_SECRETS_STATE_KEY = "rapidb.orphanedConnectionSecrets";
-const WORKSPACE_SCOPED_IDS_STATE_KEY = "rapidb.workspaceScopedConnectionIds";
 const SESSION_NONCES_STATE_KEY = "rapidb.connectionSessionNonces";
+const DYNAMODB_TARGET_STATE_PREFIX = "rapidb.dynamoDBTarget.";
+const SETTINGS_OWNER_STATE_KEY = "rapidb.connectionSettingsOwner.v1";
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HISTORY_LIMIT_DEFAULT = 100;
 const HISTORY_LIMIT_MAX = 10000;
 const VALID_PAGE_SIZES = [25, 100, 500, 1000] as const;
+
+const pendingRepairIds = new WeakMap<vscode.SecretStorage, Set<string>>();
+
+// The explorer can display repaired IDs before the asynchronous write. Until
+// then a candidate may collide with a Secret Storage key not in settings.
+export function readConnectionSecret(
+  storage: vscode.SecretStorage,
+  id: string,
+): PromiseLike<string | undefined> {
+  return pendingRepairIds.get(storage)?.has(id)
+    ? Promise.resolve(undefined)
+    : storage.get(id);
+}
 
 export interface ConnectionManagerStore {
   onDidChangeConfiguration(
@@ -38,7 +60,7 @@ export interface ConnectionManagerStore {
     subscriptions: vscode.Disposable[],
   ): void;
   getConnections(): StoredConnectionConfig[];
-  saveConnections(connections: ConnectionConfig[]): Promise<void>;
+  canMutateConnections?(): boolean;
   getConnectionsRevision(): string;
   saveConnectionsIfRevision(
     expectedRevision: string,
@@ -61,17 +83,10 @@ export interface ConnectionManagerStore {
   onDidChangeSecret?(
     listener: (id: string) => void,
   ): vscode.Disposable | undefined;
-  getConnectionIdsByScope?(): ConnectionIdsByScope;
-  hasConnectionIdInAnyScope?(id: string): boolean;
-  hasConnectionIdOutsideActiveScope?(id: string): boolean;
-  readOrphanedSecretIds?(): string[];
-  writeOrphanedSecretIds?(ids: string[]): Promise<void>;
-  readWorkspaceScopedConnectionIds?(): string[];
-  writeWorkspaceScopedConnectionIds?(ids: string[]): Promise<void>;
-  clearLegacyOrphanedSecretIds?(): Promise<void>;
-  isRemoteWindow?(): boolean;
   readConnectionSessionNonce?(id: string): string | undefined;
   writeConnectionSessionNonce?(id: string, nonce: string): Promise<void>;
+  readDynamoDBTarget?(id: string): DynamoDBTargetRecord | undefined;
+  writeDynamoDBTarget?(id: string, target: DynamoDBTargetRecord): Promise<void>;
   getHistoryLimit(): number;
   getDefaultPageSize(): number;
   getQueryRowLimit(): number;
@@ -79,23 +94,22 @@ export interface ConnectionManagerStore {
   getTimeoutSettings(): DriverTimeoutSettingsSnapshot;
 }
 
-export interface ConnectionIdsByScope {
-  user: string[];
-  workspace: string[];
-  effective: string[];
+export interface DynamoDBTargetRecord {
+  settingsKey: string;
+  fingerprint: string | null;
 }
 
-export function connectionIdsMatch(candidate: string, id: string): boolean {
-  return candidate === id || candidate.trim() === id.trim();
-}
-
-function collectConnectionIds(values: unknown[]): string[] {
+function collectConnectionIds(
+  values: unknown[],
+  includeBlank = false,
+): string[] {
   const ids = new Set<string>();
   for (const value of values) {
     if (!Array.isArray(value)) continue;
     for (const connection of value) {
       const rawId = (connection as { id?: unknown } | null)?.id;
-      if (typeof rawId === "string" && rawId.trim()) ids.add(rawId);
+      if (typeof rawId === "string" && (includeBlank || rawId.trim()))
+        ids.add(rawId);
     }
   }
   return [...ids];
@@ -108,7 +122,7 @@ function finiteOr(value: unknown, fallback: number): number {
 export interface ConnectionStoreMutation<TResult> {
   connections?: ConnectionConfig[];
   result: TResult;
-  rollback?: () => Promise<void>;
+  rollback?: (settingsWriteUnconfirmed?: boolean) => Promise<void>;
   // A credential-only Save commits in SecretStorage, not in settings. Run
   // this only after checking the settings snapshot, under the mutation queue.
   commitSecretOnly?: () => Promise<void>;
@@ -120,18 +134,35 @@ interface ConnectionsConfigurationSnapshot {
   connections: StoredConnectionConfig[];
   target: vscode.ConfigurationTarget;
   revision: string;
+  resource: vscode.Uri | undefined;
+  singleFolder: boolean;
 }
 
-function stableSerialize(value: unknown): string {
+class UnconfirmedConnectionSettingsWrite extends Error {
+  constructor(error: unknown) {
+    super(
+      `Could not confirm the connection settings write: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+function stableSerialize(
+  value: unknown,
+  compareKeys = (a: string, b: string) => a.localeCompare(b),
+): string {
   if (Array.isArray(value)) {
-    return `[${value.map((item) => stableSerialize(item)).join(",")}]`;
+    return `[${value.map((item) => stableSerialize(item, compareKeys)).join(",")}]`;
   }
 
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).sort((a, b) => a.localeCompare(b));
+    const keys = Object.keys(record).sort(compareKeys);
     return `{${keys
-      .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+      .map(
+        (key) =>
+          `${JSON.stringify(key)}:${stableSerialize(record[key], compareKeys)}`,
+      )
       .join(",")}}`;
   }
 
@@ -142,7 +173,22 @@ function computeConnectionsRevision(
   connections: StoredConnectionConfig[],
 ): string {
   const persisted = JSON.parse(JSON.stringify(connections));
-  return createHash("sha256").update(stableSerialize(persisted)).digest("hex");
+  return createHash("sha256")
+    .update(stableSerialize(persisted, (a, b) => (a < b ? -1 : Number(a > b))))
+    .digest("hex");
+}
+
+async function canonicalSettingsPath(path: string): Promise<string> {
+  try {
+    return await realpath(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    // The settings file or .vscode directory can be created by the first
+    // writer. Preserve its identity before and after that creation.
+    const parent = dirname(path);
+    if (parent === path) throw error;
+    return join(await canonicalSettingsPath(parent), basename(path));
+  }
 }
 
 export function canonicalizeOracleServiceName(
@@ -197,7 +243,7 @@ export function connectionSessionKey(
   if (!config) return undefined;
   try {
     const settings = connectionSessionSettings(
-      sanitizeConnectionConfigForResponse(config),
+      sanitizeConnectionSessionConfig(config),
     );
     delete settings.readOnly;
     if (settings.ssh) delete settings.ssh.hostFingerprintSha256;
@@ -207,6 +253,34 @@ export function connectionSessionKey(
   } catch {
     return null;
   }
+}
+
+export function sanitizeConnectionSessionConfig(
+  config: ConnectionConfig,
+): ConnectionConfig {
+  // A migration from inline static keys to Secret Storage adds only a source
+  // marker; the old and newly sanitized settings describe the same session.
+  return config.type === "dynamodb" && config.useSecretStorage === true
+    ? sanitizePersistedConnectionConfig(config)
+    : sanitizeConnectionConfigForResponse(config);
+}
+
+export function dynamoDBSessionKey(
+  settingsKey: string,
+  fingerprint: string,
+): string {
+  return createHash("sha256")
+    .update(stableSerialize({ settingsKey, dynamoDBTarget: fingerprint }))
+    .digest("hex");
+}
+
+export function bindDynamoDBSshTarget(
+  fingerprint: string,
+  sshHostKey: string,
+): string {
+  return createHash("sha256")
+    .update(stableSerialize({ fingerprint, sshHostKey }))
+    .digest("hex");
 }
 
 function migrateLegacyTlsFlags(
@@ -274,15 +348,46 @@ function markHandWrittenPlaintextSecrets(
   return changed ? migrated : connections;
 }
 
-function normalizeStoredConnections(connections: StoredConnectionConfig[]): {
+interface ConnectionIdRepair {
+  id: string;
+  moveSecretFrom?: string;
+}
+
+interface NormalizedConnections {
   connections: StoredConnectionConfig[];
   changed: boolean;
-} {
+  repairs: ConnectionIdRepair[];
+  credentialsNotCopied: boolean;
+}
+
+interface CachedNormalization
+  extends ConnectionsConfigurationSnapshot,
+    NormalizedConnections {
+  scopeIdsKey: string;
+  scheduled: boolean;
+}
+
+function normalizeStoredConnections(
+  connections: StoredConnectionConfig[],
+  otherIds: string[],
+  pendingIds?: ReadonlySet<string>,
+): NormalizedConnections {
   const tlsMigrated = markHandWrittenPlaintextSecrets(
     dropRemovedConnectionFields(migrateLegacyTlsFlags(connections)),
   );
   let changed = tlsMigrated !== connections;
+  const idCounts = new Map<string, number>();
+  for (const { id } of tlsMigrated) {
+    if (typeof id !== "string") continue;
+    const key = id.trim();
+    idCounts.set(key, (idCounts.get(key) ?? 0) + 1);
+  }
+  const otherKeys = new Set(otherIds.map((id) => id.trim()));
+  // Reserve IDs from the entire array, including profiles after the repair.
+  const reservedIds = new Set([...idCounts.keys(), ...otherKeys]);
   const usedIds = new Set<string>();
+  const repairs: ConnectionIdRepair[] = [];
+  let credentialsNotCopied = false;
   const normalized = tlsMigrated.map((connection) => {
     const rawId = (connection as { id?: unknown }).id;
     const id = typeof rawId === "string" ? rawId.trim() : "";
@@ -293,24 +398,42 @@ function normalizeStoredConnections(connections: StoredConnectionConfig[]): {
 
     changed = true;
     let generatedId = randomUUID();
-    while (usedIds.has(generatedId)) {
+    while (reservedIds.has(generatedId) || pendingIds?.has(generatedId)) {
       generatedId = randomUUID();
     }
-    usedIds.add(generatedId);
-    return { ...connection, id: generatedId };
+    reservedIds.add(generatedId);
+
+    const repaired = { ...connection, id: generatedId };
+    const mayUseStoredSecrets =
+      connection.type !== "sqlite" && connection.useSecretStorage !== false;
+    const ambiguous = (idCounts.get(id) ?? 0) > 1 || otherKeys.has(id);
+    if (ambiguous || typeof rawId !== "string") {
+      // A profile link is part of the old credential association, not a
+      // setting to carry over to a profile that must supply its own secrets.
+      delete repaired.secretStorageProfile;
+      if (ambiguous && mayUseStoredSecrets) credentialsNotCopied = true;
+      repairs.push({ id: generatedId });
+    } else {
+      repairs.push({
+        id: generatedId,
+        moveSecretFrom: mayUseStoredSecrets ? rawId : undefined,
+      });
+    }
+    return repaired;
   });
 
-  return { connections: changed ? normalized : connections, changed };
+  return {
+    connections: changed ? normalized : connections,
+    changed,
+    repairs,
+    credentialsNotCopied,
+  };
 }
 
 export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   private static mutationTail: Promise<void> = Promise.resolve();
-  private normalizedCache:
-    | (ConnectionsConfigurationSnapshot & {
-        changed: boolean;
-        scheduled: boolean;
-      })
-    | undefined;
+  private readonly writer = randomUUID();
+  private normalizedCache: CachedNormalization | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -320,15 +443,28 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       typeof configuration.inspect === "function"
         ? configuration.inspect<StoredConnectionConfig[]>("connections")
         : undefined;
+    const singleFolder =
+      vscode.workspace.workspaceFolders?.length === 1
+        ? vscode.workspace.workspaceFolders[0].uri
+        : undefined;
+    const folderValue =
+      inspected?.workspaceValue === undefined &&
+      singleFolder &&
+      !vscode.workspace.workspaceFile
+        ? vscode.workspace
+            .getConfiguration("rapidb", singleFolder)
+            .inspect?.<StoredConnectionConfig[]>("connections")
+            ?.workspaceFolderValue
+        : undefined;
     let connections: StoredConnectionConfig[];
     let target: vscode.ConfigurationTarget;
+    let resource: vscode.Uri | undefined;
 
-    if (inspected?.workspaceFolderValue !== undefined) {
-      connections = inspected.workspaceFolderValue;
-      target = vscode.ConfigurationTarget.WorkspaceFolder;
-    } else if (inspected?.workspaceValue !== undefined) {
-      connections = inspected.workspaceValue;
+    const workspaceValue = inspected?.workspaceValue ?? folderValue;
+    if (workspaceValue !== undefined) {
+      connections = workspaceValue;
       target = vscode.ConfigurationTarget.Workspace;
+      resource = vscode.workspace.workspaceFile ?? singleFolder;
     } else if (inspected?.globalValue !== undefined) {
       connections = inspected.globalValue;
       target = vscode.ConfigurationTarget.Global;
@@ -342,7 +478,131 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       connections,
       target,
       revision: computeConnectionsRevision(connections),
+      resource,
+      singleFolder:
+        target === vscode.ConfigurationTarget.Workspace &&
+        vscode.workspace.workspaceFile === undefined,
     };
+  }
+
+  private getWriteDomain(snapshot: ConnectionsConfigurationSnapshot) {
+    const storage = this.context.globalStorageUri;
+    const remote = vscode.env.remoteName !== undefined;
+    // Native VS Code exposes its file-backed User storage as vscode-userdata
+    // in the desktop host. Do not treat arbitrary providers as local paths.
+    if (
+      !storage ||
+      !isAbsolute(storage.fsPath) ||
+      (storage.scheme !== "file" &&
+        !(
+          storage.scheme === "vscode-userdata" &&
+          !remote &&
+          vscode.env.uiKind === vscode.UIKind.Desktop
+        ))
+    )
+      return;
+    if (snapshot.target === vscode.ConfigurationTarget.Global) {
+      // Global is a merged local/remote read in Remote windows. VS Code may
+      // direct the write to either machine, without telling the extension.
+      if (!remote) return { directory: storage.fsPath, resource: undefined };
+      return;
+    }
+    const resource = snapshot.resource;
+    if (!resource || !isAbsolute(resource.fsPath)) return;
+    // File URIs in the remote workspace host refer to that host's filesystem.
+    // Client-local and virtual URIs must never be keyed as paths on that host.
+    if (
+      resource.scheme !== "file" ||
+      (remote &&
+        this.context.extension.extensionKind !== vscode.ExtensionKind.Workspace)
+    )
+      return;
+    return { directory: storage.fsPath, resource };
+  }
+
+  canMutateConnections(): boolean {
+    return this.getWriteDomain(this.readConnectionsSnapshot()) !== undefined;
+  }
+
+  private async withWriteDomain<TResult>(
+    operation: (
+      snapshot: ConnectionsConfigurationSnapshot,
+      fence: ConnectionSettingsFence,
+    ) => Promise<TResult>,
+  ): Promise<TResult> {
+    return this.enqueue(async () => {
+      const candidate = this.readConnectionsSnapshot();
+      const domain = this.getWriteDomain(candidate);
+      if (!domain) {
+        throw new Error(
+          "RapiDB cannot safely edit connections in this VS Code settings scope. Use the settings editor in the appropriate window instead.",
+        );
+      }
+      const canonical =
+        domain.resource &&
+        (await canonicalSettingsPath(
+          candidate.singleFolder
+            ? join(domain.resource.fsPath, ".vscode", "settings.json")
+            : domain.resource.fsPath,
+        ));
+      const identity =
+        canonical &&
+        (process.platform === "linux" ? canonical : canonical.toLowerCase());
+      const key = identity
+        ? createHash("sha256").update(identity).digest("hex")
+        : "user";
+      const directory = join(domain.directory, "connection-settings-v1", key);
+      return withConnectionSettingsLock(
+        directory,
+        async () => this.settingsFileOwner(canonical, directory),
+        key === "user" || process.platform !== "linux",
+        async (fence) => {
+          const snapshot = this.readConnectionsSnapshot();
+          this.assertSameTarget(candidate, snapshot);
+          fence.assertFresh(snapshot.revision);
+          return operation(snapshot, fence);
+        },
+      );
+    });
+  }
+
+  // Identifies the settings file behind a lock domain that may cover several
+  // files, stably across reloads. realpath() returns the on-disk letter case,
+  // so one workspace file has one owner while case variants share the lock.
+  //
+  // User settings: the token lives in the lock directory and is created under
+  // the lock (see readOrCreateStorageOwnerToken), so windows of one profile
+  // cannot diverge while globalState is still propagating between them. The
+  // lock directory is inside globalStorageUri, which VS Code scopes exactly
+  // like globalState (both live in the profile's global storage home). A
+  // globalState token that differs from the directory's token belongs to a
+  // profile that established its own identity, and is used instead: it never
+  // inherits another profile's restored value.
+  private async settingsFileOwner(
+    canonical: string | undefined,
+    directory: string,
+  ): Promise<string> {
+    if (canonical) {
+      return `file:${createHash("sha256").update(canonical).digest("hex")}`;
+    }
+    const state = this.context.globalState;
+    if (!state) return `window:${this.writer}`;
+    const existing = state.get<unknown>(SETTINGS_OWNER_STATE_KEY);
+    const own =
+      typeof existing === "string" && UUID.test(existing)
+        ? existing
+        : undefined;
+    const token = await readOrCreateStorageOwnerToken(directory, own);
+    if (own !== undefined) return `profile:${own}`;
+    try {
+      await state.update(SETTINGS_OWNER_STATE_KEY, token);
+    } catch (error) {
+      // The directory token stays authoritative for this profile's windows.
+      logger.warn(
+        `Could not record the connection settings owner in profile state: ${String(error)}`,
+      );
+    }
+    return `profile:${token}`;
   }
 
   private enqueue<TResult>(
@@ -360,96 +620,172 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   }
 
   private getNormalization(snapshot: ConnectionsConfigurationSnapshot) {
-    if (
-      this.normalizedCache?.revision !== snapshot.revision ||
-      this.normalizedCache.target !== snapshot.target
-    ) {
-      this.normalizedCache = {
-        ...snapshot,
-        ...normalizeStoredConnections(snapshot.connections),
-        scheduled: false,
-      };
+    const cached = this.normalizedCache;
+    const sameSnapshot =
+      cached?.revision === snapshot.revision &&
+      cached.target === snapshot.target &&
+      cached.singleFolder === snapshot.singleFolder &&
+      cached.resource?.toString() === snapshot.resource?.toString();
+    if (sameSnapshot && cached.repairs.length === 0) return cached;
+    const scopeIds = this.readConnectionIdsOutsideScope(snapshot.target, true);
+    const scopeIdsKey = JSON.stringify(scopeIds.sort());
+    if (sameSnapshot && cached.scopeIdsKey === scopeIdsKey) return cached;
+    const storage = this.context.secrets;
+    const pending = pendingRepairIds.get(storage);
+    const normalized = normalizeStoredConnections(
+      snapshot.connections,
+      scopeIds,
+      pending,
+    );
+    if (normalized.repairs.length > 0) {
+      const reserved = pending ?? new Set<string>();
+      for (const { id } of normalized.repairs) reserved.add(id);
+      if (!pending) pendingRepairIds.set(storage, reserved);
     }
+    this.normalizedCache = {
+      ...snapshot,
+      ...normalized,
+      scopeIdsKey,
+      scheduled: false,
+    };
     return this.normalizedCache;
+  }
+
+  private assertNormalizationCurrent(
+    snapshot: ConnectionsConfigurationSnapshot,
+    normalized: CachedNormalization,
+  ): void {
+    this.assertSnapshotCurrent(snapshot);
+    if (
+      normalized.repairs.length > 0 &&
+      JSON.stringify(
+        this.readConnectionIdsOutsideScope(snapshot.target, true).sort(),
+      ) !== normalized.scopeIdsKey
+    ) {
+      throw new Error(
+        "Connection IDs in other settings scopes changed during the operation. Please retry.",
+      );
+    }
   }
 
   private assertSnapshotCurrent(
     snapshot: ConnectionsConfigurationSnapshot,
   ): void {
     const current = this.readConnectionsSnapshot();
-    if (
-      current.revision !== snapshot.revision ||
-      current.target !== snapshot.target
-    ) {
+    this.assertSameTarget(snapshot, current);
+    if (current.revision !== snapshot.revision) {
       throw new Error(
         "Connection settings changed during the operation. Please retry.",
       );
     }
   }
 
+  private assertSameTarget(
+    before: ConnectionsConfigurationSnapshot,
+    after: ConnectionsConfigurationSnapshot,
+  ): void {
+    if (
+      before.target !== after.target ||
+      before.singleFolder !== after.singleFolder ||
+      before.resource?.toString() !== after.resource?.toString()
+    ) {
+      throw new Error(
+        "Connection settings changed during the operation (settings scope changed). Please retry.",
+      );
+    }
+  }
+
+  private async writeConnections(
+    snapshot: ConnectionsConfigurationSnapshot,
+    connections: ConnectionConfig[],
+    fence: ConnectionSettingsFence,
+    check = () => this.assertSnapshotCurrent(snapshot),
+  ): Promise<void> {
+    const revision = computeConnectionsRevision(connections);
+    if (revision === snapshot.revision) {
+      check();
+      return;
+    }
+    const finish = await fence.beginWrite(snapshot.revision, revision);
+    try {
+      check();
+    } catch (error) {
+      await finish(false); // No configuration RPC was issued.
+      throw error;
+    }
+    try {
+      await vscode.workspace
+        .getConfiguration("rapidb")
+        .update("connections", connections, snapshot.target);
+    } catch (error) {
+      let current: ConnectionsConfigurationSnapshot;
+      try {
+        current = this.readConnectionsSnapshot();
+      } catch {
+        throw new UnconfirmedConnectionSettingsWrite(error);
+      }
+      if (
+        current.target !== snapshot.target ||
+        current.singleFolder !== snapshot.singleFolder ||
+        current.resource?.toString() !== snapshot.resource?.toString() ||
+        current.revision !== revision
+      )
+        throw new UnconfirmedConnectionSettingsWrite(error);
+    }
+    try {
+      await finish(true);
+    } catch (error) {
+      // Settings committed. Do not undo credentials because metadata failed;
+      // the pending fence still prevents an overwrite by a stale participant.
+      logger.error("Could not confirm the connection settings revision", error);
+    }
+  }
+
   private async persistNormalization(
     snapshot: ConnectionsConfigurationSnapshot,
+    fence: ConnectionSettingsFence,
   ): Promise<void> {
     const normalized = this.getNormalization(snapshot);
     if (!normalized.changed) return;
-    const backups: Array<{ id: string; raw: string | undefined }> = [];
-    const retainedIds = new Set(
-      normalized.connections.map((connection) => connection.id),
-    );
-    const orphanedSecrets = new Map<string, string>();
-    let writeStarted = false;
-    try {
-      for (const [index, connection] of normalized.connections.entries()) {
-        const originalId = snapshot.connections[index].id;
-        if (typeof originalId !== "string" || originalId === connection.id)
-          continue;
-        const raw = await this.getSecret(originalId);
-        if (raw === undefined) continue;
-        backups.push({
-          id: connection.id,
-          raw: await this.getSecret(connection.id),
-        });
-        await this.storeSecret(connection.id, raw);
-        if (!retainedIds.has(originalId)) orphanedSecrets.set(originalId, raw);
+    const copies: Array<{ id: string; raw: string }> = [];
+    for (const { id, moveSecretFrom } of normalized.repairs) {
+      if ((await this.context.secrets.get(id)) !== undefined) {
+        // Even an unreferenced Secret Storage entry isn't ours to overwrite
+        // or expose. Keep the rejected ID blocked for stale UI snapshots.
+        if (this.normalizedCache === normalized)
+          this.normalizedCache = undefined;
+        throw new Error("The repaired connection ID is in use. Please retry.");
       }
-      this.assertSnapshotCurrent(snapshot);
-      for (const [id, raw] of orphanedSecrets) {
-        backups.push({ id, raw });
-        await this.deleteSecret(id);
-      }
-      this.assertSnapshotCurrent(snapshot);
-      writeStarted = true;
-      await vscode.workspace
-        .getConfiguration("rapidb")
-        .update("connections", normalized.connections, snapshot.target);
-    } catch (error) {
-      const current = this.readConnectionsSnapshot();
-      if (
-        !(
-          writeStarted &&
-          current.target === snapshot.target &&
-          current.revision ===
-            computeConnectionsRevision(normalized.connections)
-        )
-      ) {
-        const errors: unknown[] = [error];
-        for (const backup of backups.reverse()) {
-          try {
-            if (backup.raw === undefined) await this.deleteSecret(backup.id);
-            else await this.storeSecret(backup.id, backup.raw);
-          } catch (rollbackError) {
-            errors.push(rollbackError);
-          }
-        }
-        if (errors.length > 1)
-          throw new AggregateError(
-            errors,
-            "Connection normalization and rollback failed.",
-          );
-        throw error;
-      }
+      if (moveSecretFrom === undefined) continue;
+      const raw = await this.context.secrets.get(moveSecretFrom);
+      if (raw !== undefined) copies.push({ id, raw });
     }
+    try {
+      this.assertNormalizationCurrent(snapshot, normalized);
+      for (const { id, raw } of copies) await this.storeSecret(id, raw);
+      await this.writeConnections(snapshot, normalized.connections, fence, () =>
+        this.assertNormalizationCurrent(snapshot, normalized),
+      );
+    } catch (error) {
+      // Never delete the source (or a copy that may have been published).
+      // A retry must allocate fresh IDs rather than treating a staged key
+      // as evidence of ownership. Keep old candidates blocked in this host.
+      if (copies.length > 0 && this.normalizedCache === normalized)
+        this.normalizedCache = undefined;
+      throw error;
+    }
+    const pending = pendingRepairIds.get(this.context.secrets);
+    for (const { id } of normalized.repairs) pending?.delete(id);
     if (this.normalizedCache === normalized) this.normalizedCache = undefined;
+    if (normalized.credentialsNotCopied) {
+      void Promise.resolve()
+        .then(() =>
+          vscode.window.showWarningMessage(
+            "[RapiDB] Duplicate connection IDs were repaired without copying saved credentials. If an affected profile needs credentials, re-enter them in Edit Connection.",
+          ),
+        )
+        .catch(() => {});
+    }
   }
 
   onDidChangeConfiguration(
@@ -466,11 +802,15 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   getConnections(): StoredConnectionConfig[] {
     const snapshot = this.readConnectionsSnapshot();
     const normalized = this.getNormalization(snapshot);
-    if (normalized.changed && !normalized.scheduled) {
+    if (
+      normalized.changed &&
+      !normalized.scheduled &&
+      this.getWriteDomain(snapshot)
+    ) {
       normalized.scheduled = true;
-      void this.enqueue(async () => {
+      void this.withWriteDomain(async (_current, fence) => {
         this.assertSnapshotCurrent(snapshot);
-        await this.persistNormalization(snapshot);
+        await this.persistNormalization(snapshot, fence);
       })
         .catch(() => {})
         .finally(() => {
@@ -480,38 +820,42 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     return normalized.connections.map((connection) => ({ ...connection }));
   }
 
-  async saveConnections(connections: ConnectionConfig[]): Promise<void> {
-    await this.mutateConnections(() => ({ connections, result: undefined }));
+  getConnectionsRevision(): string {
+    return this.editRevision(this.readConnectionsSnapshot());
   }
 
-  getConnectionsRevision(): string {
-    return this.readConnectionsSnapshot().revision;
+  private editRevision(snapshot: ConnectionsConfigurationSnapshot): string {
+    return JSON.stringify([
+      snapshot.target,
+      snapshot.singleFolder,
+      snapshot.resource?.toString(),
+      snapshot.revision,
+    ]);
   }
 
   async saveConnectionsIfRevision(
     expectedRevision: string,
     connections: ConnectionConfig[],
   ): Promise<boolean> {
-    return await this.enqueue(async () => {
-      const snapshot = this.readConnectionsSnapshot();
-      if (snapshot.revision !== expectedRevision) {
+    return await this.withWriteDomain(async (snapshot, fence) => {
+      if (this.editRevision(snapshot) !== expectedRevision) {
         return false;
       }
 
       const normalizedRevision = computeConnectionsRevision(
         this.getNormalization(snapshot).connections,
       );
-      await this.persistNormalization(snapshot);
+      await this.persistNormalization(snapshot, fence);
       const current = this.readConnectionsSnapshot();
       if (
         current.revision !== normalizedRevision ||
-        current.target !== snapshot.target
+        current.target !== snapshot.target ||
+        current.singleFolder !== snapshot.singleFolder ||
+        current.resource?.toString() !== snapshot.resource?.toString()
       ) {
         return false;
       }
-      await vscode.workspace
-        .getConfiguration("rapidb")
-        .update("connections", connections, snapshot.target);
+      await this.writeConnections(current, connections, fence);
       this.normalizedCache = undefined;
       return true;
     });
@@ -524,45 +868,43 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
       | ConnectionStoreMutation<TResult>
       | Promise<ConnectionStoreMutation<TResult>>,
   ): Promise<TResult> {
-    return await this.enqueue(async () => {
-      await this.persistNormalization(this.readConnectionsSnapshot());
+    return await this.withWriteDomain(async (original, fence) => {
+      const expectedRevision = computeConnectionsRevision(
+        this.getNormalization(original).connections,
+      );
+      await this.persistNormalization(original, fence);
       const snapshot = this.readConnectionsSnapshot();
+      this.assertSameTarget(original, snapshot);
+      if (snapshot.revision !== expectedRevision) {
+        throw new Error(
+          "Connection settings changed or are still refreshing. Please retry.",
+        );
+      }
       const normalized = this.getNormalization(snapshot);
       const mutation = await mutate(
         normalized.connections.map((connection) => ({ ...connection })),
       );
-      let writeStarted = false;
       try {
         this.assertSnapshotCurrent(snapshot);
         if (!mutation.connections) {
           await mutation.commitSecretOnly?.();
           return mutation.result;
         }
-        writeStarted = true;
-        await vscode.workspace
-          .getConfiguration("rapidb")
-          .update("connections", mutation.connections, snapshot.target);
+        await this.writeConnections(snapshot, mutation.connections, fence);
       } catch (writeError) {
-        const postFailureSnapshot = this.readConnectionsSnapshot();
-        const settingsApplied =
-          writeStarted &&
-          mutation.connections &&
-          postFailureSnapshot.target === snapshot.target &&
-          computeConnectionsRevision(mutation.connections) ===
-            postFailureSnapshot.revision;
-        if (!settingsApplied) {
-          if (mutation.rollback) {
-            try {
-              await mutation.rollback();
-            } catch (rollbackError) {
-              throw new AggregateError(
-                [writeError, rollbackError],
-                "Connection settings write and rollback both failed.",
-              );
-            }
+        if (mutation.rollback) {
+          try {
+            await mutation.rollback(
+              writeError instanceof UnconfirmedConnectionSettingsWrite,
+            );
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [writeError, rollbackError],
+              "Connection settings write and rollback both failed.",
+            );
           }
-          throw writeError;
         }
+        throw writeError;
       }
       this.normalizedCache = undefined;
       await mutation.afterSettingsWrite?.();
@@ -591,7 +933,7 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
   }
 
   async getSecret(id: string): Promise<string | undefined> {
-    return await this.context.secrets.get(id);
+    return await readConnectionSecret(this.context.secrets, id);
   }
 
   async storeSecret(id: string, value: string): Promise<void> {
@@ -608,17 +950,10 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     return this.context.secrets.onDidChange?.(({ key }) => listener(key));
   }
 
-  getConnectionIdsByScope(): ConnectionIdsByScope {
-    const { user, workspace, effective } = this.readConnectionScopeValues();
-    return {
-      user: collectConnectionIds(user),
-      workspace: collectConnectionIds(workspace),
-      effective: collectConnectionIds(effective),
-    };
-  }
-
-  hasConnectionIdOutsideActiveScope(id: string): boolean {
-    const { target } = this.readConnectionsSnapshot();
+  private readConnectionIdsOutsideScope(
+    target: vscode.ConfigurationTarget,
+    includeBlank = false,
+  ): string[] {
     const singleFolder = vscode.workspace.workspaceFile === undefined;
     const sharesWorkspaceFile =
       singleFolder && target !== vscode.ConfigurationTarget.Global;
@@ -629,9 +964,7 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
           : !(sharesWorkspaceFile || (!entry.folder && target === entry.scope)),
       )
       .map((entry) => entry.value);
-    return collectConnectionIds(otherScopes).some((candidate) =>
-      connectionIdsMatch(candidate, id),
-    );
+    return collectConnectionIds(otherScopes, includeBlank);
   }
 
   private readConnectionScopeEntries(): Array<{
@@ -679,68 +1012,6 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     return entries;
   }
 
-  private readConnectionScopeValues(): {
-    user: unknown[];
-    workspace: unknown[];
-    effective: unknown[];
-  } {
-    const configuration = vscode.workspace.getConfiguration("rapidb");
-    const user: unknown[] = [];
-    const workspace: unknown[] = [];
-    for (const entry of this.readConnectionScopeEntries()) {
-      (entry.scope === vscode.ConfigurationTarget.Global
-        ? user
-        : workspace
-      ).push(entry.value);
-    }
-    return { user, workspace, effective: [configuration.get("connections")] };
-  }
-
-  hasConnectionIdInAnyScope(id: string): boolean {
-    const scopes = this.getConnectionIdsByScope();
-    return [...scopes.user, ...scopes.workspace, ...scopes.effective].some(
-      (candidate) => connectionIdsMatch(candidate, id),
-    );
-  }
-
-  readOrphanedSecretIds(): string[] {
-    return this.readStateIds(ORPHANED_SECRETS_STATE_KEY);
-  }
-
-  async writeOrphanedSecretIds(ids: string[]): Promise<void> {
-    await this.context.globalState.update(
-      ORPHANED_SECRETS_STATE_KEY,
-      ids.length > 0 ? ids : undefined,
-    );
-  }
-
-  readWorkspaceScopedConnectionIds(): string[] {
-    return this.readStateIds(WORKSPACE_SCOPED_IDS_STATE_KEY);
-  }
-
-  async writeWorkspaceScopedConnectionIds(ids: string[]): Promise<void> {
-    await this.context.globalState.update(
-      WORKSPACE_SCOPED_IDS_STATE_KEY,
-      ids.length > 0 ? ids : undefined,
-    );
-  }
-
-  async clearLegacyOrphanedSecretIds(): Promise<void> {
-    if (
-      this.context.globalState.get(LEGACY_ORPHANED_SECRETS_STATE_KEY) ===
-      undefined
-    )
-      return;
-    await this.context.globalState.update(
-      LEGACY_ORPHANED_SECRETS_STATE_KEY,
-      undefined,
-    );
-  }
-
-  isRemoteWindow(): boolean {
-    return vscode.env.remoteName !== undefined;
-  }
-
   readConnectionSessionNonce(id: string): string | undefined {
     const nonce = this.readSessionNonces()[id];
     return typeof nonce === "string" ? nonce : undefined;
@@ -753,6 +1024,32 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     });
   }
 
+  readDynamoDBTarget(id: string): DynamoDBTargetRecord | undefined {
+    const value = this.context.globalState.get<Partial<DynamoDBTargetRecord>>(
+      `${DYNAMODB_TARGET_STATE_PREFIX}${id}`,
+    );
+    if (
+      value &&
+      typeof value.settingsKey === "string" &&
+      /^[a-f0-9]{64}$/.test(value.settingsKey) &&
+      (value.fingerprint === null ||
+        (typeof value.fingerprint === "string" &&
+          /^[a-f0-9]{64}$/.test(value.fingerprint)))
+    ) {
+      return { settingsKey: value.settingsKey, fingerprint: value.fingerprint };
+    }
+  }
+
+  async writeDynamoDBTarget(
+    id: string,
+    target: DynamoDBTargetRecord,
+  ): Promise<void> {
+    await this.context.globalState.update(
+      `${DYNAMODB_TARGET_STATE_PREFIX}${id}`,
+      target,
+    );
+  }
+
   private readSessionNonces(): Record<string, unknown> {
     const nonces = this.context.globalState.get<unknown>(
       SESSION_NONCES_STATE_KEY,
@@ -760,13 +1057,6 @@ export class VSCodeConnectionManagerStore implements ConnectionManagerStore {
     return nonces && typeof nonces === "object" && !Array.isArray(nonces)
       ? (nonces as Record<string, unknown>)
       : {};
-  }
-
-  private readStateIds(key: string): string[] {
-    const ids = this.context.globalState.get<unknown>(key);
-    return Array.isArray(ids)
-      ? ids.filter((id): id is string => typeof id === "string")
-      : [];
   }
 
   getHistoryLimit(): number {

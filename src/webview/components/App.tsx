@@ -29,7 +29,9 @@ export function App(): ReactElement {
             connectionId={state.connectionId ?? ""}
             connectionType={state.connectionType ?? ""}
             postgresDatabase={state.postgresDatabase}
+            mssqlDatabase={state.mssqlDatabase}
             targetBinding={state.targetBinding}
+            queryRunStatus={state.queryRunStatus}
             initialQueryText={state.queryText ?? state.initialSql ?? ""}
             formatOnOpen={state.formatOnOpen}
             isBookmarked={state.isBookmarked ?? false}

@@ -3,6 +3,11 @@ import * as vscode from "vscode";
 import { connectionEditState } from "../../src/extension/connectionEditState";
 import { ConnectionManager } from "../../src/extension/connectionManager";
 import {
+  connectionSessionKey,
+  VSCodeConnectionManagerStore,
+} from "../../src/extension/connectionManagerStore";
+import { bindConnectionSecret } from "../../src/extension/connectionSecretBinding";
+import {
   readConnectionCredentialRevision,
   withConnectionCredentialRevision,
 } from "../../src/extension/connectionSecretsData";
@@ -11,7 +16,10 @@ import { QueryPanel } from "../../src/extension/panels/queryPanel";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import { normalizeUnknownError } from "../../src/extension/utils/errorHandling";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
-import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
+import { registerConnectionStorageFixture } from "../support/connectionStorageContext";
+import { FakeConnectionManagerStore } from "../support/fakeConnectionManagerStore";
+
+const createExtensionContextStub = registerConnectionStorageFixture();
 
 const configuration = vi.hoisted(() => ({
   connections: [] as ConnectionConfig[],
@@ -62,6 +70,7 @@ vi.mock("../../src/extension/panels/webviewShell", () => ({
 function sharedSecretStorage() {
   const listeners = new Set<(event: { key: string }) => void>();
   const entries = new Map<string, string>();
+  const { globalState } = createExtensionContextStub();
   const emit = (key: string) => {
     for (const listener of listeners) listener({ key });
   };
@@ -80,6 +89,7 @@ function sharedSecretStorage() {
     },
     context: () => ({
       ...createExtensionContextStub(),
+      globalState,
       secrets: {
         onDidChange(listener: (event: { key: string }) => void) {
           listeners.add(listener);
@@ -115,6 +125,8 @@ function credentialDriver(hold?: () => Promise<void>) {
       connected = false;
     }),
     isConnected: () => connected,
+    getDynamoDBTargetFingerprint: () => "a".repeat(64),
+    verifyDynamoDBTarget: vi.fn(async () => undefined),
     query: vi.fn(async () => ({
       columns: [],
       rows: [],
@@ -130,7 +142,27 @@ const sharedCredentialProfile = {
   type: "dynamodb",
   useSecretStorage: true,
   awsRegion: "us-east-1",
+  awsCredentialMode: "static",
 } satisfies ConnectionConfig;
+
+async function rememberPreviouslyVerifiedTarget(
+  context: vscode.ExtensionContext,
+  manager: ConnectionManager,
+): Promise<void> {
+  const config = sharedCredentialProfile;
+  const settingsKey = connectionSessionKey(
+    config,
+    manager.getConnectionSessionNonce(config.id),
+  );
+  if (!settingsKey) throw new Error("missing connection settings key");
+  await new VSCodeConnectionManagerStore(context).writeDynamoDBTarget(
+    config.id,
+    {
+      settingsKey,
+      fingerprint: "a".repeat(64),
+    },
+  );
+}
 
 const originalCredentials = {
   awsAccessKeyId: "synthetic-access-key-A",
@@ -142,6 +174,241 @@ const replacementCredentials = {
 };
 const originalRevision = "00000000-0000-4000-8000-000000000001";
 
+describe("credential documents are fenced by the saved profile", () => {
+  const original: ConnectionConfig = {
+    id: "bound-profile",
+    name: "Profile",
+    type: "pg",
+    useSecretStorage: true,
+    host: "first.invalid",
+    port: 5432,
+    username: "reader",
+    database: "app",
+  };
+
+  it.each([
+    false,
+    true,
+  ])("keeps a peer from using staged credentials with old settings (rollback=%s)", async (rollback) => {
+    const context = createExtensionContextStub();
+    const writerStore = new FakeConnectionManagerStore();
+    const peerStore = new FakeConnectionManagerStore();
+    const legacy = '{"password":"previous"}';
+    writerStore.setConnections([original]);
+    writerStore.setSecret(original.id, legacy);
+    peerStore.setConnections([original]);
+    vi.spyOn(peerStore, "getSecret").mockImplementation((key) =>
+      writerStore.getSecret(key),
+    );
+    const writer = new ConnectionManager(context as never, writerStore);
+    const peer = new ConnectionManager(context as never, peerStore);
+    const peerDriver = credentialDriver();
+    const factory = credentialDriverFactory(peer).mockReturnValue(
+      peerDriver as unknown as IDBDriver,
+    );
+    const storeSecret = writerStore.storeSecret.bind(writerStore);
+    vi.spyOn(writerStore, "storeSecret").mockImplementationOnce(
+      async (key, value) => {
+        await storeSecret(key, value);
+        await expect(peer.connectTo(original.id, "explicit")).rejects.toThrow(
+          "do not match",
+        );
+        expect(factory).not.toHaveBeenCalled();
+        expect(peerDriver.connect).not.toHaveBeenCalled();
+      },
+    );
+    if (rollback)
+      writerStore.failNextConnectionWrite(new Error("settings unavailable"));
+    try {
+      const saving = writer.saveConnection({
+        ...original,
+        host: "second.invalid",
+        password: "replacement",
+      });
+      if (rollback) {
+        await expect(saving).rejects.toThrow("settings unavailable");
+        await expect(writerStore.getSecret(original.id)).resolves.toBe(legacy);
+      } else {
+        await saving;
+        peerStore.setConnections(writerStore.getConnections());
+        peerStore.fireConfigurationChange("rapidb.connections");
+      }
+      await peer.connectTo(original.id, "explicit");
+      expect(factory).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          host: rollback ? "first.invalid" : "second.invalid",
+          password: rollback ? "previous" : "replacement",
+        }),
+      );
+    } finally {
+      await Promise.all([writer.dispose(), peer.dispose()]);
+    }
+  });
+
+  it("does not inherit an old password on a manager-level target change", async () => {
+    const context = createExtensionContextStub();
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([original]);
+    store.setSecret(original.id, "previous");
+    const manager = new ConnectionManager(context as never, store);
+    try {
+      await manager.saveConnection({ ...original, host: "second.invalid" });
+      const [saved] = store.getConnections();
+      await expect(manager._hydratePassword(saved)).resolves.toMatchObject({
+        host: "second.invalid",
+        password: "",
+      });
+      await expect(manager._hydratePassword(original)).rejects.toThrow(
+        "do not match",
+      );
+      await store.deleteSecret(original.id);
+      const driver = credentialDriver();
+      const factory = credentialDriverFactory(manager).mockReturnValue(
+        driver as unknown as IDBDriver,
+      );
+      await expect(manager.connectTo(original.id, "explicit")).rejects.toThrow(
+        "do not match",
+      );
+      expect(factory).not.toHaveBeenCalled();
+      expect(driver.connect).not.toHaveBeenCalled();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("rotates the profile link when URI credentials change under the same redacted URI", async () => {
+    const context = createExtensionContextStub();
+    const store = new FakeConnectionManagerStore();
+    const manager = new ConnectionManager(context as never, store);
+    const config: ConnectionConfig = {
+      id: "uri-profile",
+      name: "URI profile",
+      type: "mongodb",
+      mongoConnectionMode: "uri",
+      useSecretStorage: true,
+      connectionUri: "mongodb://original:original-password@db.invalid/app",
+    };
+    try {
+      const first = await manager.saveConnection(config);
+      const second = await manager.saveConnection({
+        ...config,
+        connectionUri: "mongodb://replacement:new-password@db.invalid/app",
+      });
+      expect(first.connectionUri).toBe(second.connectionUri);
+      expect(first.secretStorageProfile).not.toBe(second.secretStorageProfile);
+      await expect(manager._hydratePassword(first)).rejects.toThrow(
+        "do not match",
+      );
+      await expect(manager._hydratePassword(second)).resolves.toMatchObject({
+        connectionUri: "mongodb://replacement:new-password@db.invalid/app",
+      });
+    } finally {
+      await manager.dispose();
+    }
+  });
+});
+
+describe("legacy credentials are bound to their target on first use", () => {
+  const legacyProfile: ConnectionConfig = {
+    id: "legacy-profile",
+    name: "Legacy",
+    type: "pg",
+    host: "first.invalid",
+    port: 5432,
+    username: "reader",
+    database: "app",
+  };
+
+  it("binds an unbound document on first use and then refuses a changed host", async () => {
+    const context = createExtensionContextStub();
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([legacyProfile]);
+    store.setSecret(legacyProfile.id, '{"password":"legacy-password"}');
+    const manager = new ConnectionManager(context as never, store);
+    const driver = credentialDriver();
+    const factory = credentialDriverFactory(manager).mockReturnValue(
+      driver as unknown as IDBDriver,
+    );
+    try {
+      await manager.connectTo(legacyProfile.id, "explicit");
+      expect(factory).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({
+          host: "first.invalid",
+          password: "legacy-password",
+        }),
+      );
+      const bound = JSON.parse(
+        (await store.getSecret(legacyProfile.id)) as string,
+      );
+      expect(bound).toMatchObject({ password: "legacy-password" });
+      expect(typeof bound.rapidbSecretTargetV1).toBe("string");
+      await manager.disconnectFrom(legacyProfile.id);
+
+      // A host change made outside Edit Connection must not receive the
+      // password that was trusted for the first host.
+      store.setConnections([{ ...legacyProfile, host: "attacker.invalid" }]);
+      store.fireConfigurationChange("rapidb.connections");
+      factory.mockClear();
+      await expect(
+        manager.connectTo(legacyProfile.id, "explicit"),
+      ).rejects.toThrow(/do not match.*Edit Connection/);
+      expect(factory).not.toHaveBeenCalled();
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("still connects when Secret Storage cannot persist the binding", async () => {
+    const context = createExtensionContextStub();
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([legacyProfile]);
+    store.setSecret(legacyProfile.id, "plain-legacy");
+    vi.spyOn(store, "storeSecret").mockRejectedValue(
+      new Error("keychain unavailable"),
+    );
+    const manager = new ConnectionManager(context as never, store);
+    const driver = credentialDriver();
+    const factory = credentialDriverFactory(manager).mockReturnValue(
+      driver as unknown as IDBDriver,
+    );
+    try {
+      await manager.connectTo(legacyProfile.id, "explicit");
+      expect(factory).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ password: "plain-legacy" }),
+      );
+      await expect(store.getSecret(legacyProfile.id)).resolves.toBe(
+        "plain-legacy",
+      );
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("does not bind when the settings target changed before the lock was taken", async () => {
+    const context = createExtensionContextStub();
+    const store = new FakeConnectionManagerStore();
+    store.setConnections([legacyProfile]);
+    store.setSecret(legacyProfile.id, '{"password":"legacy-password"}');
+    const mutate = store.mutateConnections.bind(store);
+    vi.spyOn(store, "mutateConnections").mockImplementation(async (fn) => {
+      store.setConnections([{ ...legacyProfile, host: "other.invalid" }]);
+      return mutate(fn);
+    });
+    const manager = new ConnectionManager(context as never, store);
+    credentialDriverFactory(manager).mockReturnValue(
+      credentialDriver() as unknown as IDBDriver,
+    );
+    try {
+      await manager.connectTo(legacyProfile.id, "explicit");
+      await expect(store.getSecret(legacyProfile.id)).resolves.toBe(
+        '{"password":"legacy-password"}',
+      );
+    } finally {
+      await manager.dispose();
+    }
+  });
+});
+
 describe("credential revisions across VS Code windows", () => {
   it("disconnects both live sessions once, leaves other keys alone, and requires a new query target binding", async () => {
     const config = sharedCredentialProfile;
@@ -150,9 +417,15 @@ describe("credential revisions across VS Code windows", () => {
     const secrets = sharedSecretStorage();
     secrets.entries.set(
       config.id,
-      JSON.stringify({ ...originalCredentials, future: 42 }),
+      bindConnectionSecret(
+        config,
+        JSON.stringify({ ...originalCredentials, future: 42 }),
+      ),
     );
-    secrets.entries.set(unrelated.id, JSON.stringify(originalCredentials));
+    secrets.entries.set(
+      unrelated.id,
+      bindConnectionSecret(unrelated, JSON.stringify(originalCredentials)),
+    );
     const origin = new ConnectionManager(secrets.context() as never);
     const peer = new ConnectionManager(secrets.context() as never);
     const originSession = vi.fn();
@@ -211,10 +484,13 @@ describe("credential revisions across VS Code windows", () => {
       await expect(
         peer.getDriverForQuery(config.id, originalKey),
       ).resolves.toBeUndefined();
+      expect(peer.getQueryTargetSessionKey(config.id)).toBeNull();
+      expect(origin.getQueryTargetSessionKey(config.id)).toBeNull();
+      secrets.emit(config.id); // writer echo / duplicate or delayed broadcast resolved by read
+      await peer.connectTo(config.id, "explicit");
       const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
       expect(currentKey).not.toBe(originalKey);
       expect(origin.getQueryTargetSessionKey(config.id)).toBe(currentKey);
-      secrets.emit(config.id); // writer echo / duplicate or delayed broadcast resolved by read
       await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
         replacementDriver,
       );
@@ -248,9 +524,13 @@ describe("credential revisions across VS Code windows", () => {
     const config = sharedCredentialProfile;
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    secrets.entries.set(
+      config.id,
+      bindConnectionSecret(config, JSON.stringify(originalCredentials)),
+    );
     const origin = new ConnectionManager(secrets.context() as never);
-    const peer = new ConnectionManager(secrets.context() as never);
+    const peerContext = secrets.context() as unknown as vscode.ExtensionContext;
+    const peer = new ConnectionManager(peerContext);
     const sessions = vi.fn();
     const connected = vi.fn();
     peer.onDidChangeConnectionSession(sessions);
@@ -267,6 +547,7 @@ describe("credential revisions across VS Code windows", () => {
     try {
       if (rename) configuration.afterApply = fireConnectionsConfigurationChange;
       await peer.initializeConnectionCredentialRevision(config.id);
+      await rememberPreviouslyVerifiedTarget(peerContext, peer);
       const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
       const oldQuery = peer.getDriverForQuery(config.id, oldKey);
       await vi.waitFor(() => expect(oldDriver.connect).toHaveBeenCalledOnce());
@@ -307,9 +588,12 @@ describe("credential revisions across VS Code windows", () => {
     const edited = { ...config, name: "Renamed", color: "red", folder: "Ops" };
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    const original = withConnectionCredentialRevision(
-      JSON.stringify({ ...originalCredentials, future: 42 }),
-      originalRevision,
+    const original = bindConnectionSecret(
+      config,
+      withConnectionCredentialRevision(
+        JSON.stringify({ ...originalCredentials, future: 42 }),
+        originalRevision,
+      ),
     );
     secrets.entries.set(config.id, original);
     const origin = new ConnectionManager(secrets.context() as never);
@@ -371,7 +655,11 @@ describe("credential revisions across VS Code windows", () => {
           {
             kind: "edit",
             id: config.id,
-            state: connectionEditState(config, originalCredentials),
+            state: connectionEditState(
+              config,
+              originalCredentials,
+              originalRevision,
+            ),
           },
         ),
       ).resolves.toMatchObject(edited);
@@ -407,10 +695,13 @@ describe("credential revisions across VS Code windows", () => {
       await expect(
         peer.getDriverForQuery(config.id, oldKey),
       ).resolves.toBeUndefined();
+      expect(peer.getQueryTargetSessionKey(config.id)).toBeNull();
+      expect(origin.getQueryTargetSessionKey(config.id)).toBeNull();
+      secrets.emit(config.id);
+      await peer.connectTo(config.id, "explicit");
       const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
       expect(currentKey).not.toBe(oldKey);
       expect(origin.getQueryTargetSessionKey(config.id)).toBe(currentKey);
-      secrets.emit(config.id);
       await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
         replacementDriver,
       );
@@ -447,17 +738,23 @@ describe("credential revisions across VS Code windows", () => {
     const edited = { ...config, name: "Renamed", color: "red" };
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    const original = withConnectionCredentialRevision(
-      JSON.stringify(originalCredentials),
-      originalRevision,
+    const original = bindConnectionSecret(
+      config,
+      withConnectionCredentialRevision(
+        JSON.stringify(originalCredentials),
+        originalRevision,
+      ),
     );
     const newerCredentials = {
       awsAccessKeyId: "synthetic-access-key-C",
       awsSecretAccessKey: "synthetic-secret-key-C",
     };
-    const newer = withConnectionCredentialRevision(
-      JSON.stringify(newerCredentials),
-      "00000000-0000-4000-8000-000000000002",
+    const newer = bindConnectionSecret(
+      config,
+      withConnectionCredentialRevision(
+        JSON.stringify(newerCredentials),
+        "00000000-0000-4000-8000-000000000002",
+      ),
     );
     secrets.entries.set(config.id, original);
     const origin = new ConnectionManager(secrets.context() as never);
@@ -548,15 +845,20 @@ describe("credential revisions across VS Code windows", () => {
     const config = sharedCredentialProfile;
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    secrets.entries.set(
+      config.id,
+      bindConnectionSecret(config, JSON.stringify(originalCredentials)),
+    );
     const origin = new ConnectionManager(secrets.context() as never);
-    const peer = new ConnectionManager(secrets.context() as never);
+    const peerContext = secrets.context() as unknown as vscode.ExtensionContext;
+    const peer = new ConnectionManager(peerContext);
     const driver = credentialDriver();
     const factory = credentialDriverFactory(peer).mockReturnValue(
       driver as unknown as IDBDriver,
     );
     try {
       await peer.initializeConnectionCredentialRevision(config.id);
+      await rememberPreviouslyVerifiedTarget(peerContext, peer);
       const oldKey = peer.getQueryTargetSessionKey(config.id) as string;
       secrets.muteEvents();
       await origin.saveConnection({ ...config, ...replacementCredentials });
@@ -565,6 +867,8 @@ describe("credential revisions across VS Code windows", () => {
       ).resolves.toBeUndefined();
       expect(factory).not.toHaveBeenCalled();
       await peer.disconnectFrom(config.id);
+      expect(peer.getQueryTargetSessionKey(config.id)).toBeNull();
+      await peer.connectTo(config.id, "explicit");
       const currentKey = peer.getQueryTargetSessionKey(config.id) as string;
       expect(currentKey).not.toBe(oldKey);
       await expect(peer.getDriverForQuery(config.id, currentKey)).resolves.toBe(
@@ -582,7 +886,10 @@ describe("credential revisions across VS Code windows", () => {
     const config = sharedCredentialProfile;
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    const original = JSON.stringify(originalCredentials);
+    const original = bindConnectionSecret(
+      config,
+      JSON.stringify(originalCredentials),
+    );
     secrets.entries.set(config.id, original);
     const origin = new ConnectionManager(secrets.context() as never);
     const peer = new ConnectionManager(secrets.context() as never);
@@ -616,15 +923,16 @@ describe("credential revisions across VS Code windows", () => {
       expect(sessions).not.toHaveBeenCalled();
       expect(driver.disconnect).not.toHaveBeenCalled();
 
-      // A runtime-affecting edit still takes the staged/rollback path.
+      // A second write must not trust the cached baseline after an uncertain
+      // acknowledgement, even though this test knows the first RPC failed.
       await expect(
         origin.saveConnection({
           ...config,
           ...replacementCredentials,
           awsRegion: "us-west-2",
         }),
-      ).rejects.toThrow("settings write failed");
-      expect(secrets.store).toHaveBeenCalledTimes(5);
+      ).rejects.toThrow("stale");
+      expect(secrets.store).toHaveBeenCalledTimes(3);
       expect(secrets.entries.get(config.id)).toBe(original);
       await expect(peer.getDriverForQuery(config.id, key)).resolves.toBe(
         driver,
@@ -637,11 +945,14 @@ describe("credential revisions across VS Code windows", () => {
     }
   });
 
-  it("keeps a clear revision without retaining credentials so peers reconnect without the old identity", async () => {
+  it("requires an explicit mode switch before peers reconnect without the old static credentials", async () => {
     const config = sharedCredentialProfile;
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    secrets.entries.set(
+      config.id,
+      bindConnectionSecret(config, JSON.stringify(originalCredentials)),
+    );
     const origin = new ConnectionManager(secrets.context() as never);
     const peer = new ConnectionManager(secrets.context() as never);
     const driver = credentialDriver();
@@ -650,7 +961,14 @@ describe("credential revisions across VS Code windows", () => {
     );
     try {
       await peer.connectTo(config.id);
-      await origin.saveConnection(config, { awsCredentials: true });
+      await expect(
+        origin.saveConnection(config, { awsCredentials: true }),
+      ).rejects.toThrow(/static AWS credentials/i);
+      configuration.afterApply = fireConnectionsConfigurationChange;
+      await origin.saveConnection(
+        { ...config, awsCredentialMode: "default" },
+        { awsCredentials: true },
+      );
       const stored = JSON.parse(secrets.entries.get(config.id) ?? "{}");
       expect(stored).not.toHaveProperty("awsAccessKeyId");
       expect(stored).not.toHaveProperty("awsSecretAccessKey");
@@ -661,6 +979,7 @@ describe("credential revisions across VS Code windows", () => {
       expect(factory.mock.calls.at(-1)?.[0].awsSecretAccessKey).toBeUndefined();
       expect(peer.isConnected(config.id)).toBe(true);
     } finally {
+      configuration.afterApply = undefined;
       await Promise.all([origin.dispose(), peer.dispose()]);
     }
   });
@@ -669,7 +988,10 @@ describe("credential revisions across VS Code windows", () => {
     const config = sharedCredentialProfile;
     configuration.connections = [config];
     const secrets = sharedSecretStorage();
-    secrets.entries.set(config.id, JSON.stringify(originalCredentials));
+    secrets.entries.set(
+      config.id,
+      bindConnectionSecret(config, JSON.stringify(originalCredentials)),
+    );
     const origin = new ConnectionManager(secrets.context() as never);
     const context = secrets.context() as unknown as vscode.ExtensionContext;
     const peer = new ConnectionManager(context);
@@ -698,6 +1020,7 @@ describe("credential revisions across VS Code windows", () => {
       await origin.saveConnection({ ...config, ...replacementCredentials });
       await vi.waitFor(() => expect(peer.getDriver(config.id)).toBeUndefined());
       await peer.disconnectFrom(config.id);
+      await peer.connectTo(config.id, "explicit");
       const newKey = peer.getQueryTargetSessionKey(config.id) as string;
       expect(webview.postMessage).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -945,10 +1268,10 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       });
       expect(configuration.writes).toBe(2);
       expect(stores).toHaveBeenCalledTimes(1);
-      expect(stores).toHaveBeenCalledWith(
-        "other",
-        JSON.stringify({ password: "other" }),
-      );
+      expect(stores).toHaveBeenCalledWith("other", expect.any(String));
+      expect(
+        JSON.parse((await context.secrets.get("other")) ?? "{}"),
+      ).toMatchObject({ password: "other" });
       expect(deletes).not.toHaveBeenCalled();
       await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
     } finally {
@@ -978,7 +1301,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       expect(configuration.connections[0].useSecretStorage).toBe(true);
       expect(
         JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
-      ).toEqual({ password: "legacy-password" });
+      ).toMatchObject({ password: "legacy-password" });
     } finally {
       await manager.dispose();
     }
@@ -1020,7 +1343,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       expect(configuration.connections[0].connectionUri).toBeUndefined();
       expect(
         JSON.parse((await context.secrets.get(existing.id)) ?? "{}"),
-      ).toEqual({ endpoint: fullEndpoint });
+      ).toMatchObject({ endpoint: fullEndpoint });
     } finally {
       await manager.dispose();
     }
@@ -1035,7 +1358,13 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
     ],
   ])("handles legacy URI credentials safely through save and edit: %s", async (connectionUri, redacted) => {
     for (const useSecretStorage of [undefined, true]) {
-      configuration.connections = [];
+      // Replace the fixture with a new revision between the subcases.
+      const independentSettings = {
+        id: `other-${String(useSecretStorage)}`,
+        name: "Other",
+        type: "sqlite" as const,
+      };
+      configuration.connections = [independentSettings];
       const context = createExtensionContextStub();
       const manager = new ConnectionManager(context as never);
       const config: ConnectionConfig = {
@@ -1050,7 +1379,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
           await expect(manager.saveConnection(config)).rejects.toThrow(
             "Enter a valid MongoDB URI",
           );
-          expect(configuration.connections).toEqual([]);
+          expect(configuration.connections).toEqual([independentSettings]);
           expect(await context.secrets.get(config.id)).toBeUndefined();
           continue;
         }
@@ -1058,16 +1387,17 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
         expect(saved.connectionUri).toBe(redacted);
         if (useSecretStorage === undefined) {
           expect(configuration.connections).toEqual([
+            independentSettings,
             { ...config, useSecretStorage: false },
           ]);
           expect(await context.secrets.get(config.id)).toBeUndefined();
           continue;
         }
-        expect(configuration.connections[0].connectionUri).toBe(redacted);
-        expect(configuration.connections[0].useSecretStorage).toBe(true);
+        expect(configuration.connections[1].connectionUri).toBe(redacted);
+        expect(configuration.connections[1].useSecretStorage).toBe(true);
         expect(
           JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
-        ).toEqual({
+        ).toMatchObject({
           connectionUri,
         });
         const edited = await manager.saveConnection({
@@ -1075,10 +1405,10 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
           name: "Renamed",
         });
         expect(edited.connectionUri).toBe(redacted);
-        expect(configuration.connections[0].connectionUri).toBe(redacted);
+        expect(configuration.connections[1].connectionUri).toBe(redacted);
         expect(
           JSON.parse((await context.secrets.get(config.id)) ?? "{}"),
-        ).toEqual({
+        ).toMatchObject({
           connectionUri,
         });
       } finally {
@@ -1122,9 +1452,11 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
           "Ambiguous URI credentials",
         );
         expect(factory).not.toHaveBeenCalled();
-        expect(configuration.connections).toEqual([
-          { ...config, useSecretStorage: useSecretStorage ?? false },
-        ]);
+        await vi.waitFor(() =>
+          expect(configuration.connections).toEqual([
+            { ...config, useSecretStorage: useSecretStorage ?? false },
+          ]),
+        );
         await expect(context.secrets.get(config.id)).resolves.toBeUndefined();
       } finally {
         await legacyManager.dispose();
@@ -1325,7 +1657,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
         connectionUri: config.connectionUri,
         tlsKeyPassphrase: config.tls?.keyPassphrase,
       });
-      if (existing) expect(JSON.parse(raw ?? "{}").future).toBe(42);
+      expect(JSON.parse(raw ?? "{}")).not.toHaveProperty("future");
       expect(deletes).not.toHaveBeenCalled();
       await manager.connectTo(saved.id);
       expect(factory).toHaveBeenCalledWith(
@@ -1421,7 +1753,6 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
   ])("preserves the last-read error and credentials across %s failed attempt(s), then reconnects", async (failures) => {
     const context = createExtensionContextStub();
     const password = " database password ";
-    const rawSecret = '{ "password": " database password ", "future": 42 }';
     const config: ConnectionConfig = {
       id: "keychain-hydration",
       name: "Keychain hydration",
@@ -1432,6 +1763,7 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       password,
       useSecretStorage: true,
     };
+    const rawSecret = '{ "password": " database password ", "future": 42 }';
     configuration.connections = [config];
     await context.secrets.store(config.id, rawSecret);
     const readSecret = context.secrets.get.bind(context.secrets);
@@ -1500,7 +1832,12 @@ describe("ConnectionManager with VSCode SecretStorage", () => {
       expect(driver.connect).toHaveBeenCalledOnce();
       expect(manager.isConnected(config.id)).toBe(true);
       expect(manager.isConnecting(config.id)).toBe(false);
-      await expect(readSecret(config.id)).resolves.toBe(rawSecret);
+      // Credentials are preserved; the legacy document is only bound to its
+      // target on first successful use.
+      expect(JSON.parse((await readSecret(config.id)) as string)).toEqual({
+        ...JSON.parse(rawSecret),
+        rapidbSecretTargetV1: expect.stringMatching(/^[0-9a-f]{64}$/),
+      });
     } finally {
       await manager.dispose();
     }

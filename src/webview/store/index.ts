@@ -28,6 +28,7 @@ export interface QueryResult extends QueryResultCounts {
   error?: string;
 
   truncated?: boolean;
+  truncatedBySize?: boolean;
 
   truncatedAt?: number;
 }

@@ -1,4 +1,5 @@
 import { isMssqlSqlVariantPrimaryKeyValue } from "../../shared/mssqlSqlVariantRowIdentity";
+import { observedNoSqlDeleteBackend } from "../../shared/noSqlDeleteObservation";
 import { isOracleTemporalPrimaryKeyValue } from "../../shared/oracleTemporalRowIdentity";
 import { isPostgresIntervalPrimaryKeyValue } from "../../shared/postgresIntervalRowIdentity";
 import { isSQLitePrimaryKeyValue } from "../../shared/sqliteRowIdentity";
@@ -22,6 +23,7 @@ import type {
 import { normalizeUnknownError } from "../utils/errorHandling";
 import { buildWhere, validateFilterExpressions } from "./filterSql";
 import type { SortConfig, TablePage } from "./tableDataContracts";
+import { tableDataReference } from "./tableDataReference";
 
 type ExportOrderColumn = {
   column: ColumnTypeMeta;
@@ -180,6 +182,12 @@ export class TableReadService {
     }
 
     if (driver.readTablePage) {
+      const connection = this.connectionManager.getConnection(connectionId);
+      const observeNoSqlDelete =
+        !assertExportSession &&
+        !connection?.readOnly &&
+        driver.prepareObservedDelete &&
+        observedNoSqlDeleteBackend(connection?.type);
       return driver.readTablePage({
         database,
         schema,
@@ -191,6 +199,7 @@ export class TableReadService {
         skipCount,
         ...(assertExportSession ? { omitRowIdentity: true } : {}),
         ...(observeSqlDelete ? { observeSqlDelete: true } : {}),
+        ...(observeNoSqlDelete ? { observeNoSqlDelete: true } : {}),
         ...(conflictRefresh ? { conflictRefresh: true } : {}),
         ...(browsingSnapshot ? { browsingSnapshot } : {}),
         ...(signal ? { signal } : {}),
@@ -305,12 +314,12 @@ export class TableReadService {
       (await this.getColumns(connectionId, database, schema, table));
     assertExportSession?.();
     signal?.throwIfAborted();
-
     const { clause: whereClause, params: whereParams } = buildWhere(
       driver,
       filters,
       columns,
     );
+    const from = tableDataReference(driver, database, schema, table, columns);
     const offset = (page - 1) * pageSize;
     const orderByClause = this.resolveFallbackOrderBy(
       driver,
@@ -331,7 +340,7 @@ export class TableReadService {
       connectionId,
       driver,
       database,
-      qualifiedTableName,
+      from,
       whereClause,
       whereParams,
       skipCount,
@@ -410,7 +419,7 @@ export class TableReadService {
       )
       .join("");
     const pageQuery = (base: string, snapshot = "") =>
-      `SELECT ${base}${identityProjection}${snapshot} FROM ${qualifiedTableName} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
+      `SELECT ${base}${identityProjection}${snapshot} FROM ${from} ${whereClause} ${effectiveOrderBy} ${pagination.sql}`;
     const read = (snapshot?: string) =>
       this.readFallbackDataResult(
         driver,
@@ -632,10 +641,10 @@ export class TableReadService {
     missingCells?: QueryMissingCell[];
   }> {
     const { driver } = this.getConnectionDriver(connectionId);
+    if (!Array.isArray(filters)) {
+      throw new Error("[RapiDB Filter] Filters must be an array.");
+    }
     if (driver.exportTableChunks) {
-      if (!Array.isArray(filters)) {
-        throw new Error("[RapiDB Filter] Filters must be an array.");
-      }
       if (filters.length > 0) {
         const columns = await this.getColumns(
           connectionId,
@@ -653,15 +662,12 @@ export class TableReadService {
       );
       return;
     }
-    if (!driver.readTablePage) {
-      const keysetOrder = await this.resolveKeysetExportOrder(
-        connectionId,
-        database,
-        schema,
-        table,
-        sort,
-      );
-      assertSession?.();
+    const fallbackColumns = !driver.readTablePage
+      ? await this.getColumns(connectionId, database, schema, table)
+      : undefined;
+    assertSession?.();
+    if (fallbackColumns) {
+      const keysetOrder = this.resolveKeysetExportOrder(fallbackColumns, sort);
       if (keysetOrder) {
         yield* this.exportAllWithKeysetPagination(
           connectionId,
@@ -670,6 +676,7 @@ export class TableReadService {
           table,
           chunkSize,
           filters,
+          fallbackColumns,
           keysetOrder,
           signal,
           assertSession,
@@ -688,18 +695,37 @@ export class TableReadService {
 
       let rowCount = 0;
       let emptyColumns: ColumnTypeMeta[] | undefined;
-      for await (const chunk of this.getPageChunks(
-        connectionId,
-        database,
-        schema,
-        table,
-        page,
-        chunkSize,
-        filters,
-        sort,
-        signal,
-        assertSession,
-      )) {
+      const chunks =
+        fallbackColumns && !driver.readTablePageChunks
+          ? [
+              await this.readFallbackPage(
+                connectionId,
+                database,
+                schema,
+                table,
+                page,
+                chunkSize,
+                filters,
+                sort,
+                true,
+                fallbackColumns,
+                assertSession,
+                signal,
+              ),
+            ]
+          : this.getPageChunks(
+              connectionId,
+              database,
+              schema,
+              table,
+              page,
+              chunkSize,
+              filters,
+              sort,
+              signal,
+              assertSession,
+            );
+      for await (const chunk of chunks) {
         assertSession?.();
         if (chunk.rows.length === 0) {
           emptyColumns ??= chunk.columns;
@@ -766,7 +792,7 @@ export class TableReadService {
     connectionId: string,
     driver: ReturnType<TableReadService["getConnectionDriver"]>["driver"],
     database: string,
-    qualifiedTableName: string,
+    from: string,
     whereClause: string,
     whereParams: unknown[],
     skipCount: boolean,
@@ -777,7 +803,7 @@ export class TableReadService {
     }
 
     try {
-      const countSql = `SELECT COUNT(*) AS cnt FROM ${qualifiedTableName} ${whereClause}`;
+      const countSql = `SELECT COUNT(*) AS cnt FROM ${from} ${whereClause}`;
       const countResult = await driver.query(countSql, whereParams, {
         database,
         ...this.getSQLiteAttachmentScope(),
@@ -938,6 +964,7 @@ export class TableReadService {
     table: string,
     chunkSize: number,
     filters: FilterExpression[],
+    columns: ColumnTypeMeta[],
     order: readonly ExportOrderColumn[],
     signal?: AbortSignal,
     assertSession?: () => void,
@@ -951,13 +978,8 @@ export class TableReadService {
       schema,
       table,
     );
-    const columns = await this.getColumns(
-      connectionId,
-      database,
-      schema,
-      table,
-    );
     assertSession?.();
+    const from = tableDataReference(driver, database, schema, table, columns);
     const orderByClause = this.buildOrderByClause(
       driver,
       order,
@@ -1009,11 +1031,11 @@ export class TableReadService {
         baseWhereParams.length + (cursorCondition?.params.length ?? 0) + 1,
       );
       const projection = driver.buildTableDataProjection?.(columns) ?? "*";
-      const sql = `SELECT ${projection}${cursorProjection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+      const sql = `SELECT ${projection}${cursorProjection} FROM ${from} ${whereClause} ${orderByClause} ${pagination.sql}`;
       const fallbackSql =
         projection === "*"
           ? undefined
-          : `SELECT *${cursorProjection} FROM ${qualifiedTableName} ${whereClause} ${orderByClause} ${pagination.sql}`;
+          : `SELECT *${cursorProjection} FROM ${from} ${whereClause} ${orderByClause} ${pagination.sql}`;
       const params = [
         ...baseWhereParams,
         ...(cursorCondition?.params ?? []),
@@ -1077,19 +1099,10 @@ export class TableReadService {
     }
   }
 
-  private async resolveKeysetExportOrder(
-    connectionId: string,
-    database: string,
-    schema: string,
-    table: string,
+  private resolveKeysetExportOrder(
+    columns: ColumnTypeMeta[],
     sort: SortConfig | null,
-  ): Promise<ExportOrderColumn[] | null> {
-    const columns = await this.getColumns(
-      connectionId,
-      database,
-      schema,
-      table,
-    );
+  ): ExportOrderColumn[] | null {
     const byName = new Map(columns.map((column) => [column.name, column]));
     const primaryKeys = columns
       .filter((column) => column.isPrimaryKey)

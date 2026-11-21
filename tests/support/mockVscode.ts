@@ -199,7 +199,8 @@ export function createMockVscodeModule(): {
   return {
     module: {
       EventEmitter: MockEventEmitter,
-      ProgressLocation: { Window: 10 },
+      ProgressLocation: { Window: 10, Notification: 15 },
+      ExtensionMode: { Production: 1, Development: 2, Test: 3 },
       ViewColumn: { One: 1 },
       ConfigurationTarget: { Global: 1 },
       window: {

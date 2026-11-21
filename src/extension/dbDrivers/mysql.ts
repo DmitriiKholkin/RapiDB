@@ -40,9 +40,16 @@ import {
 } from "./mysqlBoundedQuery";
 import { formatMysqlQuery, formatMysqlStringLiteral } from "./mysqlQueryFormat";
 import {
+  mariaDbGrantedRoles,
+  mysqlGrantsShowTriggerAccess,
+  parseMysqlCurrentRoles,
+  UnverifiedTriggerVisibilityError,
+} from "./mysqlTriggerVisibility";
+import {
   canonicalizeExactNumeric,
   numberToDecimalString,
 } from "./numericUtils";
+import { isServerReportedQueryError } from "./queryErrorOutcome";
 import {
   buildSqlDeleteSnapshot,
   readSqlDeleteObservations,
@@ -74,6 +81,10 @@ import type {
   QueryResult,
   SchemaInfo,
   TableInfo,
+  TableMutationTarget,
+  TransactionContext,
+  TransactionOperation,
+  TransactionOptions,
   TypeCategory,
   ValueSemantics,
 } from "./types";
@@ -224,6 +235,32 @@ function mayMysqlServerHaveRolledBackTransaction(error: unknown): boolean {
     native.errno === 1205 ||
     native.sqlState === "40001"
   );
+}
+
+function mysqlErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function mysqlMutationNotExecuted(error: unknown): MutationNotExecutedError {
+  return new MutationNotExecutedError(mysqlErrorMessage(error), error);
+}
+
+function mysqlEngineRollbackRisk(
+  target: string,
+  row: { ENGINE?: unknown; TRANSACTIONS?: unknown } | undefined,
+): string | null {
+  const engine =
+    typeof row?.ENGINE === "string" ? row.ENGINE.trim().toUpperCase() : "";
+  const transactions =
+    typeof row?.TRANSACTIONS === "string"
+      ? row.TRANSACTIONS.trim().toUpperCase()
+      : "";
+  if (engine && transactions === "YES") return null;
+  const reason =
+    engine && transactions === "NO"
+      ? `Table ${target} uses the non-transactional MySQL engine ${engine}.`
+      : `Cannot confirm rollback support for table ${target}${engine ? ` (engine ${engine})` : ""}: storage engine transaction metadata is unavailable or inconclusive.`;
+  return `${reason} Multi-statement table mutations and mutations requiring verification are blocked to avoid partial writes. Use a transactional engine such as InnoDB and ensure its engine metadata is visible.`;
 }
 
 function hasJsonValidColumnCheck(
@@ -1455,6 +1492,17 @@ function mysqlServerIdentitySql(connection: object): string {
     ? "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_uuid, @@hostname, @@port) AS server_identity"
     : "SELECT CONNECTION_ID() AS connection_id, @@autocommit AS autocommit, CONCAT_WS(':', @@server_id, @@hostname, @@port) AS server_identity";
 }
+function isMariaDbConnection(connection: unknown): boolean {
+  const handshake =
+    connection && typeof connection === "object"
+      ? Reflect.get(connection, "_handshakePacket")
+      : undefined;
+  const version =
+    handshake && typeof handshake === "object"
+      ? Reflect.get(handshake, "serverVersion")
+      : undefined;
+  return typeof version === "string" && /mariadb/i.test(version);
+}
 function mysqlHandshakeStatus(connection: object): unknown {
   const handshake = Reflect.get(connection, "_handshakePacket");
   return handshake && typeof handshake === "object"
@@ -1541,6 +1589,8 @@ function splitMysqlQueryResults(
   ];
 }
 export class MySQLDriver extends BaseDBDriver {
+  readonly usesLockedTableMutationChecks = true;
+
   protected override getQueryEditorSqlDialect() {
     return "mysql" as const;
   }
@@ -2582,7 +2632,12 @@ export class MySQLDriver extends BaseDBDriver {
           : {}),
         ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
         ...(error !== undefined
-          ? { error: normalizeUnknownError(error, this.config).message }
+          ? {
+              error: normalizeUnknownError(error, this.config).message,
+              ...(isServerReportedQueryError(error)
+                ? { serverReportedError: true }
+                : {}),
+            }
           : {}),
       };
     };
@@ -3351,7 +3406,12 @@ export class MySQLDriver extends BaseDBDriver {
           ? { affectedRows: totalAffected }
           : {}),
         ...(error !== undefined
-          ? { error: normalizeUnknownError(error, this.config).message }
+          ? {
+              error: normalizeUnknownError(error, this.config).message,
+              ...(isServerReportedQueryError(error)
+                ? { serverReportedError: true }
+                : {}),
+            }
           : {}),
       };
     };
@@ -3827,14 +3887,26 @@ export class MySQLDriver extends BaseDBDriver {
     return null;
   }
   async runTransaction(
-    operations: import("./types").TransactionOperation[],
-    context?: import("./types").TransactionContext,
-    scope?: import("./types").TransactionOptions,
+    operations: TransactionOperation[],
+    context?: TransactionContext,
+    scope?: TransactionOptions,
   ): Promise<void> {
-    throwIfTransactionCancelled(context);
-    const conn = await this.requirePool().getConnection();
+    const guarded = scope?.lockedTableMutation;
+    let pool: Pool;
+    let conn: PoolConnection;
+    try {
+      throwIfTransactionCancelled(context);
+      pool = this.requirePool();
+      conn = guarded
+        ? await this.checkoutFreshMutationConnection(pool, context)
+        : await pool.getConnection();
+    } catch (error) {
+      if (guarded) throw mysqlMutationNotExecuted(error);
+      throw error;
+    }
     this.activeTransactionConnections.add(conn);
     let discardTransactionConnection = false;
+    let writeAttempted = false;
     let commitAttempted = false;
     const cancel = () => {
       if (this.activeTransactionConnections.delete(conn)) {
@@ -3855,6 +3927,15 @@ export class MySQLDriver extends BaseDBDriver {
         throwIfTransactionCancelled(context);
       }
       await conn.beginTransaction();
+      throwIfTransactionCancelled(context);
+      if (guarded) {
+        await this.assertLockedTableMutationSupport(
+          conn,
+          guarded.targets,
+          context,
+          guarded.acceptUnverifiedTriggerVisibility,
+        );
+      }
       await this.assertUnambiguousTimestampWrites(conn, operations, context);
       const identities = new TransactionIdentityStore();
       const generatedZeros = new Set<number>();
@@ -3892,6 +3973,18 @@ export class MySQLDriver extends BaseDBDriver {
             );
           }
         }
+        if (!writeAttempted && guarded) {
+          if (!this.activeTransactionConnections.has(conn)) {
+            throw new Error("MySQL transaction was cancelled before writing.");
+          }
+          if (pool !== this.pool)
+            throw new Error(
+              "MySQL connection changed during mutation preflight.",
+            );
+          guarded.assertWritable();
+          throwIfTransactionCancelled(context);
+        }
+        writeAttempted = true;
         const [rows] = await conn.query<ResultSetHeader>(
           this.createQueryOptions(op.sql, op.params as QueryOptions["values"]),
         );
@@ -3967,6 +4060,20 @@ export class MySQLDriver extends BaseDBDriver {
       commitAttempted = true;
       await conn.commit();
     } catch (error) {
+      const notWritten = guarded && !writeAttempted && !commitAttempted;
+      if (notWritten) {
+        if (!this.activeTransactionConnections.has(conn)) {
+          throw mysqlMutationNotExecuted(error);
+        }
+        if (
+          Reflect.get(Object(error), "code") === "PROTOCOL_SEQUENCE_TIMEOUT"
+        ) {
+          // mysql2 can time out a command while it is still waiting on the
+          // server. Do not queue a rollback behind it or reuse the session.
+          cancel();
+          throw mysqlMutationNotExecuted(error);
+        }
+      }
       let rollbackResult: ResultSetHeader;
       try {
         [rollbackResult] = await conn.query<ResultSetHeader>(
@@ -3974,33 +4081,36 @@ export class MySQLDriver extends BaseDBDriver {
         );
       } catch (rollbackError) {
         discardTransactionConnection = true;
-        throw new AggregateError(
+        const failure = new AggregateError(
           [error, rollbackError],
-          "MySQL transaction and rollback failed; the connection was discarded.",
+          notWritten
+            ? `MySQL preflight failed and rollback could not be confirmed; the connection was discarded. ${mysqlErrorMessage(error)}`
+            : "MySQL transaction and rollback failed; the connection was discarded.",
         );
+        throw notWritten ? mysqlMutationNotExecuted(failure) : failure;
       }
       if (rollbackResult?.warningStatus !== 0) {
         discardTransactionConnection = true;
-        const detail = error instanceof Error ? error.message : String(error);
-        throw new AggregateError(
+        const detail = mysqlErrorMessage(error);
+        const failure = new AggregateError(
           [error],
           `MySQL transaction failed; a complete rollback could not be confirmed${
             typeof rollbackResult?.warningStatus === "number"
               ? ` (ROLLBACK reported ${rollbackResult.warningStatus} warning(s))`
               : " (ROLLBACK warning metadata was unavailable)"
-          }. Some changes may persist; the connection was discarded. ${detail}`,
+          }. ${notWritten ? "" : "Some changes may persist; "}The connection was discarded. ${detail}`,
         );
+        throw notWritten ? mysqlMutationNotExecuted(failure) : failure;
       }
       if (!commitAttempted && error instanceof TransactionVerificationError) {
         error.rollbackConfirmed = true;
       }
       if (
         !commitAttempted &&
-        !mayMysqlServerHaveRolledBackTransaction(error) &&
+        (notWritten || !mayMysqlServerHaveRolledBackTransaction(error)) &&
         !(error instanceof TransactionVerificationError)
       ) {
-        const message = error instanceof Error ? error.message : String(error);
-        throw new MutationNotExecutedError(message, error);
+        throw mysqlMutationNotExecuted(error);
       }
       throw error;
     } finally {
@@ -4010,6 +4120,216 @@ export class MySQLDriver extends BaseDBDriver {
         else conn.release();
       }
     }
+  }
+  private async checkoutFreshMutationConnection(
+    pool: Pool,
+    context?: TransactionContext,
+  ): Promise<PoolConnection> {
+    // SHOW GRANTS reflects current ACLs; MySQL/MariaDB may still use old
+    // global privileges on a pooled session. Don't use a pre-existing session
+    // to infer visibility from its grants, or trust its temporary namespace.
+    const tracked: ReadonlySet<unknown> | undefined =
+      this.poolConnections.get(pool);
+    const previous = new Set(tracked);
+    while (true) {
+      throwIfTransactionCancelled(context);
+      const conn = await pool.getConnection();
+      const native = Reflect.get(conn, "connection");
+      if (context?.signal.aborted || pool !== this.pool) {
+        conn.destroy();
+        throwIfTransactionCancelled(context);
+        throw new Error("MySQL connection changed during mutation checkout.");
+      }
+      if (tracked && !tracked.has(native)) {
+        conn.destroy();
+        throw new Error(
+          "Cannot confirm the identity of the MySQL write session.",
+        );
+      }
+      if (!previous.has(native)) return conn;
+      conn.destroy();
+    }
+  }
+  private async assertLockedTableMutationSupport(
+    conn: PoolConnection,
+    targets: readonly TableMutationTarget[],
+    context?: TransactionContext,
+    acceptUnverifiedTriggerVisibility?: readonly string[],
+  ): Promise<void> {
+    const byName = new Map<
+      string,
+      {
+        database: string;
+        table: string;
+        events: Set<TableMutationTarget["event"]>;
+      }
+    >();
+    for (const { database, table, event } of targets) {
+      if (!database || !table) {
+        throw new Error(
+          "MySQL rollback checks require fully qualified table names.",
+        );
+      }
+      const name = this.qualifiedTableName(database, "", table);
+      const target = byName.get(name) ?? { database, table, events: new Set() };
+      target.events.add(event);
+      byName.set(name, target);
+    }
+    if (!byName.size)
+      throw new Error("No MySQL mutation targets were supplied.");
+    const ordered = [...byName.entries()].sort(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    const read = async (
+      sql: string,
+      values?: QueryOptions["values"],
+      rowsAsArray = false,
+    ): Promise<RowDataPacket[]> => {
+      throwIfTransactionCancelled(context);
+      const options = this.createQueryOptions(sql, values);
+      if (context && Number.isFinite(context.deadline)) {
+        options.timeout = Math.min(
+          options.timeout || Infinity,
+          Math.max(1, Math.ceil(context.deadline - Date.now())),
+        );
+      }
+      const [rows] = await conn.query<RowDataPacket[]>({
+        ...options,
+        rowsAsArray,
+      });
+      throwIfTransactionCancelled(context);
+      if (!Array.isArray(rows))
+        throw new Error("MySQL metadata was unavailable.");
+      return rows;
+    };
+    // Opening a table in an explicit transaction takes transaction-duration
+    // metadata locks even with LIMIT 0 (no row scan/row locks). Both ALTER/
+    // RENAME and trigger DDL need an incompatible lock on the subject table.
+    // CONNECTION_ID() prevents serving this probe from the legacy query cache.
+    // Don't use LOCK TABLES, which would implicitly commit the transaction.
+    for (const [name] of ordered) {
+      await read(`SELECT CONNECTION_ID() FROM ${name} LIMIT 0`);
+    }
+    for (const [name, { database, table }] of ordered) {
+      // A same-session temporary table can shadow even a qualified name,
+      // while INFORMATION_SCHEMA on some servers still shows the base table.
+      const [definition] = await read(`SHOW CREATE TABLE ${name}`);
+      const ddl: unknown = definition?.["Create Table"];
+      if (typeof ddl !== "string" || !ddl.startsWith("CREATE TABLE ")) {
+        throw new Error(
+          `Cannot confirm that ${name} is a permanent MySQL base table.`,
+        );
+      }
+      const rows = await read(
+        `SELECT t.ENGINE, e.TRANSACTIONS
+         FROM information_schema.TABLES t
+         LEFT JOIN information_schema.ENGINES e ON e.ENGINE = t.ENGINE
+         WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?
+           AND CAST(t.TABLE_SCHEMA AS BINARY) = CAST(? AS BINARY)
+           AND CAST(t.TABLE_NAME AS BINARY) = CAST(? AS BINARY)
+           AND t.TABLE_TYPE = 'BASE TABLE'`,
+        [database, table, database, table],
+      );
+      const row = rows.length === 1 ? rows[0] : undefined;
+      const risk = mysqlEngineRollbackRisk(name, {
+        ENGINE: row?.ENGINE,
+        TRANSACTIONS: row?.TRANSACTIONS,
+      });
+      if (risk) throw new Error(risk);
+    }
+    const mariaDb = isMariaDbConnection(Reflect.get(conn, "connection"));
+    // Privileges of active roles are not part of the account's own listing.
+    // MySQL 8 expands them with USING; MariaDB lists each (nested) role.
+    const readGrants = async (): Promise<unknown[]> => {
+      let roles: string[] | undefined = [];
+      try {
+        const [row] = await read("SELECT CURRENT_ROLE()", undefined, true);
+        roles = parseMysqlCurrentRoles(row?.[0], mariaDb);
+      } catch (error) {
+        // MySQL 5.7 has no roles; any other failure leaves roles unexpanded.
+        if (!isMysqlServerQueryError(error)) throw error;
+      }
+      if (!mariaDb) {
+        if (roles && roles.length > 0) {
+          try {
+            return await read(
+              `SHOW GRANTS FOR CURRENT_USER() USING ${roles.join(", ")}`,
+              undefined,
+              true,
+            );
+          } catch (error) {
+            if (!isMysqlServerQueryError(error)) throw error;
+          }
+        }
+        return read("SHOW GRANTS FOR CURRENT_USER()", undefined, true);
+      }
+      const rows: unknown[] = [
+        ...(await read("SHOW GRANTS FOR CURRENT_USER()", undefined, true)),
+      ];
+      const pending = [...(roles ?? [])];
+      const seen = new Set<string>();
+      while (pending.length > 0 && seen.size < 16) {
+        const role = pending.shift() as string;
+        if (seen.has(role)) continue;
+        seen.add(role);
+        const roleRows = await read(`SHOW GRANTS FOR ${role}`, undefined, true);
+        rows.push(...roleRows);
+        pending.push(...mariaDbGrantedRoles(roleRows));
+      }
+      return rows;
+    };
+    const accepted = new Set(acceptUnverifiedTriggerVisibility ?? []);
+    const assertTriggerAccess = (grants: unknown) => {
+      const unverified = ordered
+        .filter(
+          ([, { database, table }]) =>
+            !mysqlGrantsShowTriggerAccess(grants, database, table),
+        )
+        .map(([name]) => name);
+      // Fail closed unless the user explicitly accepted these exact tables.
+      if (unverified.some((name) => !accepted.has(name))) {
+        throw new UnverifiedTriggerVisibilityError(unverified);
+      }
+    };
+    assertTriggerAccess(await readGrants());
+    for (const [name, { database, table, events }] of ordered) {
+      const rows = await read(
+        `SELECT EVENT_MANIPULATION FROM information_schema.TRIGGERS
+         WHERE EVENT_OBJECT_SCHEMA = ? AND EVENT_OBJECT_TABLE = ?
+           AND CAST(EVENT_OBJECT_SCHEMA AS BINARY) = CAST(? AS BINARY)
+           AND CAST(EVENT_OBJECT_TABLE AS BINARY) = CAST(? AS BINARY)`,
+        [database, table, database, table],
+      );
+      // MariaDB 12+ can report multiple events for a single trigger. Reject
+      // unknown events rather than filtering them out at the catalog boundary.
+      for (const row of rows) {
+        const metadata: unknown = row.EVENT_MANIPULATION;
+        if (typeof metadata !== "string") {
+          throw new Error(`Cannot confirm trigger event metadata for ${name}.`);
+        }
+        for (const event of metadata.split(",").map((value) => value.trim())) {
+          if (event !== "INSERT" && event !== "UPDATE" && event !== "DELETE") {
+            throw new Error(
+              `Cannot confirm trigger event metadata for ${name}.`,
+            );
+          }
+          if (events.has(event)) {
+            throw new Error(
+              `Cannot verify rollback safety for ${name}: a ${event} trigger may have non-transactional side effects.`,
+            );
+          }
+        }
+      }
+      const [warnings] = await read("SHOW COUNT(*) WARNINGS", undefined, true);
+      const warningCount: unknown = warnings?.[0];
+      if (warningCount !== 0 && warningCount !== "0") {
+        throw new Error(
+          `Cannot confirm trigger metadata for ${name}: MySQL reported warnings or warning metadata was unavailable.`,
+        );
+      }
+    }
+    // Refuse if the grant was lost during metadata inspection.
+    assertTriggerAccess(await readGrants());
   }
   private async assertUnambiguousTimestampWrites(
     conn: PoolConnection,
@@ -4073,6 +4393,8 @@ export class MySQLDriver extends BaseDBDriver {
     _schema: string,
     table: string,
   ): Promise<string | null> {
+    // Advisory only (including before a Table Viewer preview). runTransaction
+    // must recheck on the write session after locking the exact target.
     const rows = await this.queryObjectRows<
       RowDataPacket & {
         ENGINE: string | null;
@@ -4086,22 +4408,10 @@ export class MySQLDriver extends BaseDBDriver {
        LIMIT 1`,
       [database, table],
     );
-    const engine =
-      typeof rows[0]?.ENGINE === "string"
-        ? rows[0].ENGINE.trim().toUpperCase()
-        : "";
-    const transactions =
-      typeof rows[0]?.TRANSACTIONS === "string"
-        ? rows[0].TRANSACTIONS.trim().toUpperCase()
-        : "";
-    if (engine && transactions === "YES") {
-      return null;
-    }
-    const reason =
-      engine && transactions === "NO"
-        ? `Table \`${database}\`.\`${table}\` uses the non-transactional MySQL engine ${engine}.`
-        : `Cannot confirm rollback support for table \`${database}\`.\`${table}\`${engine ? ` (engine ${engine})` : ""}: storage engine transaction metadata is unavailable or inconclusive.`;
-    return `${reason} Multi-statement table mutations and mutations requiring verification are blocked to avoid partial writes. Use a transactional engine such as InnoDB and ensure its engine metadata is visible.`;
+    return mysqlEngineRollbackRisk(
+      this.qualifiedTableName(database, "", table),
+      rows[0],
+    );
   }
   mapTypeCategory(nativeType: string): TypeCategory {
     const ct = nativeType.toLowerCase();

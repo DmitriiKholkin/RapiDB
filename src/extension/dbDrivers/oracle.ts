@@ -37,6 +37,7 @@ import {
   oracleTemporalIdentityKind,
   oracleTemporalIdentityProjection,
 } from "./oracleTemporalIdentity";
+import { isServerReportedQueryError } from "./queryErrorOutcome";
 import {
   indexedPlaceholderOffsets,
   replaceIndexedPlaceholders,
@@ -3189,6 +3190,9 @@ export class OracleDriver extends BaseDBDriver {
             : {}),
           ...(resultSetsTruncated ? { resultSetsTruncated: true } : {}),
           error: normalizeUnknownError(error, this.config).message,
+          ...(isServerReportedQueryError(error)
+            ? { serverReportedError: true }
+            : {}),
         };
       }
       throw error;

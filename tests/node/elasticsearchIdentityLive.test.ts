@@ -202,7 +202,7 @@ describe.skipIf(!endpoint)(
           { add: { index: nextIndex, alias } },
         ],
       });
-      const preview = driver.buildMutationPreviewStatement(
+      const [preview] = await driver.buildMutationPreviewStatements(
         "delete",
         "default",
         "indices",

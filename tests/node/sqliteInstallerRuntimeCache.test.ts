@@ -17,7 +17,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SQLITE_ARTIFACTS,
   type SQLiteArtifactManifest,
-  type SQLiteArtifactTarget,
   sqliteArtifactPolicyId,
 } from "../../src/extension/utils/sqliteArtifactPins";
 import {
@@ -26,9 +25,17 @@ import {
   probeInstalledBetterSqlite3Runtime,
   removeObsoleteSQLiteRuntimes,
   resetSQLiteInstallerForTests,
+  setSQLiteHostForTests,
   setSQLiteInstallLockTimingsForTests,
 } from "../../src/extension/utils/sqliteInstaller";
 import { createProjectTempDir } from "../runtime/tempDirectories";
+import {
+  FIXTURE_TARGET,
+  hostProbe,
+  mockRegistry,
+  pinFixturePackage,
+  restoreSQLiteArtifacts,
+} from "./sqliteRuntimeFixtures";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -37,88 +44,54 @@ vi.mock("node:fs", async (importOriginal) => {
 
 afterEach(() => {
   vi.mocked(renameSync).mockReset();
+  vi.restoreAllMocks();
   resetSQLiteInstallerForTests();
+  restoreSQLiteArtifacts();
 });
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const POLICY = "pins-v5-0123456789abcdef";
+const POLICY = "pins-v6-0123456789abcdef";
+const LEGACY_VERSION = "12.11.1";
+const VERSION = SQLITE_ARTIFACTS.betterSqlite3Version;
 
 function manifestCopy(): SQLiteArtifactManifest {
   return JSON.parse(JSON.stringify(SQLITE_ARTIFACTS));
 }
 
-function target(overrides: Partial<SQLiteArtifactTarget> = {}) {
-  return {
-    betterSqlite3Version: "12.10.0",
-    runtime: "electron",
-    abi: "146",
-    platform: "darwin",
-    arch: "arm64",
-    libc: "",
-    electronVersion: "42.0.0",
-    ...overrides,
-  } satisfies SQLiteArtifactTarget;
-}
-
-function pin(url: string) {
-  return {
-    url,
-    integrity: `sha512-${url}`,
-    size: 1,
-    releaseId: 1,
-    assetId: 1,
-    apiDigest: "sha256:0",
-  };
-}
-
 describe("SQLite runtime cache identity", () => {
-  it("ignores pins for unrelated platforms, ABIs and Electron versions", () => {
+  it("ignores pins for other targets", () => {
     const manifest = manifestCopy();
-    const before = sqliteArtifactPolicyId(target(), manifest);
-    manifest.prebuilts[
-      "official/better-sqlite3-v12.10.0-electron-v146-linux-x64.tar.gz"
-    ] = pin("changed-linux");
-    manifest.prebuilts[
-      "patched/better-sqlite3-v12.10.0-electron-v146-win32-arm64.tar.gz"
-    ] = pin("changed-windows");
-    manifest.prebuilts[
-      "official/better-sqlite3-v12.10.0-node-v146-darwin-arm64.tar.gz"
-    ] = pin("changed-node");
-    manifest.headers["43-148"].archive.integrity = "sha512-changed";
-    manifest.headers["42-146"].windowsLibraries.x64 = pin("changed-lib");
-    expect(sqliteArtifactPolicyId(target(), manifest)).toBe(before);
-    expect(before).toMatch(/^pins-v5-[0-9a-f]{16}$/);
-
-    const node = target({ runtime: "node", electronVersion: undefined });
-    const nodeBefore = sqliteArtifactPolicyId(node, manifest);
-    manifest.headers["42-146"].archive.integrity = "sha512-changed";
-    manifest.prebuilts[
-      "patched/better-sqlite3-v12.10.0-electron-v146-darwin-arm64.tar.gz"
-    ] = pin("changed-patched");
-    expect(sqliteArtifactPolicyId(node, manifest)).toBe(nodeBefore);
+    const before = sqliteArtifactPolicyId("linux-x64", manifest);
+    manifest.prebuilds["linuxmusl-x64"].sha256 = "0".repeat(64);
+    manifest.prebuilds["win32-arm64"].size += 1;
+    delete manifest.prebuilds["darwin-arm64"];
+    expect(sqliteArtifactPolicyId("linux-x64", manifest)).toBe(before);
+    expect(before).toMatch(/^pins-v6-[0-9a-f]{16}$/);
   });
 
   it.each([
     [
-      "official prebuilt",
+      "target prebuild",
       (manifest: SQLiteArtifactManifest) => {
-        manifest.prebuilts[
-          "official/better-sqlite3-v12.10.0-electron-v146-darwin-arm64.tar.gz"
-        ] = pin("official");
+        manifest.prebuilds["linux-x64"].sha256 = "0".repeat(64);
       },
     ],
     [
-      "patched prebuilt",
+      "tarball",
       (manifest: SQLiteArtifactManifest) => {
-        manifest.prebuilts[
-          "patched/better-sqlite3-v12.10.0-electron-v146-darwin-arm64.tar.gz"
-        ] = pin("patched");
+        manifest.tarball.size += 1;
       },
     ],
     [
-      "header archive",
+      "JavaScript file",
       (manifest: SQLiteArtifactManifest) => {
-        manifest.headers["42-146"].archive.integrity = "sha512-changed";
+        manifest.files["lib/database.js"].sha256 = "0".repeat(64);
+      },
+    ],
+    [
+      "Node-API version",
+      (manifest: SQLiteArtifactManifest) => {
+        manifest.nodeApiVersion += 1;
       },
     ],
     [
@@ -127,61 +100,46 @@ describe("SQLite runtime cache identity", () => {
         manifest.schemaVersion += 1;
       },
     ],
-  ])("changes when the target's %s pin changes", (_name, mutate) => {
+  ])("changes when the %s pin changes", (_name, mutate) => {
     const manifest = manifestCopy();
-    const before = sqliteArtifactPolicyId(target(), manifest);
+    const before = sqliteArtifactPolicyId("linux-x64", manifest);
     mutate(manifest);
-    expect(sqliteArtifactPolicyId(target(), manifest)).not.toBe(before);
+    expect(sqliteArtifactPolicyId("linux-x64", manifest)).not.toBe(before);
   });
 
-  it("scopes Windows import libraries to the current architecture", () => {
-    const windows = target({ platform: "win32", arch: "x64" });
-    const manifest = manifestCopy();
-    const before = sqliteArtifactPolicyId(windows, manifest);
-    manifest.headers["42-146"].windowsLibraries.arm64 = pin("arm64");
-    expect(sqliteArtifactPolicyId(windows, manifest)).toBe(before);
-    manifest.headers["42-146"].windowsLibraries.x64 = pin("x64");
-    expect(sqliteArtifactPolicyId(windows, manifest)).not.toBe(before);
-  });
-
-  it("keys the managed runtime directory by the scoped policy", async () => {
+  it("keys the managed runtime directory by version, target and the scoped policy", async () => {
     const f = await fixture();
     expect(basename(f.currentRoot)).toBe(
-      `node-abi-${process.versions.modules}-${process.platform}-${process.arch}-${sqliteArtifactPolicyId(
-        target({
-          runtime: process.versions.electron ? "electron" : "node",
-          abi: process.versions.modules,
-          platform: process.platform,
-          arch: process.arch,
-          electronVersion: process.versions.electron,
-        }),
-      )}`,
+      `${FIXTURE_TARGET}-${sqliteArtifactPolicyId(FIXTURE_TARGET)}`,
     );
+    expect(basename(dirname(f.currentRoot))).toBe(VERSION);
   });
 });
 
 async function fixture() {
   const root = await createProjectTempDir("sqlite-runtime-cache");
-  writeFileSync(join(root, "package.json"), "{}");
-  for (const name of ["better-sqlite3", "bindings", "file-uri-to-path"]) {
-    const packagePath = join(root, "node_modules", name);
-    mkdirSync(packagePath, { recursive: true });
-    writeFileSync(
-      join(packagePath, "package.json"),
-      JSON.stringify({ name, version: "12.10.0" }),
-    );
-  }
   const logs: string[] = [];
   configureSQLiteInstaller({
     storageRoot: join(root, "storage"),
     allowInstall: () => true,
     log: (line) => logs.push(line),
   });
-  const baseDir = join(root, "dist");
-  const probe = probeInstalledBetterSqlite3Runtime(baseDir);
+  setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
+  const probe = probeInstalledBetterSqlite3Runtime();
   const currentRoot = dirname(dirname(probe.installedPackagePath as string));
   const cacheRoot = dirname(dirname(currentRoot));
-  return { root, logs, baseDir, currentRoot, cacheRoot };
+  return { root, logs, currentRoot, cacheRoot };
+}
+
+function reconfigure(
+  root: string,
+  allowInstall?: () => boolean | Promise<boolean>,
+) {
+  configureSQLiteInstaller({
+    storageRoot: join(root, "storage"),
+    allowInstall,
+  });
+  setSQLiteHostForTests({ probe: hostProbe(FIXTURE_TARGET) });
 }
 
 function runtime(
@@ -209,47 +167,44 @@ async function failObsoleteRenames(error: Error) {
   });
 }
 
+function ageTree(path: string, days: number) {
+  const time = new Date(Date.now() - days * DAY_MS);
+  for (const entry of readdirSync(path, { recursive: true }) as string[]) {
+    utimesSync(join(path, entry), time, time);
+  }
+  utimesSync(path, time, time);
+}
+
 function markerAge(path: string) {
   return Date.now() - statSync(join(path, ".rapidb-last-used")).mtimeMs;
 }
 
-function obsoleteName(abi: number, policy = POLICY) {
-  return `node-abi-${abi}-${process.platform}-${process.arch}-${policy}`;
+function obsoleteName(index: number, policy = POLICY) {
+  return `${["linuxmusl-x64", "linux-arm64", "darwin-x64", "win32-x64", "win32-arm64", "darwin-arm64", "linuxmusl-arm64", "linux-x64"][index % 8]}-${policy.slice(0, -2)}${String(index).padStart(2, "0")}`;
 }
 
-function currentRuntime(root: string) {
-  const path = runtime(root, 90, {
-    betterSqlite3Version: "12.10.0",
-    runtime: process.versions.electron ? "electron" : "node",
-    abi: process.versions.modules,
-    platform: process.platform,
-    arch: process.arch,
-    libc: "",
-  });
-  const packagePath = join(path, "node_modules", "better-sqlite3");
-  mkdirSync(join(packagePath, "build", "Release"), { recursive: true });
-  writeFileSync(join(packagePath, "package.json"), "{}");
-  writeFileSync(
-    join(packagePath, "build", "Release", "better_sqlite3.node"),
-    "",
-  );
-  return packagePath;
+function legacyName(abi: number, suffix = "-pins-v5-0123456789abcdef") {
+  return `electron-abi-${abi}-linux-x64${suffix}`;
+}
+
+// Install the current runtime through the real installer (with a mocked
+// registry), then age its use marker.
+async function installCurrent(root: string, idleDays = 90) {
+  const pkg = pinFixturePackage();
+  const urls = mockRegistry(() => ({ data: pkg.data }));
+  const packagePath = await ensureSQLiteRuntimeInstalled();
+  expect(urls).toHaveLength(1);
+  vi.restoreAllMocks();
+  resetSQLiteInstallerForTests();
+  reconfigure(root);
+  const runtimeRoot = dirname(dirname(packagePath as string));
+  setMarkerAge(runtimeRoot, idleDays);
+  return packagePath as string;
 }
 
 function setMarkerAge(runtimeRoot: string, days: number) {
   const time = new Date(Date.now() - days * DAY_MS);
   utimesSync(join(runtimeRoot, ".rapidb-last-used"), time, time);
-}
-
-function otherVersionBaseDir(root: string) {
-  const packagePath = join(root, "other", "node_modules", "better-sqlite3");
-  mkdirSync(packagePath, { recursive: true });
-  writeFileSync(join(root, "other", "package.json"), "{}");
-  writeFileSync(
-    join(packagePath, "package.json"),
-    JSON.stringify({ name: "better-sqlite3", version: "12.11.0" }),
-  );
-  return join(root, "other", "dist");
 }
 
 function liveLock(runtimeRoot: string, token: string) {
@@ -270,20 +225,16 @@ function liveLock(runtimeRoot: string, token: string) {
 describe("SQLite obsolete runtime cleanup", () => {
   it("removes only long-unused, unlocked runtimes created by the installer", async () => {
     const f = await fixture();
-    const version = join(f.cacheRoot, "12.10.0");
+    const version = join(f.cacheRoot, VERSION);
     const current = runtime(f.currentRoot, 90);
     const old = runtime(join(version, obsoleteName(1)), 31);
     const oldOtherVersion = runtime(
-      join(
-        f.cacheRoot,
-        "12.9.0",
-        obsoleteName(130, "pins-v6-0123456789abcdef"),
-      ),
+      join(f.cacheRoot, "13.0.0", obsoleteName(2)),
       400,
     );
     const trash = join(
       version,
-      `${obsoleteName(2)}.obsolete-1-${randomUUID()}`,
+      `${obsoleteName(3)}.obsolete-1-${randomUUID()}`,
     );
     mkdirSync(join(trash, "node_modules"), { recursive: true });
     const lockedTrash = join(
@@ -292,16 +243,16 @@ describe("SQLite obsolete runtime cleanup", () => {
     );
     mkdirSync(join(lockedTrash, "node_modules"), { recursive: true });
     liveLock(join(version, obsoleteName(9)), "removing-window");
-    const recent = runtime(join(version, obsoleteName(3)), 5);
-    const unmarked = runtime(join(version, obsoleteName(4)), null);
-    const incomplete = join(version, obsoleteName(5));
+    const recent = runtime(join(version, obsoleteName(4)), 5);
+    const unmarked = runtime(join(version, obsoleteName(5)), null);
+    const incomplete = join(version, obsoleteName(6));
     mkdirSync(incomplete);
     writeFileSync(join(incomplete, ".rapidb-last-used"), "");
     const past = new Date(Date.now() - 60 * DAY_MS);
     utimesSync(join(incomplete, ".rapidb-last-used"), past, past);
-    const locked = runtime(join(version, obsoleteName(6)), 60);
+    const locked = runtime(join(version, obsoleteName(7)), 60);
     const owner = liveLock(locked, "other-window");
-    const installing = runtime(join(version, obsoleteName(7)), 60);
+    const installing = runtime(join(version, obsoleteName(10)), 60);
     mkdirSync(`${installing}.tmp-${process.pid}-${Date.now()}`);
     const unrelated = runtime(join(version, "my-notes"), 60);
     const outside = runtime(join(f.root, "outside", obsoleteName(8)), 60);
@@ -310,7 +261,7 @@ describe("SQLite obsolete runtime cleanup", () => {
     const linkedVersion = join(f.cacheRoot, "12.8.0");
     symlinkSync(dirname(outside), linkedVersion, "dir");
 
-    const removed = await removeObsoleteSQLiteRuntimes(f.baseDir);
+    const removed = await removeObsoleteSQLiteRuntimes();
 
     expect(removed.sort()).toEqual([old, oldOtherVersion, trash].sort());
     for (const path of [old, oldOtherVersion, trash]) {
@@ -332,7 +283,9 @@ describe("SQLite obsolete runtime cleanup", () => {
     ]) {
       expect(existsSync(path)).toBe(true);
     }
-    expect(markerAge(unmarked)).toBeLessThan(60_000);
+    // A runtime without a use marker is neither marked nor removed while its
+    // files are recent.
+    expect(existsSync(join(unmarked, ".rapidb-last-used"))).toBe(false);
     expect(
       JSON.parse(readFileSync(join(`${locked}.lock`, "owner.json"), "utf8")),
     ).toEqual(owner);
@@ -341,7 +294,7 @@ describe("SQLite obsolete runtime cleanup", () => {
 
   it("removes abandoned install leftovers of obsolete runtimes only after the idle limit", async () => {
     const f = await fixture();
-    const version = join(f.cacheRoot, "12.10.0");
+    const version = join(f.cacheRoot, VERSION);
     const name = obsoleteName(1);
     const runtimeRoot = runtime(join(version, name), 45);
     const leftover = join(version, `${name}.tmp-1-1`);
@@ -352,7 +305,7 @@ describe("SQLite obsolete runtime cleanup", () => {
     mkdirSync(currentLeftover, { recursive: true });
     utimesSync(currentLeftover, past, past);
 
-    expect((await removeObsoleteSQLiteRuntimes(f.baseDir)).sort()).toEqual(
+    expect((await removeObsoleteSQLiteRuntimes()).sort()).toEqual(
       [leftover, runtimeRoot].sort(),
     );
     expect(existsSync(currentLeftover)).toBe(true);
@@ -360,22 +313,22 @@ describe("SQLite obsolete runtime cleanup", () => {
 
   it("bounds the number of removals per run", async () => {
     const f = await fixture();
-    const version = join(f.cacheRoot, "12.10.0");
-    const paths = [1, 2, 3, 4, 5].map((abi) =>
-      runtime(join(version, obsoleteName(abi)), 40),
+    const version = join(f.cacheRoot, VERSION);
+    const paths = [1, 2, 3, 4, 5].map((index) =>
+      runtime(join(version, obsoleteName(index)), 40),
     );
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toHaveLength(3);
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toHaveLength(2);
+    expect(await removeObsoleteSQLiteRuntimes()).toHaveLength(3);
+    expect(await removeObsoleteSQLiteRuntimes()).toHaveLength(2);
     expect(paths.some((path) => existsSync(path))).toBe(false);
   });
 
   it("logs and keeps a runtime it cannot move, releasing its lock", async () => {
     const f = await fixture();
-    const old = runtime(join(f.cacheRoot, "12.10.0", obsoleteName(1)), 40);
+    const old = runtime(join(f.cacheRoot, VERSION, obsoleteName(1)), 40);
     await failObsoleteRenames(
       Object.assign(new Error("in use"), { code: "EPERM" }),
     );
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toEqual([]);
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
     expect(existsSync(join(old, "runtime.json"))).toBe(true);
     expect(existsSync(`${old}.lock`)).toBe(false);
     expect(f.logs.join("\n")).toContain(
@@ -385,55 +338,29 @@ describe("SQLite obsolete runtime cleanup", () => {
 
   it("marks the current runtime as used and cleans up without failing a successful load", async () => {
     const f = await fixture();
-    const packagePath = currentRuntime(f.currentRoot);
-    const old = runtime(join(f.cacheRoot, "12.10.0", obsoleteName(1)), 40);
+    const packagePath = await installCurrent(f.root);
+    configureSQLiteInstaller({
+      storageRoot: join(f.root, "storage"),
+      log: (line) => f.logs.push(line),
+    });
+    const old = runtime(join(f.cacheRoot, VERSION, obsoleteName(1)), 40);
     await failObsoleteRenames(new Error("unexpected failure"));
 
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).resolves.toBe(
-      packagePath,
-    );
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(packagePath);
     expect(markerAge(f.currentRoot)).toBeLessThan(60_000);
     expect(existsSync(old)).toBe(true);
     expect(f.logs.join("\n")).toContain("unexpected failure");
 
     vi.mocked(renameSync).mockReset();
     resetSQLiteInstallerForTests();
-    configureSQLiteInstaller({ storageRoot: join(f.root, "storage") });
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).resolves.toBe(
-      packagePath,
-    );
+    reconfigure(f.root);
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(packagePath);
     expect(existsSync(old)).toBe(false);
-  });
-
-  it("never touches runtimes of older extension versions that do not record use", async () => {
-    const f = await fixture();
-    const version = join(f.cacheRoot, "12.10.0");
-    const legacy = [
-      join(f.cacheRoot, "12.9.0", "electron-abi-130-darwin-arm64"),
-      join(version, `node-abi-1-${process.platform}-${process.arch}`),
-      join(version, obsoleteName(2).replace(`-${POLICY}`, "-archive-v1")),
-      join(version, obsoleteName(3, "pins-v2-0123456789abcdef")),
-      join(version, obsoleteName(4, "pins-v4-0123456789abcdef")),
-    ];
-    const marked = legacy.map((path) => runtime(path, 400));
-    const unmarked = runtime(
-      join(version, obsoleteName(5, "pins-v4-0123456789abcdef")),
-      null,
-    );
-    const ages = marked.map(markerAge);
-
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toEqual([]);
-    for (const [index, path] of marked.entries()) {
-      expect(existsSync(join(path, "runtime.json"))).toBe(true);
-      expect(markerAge(path)).toBeGreaterThanOrEqual(ages[index]);
-    }
-    expect(existsSync(join(unmarked, ".rapidb-last-used"))).toBe(false);
-    expect(existsSync(`${unmarked}.lock`)).toBe(false);
   });
 
   it("restores a runtime whose use was recorded right before it was moved", async () => {
     const f = await fixture();
-    const version = join(f.cacheRoot, "12.10.0");
+    const version = join(f.cacheRoot, VERSION);
     const old = runtime(join(version, obsoleteName(1)), 40);
     const actual = (await vi.importActual<typeof import("node:fs")>("node:fs"))
       .renameSync;
@@ -445,7 +372,7 @@ describe("SQLite obsolete runtime cleanup", () => {
       actual(from, to);
     });
 
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toEqual([]);
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
     expect(existsSync(join(old, "runtime.json"))).toBe(true);
     expect(markerAge(old)).toBeLessThan(60_000);
     expect(readdirSync(version).sort()).toEqual([basename(old)]);
@@ -454,7 +381,7 @@ describe("SQLite obsolete runtime cleanup", () => {
 
   it("removes a runtime once it is moved, failing later attempts to record use", async () => {
     const f = await fixture();
-    const old = runtime(join(f.cacheRoot, "12.10.0", obsoleteName(1)), 40);
+    const old = runtime(join(f.cacheRoot, VERSION, obsoleteName(1)), 40);
     const actual = (await vi.importActual<typeof import("node:fs")>("node:fs"))
       .renameSync;
     let lateUse: unknown = null;
@@ -470,25 +397,187 @@ describe("SQLite obsolete runtime cleanup", () => {
       }
     });
 
-    expect(await removeObsoleteSQLiteRuntimes(f.baseDir)).toEqual([old]);
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([old]);
     expect(lateUse).toMatchObject({ code: "ENOENT" });
     expect(existsSync(old)).toBe(false);
+  });
+});
+
+describe("SQLite better-sqlite3 12.x (ABI-keyed) runtime migration", () => {
+  it("removes idle legacy runtimes of every former cache policy", async () => {
+    const f = await fixture();
+    const legacyVersion = join(f.cacheRoot, LEGACY_VERSION);
+    const legacy = [
+      legacyName(146),
+      legacyName(143, "-archive-v1"),
+      legacyName(140, ""),
+      legacyName(145, "-pins-v2-0123456789abcdef"),
+    ].map((name) =>
+      runtime(join(legacyVersion, name), 45, {
+        betterSqlite3Version: LEGACY_VERSION,
+        runtime: "electron",
+        abi: "146",
+      }),
+    );
+    const node = runtime(
+      join(
+        f.cacheRoot,
+        "12.10.0",
+        "node-abi-137-linux-x64-pins-v5-0123456789abcdef",
+      ),
+      400,
+    );
+    const removed: string[] = [];
+    for (let run = 0; run < 3; run++)
+      removed.push(...(await removeObsoleteSQLiteRuntimes()));
+    expect(removed.sort()).toEqual([...legacy, node].sort());
+    for (const path of [...legacy, node]) expect(existsSync(path)).toBe(false);
+    expect(f.logs.join("\n")).toContain(`Removing SQLite runtime ${legacy[0]}`);
+  });
+
+  it("removes legacy runtimes without a use marker only once nothing in them changed for 30 days", async () => {
+    const f = await fixture();
+    const untracked = runtime(
+      join(f.cacheRoot, LEGACY_VERSION, legacyName(143, "-archive-v1")),
+      null,
+    );
+    mkdirSync(join(untracked, "node_modules", "better-sqlite3", "lib"), {
+      recursive: true,
+    });
+    const nested = join(untracked, "node_modules", "better-sqlite3", "lib");
+    writeFileSync(join(nested, "index.js"), "");
+
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(join(untracked, ".rapidb-last-used"))).toBe(false);
+    expect(existsSync(`${untracked}.lock`)).toBe(false);
+
+    // Everything is old except one nested file: still kept.
+    ageTree(untracked, 31);
+    const recent = new Date(Date.now() - 2 * DAY_MS);
+    utimesSync(join(nested, "index.js"), recent, recent);
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(untracked)).toBe(true);
+
+    ageTree(untracked, 31);
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([untracked]);
+    expect(existsSync(untracked)).toBe(false);
+    expect(
+      vi
+        .mocked(renameSync)
+        .mock.calls.some(
+          ([from, to]) =>
+            from === untracked && String(to).includes(".obsolete-"),
+        ),
+    ).toBe(true);
+    expect(f.logs.join("\n")).toContain(
+      `Removing SQLite runtime ${untracked}; it records no use and has not been modified for over 30 days.`,
+    );
+  });
+
+  it("keeps an old runtime without a use marker while another window holds its lock", async () => {
+    const f = await fixture();
+    const untracked = runtime(
+      join(f.cacheRoot, LEGACY_VERSION, legacyName(146)),
+      null,
+    );
+    ageTree(untracked, 400);
+    const owner = liveLock(untracked, "old-rapidb-window");
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(join(untracked, "runtime.json"))).toBe(true);
+    expect(
+      JSON.parse(readFileSync(join(`${untracked}.lock`, "owner.json"), "utf8")),
+    ).toEqual(owner);
+  });
+
+  it("keeps an old runtime without a use marker that cannot be moved", async () => {
+    const f = await fixture();
+    const untracked = runtime(
+      join(f.cacheRoot, LEGACY_VERSION, legacyName(146)),
+      null,
+    );
+    ageTree(untracked, 400);
+    await failObsoleteRenames(
+      Object.assign(new Error("in use"), { code: "EBUSY" }),
+    );
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(join(untracked, "runtime.json"))).toBe(true);
+    expect(existsSync(`${untracked}.lock`)).toBe(false);
+  });
+
+  it("keeps recently used, locked, incomplete or linked legacy runtimes", async () => {
+    const f = await fixture();
+    const legacyVersion = join(f.cacheRoot, LEGACY_VERSION);
+    const recent = runtime(join(legacyVersion, legacyName(146)), 3);
+    const locked = runtime(join(legacyVersion, legacyName(143)), 60);
+    liveLock(locked, "older-rapidb-window");
+    const incomplete = join(legacyVersion, legacyName(140));
+    mkdirSync(join(incomplete, "node_modules"), { recursive: true });
+    const outside = runtime(join(f.root, "outside", legacyName(139)), 400);
+    const linked = join(legacyVersion, legacyName(139));
+    symlinkSync(outside, linked, "dir");
+    const notes = runtime(join(legacyVersion, "electron-notes"), 400);
+
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    for (const path of [recent, locked, incomplete, outside, linked, notes])
+      expect(existsSync(path)).toBe(true);
+    expect(markerAge(outside)).toBeGreaterThan(300 * DAY_MS);
+  });
+
+  it("removes an emptied legacy version directory only once it is idle, never the current one", async () => {
+    const f = await fixture();
+    const emptyOld = join(f.cacheRoot, LEGACY_VERSION);
+    const emptyFresh = join(f.cacheRoot, "12.10.0");
+    const nonEmpty = join(f.cacheRoot, "12.9.0");
+    const current = join(f.cacheRoot, VERSION);
+    for (const path of [emptyOld, emptyFresh, nonEmpty, current])
+      mkdirSync(path, { recursive: true });
+    writeFileSync(join(nonEmpty, "keep.txt"), "");
+    const past = new Date(Date.now() - 40 * DAY_MS);
+    for (const path of [emptyOld, nonEmpty, current])
+      utimesSync(path, past, past);
+
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(emptyOld)).toBe(false);
+    for (const path of [emptyFresh, nonEmpty, current])
+      expect(existsSync(path)).toBe(true);
+  });
+
+  it("does not touch anything outside the managed cache", async () => {
+    const f = await fixture();
+    const sibling = runtime(
+      join(
+        f.root,
+        "storage",
+        "other-extension-data",
+        LEGACY_VERSION,
+        legacyName(146),
+      ),
+      400,
+    );
+    const linkedCache = join(f.root, "linked-cache");
+    runtime(join(linkedCache, LEGACY_VERSION, legacyName(143)), 400);
+    mkdirSync(dirname(f.cacheRoot), { recursive: true });
+    symlinkSync(linkedCache, f.cacheRoot, "dir");
+    expect(await removeObsoleteSQLiteRuntimes()).toEqual([]);
+    expect(existsSync(sibling)).toBe(true);
+    expect(
+      existsSync(
+        join(linkedCache, LEGACY_VERSION, legacyName(143), "runtime.json"),
+      ),
+    ).toBe(true);
   });
 });
 
 describe("SQLite runtime use recording", () => {
   it("records use of an unmarked runtime under the lock without asking to install", async () => {
     const f = await fixture();
-    const packagePath = currentRuntime(f.currentRoot);
+    const packagePath = await installCurrent(f.root);
     rmSync(join(f.currentRoot, ".rapidb-last-used"));
     const allowInstall = vi.fn(() => false);
-    configureSQLiteInstaller({
-      storageRoot: join(f.root, "storage"),
-      allowInstall,
-    });
+    reconfigure(f.root, allowInstall);
     liveLock(f.currentRoot, "cleanup-window");
 
-    const ensured = ensureSQLiteRuntimeInstalled(f.baseDir);
+    const ensured = ensureSQLiteRuntimeInstalled();
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(existsSync(join(f.currentRoot, ".rapidb-last-used"))).toBe(false);
     rmSync(`${f.currentRoot}.lock`, { recursive: true, force: true });
@@ -505,14 +594,12 @@ describe("SQLite runtime use recording", () => {
     ["one minute in the future", -1 / (24 * 60)],
   ])("records use without the lock when the marker is %s", async (_name, days) => {
     const f = await fixture();
-    const packagePath = currentRuntime(f.currentRoot);
+    const packagePath = await installCurrent(f.root);
     setMarkerAge(f.currentRoot, days);
     const owner = liveLock(f.currentRoot, "cleanup-window");
     setSQLiteInstallLockTimingsForTests({ waitMs: 500 });
 
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).resolves.toBe(
-      packagePath,
-    );
+    await expect(ensureSQLiteRuntimeInstalled()).resolves.toBe(packagePath);
     expect(markerAge(f.currentRoot)).toBeLessThan(60_000);
     expect(markerAge(f.currentRoot)).toBeGreaterThanOrEqual(-60_000);
     expect(
@@ -528,18 +615,15 @@ describe("SQLite runtime use recording", () => {
     ["two days in the future", -2],
   ])("records use under the lock when the marker is %s", async (_name, days) => {
     const f = await fixture();
-    const packagePath = currentRuntime(f.currentRoot);
+    const packagePath = await installCurrent(f.root);
     setMarkerAge(f.currentRoot, days);
     const before = markerAge(f.currentRoot);
     const allowInstall = vi.fn(() => false);
-    configureSQLiteInstaller({
-      storageRoot: join(f.root, "storage"),
-      allowInstall,
-    });
+    reconfigure(f.root, allowInstall);
     liveLock(f.currentRoot, "cleanup-window");
 
     let settled = false;
-    const ensured = ensureSQLiteRuntimeInstalled(f.baseDir).finally(() => {
+    const ensured = ensureSQLiteRuntimeInstalled().finally(() => {
       settled = true;
     });
     await new Promise((resolve) => setTimeout(resolve, 300));
@@ -557,16 +641,20 @@ describe("SQLite runtime use recording", () => {
   it.each([
     ["removed", false],
     ["restored", true],
-  ])("waits for a cleanup that holds the lock and uses the %s runtime", async (_name, usedMeanwhile) => {
+  ])("waits for another window's cleanup that holds the lock and uses the %s runtime", async (_name, usedMeanwhile) => {
     const f = await fixture();
-    const packagePath = currentRuntime(f.currentRoot);
+    const packagePath = await installCurrent(f.root);
     setMarkerAge(f.currentRoot, 40);
     const allowInstall = vi.fn(() => false);
-    configureSQLiteInstaller({
-      storageRoot: join(f.root, "storage"),
-      allowInstall,
-    });
-    const otherBaseDir = otherVersionBaseDir(f.root);
+    reconfigure(f.root, allowInstall);
+    // Another window on a host that selects a different target sees this
+    // runtime as obsolete.
+    const installerPath = "../../src/extension/utils/sqliteInstaller";
+    const other = (await import(
+      `${installerPath}?other-window`
+    )) as typeof import("../../src/extension/utils/sqliteInstaller");
+    other.configureSQLiteInstaller({ storageRoot: join(f.root, "storage") });
+    other.setSQLiteHostForTests({ probe: hostProbe("linuxmusl-x64") });
     const actual = (await vi.importActual<typeof import("node:fs")>("node:fs"))
       .renameSync;
     let ensured = null as Promise<string | null> | null;
@@ -574,7 +662,7 @@ describe("SQLite runtime use recording", () => {
     let ageAtRename = 0;
     vi.mocked(renameSync).mockImplementation((from, to) => {
       if (from === f.currentRoot && String(to).includes(".obsolete-")) {
-        ensured = ensureSQLiteRuntimeInstalled(f.baseDir).finally(() => {
+        ensured = ensureSQLiteRuntimeInstalled().finally(() => {
           settled = true;
         });
         ensured.catch(() => {});
@@ -589,7 +677,8 @@ describe("SQLite runtime use recording", () => {
       actual(from, to);
     });
 
-    const removed = await removeObsoleteSQLiteRuntimes(otherBaseDir);
+    const removed = await other.removeObsoleteSQLiteRuntimes();
+    other.resetSQLiteInstallerForTests();
 
     expect(ensured).not.toBeNull();
     expect(ageAtRename).toBeGreaterThan(30 * DAY_MS);
@@ -610,15 +699,12 @@ describe("SQLite runtime use recording", () => {
 
   it("falls back to installation instead of returning a runtime that was moved away", async () => {
     const f = await fixture();
-    currentRuntime(f.currentRoot);
+    await installCurrent(f.root);
     renameSync(f.currentRoot, `${f.currentRoot}.obsolete-1-${randomUUID()}`);
     const allowInstall = vi.fn(() => false);
-    configureSQLiteInstaller({
-      storageRoot: join(f.root, "storage"),
-      allowInstall,
-    });
+    reconfigure(f.root, allowInstall);
 
-    await expect(ensureSQLiteRuntimeInstalled(f.baseDir)).rejects.toThrow(
+    await expect(ensureSQLiteRuntimeInstalled()).rejects.toThrow(
       /not authorized/,
     );
     expect(allowInstall).toHaveBeenCalledTimes(1);

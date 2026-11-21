@@ -8,6 +8,7 @@ import {
   buildPendingRestoreState,
   restorePendingEditsSafely,
 } from "../../src/webview/components/table/tableViewHelpers";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const config = {
   id: "float-transport",
@@ -33,6 +34,7 @@ describe("PostgreSQL special float webview transport", () => {
     "double precision",
   ])("preserves %s special values through JSON and CAS", async (nativeType) => {
     const driver = new PostgresDriver(config);
+    mockPostgresTableScope(driver);
     const floatColumn: ColumnTypeMeta = {
       ...idColumn,
       name: "f",

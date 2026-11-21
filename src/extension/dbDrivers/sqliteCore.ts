@@ -959,7 +959,8 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
   const hours = Number(match[4]);
   const minutes = Number(match[5]);
   const seconds = Number(match[6] ?? "00");
-  if (hours > 23 || minutes > 59 || seconds > 59) return null;
+  // Hour 24 is the next day, as for stored values and TIME literals.
+  if (hours > 24 || minutes > 59 || seconds > 59) return null;
   const offsetHours = Number(match[7] ?? "00");
   const offsetMinutes = Number(match[8] ?? "00");
   if (offsetHours > 14 || offsetMinutes > 59) return null;
@@ -967,6 +968,14 @@ function normalizeSqliteDatetimeLiteral(value: string): string | null {
 }
 function sqliteDatetimeKeyExpression(column: string): string {
   return `COALESCE(RAPIDB_DATETIME_KEY(${column}), RAPIDB_DATETIME_KEY(DATETIME(${column})))`;
+}
+// DATE filters use the calendar day of RapiDB's datetime key, not SQLite's
+// DATE(): SQLite >= 3.54 returns NULL for an hour of 24 other than 24:00:00,
+// while RapiDB treats 24:MM[:SS] as the next day in every filter. Formats the
+// key does not parse fall back to SQLite's DATETIME() normalization, exactly
+// as for DATETIME filters.
+function sqliteDateKeyExpression(value: string): string {
+  return `COALESCE(RAPIDB_DATE_KEY(${value}), RAPIDB_DATE_KEY(DATETIME(${value})))`;
 }
 function parseSqliteBlobDisplayValue(val: string): Uint8Array | null {
   try {
@@ -2647,10 +2656,11 @@ export class SQLiteCoreDriver extends BaseDBDriver {
       return { sql: `${col} ${sqlOp} ?`, params: [Number(val)] };
     }
     if (column.category === "date") {
+      const literal = sqliteDateKeyExpression("?");
       if (operator === "between" && Array.isArray(val)) {
         return {
-          sql: `DATE(${col}) BETWEEN DATE(?) AND DATE(?)`,
-          params: [val[0], val[1]],
+          sql: `${sqliteDateKeyExpression(col)} BETWEEN ${literal} AND ${literal}`,
+          params: [val[0], val[0], val[1], val[1]],
         };
       }
       if (typeof val === "string" && operator === "in") {
@@ -2659,8 +2669,8 @@ export class SQLiteCoreDriver extends BaseDBDriver {
           .map((part) => part.trim())
           .filter(Boolean);
         return {
-          sql: `DATE(${col}) IN (${parts.map(() => "DATE(?)").join(", ")})`,
-          params: parts,
+          sql: `${sqliteDateKeyExpression(col)} IN (${parts.map(() => literal).join(", ")})`,
+          params: parts.flatMap((part) => [part, part]),
         };
       }
       if (
@@ -2668,7 +2678,10 @@ export class SQLiteCoreDriver extends BaseDBDriver {
         ["eq", "neq", "gt", "gte", "lt", "lte"].includes(operator)
       ) {
         const sqlOp = operator === "neq" ? "!=" : this.sqlOperator(operator);
-        return { sql: `DATE(${col}) ${sqlOp} DATE(?)`, params: [val] };
+        return {
+          sql: `${sqliteDateKeyExpression(col)} ${sqlOp} ${literal}`,
+          params: [val, val],
+        };
       }
     }
     if (column.category === "time") {

@@ -349,6 +349,7 @@ export interface TableGridLayout {
 
 interface TableGridProps {
   getRowMutationBlockReason?: (rowIdx: number) => string | null;
+  getRowUpdateBlockReason?: (rowIdx: number) => string | null;
   canEditRows: boolean;
   // Base permission for paste intent, before temporary busy-state restrictions.
   canPasteIntoPersistedRows?: boolean;
@@ -450,6 +451,7 @@ export function TableGrid(props: UnifiedTableGridProps) {
 function TableDataGrid({
   getRowCellColumn,
   getRowMutationBlockReason,
+  getRowUpdateBlockReason = getRowMutationBlockReason,
   canEditRows,
   canPasteIntoPersistedRows = canEditRows,
   getPasteBlockReason,
@@ -874,7 +876,7 @@ function TableDataGrid({
               !canEditColumn(column) ||
               redisBinarySnapshotDisplay(currentValue, column.nativeType) !==
                 undefined ||
-              Boolean(getRowMutationBlockReason?.(rowIdx))),
+              Boolean(getRowUpdateBlockReason?.(rowIdx))),
         });
       } else {
         (isDraft ? onStartDraftEdit : onStartEdit)(rowIdx, column);
@@ -890,7 +892,7 @@ function TableDataGrid({
       editCell,
       pendingEdits,
       canEditRows,
-      getRowMutationBlockReason,
+      getRowUpdateBlockReason,
       onOpenStructuredCell,
       onStartDraftEdit,
       onStartEdit,
@@ -1474,7 +1476,7 @@ function TableDataGrid({
                   readOnly={
                     !canEditRows ||
                     !canEditColumn(column) ||
-                    Boolean(getRowMutationBlockReason?.(rowIdx))
+                    Boolean(getRowUpdateBlockReason?.(rowIdx))
                   }
                   onCommit={(value) =>
                     onCommitCellEdit(rowIdx, column, value, originalValue)
@@ -1486,7 +1488,7 @@ function TableDataGrid({
             }
 
             return (
-              <div title={getRowMutationBlockReason?.(rowIdx) ?? undefined}>
+              <div title={getRowUpdateBlockReason?.(rowIdx) ?? undefined}>
                 <CellDisplay
                   value={displayValue}
                   isMissing={
@@ -1508,6 +1510,7 @@ function TableDataGrid({
       canSelectAndDeleteRows,
       rowSelectionDisabled,
       getRowMutationBlockReason,
+      getRowUpdateBlockReason,
       selectableRowIndexes,
       colSizes,
       defaultColSizes,

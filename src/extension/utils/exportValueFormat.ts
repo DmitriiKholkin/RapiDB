@@ -323,8 +323,11 @@ function getDriverDisplaySnapshotValue(
 ): string | undefined {
   const redisDisplay = redisBinarySnapshotDisplay(value, nativeType);
   if (redisDisplay !== undefined && isRedisOversizedValueSnapshot(value)) {
+    const reason = isRedisUnavailableValueSnapshot(value)
+      ? "was not safely loaded"
+      : "exceeds the table viewer read limit";
     throw new Error(
-      `Redis value ${redisDisplay} exceeds the table viewer read limit and cannot be exported without data loss. Narrow the keyspace or export it with a Redis client.`,
+      `Redis value ${redisDisplay} ${reason} and cannot be exported without data loss. Narrow the keyspace or export it with a Redis client.`,
     );
   }
   if (redisDisplay !== undefined) return redisDisplay;
@@ -444,5 +447,6 @@ function isRawJsonLiteral(value: unknown): value is RawJsonLiteral {
 
 import {
   isRedisOversizedValueSnapshot,
+  isRedisUnavailableValueSnapshot,
   redisBinarySnapshotDisplay,
 } from "../../shared/redisValueSnapshot";

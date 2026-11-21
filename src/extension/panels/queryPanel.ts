@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { isPostgresQueryDatabase } from "../../shared/postgresQueryDatabase";
+import {
+  type QueryDatabaseScope,
+  queryDatabaseFields,
+  queryDatabaseTarget,
+  readQueryDatabaseScope,
+} from "../../shared/queryDatabaseTarget";
 import {
   isRecord,
   parseQueryTargetBinding,
@@ -33,7 +38,6 @@ const QUERY_PANEL_RETENTION_MODE = "retain" as const;
 interface QueryPanelSerializedState {
   panelId: string;
   connectionId: string;
-  postgresDatabase?: string;
   initialQueryText?: string;
   formatOnOpen?: boolean;
   isBookmarked?: boolean;
@@ -51,8 +55,6 @@ function isQueryPanelSerialization(
       state.panelId,
     ) &&
     typeof state.connectionId === "string" &&
-    (state.postgresDatabase === undefined ||
-      isPostgresQueryDatabase(state.postgresDatabase)) &&
     (state.initialQueryText === undefined ||
       typeof state.initialQueryText === "string") &&
     (state.formatOnOpen === undefined ||
@@ -95,7 +97,7 @@ export class QueryPanel {
     isBookmarked?: boolean,
     editorLanguage?: QueryEditorLanguage,
     private readonly panelId?: string,
-    private readonly postgresDatabase?: string,
+    private readonly databaseScope?: QueryDatabaseScope,
     initialTargetBinding?: QueryTargetBinding,
   ) {
     this.panel = panel;
@@ -116,6 +118,8 @@ export class QueryPanel {
         getInitialConnectionId: () => this.initialConnectionId,
         getLastQueryResult: () => this.lastQueryResult,
         postMessage: (message) => {
+          // Transport success is not receipt by the document. The controller
+          // records the run outcome independently for status reconciliation.
           try {
             const result = this.panel.webview.postMessage(message);
             void Promise.resolve(result).then(
@@ -147,8 +151,9 @@ export class QueryPanel {
         },
       },
       context,
-      postgresDatabase,
+      databaseScope,
       targetBinding,
+      this.panelId,
     );
     this.panel.webview.html = this.buildHtml(
       context,
@@ -245,13 +250,13 @@ export class QueryPanel {
         const restored = {
           panelId: initialState.panelId,
           connectionId: initialState.connectionId,
-          postgresDatabase: initialState.postgresDatabase,
           initialQueryText: initialState.queryText ?? initialState.initialSql,
           formatOnOpen: initialState.formatOnOpen,
           isBookmarked: initialState.isBookmarked,
           editorLanguage: initialState.editorLanguage,
         };
-        if (!isQueryPanelSerialization(restored)) {
+        const databaseScope = readQueryDatabaseScope(initialState);
+        if (!isQueryPanelSerialization(restored) || databaseScope === null) {
           panel.dispose();
           return;
         }
@@ -266,7 +271,7 @@ export class QueryPanel {
           draft ? draft.targetBinding : initialState.targetBinding,
         );
         const activeConnectionId =
-          restored.postgresDatabase !== undefined
+          databaseScope !== undefined
             ? restored.connectionId
             : (previousBinding?.connectionId ??
               (typeof draft?.activeConnectionId === "string" &&
@@ -288,7 +293,7 @@ export class QueryPanel {
           restored.isBookmarked,
           restored.editorLanguage,
           restored.panelId,
-          restored.postgresDatabase,
+          databaseScope,
           {
             connectionId: activeConnectionId,
             sessionKey:
@@ -313,26 +318,32 @@ export class QueryPanel {
     formatOnOpen?: boolean,
     isBookmarked = false,
     editorLanguage?: QueryEditorLanguage,
-    postgresDatabase?: string,
+    databaseScope?: QueryDatabaseScope,
     initialTargetBinding?: QueryTargetBinding,
   ): QueryPanel {
     const connection = connectionManager.getConnection(connectionId);
+    const databaseTarget = queryDatabaseTarget(databaseScope);
     if (
-      postgresDatabase !== undefined &&
-      !isPostgresQueryDatabase(postgresDatabase)
+      databaseScope !== undefined &&
+      !readQueryDatabaseScope(queryDatabaseFields(databaseScope))
     ) {
-      throw new Error("Invalid PostgreSQL query database.");
+      throw new Error(`Invalid ${databaseTarget?.label} query database.`);
     }
     const title =
-      postgresDatabase === undefined
+      databaseTarget === undefined
         ? `Query [${connection?.name ?? connectionId}]`
-        : pinnedQueryTitle(connection?.name ?? connectionId, postgresDatabase);
+        : pinnedQueryTitle(
+            connection?.name ?? connectionId,
+            databaseTarget.database,
+          );
 
     if (!initialTargetBinding && !initialQueryText && !forceNew) {
       for (const panel of QueryPanel.panels.values()) {
+        const panelTarget = queryDatabaseTarget(panel.databaseScope);
         if (
           panel.activeConnectionId === connectionId &&
-          panel.postgresDatabase === postgresDatabase
+          panelTarget?.type === databaseTarget?.type &&
+          panelTarget?.database === databaseTarget?.database
         ) {
           panel.panel.reveal(vscode.ViewColumn.One);
           return panel;
@@ -358,7 +369,7 @@ export class QueryPanel {
       isBookmarked,
       editorLanguage,
       panelId,
-      postgresDatabase,
+      databaseScope,
       initialTargetBinding,
     );
     QueryPanel.trackPanel(panelId, instance);
@@ -369,12 +380,13 @@ export class QueryPanel {
     const connection = this.connectionManager.getConnection(
       this.activeConnectionId,
     );
+    const databaseTarget = queryDatabaseTarget(this.databaseScope);
     this.panel.title =
-      this.postgresDatabase === undefined
+      databaseTarget === undefined
         ? `Query — ${connection?.name ?? "Select a connection"}`
         : pinnedQueryTitle(
             connection?.name ?? this.initialConnectionId,
-            this.postgresDatabase,
+            databaseTarget.database,
           );
   }
 
@@ -386,11 +398,11 @@ export class QueryPanel {
     const connection = this.connectionManager.getConnection(
       this.initialConnectionId,
     );
-    const connectionType =
-      this.postgresDatabase === undefined ? (connection?.type ?? "") : "pg";
+    const databaseTarget = queryDatabaseTarget(this.databaseScope);
+    const connectionType = databaseTarget?.type ?? connection?.type ?? "";
     const resolvedQueryText = initialQueryText;
     const driverEditorPresentation =
-      this.postgresDatabase === undefined || connection?.type === "pg"
+      databaseTarget === undefined || connection?.type === databaseTarget.type
         ? this.connectionManager.getQueryEditorPresentation(
             this.initialConnectionId,
           )
@@ -423,9 +435,8 @@ export class QueryPanel {
         connectionId: this.initialConnectionId,
         connectionType,
         targetBinding,
-        ...(this.postgresDatabase !== undefined
-          ? { postgresDatabase: this.postgresDatabase }
-          : {}),
+        queryRunStatus: true,
+        ...queryDatabaseFields(this.databaseScope),
         queryText: initialSql,
         initialSql,
         formatOnOpen: this.formatOnOpen,

@@ -226,6 +226,9 @@ describe("MongoDB default scopes with real SDK database and collection objects",
         async toArray() {
           return [{ _id: "probe", value: 1 }];
         },
+        async *[Symbol.asyncIterator]() {
+          yield { _id: "probe", value: 1 };
+        },
       } as never;
     });
     vi.spyOn(Collection.prototype, "indexes").mockImplementation(

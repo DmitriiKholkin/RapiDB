@@ -1,247 +1,317 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
-import { resolve } from "node:path";
+import { builtinModules, createRequire } from "node:module";
+import { posix, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { gunzipSync } from "node:zlib";
+import { readElfRequirements } from "./sqlite-elf-requirements.mjs";
 
 const require = createRequire(import.meta.url);
 const tarStream = require("tar-stream");
-const lock = JSON.parse(
-  readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"),
-);
-const version = lock.packages["node_modules/better-sqlite3"].version;
-const hosts = new Set([
-  "api.github.com",
-  "github.com",
-  "release-assets.githubusercontent.com",
-  "objects.githubusercontent.com",
-  "artifacts.electronjs.org",
+const REGISTRY = "registry.npmjs.org";
+const TARGETS = [
+  "darwin-arm64",
+  "darwin-x64",
+  "linux-arm64",
+  "linux-x64",
+  "linuxmusl-arm64",
+  "linuxmusl-x64",
+  "win32-arm64",
+  "win32-x64",
+];
+const MAX_TARBALL_BYTES = 32 * 1024 * 1024;
+const MAX_EXPANDED_BYTES = 128 * 1024 * 1024;
+const INSTALLABLE_FILE =
+  /^(?:package\.json|LICENSE|lib\/(?:[a-z0-9-]+\/)?[a-z0-9-]+\.js)$/;
+// Package files that are reviewed as unused at runtime and never installed.
+// Every other file must be pinned (INSTALLABLE_FILE or a prebuild) or the
+// refresh fails for review.
+const IGNORED_PACKAGE_FILE = /^(?:README\.md|binding\.gyp|deps\/.+|src\/.+)$/;
+const PREBUILD_FILE = /^prebuilds\/[^/]+\.node$/;
+// Non-literal require() calls reviewed in better-sqlite3's lib/binding.js;
+// they load only the nativeBinding path RapiDB passes or node-gyp outputs.
+const REVIEWED_DYNAMIC_REQUIRES = new Map([
+  ["lib/binding.js", new Set(["filename", "getPrebuildPath() || filename"])],
 ]);
-const maxBytes = 32 * 1024 * 1024;
+const GLIBC_TARGETS = new Set(["linux-x64", "linux-arm64"]);
+const MUSL_TARGETS = new Set(["linuxmusl-x64", "linuxmusl-arm64"]);
+// Shared libraries a Linux prebuild may depend on; anything else is reviewed.
+const GLIBC_ALLOWED_LIBRARIES = new Set([
+  "libc.so.6",
+  "libm.so.6",
+  "libdl.so.2",
+  "libpthread.so.0",
+  "libgcc_s.so.1",
+  "libstdc++.so.6",
+  "ld-linux-x86-64.so.2",
+  "ld-linux-aarch64.so.1",
+]);
+const MUSL_ALLOWED_LIBRARIES = new Set([
+  "libc.musl-x86_64.so.1",
+  "libc.musl-aarch64.so.1",
+  "libgcc_s.so.1",
+  "libstdc++.so.6",
+]);
+const TARGET_MACHINES = { x64: "x64", arm64: "arm64" };
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
-const sri = (hex) => `sha256-${Buffer.from(hex, "hex").toString("base64")}`;
+const sha512 = (bytes) =>
+  `sha512-${createHash("sha512").update(bytes).digest("base64")}`;
 
-async function download(url, limit = maxBytes, allow404 = false) {
-  const signal = AbortSignal.timeout(60_000);
-  for (let redirects = 0; redirects <= 5; redirects++) {
-    const target = new URL(url);
-    if (target.protocol !== "https:" || !hosts.has(target.hostname))
-      throw new Error(`Untrusted bootstrap URL: ${url}`);
-    const response = await fetch(url, {
-      redirect: "manual",
-      signal,
-      headers: {
-        "User-Agent": "RapiDB-SQLite-pin-maintenance",
-        Accept: "application/vnd.github+json",
-      },
-    });
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      await response.body?.cancel();
-      url = new URL(response.headers.get("location"), url).toString();
-      continue;
-    }
-    if (response.status === 404 && allow404) {
-      await response.body?.cancel();
-      return null;
-    }
-    if (!response.ok) {
-      await response.body?.cancel();
-      throw new Error(`HTTP ${response.status}: ${url}`);
-    }
-    if (Number(response.headers.get("content-length")) > limit) {
-      await response.body?.cancel();
-      throw new Error(`Oversized bootstrap artifact: ${url}`);
-    }
-    const chunks = [];
-    let size = 0;
-    for await (const chunk of response.body) {
-      size += chunk.length;
-      if (size > limit) throw new Error(`Oversized bootstrap artifact: ${url}`);
-      chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
+function lockedPackage() {
+  const lock = JSON.parse(
+    readFileSync(new URL("../package-lock.json", import.meta.url), "utf8"),
+  );
+  const entry = lock.packages["node_modules/better-sqlite3"];
+  if (!entry?.version || !entry.integrity || !entry.resolved)
+    throw new Error("better-sqlite3 is not locked in package-lock.json");
+  return entry;
+}
+
+async function download(url, limit) {
+  const target = new URL(url);
+  if (target.protocol !== "https:" || target.hostname !== REGISTRY)
+    throw new Error(`Untrusted bootstrap URL: ${url}`);
+  const response = await fetch(url, {
+    redirect: "error",
+    signal: AbortSignal.timeout(120_000),
+    headers: { "User-Agent": "RapiDB-SQLite-pin-maintenance" },
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`HTTP ${response.status}: ${url}`);
   }
-  throw new Error(`Too many redirects: ${url}`);
+  if (Number(response.headers.get("content-length")) > limit) {
+    await response.body?.cancel();
+    throw new Error(`Oversized bootstrap artifact: ${url}`);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > limit) throw new Error(`Oversized bootstrap artifact: ${url}`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
-async function release(repo, tag, allow404 = false) {
-  const apiUrl = `https://api.github.com/repos/${repo}/releases/tags/${tag}`;
-  const bytes = await download(apiUrl, 2 * 1024 * 1024, allow404);
-  if (!bytes) return { apiUrl, status: 404, repo, tag };
-  const metadata = JSON.parse(bytes);
-  if (metadata.tag_name !== tag || !Number.isSafeInteger(metadata.id))
-    throw new Error(`Invalid release metadata: ${apiUrl}`);
-  return {
-    apiUrl,
-    status: 200,
-    repo,
-    tag,
-    id: metadata.id,
-    assets: metadata.assets,
-  };
-}
-
-async function verifyAsset(releaseInfo, asset) {
-  if (
-    !/^sha256:[a-f0-9]{64}$/.test(asset.digest ?? "") ||
-    !Number.isSafeInteger(asset.id)
-  )
-    throw new Error(`Missing API digest/ID: ${asset.name}`);
-  const prefix = `https://github.com/${releaseInfo.repo}/releases/download/${releaseInfo.tag}/`;
-  if (asset.browser_download_url !== `${prefix}${asset.name}`)
-    throw new Error(`Unexpected asset URL: ${asset.name}`);
-  const bytes = await download(asset.browser_download_url);
-  const hash = sha256(bytes);
-  if (`sha256:${hash}` !== asset.digest || bytes.length !== asset.size)
-    throw new Error(`API/bytes mismatch: ${asset.name}`);
-  return {
-    url: asset.browser_download_url,
-    integrity: sri(hash),
-    size: bytes.length,
-    releaseId: releaseInfo.id,
-    assetId: asset.id,
-    apiDigest: asset.digest,
-  };
-}
-
-async function headerAbi(bytes, version) {
+async function readTarball(bytes) {
+  const files = new Map();
   const extract = tarStream.extract();
-  let abi;
-  let root;
-  let entries = 0;
   const complete = new Promise((resolvePromise, rejectPromise) => {
     extract.on("error", rejectPromise);
     extract.on("finish", resolvePromise);
     extract.on("entry", (header, stream, next) => {
-      if (++entries > 10_000)
-        return extract.destroy(new Error("Too many header entries"));
+      if (header.type !== "file" || !header.name.startsWith("package/")) {
+        extract.destroy(
+          new Error(`Unexpected tarball entry: ${header.type} ${header.name}`),
+        );
+        return;
+      }
+      const path = header.name.slice("package/".length);
+      if (files.has(path)) {
+        extract.destroy(new Error(`Duplicate tarball entry: ${path}`));
+        return;
+      }
       const chunks = [];
       stream.on("data", (chunk) => chunks.push(chunk));
       stream.on("end", () => {
-        if (header.name.endsWith("/include/node/node_version.h")) {
-          abi = /#define NODE_MODULE_VERSION\s+(\d+)/.exec(
-            Buffer.concat(chunks).toString(),
-          )?.[1];
-          root = header.name.slice(0, -"/include/node/node_version.h".length);
-        }
+        files.set(path, Buffer.concat(chunks));
         next();
       });
     });
   });
-  extract.end(gunzipSync(bytes, { maxOutputLength: 128 * 1024 * 1024 }));
+  extract.end(gunzipSync(bytes, { maxOutputLength: MAX_EXPANDED_BYTES }));
   await complete;
-  if (!abi || !["node_headers", `node-v${version}`].includes(root))
-    throw new Error(`Cannot establish header ABI/root for Electron ${version}`);
-  return { abi, root };
+  return files;
 }
 
-export async function collectSQLitePins() {
-  const official = await release("WiseLibs/better-sqlite3", `v${version}`);
-  const patched = await release(
-    "DmitriiKholkin/RapiDB",
-    "rapidb-patched-sqlite",
-    true,
-  );
-  const pins = {
-    schemaVersion: 2,
-    betterSqlite3Version: version,
-    officialRelease: { ...official, assets: undefined },
-    patchedRelease: { ...patched, assets: undefined },
-    prebuilts: {},
-    headers: {},
-  };
-  for (const [kind, info] of [
-    ["official", official],
-    ["patched", patched],
-  ]) {
-    const assetPattern = new RegExp(
-      `^better-sqlite3-v${version.replaceAll(".", "\\.")}-(?:electron|node)-v\\d+-[a-z0-9]+-[a-z0-9]+\\.tar\\.gz$`,
-    );
-    const selected = (info.assets ?? []).filter((asset) =>
-      assetPattern.test(asset.name),
-    );
-    let cursor = 0;
-    await Promise.all(
-      Array.from({ length: 6 }, async () => {
-        while (cursor < selected.length) {
-          const asset = selected[cursor++];
-          pins.prebuilts[`${kind}/${asset.name}`] = await verifyAsset(
-            info,
-            asset,
-          );
-        }
-      }),
-    );
-    console.log(
-      `${kind}: API and downloaded bytes verified for ${selected.length} assets (release status ${info.status})`,
-    );
+// Fails on any package file that is neither pinned nor explicitly ignored.
+export function classifySQLitePackageFiles(paths) {
+  const pinned = [];
+  const prebuilds = [];
+  const unexpected = [];
+  for (const path of [...paths].sort()) {
+    if (INSTALLABLE_FILE.test(path)) pinned.push(path);
+    else if (PREBUILD_FILE.test(path)) prebuilds.push(path);
+    else if (!IGNORED_PACKAGE_FILE.test(path)) unexpected.push(path);
   }
-  for (const headerVersion of ["42.0.0", "43.0.0", "44.0.0"]) {
-    const info = await release("electron/electron", `v${headerVersion}`, true);
-    if (info.status !== 200) {
-      console.log(`Unsupported headers ${headerVersion}: no public release`);
-      continue;
+  if (unexpected.length > 0)
+    throw new Error(
+      `Unreviewed better-sqlite3 package files: ${unexpected.join(", ")}; pin them or add them to the reviewed ignore list.`,
+    );
+  return { pinned, prebuilds };
+}
+
+function requireArgument(source, open) {
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === "(") depth += 1;
+    else if (source[index] === ")" && --depth === 0)
+      return source.slice(open + 1, index).trim();
+  }
+  return null;
+}
+
+// Every require() in the installed JavaScript must load a Node.js builtin or
+// a relative path that resolves to a pinned file (or a pinned prebuild). Any
+// other require, or an unreviewed dynamic one, fails the refresh.
+export function auditSQLiteRequires(files, pinnedPaths, prebuildPaths = []) {
+  const known = new Set([...pinnedPaths, ...prebuildPaths]);
+  const builtins = new Set(builtinModules);
+  const problems = [];
+  for (const path of [...pinnedPaths].sort()) {
+    if (!path.endsWith(".js")) continue;
+    const source = files.get(path)?.toString("utf8") ?? "";
+    if (
+      /\bimport\s*\(|\bprocess\.dlopen\b|\bcreateRequire\b|\bmodule\.require\b/.test(
+        source,
+      )
+    )
+      problems.push(`${path}: unreviewed module loading`);
+    for (const match of source.matchAll(/\brequire\s*\(/g)) {
+      const argument = requireArgument(
+        source,
+        match.index + match[0].length - 1,
+      );
+      const literal = /^(['"])([^'"\\]+)\1$/.exec(argument ?? "");
+      if (!literal) {
+        if (!REVIEWED_DYNAMIC_REQUIRES.get(path)?.has(argument ?? ""))
+          problems.push(`${path}: dynamic require(${argument})`);
+        continue;
+      }
+      const specifier = literal[2];
+      if (specifier.startsWith("node:") || builtins.has(specifier)) continue;
+      if (!specifier.startsWith("./") && !specifier.startsWith("../")) {
+        problems.push(`${path}: require(${JSON.stringify(specifier)})`);
+        continue;
+      }
+      const base = posix.normalize(posix.join(posix.dirname(path), specifier));
+      const candidates = [
+        base,
+        `${base}.js`,
+        `${base}.json`,
+        `${base}/index.js`,
+      ];
+      if (base.startsWith("../") || !candidates.some((c) => known.has(c)))
+        problems.push(
+          `${path}: require(${JSON.stringify(specifier)}) does not resolve to a pinned file`,
+        );
     }
-    const base = `https://artifacts.electronjs.org/headers/dist/v${headerVersion}/`;
-    const checksumUrl = `${base}SHASUMS256.txt`;
-    const checksums = await download(checksumUrl, 64 * 1024);
-    const records = new Map(
-      checksums
-        .toString()
-        .trim()
-        .split("\n")
-        .map((line) => {
-          const match = /^([a-f0-9]{64})\s+\*?(\S+)$/.exec(line);
-          if (!match)
-            throw new Error(`Malformed headers SHASUMS: ${checksumUrl}`);
-          return [match[2], match[1]];
-        }),
-    );
-    const artifact = async (name) => {
-      const hash = records.get(name);
-      if (!hash) throw new Error(`Missing headers checksum: ${name}`);
-      const bytes = await download(`${base}${name}`);
-      if (sha256(bytes) !== hash)
-        throw new Error(`Header artifact/SHASUMS mismatch: ${name}`);
-      return {
-        bytes,
-        pin: {
-          url: `${base}${name}`,
-          integrity: sri(hash),
-          size: bytes.length,
-        },
-      };
-    };
-    const headers = await artifact(`node-v${headerVersion}-headers.tar.gz`);
-    const { abi, root: archiveRoot } = await headerAbi(
-      headers.bytes,
-      headerVersion,
-    );
-    const libraries = {};
-    for (const [arch, name] of [
-      ["x64", "x64/node.lib"],
-      ["arm64", "arm64/node.lib"],
-    ])
-      libraries[arch] = (await artifact(name)).pin;
-    pins.headers[`${headerVersion.split(".")[0]}-${abi}`] = {
-      version: headerVersion,
-      abi,
-      archiveRoot,
-      releaseId: info.id,
-      releaseApiUrl: info.apiUrl,
-      checksumUrl,
-      checksumIntegrity: sri(sha256(checksums)),
-      archive: headers.pin,
-      windowsLibraries: libraries,
-    };
-    console.log(
-      `Electron ${headerVersion} (ABI ${abi}): headers and Windows import libraries verified against captured upstream SHASUMS`,
-    );
   }
-  pins.prebuilts = Object.fromEntries(
-    Object.entries(pins.prebuilts).sort(([a], [b]) => a.localeCompare(b)),
+  if (problems.length > 0)
+    throw new Error(
+      `Unreviewed require() in better-sqlite3: ${problems.join("; ")}.`,
+    );
+}
+
+// Reads the glibc/libstdc++ symbol versions a Linux prebuild needs from its
+// ELF .gnu.version_r section and checks its library dependencies.
+export function linuxPrebuildRequirements(target, bytes) {
+  const elf = readElfRequirements(bytes);
+  const arch = target.split("-").pop();
+  if (elf.machine !== TARGET_MACHINES[arch])
+    throw new Error(`${target}: ELF machine ${elf.machine} does not match.`);
+  const allowed = GLIBC_TARGETS.has(target)
+    ? GLIBC_ALLOWED_LIBRARIES
+    : MUSL_ALLOWED_LIBRARIES;
+  const unexpected = elf.needed.filter((library) => !allowed.has(library));
+  if (unexpected.length > 0)
+    throw new Error(
+      `${target}: unreviewed shared library dependencies ${unexpected.join(", ")}.`,
+    );
+  if (GLIBC_TARGETS.has(target)) {
+    if (!elf.minGlibc || !elf.minGlibcxx)
+      throw new Error(
+        `${target}: cannot establish the minimum glibc/libstdc++ version.`,
+      );
+    return { minGlibc: elf.minGlibc, minGlibcxx: elf.minGlibcxx };
+  }
+  if (Object.keys(elf.versions).length > 0)
+    throw new Error(
+      `${target}: a musl prebuild unexpectedly requires versioned symbols.`,
+    );
+  return {};
+}
+
+export async function collectSQLitePins({ locked = lockedPackage() } = {}) {
+  const version = locked.version;
+  const tarballUrl = `https://${REGISTRY}/better-sqlite3/-/better-sqlite3-${version}.tgz`;
+  const registryMetadataUrl = `https://${REGISTRY}/better-sqlite3/${version}`;
+  if (locked.resolved !== tarballUrl)
+    throw new Error(`Unexpected locked tarball URL: ${locked.resolved}`);
+  const metadata = JSON.parse(
+    (await download(registryMetadataUrl, 1024 * 1024)).toString("utf8"),
+  );
+  if (
+    metadata.name !== "better-sqlite3" ||
+    metadata.version !== version ||
+    metadata.dist?.tarball !== tarballUrl ||
+    metadata.dist?.integrity !== locked.integrity
+  )
+    throw new Error(
+      "Registry metadata does not match the package-lock.json tarball URL and integrity.",
+    );
+  if (
+    metadata.scripts?.install ||
+    metadata.scripts?.preinstall ||
+    metadata.scripts?.postinstall
+  )
+    throw new Error(
+      "better-sqlite3 declares install scripts; review required.",
+    );
+  const bytes = await download(tarballUrl, MAX_TARBALL_BYTES);
+  if (sha512(bytes) !== locked.integrity)
+    throw new Error("Tarball bytes do not match the locked sha512 integrity.");
+  const files = await readTarball(bytes);
+  const packageJson = JSON.parse(files.get("package.json")?.toString("utf8"));
+  if (packageJson.name !== "better-sqlite3" || packageJson.version !== version)
+    throw new Error("Tarball package.json does not match the locked version.");
+  const napi = /NAPI_VERSION=(\d+)/.exec(
+    files.get("binding.gyp")?.toString("utf8") ?? "",
+  )?.[1];
+  if (!napi) throw new Error("Cannot establish the addon Node-API version.");
+  const classified = classifySQLitePackageFiles(files.keys());
+  const prebuilds = classified.prebuilds;
+  const expected = TARGETS.map((target) => `prebuilds/${target}.node`).sort();
+  if (!isDeepStrictEqual(prebuilds, expected))
+    throw new Error(
+      `Unexpected prebuild set: ${prebuilds.join(", ")}; review required.`,
+    );
+  const pins = {
+    schemaVersion: 3,
+    betterSqlite3Version: version,
+    nodeApiVersion: Number(napi),
+    registryMetadataUrl,
+    tarball: {
+      url: tarballUrl,
+      integrity: locked.integrity,
+      size: bytes.length,
+    },
+    files: {},
+    prebuilds: {},
+  };
+  for (const path of classified.pinned) {
+    const data = files.get(path);
+    pins.files[path] = { sha256: sha256(data), size: data.length };
+  }
+  if (!pins.files["lib/index.js"] || !pins.files["package.json"])
+    throw new Error("Tarball is missing lib/index.js or package.json.");
+  auditSQLiteRequires(files, classified.pinned, prebuilds);
+  for (const target of TARGETS) {
+    const path = `prebuilds/${target}.node`;
+    const data = files.get(path);
+    pins.prebuilds[target] = {
+      path,
+      sha256: sha256(data),
+      size: data.length,
+      ...(GLIBC_TARGETS.has(target) || MUSL_TARGETS.has(target)
+        ? linuxPrebuildRequirements(target, data)
+        : {}),
+    };
+  }
+  console.log(
+    `better-sqlite3 ${version}: registry metadata, lockfile integrity and tarball bytes agree; ${Object.keys(pins.files).length} JavaScript/metadata files and ${TARGETS.length} prebuilds pinned (Node-API ${napi}).`,
   );
   return pins;
 }
@@ -266,18 +336,17 @@ export async function runSQLitePinMaintenance(
   const pins = await collect();
   const serialized = `${JSON.stringify(pins, null, 2)}\n`;
   if (mode === "--check") {
-    // Compare the JSON representation, not collector-only fields such as assets: undefined.
     if (!isDeepStrictEqual(expected, JSON.parse(serialized)))
       throw new Error(
         "Upstream pins changed: review a --output candidate; do not silently accept it.",
       );
     console.log(
-      "All committed SQLite pins agree with upstream metadata and independently downloaded bytes.",
+      "All committed SQLite pins agree with registry metadata and independently downloaded bytes.",
     );
   } else {
     writeFileSync(path, serialized);
     console.log(
-      "Candidate written. A separate reviewer must verify IDs/digests/bytes before shipping.",
+      "Candidate written. A separate reviewer must verify the version, integrity and hashes before shipping.",
     );
   }
 }

@@ -4,6 +4,7 @@ import type {
   StoredConnectionConfig,
 } from "./connectionManagerModels";
 import {
+  hasConnectionConfigSecrets,
   omitAmbiguousCredentialBearingUris,
   sanitizePersistedConnectionConfig,
   serializeConnectionSecretsForStoredConfig,
@@ -20,11 +21,14 @@ export type ConnectionSavePrecondition =
 export interface ConnectionEditState {
   config: ConnectionConfig;
   secrets: StoredConnectionSecrets;
+  credentialRevision?: string;
+  inlineMigration?: boolean;
 }
 
 export function connectionEditState(
   config: StoredConnectionConfig,
   secrets: StoredConnectionSecrets,
+  credentialRevision?: string,
 ): ConnectionEditState {
   const normalized = omitAmbiguousCredentialBearingUris({
     ...config,
@@ -41,6 +45,13 @@ export function connectionEditState(
   return JSON.parse(
     JSON.stringify({
       config: sanitizePersistedConnectionConfig(normalized),
+      credentialRevision,
+      inlineMigration:
+        config.useSecretStorage !== false &&
+        config.type !== "sqlite" &&
+        hasConnectionConfigSecrets(normalized)
+          ? true
+          : undefined,
       secrets: parseStoredConnectionSecrets(
         serializeConnectionSecretsForStoredConfig(
           normalized,
@@ -72,6 +83,15 @@ export function connectionEditStatesMatch(
   current: ConnectionEditState,
 ): boolean {
   const config = { ...expected.config };
+  // Inline migration can introduce a profile link without changing the
+  // credential material represented by the edit state.
+  if (
+    expected.inlineMigration &&
+    !config.secretStorageProfile &&
+    current.config.secretStorageProfile
+  ) {
+    config.secretStorageProfile = current.config.secretStorageProfile;
+  }
   if (
     config.useSecretStorage === undefined &&
     current.config.useSecretStorage === true
@@ -84,7 +104,9 @@ export function connectionEditStatesMatch(
       hostFingerprintSha256: current.config.ssh?.hostFingerprintSha256,
     };
   }
-  return isDeepStrictEqual({ ...expected, config }, current);
+  const { inlineMigration: _expectedMigration, ...before } = expected;
+  const { inlineMigration: _currentMigration, ...after } = current;
+  return isDeepStrictEqual({ ...before, config }, after);
 }
 
 export function preserveTrustedSshFingerprint(

@@ -9,6 +9,7 @@ import { TableMutationService } from "../../src/extension/table/tableMutationSer
 import { buildUpdateRowSql } from "../../src/extension/table/updateSql";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 function column(
   name: string,
@@ -95,6 +96,7 @@ describe("generated and computed column mutation plans", () => {
 
   it("omits PostgreSQL stored-generated columns from INSERT and UPDATE plans", () => {
     const driver = new PostgresDriver(postgresConfig);
+    mockPostgresTableScope(driver);
     const columns = [
       column("id", {
         isPrimaryKey: true,

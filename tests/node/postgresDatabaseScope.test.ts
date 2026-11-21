@@ -12,6 +12,7 @@ import {
 } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { TableReadService } from "../../src/extension/table/tableReadService";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const harness = vi.hoisted(() => ({
   pools: [] as Array<{
@@ -59,14 +60,17 @@ vi.mock("pg", async (importOriginal) => {
         if (database === "denied") throw new Error("database access denied");
         if (sql.includes("current_database()"))
           return { rows: [{ name: database }] };
-        if (sql.includes("FROM pg_attribute a")) {
+        if (
+          sql.includes("AS relation_kind") ||
+          sql.includes("FROM pg_attribute a")
+        ) {
           return {
             rows: [
               {
                 column_name: "id",
                 data_type: "integer",
                 is_nullable: false,
-                is_pk: true,
+                is_pk: params[1] !== "items_without_key",
                 pk_ordinal: 1,
               },
               {
@@ -79,7 +83,11 @@ vi.mock("pg", async (importOriginal) => {
                 data_type: "text",
                 is_nullable: true,
               },
-            ],
+            ].map((column) => ({
+              ...column,
+              relation_kind: "r",
+              is_partition: false,
+            })),
           };
         }
         if (sql.includes("SELECT c.relkind"))
@@ -323,6 +331,7 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       return { rows: [], rowCount: 0 };
     });
 
+    mockPostgresTableScope(driver);
     const prepared = prepareApplyChangesPlan(
       manager as never,
       config.id,
@@ -382,6 +391,7 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
     checkoutError.code = "3D000";
     pool.connect.mockRejectedValueOnce(checkoutError);
     const checkoutCallsBeforeApply = pool.connect.mock.calls.length;
+    mockPostgresTableScope(driver);
     const prepared = prepareApplyChangesPlan(
       manager as never,
       config.id,
@@ -441,6 +451,7 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       }
       return { rows: [], rowCount: 0 };
     });
+    mockPostgresTableScope(driver);
     const prepared = prepareApplyChangesPlan(
       manager as never,
       config.id,
@@ -895,13 +906,6 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
   });
 
   it("scopes the offset export fallback for tables without a primary key", async () => {
-    const describeColumns = driver.describeColumns.bind(driver);
-    vi.spyOn(driver, "describeColumns").mockImplementation(async (...args) =>
-      (await describeColumns(...args)).map((column) => ({
-        ...column,
-        isPrimaryKey: false,
-      })),
-    );
     const read = new TableReadService(managerFor(driver) as never);
     const before = poolFor("a").query.mock.calls.length;
     const rows = [];
@@ -909,7 +913,7 @@ describe("B01 PostgreSQL database scope (mock pools)", () => {
       config.id,
       "b",
       "public",
-      "items",
+      "items_without_key",
       10,
     ))
       rows.push(...chunk.rows);

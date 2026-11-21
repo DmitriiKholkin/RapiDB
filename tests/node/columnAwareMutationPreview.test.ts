@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { OracleDriver } from "../../src/extension/dbDrivers/oracle";
 import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableMutationPreviewController } from "../../src/extension/panels/tableMutationPreviewController";
 import { prepareApplyChangesPlan } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const config = {
   id: "preview-plan",
@@ -30,6 +31,8 @@ describe.each([
   const table = `t"${marker}1`;
   const schema = `s${marker}2`;
   const qualified = `"s${marker}2"."t""${marker}1"`;
+  const rowTarget = dialect === "pg" ? `ONLY ${qualified}` : qualified;
+  beforeEach(() => mockPostgresTableScope(driver));
   const columns: ColumnTypeMeta[] = [key, name, escapedName].map(
     (name, index) => ({
       name,
@@ -83,7 +86,7 @@ describe.each([
     );
     if (!prepared.executable)
       throw new Error("Expected executable update plan");
-    const updateTarget = `${qualified}${dialect === "oracle" ? ' "RAPIDB_UPDATE_ROW"' : ""}`;
+    const updateTarget = `${rowTarget}${dialect === "oracle" ? ' "RAPIDB_UPDATE_ROW"' : ""}`;
     const executionSql = `UPDATE ${updateTarget} SET "x${marker}1" = ${marker}1, "x""${marker}2" = ${marker}2 WHERE "id""${marker}1" = ${marker}3 AND "x${marker}1" = ${marker}4 AND "x""${marker}2" IS NULL`;
     const previewSql = `UPDATE ${updateTarget} SET "x${marker}1" = 'new ${marker}2', "x""${marker}2" = NULL WHERE "id""${marker}1" = 7 AND "x${marker}1" = 'old ${marker}1' AND "x""${marker}2" IS NULL`;
     expect(prepared.plan.operations).toEqual([
@@ -149,7 +152,7 @@ describe.each([
     if (!plan) throw new Error("Expected delete plan");
     const quotedKey = `"id""${marker}1"`;
     const guardedDelete = (values: string) =>
-      `DELETE FROM ${qualified} WHERE ${quotedKey} IN (SELECT ${quotedKey} FROM ${qualified} WHERE ${quotedKey} IN (${values}) GROUP BY ${quotedKey} HAVING COUNT(*) = 1)`;
+      `DELETE FROM ${rowTarget} WHERE ${quotedKey} IN (SELECT ${quotedKey} FROM ${rowTarget} WHERE ${quotedKey} IN (${values}) GROUP BY ${quotedKey} HAVING COUNT(*) = 1)`;
     expect(plan.operations).toEqual([
       {
         sql: guardedDelete(`${marker}1, ${marker}2`),

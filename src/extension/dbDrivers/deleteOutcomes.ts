@@ -127,9 +127,10 @@ export async function deleteRowsSequentially(
   context: DriverOperationContext | undefined,
   prepare: (
     identity: Record<string, unknown>,
+    index: number,
   ) =>
-    | (() => Promise<"deleted" | "notfound" | "unknown">)
-    | Promise<() => Promise<"deleted" | "notfound" | "unknown">>,
+    | (() => Promise<SequentialDeleteStatus>)
+    | Promise<() => Promise<SequentialDeleteStatus>>,
 ): Promise<DriverMutationResult> {
   const rowOutcomes: DeleteRowOutcome[] = identities.map(
     (primaryKeys, rowIndex) => ({
@@ -150,13 +151,20 @@ export async function deleteRowsSequentially(
     try {
       throwIfTransactionCancelled(context);
       row.status = "failed";
-      const prepared = prepare(row.primaryKeys);
+      const prepared = prepare(row.primaryKeys, row.rowIndex);
       const execute =
         typeof prepared === "function" ? prepared : await prepared;
       throwIfTransactionCancelled(context);
       row.status = "unknown";
       report();
-      row.status = await execute();
+      const status = await execute();
+      if (status === "conflict") {
+        row.status = "notfound";
+        row.message =
+          "The row no longer matches the observation from the loaded page.";
+      } else {
+        row.status = status;
+      }
       row.success = row.status === "deleted";
       if (row.success) affectedRows++;
       report();
@@ -177,3 +185,5 @@ export async function deleteRowsSequentially(
   }
   return snapshot();
 }
+
+type SequentialDeleteStatus = "deleted" | "notfound" | "unknown" | "conflict";

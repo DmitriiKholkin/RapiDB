@@ -3,6 +3,7 @@ import { PostgresDriver } from "../../src/extension/dbDrivers/postgres";
 import { TablePanel } from "../../src/extension/panels/tablePanel";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
 import { parseTablePanelMessage } from "../../src/shared/webviewContracts";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 import type { FakeWebviewPanelHandle } from "../workflow/bridge/fakeWebviewPanel";
 
 type ConfigListener = (event: {
@@ -121,6 +122,7 @@ function createManager(initial: TestConfig) {
     session: new Set<(id: string) => void>(),
   };
   const driver = new PostgresDriver(initial as never);
+  mockPostgresTableScope(driver);
   const describeColumns = vi
     .spyOn(driver, "describeColumns")
     .mockResolvedValue(columns);

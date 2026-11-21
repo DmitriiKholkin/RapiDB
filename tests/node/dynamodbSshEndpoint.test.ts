@@ -6,11 +6,15 @@ import { ConnectionManager } from "../../src/extension/connectionManager";
 import type { SshRuntimeRequest } from "../../src/extension/services/sshRuntime";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import { createProjectTempDir } from "../runtime/tempDirectories";
+import { awsIdentityResponse } from "../support/awsIdentityResponse";
 import {
   createExtensionContextStub,
   FakeConnectionManagerStore,
 } from "../support/fakeConnectionManagerStore";
-import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
+import {
+  OTHER_SSH_HOST_FINGERPRINT_SHA256,
+  SSH_HOST_FINGERPRINT_SHA256,
+} from "../support/sshFingerprints";
 
 vi.mock("vscode", async () => {
   const { MockEventEmitter } = await import("../support/mockVscode");
@@ -37,7 +41,10 @@ const baseConfig = {
   },
 } satisfies ConnectionConfig;
 
-function setup(config: ConnectionConfig) {
+function setup(
+  config: ConnectionConfig,
+  getHostFingerprint = () => SSH_HOST_FINGERPRINT_SHA256,
+) {
   const handle = NodeHttpHandler.prototype.handle;
   const send = vi
     .spyOn(NodeHttpHandler.prototype, "handle")
@@ -46,6 +53,13 @@ function setup(config: ConnectionConfig) {
       await expect(
         handle.call(this, request, { abortSignal: AbortSignal.abort() }),
       ).rejects.toMatchObject({ name: "AbortError" });
+      const host = String(request.headers.host ?? request.hostname);
+      if (host.startsWith("sts.")) {
+        return awsIdentityResponse(
+          "123456789012",
+          host.endsWith(".cn") ? "aws-cn" : "aws",
+        );
+      }
       return {
         response: {
           statusCode: 200,
@@ -62,13 +76,23 @@ function setup(config: ConnectionConfig) {
       // This happens after target resolution and before the real SDK client is
       // built. SDK config must not be able to retarget the pinned tunnel now.
       vi.stubEnv("AWS_ENDPOINT_URL_DYNAMODB", "https://changed.test");
+      const { extraForwards, ...main } = request;
       return {
         transport: {
-          ...request,
+          ...main,
           localHost: "127.0.0.1" as const,
           localPort: 15432,
+          ...(extraForwards
+            ? {
+                extraForwards: extraForwards.map((forward, index) => ({
+                  ...forward,
+                  localHost: "127.0.0.1" as const,
+                  localPort: 15433 + index,
+                })),
+              }
+            : {}),
         },
-        verifiedFingerprintSha256: SSH_HOST_FINGERPRINT_SHA256,
+        verifiedFingerprintSha256: getHostFingerprint(),
         dispose,
       };
     },
@@ -199,6 +223,9 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
       await manager.connectTo(config.id);
 
       const endpoint = new URL(url);
+      const isAws =
+        url.includes("amazonaws.") || url.includes("amazonwebservices.");
+      const stsHost = `sts.${signingRegion}.amazonaws.com${region.startsWith("cn-") ? ".cn" : ""}`;
       expect(createSshRuntime).toHaveBeenCalledExactlyOnceWith(
         expect.anything(),
         {
@@ -207,11 +234,35 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
           remotePort: Number(
             endpoint.port || (endpoint.protocol === "https:" ? 443 : 80),
           ),
+          // STS account verification uses the same SSH session.
+          ...(isAws
+            ? { extraForwards: [{ remoteHost: stsHost, remotePort: 443 }] }
+            : {}),
         },
         { signal: expect.any(AbortSignal) },
       );
-      expect(send).toHaveBeenCalledTimes(1);
-      const [request] = send.mock.calls[0];
+      const ddbCalls = send.mock.calls.filter(
+        ([request]) =>
+          request.hostname === "127.0.0.1" && request.port === 15432,
+      );
+      expect(ddbCalls).toHaveLength(1);
+      const [request] = ddbCalls[0];
+      const sts = send.mock.calls.find(([request]) =>
+        String(request.headers.host).startsWith("sts."),
+      );
+      if (isAws) {
+        expect(sts?.[0]).toMatchObject({
+          hostname: "127.0.0.1",
+          port: 15433,
+          headers: { host: stsHost },
+        });
+      } else {
+        expect(sts).toBeUndefined();
+      }
+      // Nothing is sent outside the SSH forwards.
+      expect(
+        send.mock.calls.every(([call]) => call.hostname === "127.0.0.1"),
+      ).toBe(true);
       expect(request).toMatchObject({
         protocol: endpoint.protocol,
         hostname: "127.0.0.1",
@@ -228,7 +279,7 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
         /SignedHeaders=[^,]*\bhost\b/,
       );
       if (endpoint.protocol === "https:") {
-        const handler = send.mock.contexts[0];
+        const handler = send.mock.contexts.at(-1);
         if (!(handler instanceof NodeHttpHandler))
           throw new Error("Expected the Smithy HTTP handler");
         const agent = handler.httpHandlerConfigs().httpsAgent;
@@ -257,6 +308,7 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
       awsAccessKeyId: undefined,
       awsSecretAccessKey: undefined,
       awsProfile: "dynamo-test",
+      awsCredentialMode: "profile",
     });
     try {
       await manager.saveConnection(config);
@@ -265,8 +317,11 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
         kind: "tcpForward",
         remoteHost: "123456789012.ddb.us-east-1.amazonaws.com",
         remotePort: 443,
+        extraForwards: [
+          { remoteHost: "sts.us-east-1.amazonaws.com", remotePort: 443 },
+        ],
       });
-      expect(send.mock.calls[0][0].headers).toMatchObject({
+      expect(send.mock.lastCall?.[0].headers).toMatchObject({
         host: "123456789012.ddb.us-east-1.amazonaws.com",
         authorization: expect.stringContaining(
           "Credential=profile-test-access/",
@@ -290,8 +345,8 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
           Key: { id: { S: "test" } },
         }),
       );
-      expect(send).toHaveBeenCalledTimes(2);
-      expect(send.mock.calls[1][0]).toMatchObject({
+      expect(send).toHaveBeenCalledTimes(3);
+      expect(send.mock.lastCall?.[0]).toMatchObject({
         hostname: "127.0.0.1",
         port: 15432,
         headers: {
@@ -299,6 +354,33 @@ describe("DynamoDB SDK endpoints through the production SSH path", () => {
           "x-amz-target": "DynamoDB_20120810.GetItem",
         },
       });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
+  it("binds a custom SSH endpoint to the verified bastion host key", async () => {
+    let fingerprint = SSH_HOST_FINGERPRINT_SHA256;
+    const { config, manager, send } = setup(
+      { ...baseConfig, endpoint: "http://db.internal:8000" },
+      () => fingerprint,
+    );
+    try {
+      await manager.saveConnection(config);
+      await manager.connectTo(config.id);
+      const key = manager.getQueryTargetSessionKey(config.id);
+      if (!key) throw new Error("Expected a verified SSH target key");
+      await manager.disconnectFrom(config.id);
+      // Simulate an SSH runtime presenting a different, newly trusted host
+      // key under the same configured host name and remote server address.
+      fingerprint = OTHER_SSH_HOST_FINGERPRINT_SHA256;
+      await expect(
+        manager.getDriverForQuery(config.id, key),
+      ).resolves.toBeUndefined();
+      expect(manager.getQueryTargetSessionKey(config.id)).not.toBe(key);
+      expect(
+        send.mock.calls.every(([request]) => request.hostname === "127.0.0.1"),
+      ).toBe(true);
     } finally {
       await manager.dispose();
     }

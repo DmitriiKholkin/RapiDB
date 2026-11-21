@@ -1,6 +1,6 @@
 import { createHmac, randomBytes } from "node:crypto";
 import type { ConnectionOptions as TlsConnectionOptions } from "node:tls";
-import { Client, errors } from "@elastic/elasticsearch";
+import { Client } from "@elastic/elasticsearch";
 import { HttpConnection } from "@elastic/transport";
 import {
   getElasticsearchTlsEndpointError,
@@ -8,6 +8,7 @@ import {
   resolveConnectionTlsMode,
 } from "../../shared/connectionConfig";
 import { ELASTICSEARCH_READ_BUDGET } from "../../shared/safetyContracts";
+import { isRecord } from "../../shared/webviewContracts/shared";
 import type { ConnectionConfig } from "../connectionManager";
 import {
   getSshHttpAgentTransport,
@@ -46,6 +47,10 @@ import {
   stringifyCommandPayload,
   unsupported,
 } from "./nosqlUtils";
+import {
+  isServerReportedQueryError,
+  markQueryNotSent,
+} from "./queryErrorOutcome";
 import {
   DriverTimeoutError,
   type DriverTimeoutSettingsProvider,
@@ -139,12 +144,14 @@ interface ElasticsearchMutationIdentity {
   target: ElasticsearchDocumentTarget;
   indexUuid: string;
   epoch: number;
+  completeSource: boolean;
 }
 
 interface ElasticsearchReadIdentity {
   table: string;
   epoch: number;
   indexUuids: ReadonlyMap<string, string>;
+  completeSourceIndexes: ReadonlySet<string>;
 }
 
 type ElasticsearchIndexSettings = Awaited<
@@ -168,6 +175,65 @@ function isElasticsearchIndexUuid(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{22}$/.test(value);
 }
 
+const ELASTICSEARCH_SOURCE_UPDATE_BLOCK_REASON =
+  "Elasticsearch updates require a complete stored _source. Refresh the table and check the concrete index's source configuration and metadata permissions.";
+
+const SOURCE_INDEX_SETTINGS = {
+  include_defaults: true,
+  flat_settings: true,
+  local: false,
+} as const;
+
+function sourceIndexMetadata(response: unknown, index: string) {
+  if (!isRecord(response) || !Object.hasOwn(response, index)) return undefined;
+  const entry = response[index];
+  return isRecord(entry) ? entry : undefined;
+}
+
+function sourceIndexUuid(entry: ReturnType<typeof sourceIndexMetadata>) {
+  return isRecord(entry?.settings) ? entry.settings["index.uuid"] : undefined;
+}
+
+function hasCompleteStoredSource(
+  entry: ReturnType<typeof sourceIndexMetadata>,
+): boolean {
+  if (!entry || !isRecord(entry.settings) || !isRecord(entry.mappings))
+    return false;
+  const { settings, mappings, defaults } = entry;
+  if (defaults !== undefined && !isRecord(defaults)) return false;
+  // Get Index returns typeless mappings. Do not mistake a typed response for
+  // an unfiltered mapping.
+  if (Object.hasOwn(mappings, "_doc")) return false;
+  const source = Object.hasOwn(mappings, "_source") ? mappings._source : {};
+  if (!isRecord(source)) return false;
+  for (const [key, value] of Object.entries(source)) {
+    switch (key) {
+      case "enabled":
+        if (value !== true) return false;
+        break;
+      case "mode":
+        if (value !== "stored") return false;
+        break;
+      case "includes":
+      case "excludes":
+        if (!Array.isArray(value) || value.length !== 0) return false;
+        break;
+      default:
+        return false;
+    }
+  }
+  const setting = (name: string) =>
+    Object.hasOwn(settings, name) ? settings[name] : defaults?.[name];
+  const mode = setting("index.mapping.source.mode");
+  // Older servers configure source mode in the mapping, not in settings.
+  // Only trust the implicit default for a standard index. Settings values
+  // supplied by Elasticsearch may use uppercase enum names.
+  return (
+    (typeof mode === "string" && mode.toLowerCase() === "stored") ||
+    (mode === undefined && setting("index.mode") === "standard")
+  );
+}
+
 export class ElasticsearchDriver implements IDBDriver {
   private client: Client | null = null;
   private connected = false;
@@ -180,6 +246,9 @@ export class ElasticsearchDriver implements IDBDriver {
   private connectionEpoch = 0;
   private connectionAbortController?: AbortController;
   private readonly identitySecret = randomBytes(32);
+  private readonly rowsWithCompleteSource = new WeakSet<
+    Record<string, unknown>
+  >();
 
   constructor(
     private readonly config: ConnectionConfig,
@@ -619,7 +688,12 @@ export class ElasticsearchDriver implements IDBDriver {
       };
     }
     const startedAt = Date.now();
-    const commands = this.parseRestCommands(trimmed);
+    let commands: ElasticsearchRestCommand[];
+    try {
+      commands = this.parseRestCommands(trimmed);
+    } catch (error: unknown) {
+      throw markQueryNotSent(error);
+    }
     if (commands.length === 0) {
       return {
         columns: [],
@@ -659,6 +733,7 @@ export class ElasticsearchDriver implements IDBDriver {
     let affectedRows = 0;
     let mutated = false;
     let partialError: string | undefined;
+    let serverReportedError = false;
     const total = commands.length;
     const completedText = (count: number) =>
       `${count} of ${total} statement${total === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} completed and earlier writes were applied`;
@@ -670,12 +745,11 @@ export class ElasticsearchDriver implements IDBDriver {
         if (!mutated) throw error;
         const message = error instanceof Error ? error.message : String(error);
         const statement = `statement ${index + 1} of ${total}`;
+        serverReportedError =
+          !options?.signal?.aborted && isServerReportedQueryError(error);
         partialError = options?.signal?.aborted
           ? `Elasticsearch script was cancelled during ${statement} after ${completedText(index)}. The outcome of ${statement} is unknown and the remaining statements were not sent.`
-          : error instanceof errors.ResponseError &&
-              error.statusCode !== undefined &&
-              error.statusCode >= 400 &&
-              error.statusCode < 500
+          : serverReportedError
             ? `Elasticsearch ${statement} failed after ${completedText(index)}. It was not applied and the remaining statements were not sent. ${message}`
             : `Elasticsearch ${statement} failed after ${completedText(index)}. Its outcome is unknown and the remaining statements were not sent. ${message}`;
         break;
@@ -706,6 +780,9 @@ export class ElasticsearchDriver implements IDBDriver {
     return {
       ...this.buildMultiStatementQueryResult(results, startedAt, affectedRows),
       ...(partialError !== undefined ? { error: partialError } : {}),
+      ...(partialError !== undefined && serverReportedError
+        ? { serverReportedError: true }
+        : {}),
     };
   }
 
@@ -1510,6 +1587,7 @@ export class ElasticsearchDriver implements IDBDriver {
       return {
         columns,
         rows,
+        rowUpdateBlockReasons: this.sourceUpdateBlockReasons(rows),
         totalCount,
         executionTimeMs: Math.round(performance.now() - startTime),
       };
@@ -1529,7 +1607,8 @@ export class ElasticsearchDriver implements IDBDriver {
     }
     const filtered = applyFilters(rows, request.filters, columns);
     const sorted = applySort(filtered, request.sort, columns);
-    const paged = pageRows(sorted, request.page, request.pageSize).map((row) =>
+    const paged = pageRows(sorted, request.page, request.pageSize);
+    const formatted = paged.map((row) =>
       Object.fromEntries(
         Object.entries(row).map(([columnName, value]) => {
           const column = columnMetaByName.get(columnName);
@@ -1545,7 +1624,8 @@ export class ElasticsearchDriver implements IDBDriver {
       throw new DriverTimeoutError("dbOperation", "readTablePage", timeoutMs);
     return {
       columns,
-      rows: paged,
+      rows: formatted,
+      rowUpdateBlockReasons: this.sourceUpdateBlockReasons(paged),
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -1628,7 +1708,12 @@ export class ElasticsearchDriver implements IDBDriver {
       let first = true;
       while (true) {
         const { response, identity } = await reader.advance(async () => {
-          metadata ??= await this.openPit(client, reader, table);
+          metadata ??= await this.openPit(
+            client,
+            reader,
+            table,
+            pageDeadline !== Infinity,
+          );
           if (snapshot) snapshot.metadata = metadata;
           size = Math.min(size, metadata.window);
           while (true) {
@@ -1754,6 +1839,7 @@ export class ElasticsearchDriver implements IDBDriver {
     client: Client,
     reader: ElasticsearchPitSession,
     table: string,
+    checkSource: boolean,
   ): Promise<ElasticsearchPitMetadata> {
     const epoch = this.connectionEpoch;
     let window = ELASTICSEARCH_READ_BUDGET.hardCap;
@@ -1814,7 +1900,35 @@ export class ElasticsearchDriver implements IDBDriver {
         indexUuids.clear();
       }
     }
-    return { window, unknownWindow, identity: { table, epoch, indexUuids } };
+    const completeSourceIndexes = new Set<string>();
+    if (checkSource && indexUuids.size) {
+      try {
+        const metadata = await reader.request(({ signal, requestTimeout }) =>
+          client.indices.get(
+            { index: table, ...SOURCE_INDEX_SETTINGS },
+            {
+              signal,
+              // Optional edit metadata must leave time for the actual read.
+              requestTimeout: Math.max(1, Math.floor(requestTimeout / 3)),
+              maxRetries: 0,
+            },
+          ),
+        );
+        for (const [index, uuid] of indexUuids) {
+          const entry = sourceIndexMetadata(metadata, index);
+          if (sourceIndexUuid(entry) === uuid && hasCompleteStoredSource(entry))
+            completeSourceIndexes.add(index);
+        }
+      } catch {
+        reader.check();
+        // Source metadata is required for editing, not for reading/deleting.
+      }
+    }
+    return {
+      window,
+      unknownWindow,
+      identity: { table, epoch, indexUuids, completeSourceIndexes },
+    };
   }
 
   private assertCompleteSearch(response: {
@@ -1936,7 +2050,7 @@ export class ElasticsearchDriver implements IDBDriver {
           ? this.originalSourceScript(update.originalValues, document)
           : undefined;
         const replace = Object.hasOwn(update.changes, "_source");
-        await this.checkMutationIndexGeneration(client, identity, context);
+        await this.checkMutationSource(client, identity, context);
         this.checkMutationDispatch(client, identity, context);
         writeMayHaveApplied = true;
         const response = conditional
@@ -2079,38 +2193,6 @@ export class ElasticsearchDriver implements IDBDriver {
 
   async buildMutationPreviewStatements(
     operation: "insert" | "update" | "delete",
-    database: string,
-    schema: string,
-    table: string,
-    data: {
-      primaryKeys?: Record<string, unknown>;
-      changes?: Record<string, unknown>;
-      originalValues?: Record<string, unknown>;
-      values?: Record<string, unknown>;
-      primaryKeyValuesList?: Array<Record<string, unknown>>;
-    },
-  ): Promise<string[]> {
-    if (operation === "delete" && data.primaryKeyValuesList) {
-      return data.primaryKeyValuesList.map((primaryKeys) =>
-        this.buildMutationPreviewStatement(operation, database, schema, table, {
-          primaryKeys,
-        }),
-      );
-    }
-
-    return [
-      this.buildMutationPreviewStatement(
-        operation,
-        database,
-        schema,
-        table,
-        data,
-      ),
-    ];
-  }
-
-  buildMutationPreviewStatement(
-    operation: "insert" | "update" | "delete",
     _database: string,
     _schema: string,
     table: string,
@@ -2121,21 +2203,25 @@ export class ElasticsearchDriver implements IDBDriver {
       values?: Record<string, unknown>;
       primaryKeyValuesList?: Array<Record<string, unknown>>;
     },
-  ): string {
+  ): Promise<string[]> {
     if (operation === "insert") {
-      return this.buildInsertMutationPreviewStatement(table, data.values ?? {});
+      return [
+        this.buildInsertMutationPreviewStatement(table, data.values ?? {}),
+      ];
     }
     if (operation === "update") {
-      return this.buildUpdateMutationPreviewStatement(
-        table,
-        data.primaryKeys ?? {},
-        data.changes ?? {},
-        data.originalValues,
-      );
+      return [
+        await this.buildUpdateMutationPreviewStatement(
+          table,
+          data.primaryKeys ?? {},
+          data.changes ?? {},
+          data.originalValues,
+        ),
+      ];
     }
-    return this.buildDeleteMutationPreviewStatement(
-      table,
-      data.primaryKeys ?? data.primaryKeyValuesList?.[0] ?? {},
+    return (data.primaryKeyValuesList ?? [data.primaryKeys ?? {}]).map(
+      (primaryKeys) =>
+        this.buildDeleteMutationPreviewStatement(table, primaryKeys),
     );
   }
 
@@ -2156,12 +2242,12 @@ export class ElasticsearchDriver implements IDBDriver {
     );
   }
 
-  private buildUpdateMutationPreviewStatement(
+  private async buildUpdateMutationPreviewStatement(
     table: string,
     primaryKeys: Record<string, unknown>,
     changes: Record<string, unknown>,
     originalValues?: Record<string, unknown>,
-  ): string {
+  ): Promise<string> {
     const identity = this.resolveMutationIdentity(table, primaryKeys);
     if (
       Object.hasOwn(changes, "_identity") ||
@@ -2176,6 +2262,9 @@ export class ElasticsearchDriver implements IDBDriver {
     );
     const conditional = Object.hasOwn(originalValues ?? {}, "_source");
     const replace = Object.hasOwn(changes, "_source") && !conditional;
+    const client = this.requireClient();
+    await this.checkMutationSource(client, identity);
+    this.checkMutationDispatch(client, identity);
     return this.formatRestCommand(
       replace ? "PUT" : "POST",
       this.mutationIdentityPath(identity.target, replace ? "_doc" : "_update"),
@@ -2594,16 +2683,30 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
   ): Record<string, unknown>[] {
     return hits.map((hit) => {
       const source = this.normalizeSourceDocument(hit._source);
-      return {
+      const completeSource =
+        typeof hit._index === "string" &&
+        identity?.completeSourceIndexes.has(hit._index) === true &&
+        isRecord(hit._source);
+      const row = {
         _id: hit._id,
         ...(identity === undefined
           ? {}
           : {
-              _identity: this.encodeRowIdentity(identity, hit),
+              _identity: this.encodeRowIdentity(identity, hit, completeSource),
             }),
         _source: stringifyElasticsearchJson(source),
       };
+      if (completeSource) this.rowsWithCompleteSource.add(row);
+      return row;
     });
+  }
+
+  private sourceUpdateBlockReasons(rows: Record<string, unknown>[]) {
+    return rows.map((row) =>
+      this.rowsWithCompleteSource.has(row)
+        ? null
+        : ELASTICSEARCH_SOURCE_UPDATE_BLOCK_REASON,
+    );
   }
 
   private encodeRowIdentity(
@@ -2615,6 +2718,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       _seq_no?: unknown;
       _primary_term?: unknown;
     },
+    completeSource: boolean,
   ): string | null {
     if (
       typeof hit._index !== "string" ||
@@ -2632,7 +2736,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
     if (!isElasticsearchIndexUuid(indexUuid)) return null;
     const payload = Buffer.from(
       JSON.stringify([
-        2,
+        3,
         identity.epoch,
         identity.table,
         hit._index,
@@ -2641,6 +2745,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
         hit._seq_no,
         hit._primary_term,
         indexUuid,
+        completeSource,
       ]),
     ).toString("base64url");
     return `${payload}.${this.signRowIdentity(payload)}`;
@@ -2676,7 +2781,7 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
     } catch {
       throw invalid();
     }
-    if (!Array.isArray(identity) || identity.length !== 9) throw invalid();
+    if (!Array.isArray(identity) || identity.length !== 10) throw invalid();
     const [
       version,
       epoch,
@@ -2687,9 +2792,10 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       seqNo,
       primaryTerm,
       indexUuid,
+      completeSource,
     ] = identity as unknown[];
     if (
-      version !== 2 ||
+      version !== 3 ||
       epoch !== this.connectionEpoch ||
       readTable !== table ||
       typeof index !== "string" ||
@@ -2704,11 +2810,13 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
       typeof primaryTerm !== "number" ||
       !Number.isSafeInteger(primaryTerm) ||
       primaryTerm < 1 ||
-      !isElasticsearchIndexUuid(indexUuid)
+      !isElasticsearchIndexUuid(indexUuid) ||
+      typeof completeSource !== "boolean"
     )
       throw invalid();
     return {
       indexUuid,
+      completeSource,
       epoch: this.connectionEpoch,
       target: {
         index,
@@ -2774,6 +2882,52 @@ if (!same(ctx._source, params.original, new int[] {2000000})) { ctx.op = 'none' 
     )
       throw new MutationNotExecutedError(
         "Elasticsearch concrete index generation changed or could not be verified. Refresh the table before editing or deleting.",
+      );
+  }
+
+  private async checkMutationSource(
+    client: Client,
+    {
+      target: { index },
+      indexUuid,
+      completeSource,
+    }: ElasticsearchMutationIdentity,
+    context?: DriverOperationContext,
+  ): Promise<void> {
+    if (!completeSource)
+      throw new MutationNotExecutedError(
+        ELASTICSEARCH_SOURCE_UPDATE_BLOCK_REASON,
+      );
+    let metadata: unknown;
+    try {
+      throwIfTransactionCancelled(context);
+      // Check mapping, effective settings and UUID together on the hit's
+      // concrete index immediately before dispatch, not on the browsed alias.
+      // Like the delete generation check, this cannot be atomic with the write.
+      metadata = await client.indices.get(
+        { index, ...SOURCE_INDEX_SETTINGS },
+        context ? { signal: context.signal } : undefined,
+      );
+    } catch (error) {
+      throw new MutationNotExecutedError(
+        context?.signal.aborted
+          ? "Elasticsearch mutation cancelled before sending the document request."
+          : ELASTICSEARCH_SOURCE_UPDATE_BLOCK_REASON,
+        error,
+      );
+    }
+    const entry = sourceIndexMetadata(metadata, index);
+    if (
+      !isRecord(metadata) ||
+      Object.keys(metadata).length !== 1 ||
+      sourceIndexUuid(entry) !== indexUuid
+    )
+      throw new MutationNotExecutedError(
+        "Elasticsearch concrete index generation changed or could not be verified. Refresh the table before editing.",
+      );
+    if (!hasCompleteStoredSource(entry))
+      throw new MutationNotExecutedError(
+        ELASTICSEARCH_SOURCE_UPDATE_BLOCK_REASON,
       );
   }
 

@@ -1,5 +1,6 @@
 import { isColumnReadOnly } from "../../shared/tableTypes";
 import type { ColumnTypeMeta, IDBDriver } from "../dbDrivers/types";
+import { tableDataReference } from "./tableDataReference";
 
 export function coerceRecord(
   drv: IDBDriver,
@@ -144,7 +145,6 @@ export function buildUpdateRowSql(
   originalValues: Record<string, unknown> = {},
   onPreviewColumns?: (columns: Array<ColumnTypeMeta | undefined>) => void,
 ): { sql: string; params: unknown[] } | null {
-  const qt = drv.qualifiedTableName(database, schema, table);
   const colMap = new Map(cols.map((c) => [c.name, c]));
   const unknownColumns = unknownSqlMutationColumns(drv, changes, colMap);
   if (unknownColumns.length > 0) {
@@ -189,6 +189,7 @@ export function buildUpdateRowSql(
   const params: unknown[] = [];
   const previewColumns: Array<ColumnTypeMeta | undefined> = [];
   const tableAlias = drv.getUpdateTableAlias?.() ?? undefined;
+  const qt = tableDataReference(drv, database, schema, table, cols);
   const updateTarget = tableAlias
     ? `${qt} ${drv.quoteIdentifier(tableAlias)}`
     : qt;

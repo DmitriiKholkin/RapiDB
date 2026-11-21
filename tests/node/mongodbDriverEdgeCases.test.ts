@@ -15,6 +15,7 @@ import type {
   DriverTablePageRequest,
   FilterExpression,
 } from "../../src/extension/dbDrivers/types";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 type MongoDocument = Record<string, unknown>;
 
@@ -38,8 +39,8 @@ function column(
 }
 
 function createHarness(
-  pageDocuments: MongoDocument[],
-  schemaDocuments: MongoDocument[] = pageDocuments,
+  pageDocuments: Array<MongoDocument | Uint8Array>,
+  schemaDocuments = pageDocuments,
 ) {
   const driver = new MongoDBDriver({
     id: "mongo-edge-cases",
@@ -56,7 +57,9 @@ function createHarness(
     cursor.limit = vi.fn(() => cursor);
     cursor.toArray = vi.fn(async () => documents);
     cursors.push(cursor);
-    return cursor;
+    return Object.assign(cursor, {
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
+    });
   });
   const countDocuments = vi.fn(async () => pageDocuments.length);
   const aggregate = vi.fn((_pipeline: unknown[], _options?: unknown) => ({
@@ -333,7 +336,9 @@ describe("MongoDB table page server reads", () => {
       const cursor: Record<string, ReturnType<typeof vi.fn>> = {};
       cursor.limit = vi.fn(() => cursor);
       cursor.toArray = vi.fn(async () => [{ _id: "a" }]);
-      return cursor;
+      return Object.assign(cursor, {
+        [Symbol.asyncIterator]: mockMongoCursorIterator,
+      });
     });
     find.mockImplementationOnce(() => {
       throw new Error("operation exceeded time limit");
@@ -392,7 +397,9 @@ describe("MongoDB table page server reads", () => {
         cursor.skip = vi.fn(() => cursor);
         cursor.limit = vi.fn(() => cursor);
         cursor.toArray = vi.fn(async () => rows);
-        return cursor;
+        return Object.assign(cursor, {
+          [Symbol.asyncIterator]: mockMongoCursorIterator,
+        });
       });
       const page = await driver.readTablePage(
         pageRequest({
@@ -594,13 +601,15 @@ describe("MongoDB like filters on non-string BSON columns", () => {
 
 describe("MongoDB type inference trusts only native BSON values", () => {
   it("does not treat user fields named _bsontype or sub_type as BSON types", async () => {
-    const { driver } = createHarness([
-      {
+    const wire = Buffer.from(
+      BSON.serialize({
         _id: "a",
-        tagged: { _bsontype: "Int32", value: 5 },
+        tagged: { _userkind: "Int32", value: 5 },
         subtype: { sub_type: 4, note: "x" },
-      },
-    ]);
+      }),
+    );
+    Buffer.from("_bsontype").copy(wire, wire.indexOf("_userkind\0"));
+    const { driver } = createHarness([wire]);
     const page = await driver.readTablePage(pageRequest());
     const byName = new Map(page.columns.map((entry) => [entry.name, entry]));
     expect(byName.get("tagged")?.nativeType).toBe("object");

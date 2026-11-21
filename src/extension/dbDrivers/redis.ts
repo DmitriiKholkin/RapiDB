@@ -1,12 +1,18 @@
+import { isUtf8 } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { createClient, ErrorReply, RESP_TYPES } from "redis";
+import { noSqlDeleteObservationError } from "../../shared/noSqlDeleteObservation";
 import {
   isRedisBinaryCollectionValueSnapshot,
   isRedisBinaryValueSnapshot,
   isRedisNotLoadedValueSnapshot,
   isRedisOversizedValueSnapshot,
+  isRedisUnavailableValueSnapshot,
+  type RedisBinaryCollectionValueSnapshot,
+  type RedisBinaryValueSnapshot,
   type RedisOversizedValueSnapshot,
   redisOversizedValueSnapshot,
+  redisUnavailableValueSnapshot,
 } from "../../shared/redisValueSnapshot";
 import {
   type OperationCancellationContext,
@@ -41,6 +47,11 @@ import {
   unsupported,
 } from "./nosqlUtils";
 import {
+  REDIS_COMPARE_DELETE,
+  REDIS_DELETE_EVIDENCE_BYTES,
+  REDIS_OBSERVE_DELETE,
+} from "./redisDeleteObservation";
+import {
   isRedisUnprefixedKeysTable,
   REDIS_ALL_KEYS_TABLE,
   REDIS_EMPTY_PREFIX_TABLE,
@@ -72,7 +83,9 @@ import type {
   ForeignKeyMeta,
   IDBDriver,
   IndexMeta,
+  NoSqlDeleteObservation,
   PaginationResult,
+  PreparedObservedDelete,
   QueryExecutionOptions,
   QueryResult,
   SchemaInfo,
@@ -296,8 +309,7 @@ const READ_ONLY_REDIS_COMMANDS = new Set([
 
 interface RedisKeyMetadata {
   type: string;
-  size: number;
-  memoryBytes: number | null;
+  size: number | undefined;
   ttl: number;
 }
 
@@ -306,21 +318,56 @@ interface RedisSampleRow {
   row: Record<string, unknown>;
 }
 
+interface RedisLoadedValue {
+  value:
+    | string
+    | RedisOversizedValueSnapshot
+    | RedisBinaryValueSnapshot
+    | RedisBinaryCollectionValueSnapshot;
+  ttl?: number;
+  deleteState?: RedisDeleteState;
+}
+
+const REDIS_TABLE_VALUE_COMMANDS = 4;
+// Paged fallback for collections that the atomic compact read cannot bound
+// (Redis < 7, non-compact encodings, ACLs without EVAL_RO). Before any member
+// is transferred, MEMORY USAGE ... SAMPLES 0 must bound the whole value: it
+// walks every element and counts the allocations, which are never smaller
+// than the uncompressed member bytes. Each page reply is then counted and the
+// read stops (no partial value) once the members exceed the raw limit.
+export const REDIS_PAGED_PREFLIGHT_BYTES = 1024 * 1024;
+export const REDIS_PAGED_COLLECTION_BYTES = 256 * 1024;
+export const REDIS_PAGED_COUNT = 64;
+const REDIS_PAGED_MAX_COMMANDS = 1024;
+// A compact collection has <=64 KiB backing storage and <=1000 entries; a
+// paged one is refused past 256 KiB of members, and one reply is bounded by
+// the 1 MiB preflight. At most two bulk strings per entry; adding 32 bytes per
+// string for integer/score rendering gives <320 KiB raw. Sixfold JSON
+// escaping plus labels/structure stays under 2 MiB. Leave room for the
+// in-flight reply, DUMP (64 KiB) and the visible hash proof.
+const REDIS_COLLECTION_READ_RESERVATION = 3 * 1024 * 1024;
+
+interface RedisDeleteState {
+  client: RedisClient;
+  database: number;
+  table: string;
+  key: string;
+  type: string;
+  expiry: number;
+  bytes: Buffer;
+  visibleHash?: Buffer;
+}
+
+type RedisDeleteReadScope = Pick<
+  RedisDeleteState,
+  "client" | "database" | "table"
+>;
+
 type RedisHashEntries = Record<string, string>;
 
 type RedisClient = ReturnType<typeof createClient>;
 
 type RedisKeyLimitPurpose = "paging" | "filtering";
-
-function redisMemberClient(client: RedisClient) {
-  return client.withTypeMapping({
-    [RESP_TYPES.BLOB_STRING]: Buffer,
-    [RESP_TYPES.MAP]: Array,
-    [RESP_TYPES.DOUBLE]: String,
-  });
-}
-
-type RedisMemberClient = ReturnType<typeof redisMemberClient>;
 
 type RedisInsertPlan = {
   command: "set";
@@ -367,16 +414,16 @@ function assertRedisLosslessUtf8Value(value: unknown): void {
 }
 
 function isDisplayableRedisText(bytes: Buffer): boolean {
-  const text = bytes.toString("utf8");
-  if (!Buffer.from(text, "utf8").equals(bytes)) return false;
-  for (const character of text) {
-    const codePoint = character.codePointAt(0) ?? 0;
+  if (!isUtf8(bytes)) return false;
+  // Each disallowed code point is ASCII and cannot occur inside a valid
+  // UTF-8 multibyte sequence. No decoded/re-encoded scratch buffers needed.
+  for (const byte of bytes) {
     if (
-      codePoint <= 0x08 ||
-      codePoint === 0x0b ||
-      codePoint === 0x0c ||
-      (codePoint >= 0x0e && codePoint <= 0x1f) ||
-      codePoint === 0x7f
+      byte <= 0x08 ||
+      byte === 0x0b ||
+      byte === 0x0c ||
+      (byte >= 0x0e && byte <= 0x1f) ||
+      byte === 0x7f
     ) {
       return false;
     }
@@ -403,36 +450,97 @@ function formatRedisSortedSetScore(score: unknown): number | string {
       : parsed;
 }
 
-function redisReplyPairs(reply: unknown): Array<[unknown, unknown]> {
-  if (Array.isArray(reply)) {
-    const pairs: Array<[unknown, unknown]> = [];
-    for (let index = 0; index + 1 < reply.length; index += 2) {
-      pairs.push([reply[index], reply[index + 1]]);
-    }
-    return pairs;
-  }
-  if (reply instanceof Map) return [...reply];
-  return reply && typeof reply === "object" ? Object.entries(reply) : [];
-}
-
 class RedisCollectionDecoder {
   binary = false;
 
-  text(value: unknown): string {
-    if (!Buffer.isBuffer(value)) return String(value);
+  text(value: Buffer): string {
     if (isDisplayableRedisText(value)) return value.toString("utf8");
     this.binary = true;
-    return formatRedisBlobString(value);
+    return `RedisBinary(0x${value.toString("hex")})`;
   }
 
-  record(reply: unknown): Record<string, string> {
-    return Object.fromEntries(
-      redisReplyPairs(reply).map(([field, entry]) => [
-        this.text(field),
-        this.text(entry),
-      ]),
-    );
+  record(reply: Buffer[]): Record<string, string> {
+    const record: Record<string, string> = Object.create(null);
+    for (let i = 0; i < reply.length; i += 2) {
+      record[this.text(reply[i])] = this.text(reply[i + 1]);
+    }
+    return record;
   }
+}
+
+function redisStringValue(bytes: Buffer): RedisLoadedValue["value"] {
+  if (isDisplayableRedisText(bytes)) return bytes.toString("utf8");
+  const binaryHex = bytes.toString("hex");
+  return {
+    __rapidbRedisBinary: 1,
+    displayValue: `RedisBinary(0x${binaryHex})`,
+    binaryHex,
+  };
+}
+
+function formatRedisCollection(
+  type: string,
+  rawValue: unknown,
+): RedisLoadedValue["value"] | undefined {
+  const paired = type === "hash" || type === "zset";
+  if (
+    !Array.isArray(rawValue) ||
+    rawValue.length > REDIS_READ_BUDGET.maxValueEntries * (paired ? 2 : 1) ||
+    (paired && rawValue.length % 2 !== 0) ||
+    !rawValue.every(Buffer.isBuffer)
+  )
+    return undefined;
+  const decoder = new RedisCollectionDecoder();
+  let value: unknown;
+  if (type === "hash") {
+    value = decoder.record(rawValue);
+    // A literal "RedisBinary(0x...)" field can share the display label
+    // of a binary field. The grid would display only one of them.
+    if (Object.keys(value as object).length * 2 !== rawValue.length) {
+      return undefined;
+    }
+  } else if (type === "zset") {
+    value = rawValue.flatMap((entry, index) =>
+      index % 2 === 0
+        ? [
+            {
+              value: decoder.text(entry),
+              score: formatRedisSortedSetScore(
+                rawValue[index + 1].toString("ascii"),
+              ),
+            },
+          ]
+        : [],
+    );
+  } else if (type === "list" || type === "set") {
+    value = rawValue.map((entry) => decoder.text(entry));
+  } else {
+    return undefined;
+  }
+  const displayValue = JSON.stringify(value);
+  return decoder.binary
+    ? { __rapidbRedisBinaryCollection: 1, displayValue }
+    : displayValue;
+}
+
+// ZSCAN order is arbitrary. Present members in Redis rank order: by score,
+// then by member bytes.
+function sortRedisSortedSetPairs(pairs: Buffer[]): void {
+  const score = (value: Buffer) => {
+    const parsed = formatRedisSortedSetScore(value.toString("ascii"));
+    return parsed === "+inf"
+      ? Number.POSITIVE_INFINITY
+      : parsed === "-inf"
+        ? Number.NEGATIVE_INFINITY
+        : Number(parsed);
+  };
+  const entries: Array<[Buffer, Buffer]> = [];
+  for (let i = 0; i < pairs.length; i += 2)
+    entries.push([pairs[i], pairs[i + 1]]);
+  entries.sort(
+    ([a, as], [b, bs]) => score(as) - score(bs) || Buffer.compare(a, b),
+  );
+  pairs.splice(0, pairs.length, ...entries.flat());
 }
 
 function redisRowValueBytes(value: unknown): number {
@@ -1390,6 +1498,7 @@ export class RedisDriver implements IDBDriver {
           ? baseClient.withAbortSignal(querySignal)
           : baseClient;
       let partialError: string | undefined;
+      let partialErrorReportedByServer = false;
       let multiIndex: number | undefined;
       const closedTransactions: RedisClosedTransaction[] = [];
       for (const [index, parts] of commands.entries()) {
@@ -1443,6 +1552,7 @@ export class RedisDriver implements IDBDriver {
           if (results.length === 0) throw error;
           if (error instanceof ErrorReply) {
             partialError = `Redis ${statement} failed: ${stripTrailingPeriod(error.message)}. ${progress("rejected")}`;
+            partialErrorReportedByServer = true;
             results.push(formatRedisReplyValue(error));
             // Only EXECABORT ends MULTI; other rejected EXEC/DISCARD calls
             // (arity errors) leave it open, so the cleanup DISCARD must run.
@@ -1518,6 +1628,9 @@ export class RedisDriver implements IDBDriver {
         rowCount: 1,
         executionTimeMs: Date.now() - startedAt,
         ...(partialError ? { error: partialError } : {}),
+        ...(partialError && partialErrorReportedByServer
+          ? { serverReportedError: true }
+          : {}),
         ...(warnings.length > 0 ? { warnings } : {}),
       };
     } finally {
@@ -1543,20 +1656,52 @@ export class RedisDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
-    const plan = await this.planTablePage(request);
+    const scope =
+      request.observeNoSqlDelete && !request.omitRowIdentity
+        ? {
+            client: this.requireClient(),
+            database: this.resolveDbIndex(request.database),
+            table: request.table,
+          }
+        : undefined;
+    const observations = (rows: Record<string, unknown>[]) => {
+      if (!scope || scope.client !== this.client) return {};
+      let remaining = 4 * 1024 * 1024;
+      return {
+        noSqlDeleteObservations: rows.map((row) => {
+          const observation = this.observedDeleteRows.get(row);
+          const state =
+            observation && this.deleteObservationStates.get(observation);
+          if (!state) return null;
+          const cost =
+            4 * (state.bytes.length + (state.visibleHash?.length ?? 0)) +
+            Buffer.byteLength(state.key) +
+            REDIS_COMPARE_DELETE.length;
+          if (cost > remaining) return null;
+          remaining -= cost;
+          return observation;
+        }),
+      };
+    };
+    const plan = await this.planTablePage(request, scope);
     if ("rows" in plan) {
       return {
         columns: plan.columns,
         rows: plan.rows,
+        ...observations(plan.rows),
         totalCount: request.skipCount ? 0 : plan.totalCount,
         executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
-    const rows = await this.readRowsForKeys(plan.client, plan.keys, request);
+    const rows = await this.readRowsForKeys(plan.client, plan.keys, request, {
+      deleteReadScope: scope,
+    });
     throwIfQueryCancelled(request);
+    const pageRows = rows.map((entry) => entry.row);
     return {
       columns: this.inferRedisColumns(rows),
-      rows: rows.map((entry) => entry.row),
+      rows: pageRows,
+      ...observations(pageRows),
       totalCount: request.skipCount ? 0 : plan.totalCount,
       executionTimeMs: Math.round(performance.now() - startTime),
     };
@@ -1620,7 +1765,10 @@ export class RedisDriver implements IDBDriver {
     }
   }
 
-  private async planTablePage(request: DriverTablePageRequest): Promise<
+  private async planTablePage(
+    request: DriverTablePageRequest,
+    deleteReadScope?: RedisDeleteReadScope,
+  ): Promise<
     | { client: RedisClient; keys: string[]; totalCount: number }
     | {
         columns: ColumnTypeMeta[];
@@ -1696,6 +1844,7 @@ export class RedisDriver implements IDBDriver {
       boundedReadLimit,
       "filtering",
       request,
+      deleteReadScope,
     );
     const displayToOriginal = new Map(
       rows.map((entry) => [redisComparisonRow(entry.row), entry.row]),
@@ -1704,8 +1853,11 @@ export class RedisDriver implements IDBDriver {
       isRedisOversizedValueSnapshot(entry.row.value),
     );
     if (omittedValueRow) {
+      const reason = isRedisUnavailableValueSnapshot(omittedValueRow.row.value)
+        ? "could not be loaded safely"
+        : `has a value beyond the table viewer read limit (${REDIS_READ_BUDGET.maxValueEntries} entries or ${REDIS_READ_BUDGET.maxValueBytes} bytes per value, ${REDIS_READ_BUDGET.maxTotalValueBytes} bytes per read)`;
       throw new Error(
-        `Redis key '${String(omittedValueRow.row.key)}' has a value beyond the table viewer read limit (${REDIS_READ_BUDGET.maxValueEntries} entries or ${REDIS_READ_BUDGET.maxValueBytes} bytes per value, ${REDIS_READ_BUDGET.maxTotalValueBytes} bytes per read), so filtering or sorting by value is unavailable. Narrow the keyspace or filter by key, type, or TTL.`,
+        `Redis key '${String(omittedValueRow.row.key)}' ${reason}, so filtering or sorting by value is unavailable. Narrow the keyspace or filter by key, type, or TTL.`,
       );
     }
     const rowRecords = [...displayToOriginal.keys()];
@@ -1794,6 +1946,14 @@ export class RedisDriver implements IDBDriver {
         if (hasValueChange && isRedisNotLoadedValueSnapshot(originalSnapshot)) {
           throw new Error(
             "This Redis value was not loaded because the page reached its total read limit. Reload with a smaller page size or a narrower filter before editing it.",
+          );
+        }
+        if (
+          hasValueChange &&
+          isRedisUnavailableValueSnapshot(originalSnapshot)
+        ) {
+          throw new Error(
+            "This Redis value was not safely loaded and is read-only in the table viewer. Rename and TTL changes remain available.",
           );
         }
         if (
@@ -1963,10 +2123,16 @@ export class RedisDriver implements IDBDriver {
     request: DriverDeleteRowsRequest,
     context?: DriverOperationContext,
   ): Promise<DriverMutationResult> {
-    const baseClient = await prepareDeleteBatch(
+    const { keys, baseClient } = await prepareDeleteBatch(
       request.primaryKeyValuesList,
       context,
-      () => this.getDatabaseClient(request.database, context?.signal),
+      async () => ({
+        keys: this.resolveDeleteKeys(request.primaryKeyValuesList),
+        baseClient: await this.getDatabaseClient(
+          request.database,
+          context?.signal,
+        ),
+      }),
     );
     const client = context
       ? baseClient.withAbortSignal(context.signal)
@@ -1974,14 +2140,133 @@ export class RedisDriver implements IDBDriver {
     return deleteRowsSequentially(
       request.primaryKeyValuesList,
       context,
-      (entry) => {
-        const key = this.resolveStoredKey(entry.key);
-        if (key === null)
-          throw new Error("Redis delete requires a string key.");
-        return async () =>
-          (await client.del(key)) > 0 ? "deleted" : "notfound";
-      },
+      (_entry, index) => async () =>
+        (await client.del(keys[index])) > 0 ? "deleted" : "notfound",
     );
+  }
+
+  private resolveDeleteKeys(
+    identities: readonly Record<string, unknown>[],
+  ): string[] {
+    return identities.map(({ key }) => {
+      const resolved = this.resolveStoredKey(key);
+      if (resolved === null)
+        throw new Error("Redis delete requires a string key.");
+      return resolved;
+    });
+  }
+
+  private buildRedisDeletePreview(data: {
+    primaryKeys?: Record<string, unknown>;
+    primaryKeyValuesList?: Array<Record<string, unknown>>;
+  }): string[] {
+    return this.resolveDeleteKeys(
+      data.primaryKeyValuesList ?? (data.primaryKeys ? [data.primaryKeys] : []),
+    ).map((key) => formatRedisPreviewCommand("DEL", [key]));
+  }
+
+  private readonly observedDeleteRows = new WeakMap<
+    Record<string, unknown>,
+    NoSqlDeleteObservation
+  >();
+  private readonly deleteObservationStates = new WeakMap<
+    NoSqlDeleteObservation,
+    RedisDeleteState
+  >();
+
+  prepareObservedDelete(
+    request: DriverDeleteRowsRequest,
+    observations: readonly NoSqlDeleteObservation[],
+  ): PreparedObservedDelete {
+    const owner = this.requireClient();
+    const database = this.resolveDbIndex(request.database);
+    const reject = () =>
+      new MutationNotExecutedError(noSqlDeleteObservationError.redis);
+    if (observations.length !== request.primaryKeyValuesList.length)
+      throw reject();
+    const states = request.primaryKeyValuesList.map((keys, index) => {
+      const state = this.deleteObservationStates.get(observations[index]);
+      if (
+        !state ||
+        state.client !== owner ||
+        state.database !== database ||
+        state.table !== request.table ||
+        Object.keys(keys).length !== 1 ||
+        state.key !== this.resolveStoredKey(keys.key)
+      )
+        throw reject();
+      return state;
+    });
+    return {
+      previewStatements: states.map(
+        ({ key, type, expiry, bytes, visibleHash }) => {
+          const binaryArg = (value: Buffer) =>
+            `"${value.toString("hex").replace(/../g, "\\x$&")}"`;
+          return [
+            formatRedisPreviewCommand("EVAL", [
+              REDIS_COMPARE_DELETE,
+              1,
+              key,
+              type,
+              expiry,
+            ]),
+            binaryArg(bytes),
+            ...(visibleHash ? [binaryArg(visibleHash)] : []),
+          ].join(" ");
+        },
+      ),
+      execute: async (context) => {
+        const baseClient = await prepareDeleteBatch(
+          request.primaryKeyValuesList,
+          context,
+          async () => {
+            if (owner !== this.requireClient()) throw reject();
+            const client = await this.getDatabaseClient(
+              request.database,
+              context?.signal,
+            );
+            if (owner !== this.requireClient()) throw reject();
+            return client;
+          },
+        );
+        const client = context
+          ? baseClient.withAbortSignal(context.signal)
+          : baseClient;
+        return deleteRowsSequentially(
+          request.primaryKeyValuesList,
+          context,
+          (_identity, index) => {
+            if (owner !== this.requireClient()) throw reject();
+            const { key, type, expiry, bytes, visibleHash } = states[index];
+            return async () => {
+              try {
+                const result = await client.sendCommand<unknown>([
+                  "EVAL",
+                  REDIS_COMPARE_DELETE,
+                  "1",
+                  key,
+                  type,
+                  String(expiry),
+                  bytes,
+                  ...(visibleHash ? [visibleHash] : []),
+                ]);
+                return result === 1
+                  ? "deleted"
+                  : result === 0
+                    ? "conflict"
+                    : "unknown";
+              } catch (error) {
+                // DEL is the script's only write and its final operation.
+                if (error instanceof ErrorReply) {
+                  throw new MutationNotExecutedError(error.message, error);
+                }
+                throw error;
+              }
+            };
+          },
+        );
+      },
+    };
   }
 
   buildMutationPreviewStatement(
@@ -2004,20 +2289,7 @@ export class RedisDriver implements IDBDriver {
     if (operation === "update") {
       return this.buildRedisUpdatePreview(data);
     }
-    const keys = (
-      data.primaryKeyValuesList ?? (data.primaryKeys ? [data.primaryKeys] : [])
-    )
-      .map((entry) => entry.key)
-      .filter((k) => k !== undefined)
-      .map((key) => {
-        const resolved = this.resolveStoredKey(key);
-        if (resolved === null)
-          throw new Error("Redis delete requires a string key.");
-        return resolved;
-      });
-    return keys.length > 0
-      ? formatRedisPreviewCommand("DEL", keys)
-      : "DEL <key>";
+    return this.buildRedisDeletePreview(data).join("\n");
   }
 
   async buildMutationPreviewStatements(
@@ -2033,21 +2305,7 @@ export class RedisDriver implements IDBDriver {
     },
   ): Promise<string[]> {
     if (operation === "delete") {
-      const keys = (
-        data.primaryKeyValuesList ??
-        (data.primaryKeys ? [data.primaryKeys] : [])
-      )
-        .map((entry) => entry.key)
-        .filter((key): key is unknown => key !== undefined)
-        .map((key) => {
-          const resolved = this.resolveStoredKey(key);
-          if (resolved === null)
-            throw new Error("Redis delete requires a string key.");
-          return resolved;
-        });
-      return keys.length > 0
-        ? [formatRedisPreviewCommand("DEL", keys)]
-        : ["DEL <key>"];
+      return this.buildRedisDeletePreview(data);
     }
 
     if (operation === "insert") {
@@ -2291,6 +2549,7 @@ export class RedisDriver implements IDBDriver {
     maxRows: number,
     failOnTruncation: RedisKeyLimitPurpose | false = false,
     context?: QueryExecutionOptions,
+    deleteReadScope?: RedisDeleteReadScope,
   ): Promise<RedisSampleRow[]> {
     const readLimit = Math.min(maxRows, REDIS_READ_BUDGET.maxValueReads);
     const keys = (
@@ -2302,7 +2561,9 @@ export class RedisDriver implements IDBDriver {
         context,
       )
     ).sort(compareRedisKeys);
-    return await this.readRowsForKeys(client, keys, context);
+    return await this.readRowsForKeys(client, keys, context, {
+      deleteReadScope,
+    });
   }
 
   private async scanTableKeys(
@@ -2332,6 +2593,7 @@ export class RedisDriver implements IDBDriver {
       metadata?: Map<string, RedisKeyMetadata>;
       initialBytes?: number;
       stopWhenBudgetSpent?: boolean;
+      deleteReadScope?: RedisDeleteReadScope;
     } = {},
   ): Promise<RedisSampleRow[]> {
     const read = async <T>(operation: () => Promise<T>): Promise<T> => {
@@ -2340,7 +2602,7 @@ export class RedisDriver implements IDBDriver {
       throwIfQueryCancelled(context);
       return result;
     };
-    const { maxValueBytes, maxTotalValueBytes } = REDIS_READ_BUDGET;
+    const { maxTotalValueBytes } = REDIS_READ_BUDGET;
     let spentBytes = options.initialBytes ?? 0;
     let inFlightReads = 0;
     let budgetSpent = false;
@@ -2350,115 +2612,368 @@ export class RedisDriver implements IDBDriver {
       REDIS_READ_BUDGET.parallelValueReads,
       async (key) => {
         let metadata = options.metadata?.get(key);
-        const refreshSize =
-          metadata?.type === "hash" || metadata?.type === "set";
         if (!metadata) {
           const type = await read(() => client.type(key));
-          const [size, memoryBytes, ttl] = await read(() =>
+          const [size, ttl] = await read(() =>
             Promise.all([
-              this.readRedisValueSize(client, key, type),
-              this.readRedisMemoryUsage(client, key, type),
+              this.readRedisValueSize(client, key, type).catch(
+                (error: unknown) => {
+                  if (error instanceof ErrorReply) return undefined;
+                  throw error;
+                },
+              ),
               typeof client.ttl === "function"
                 ? client.ttl(key)
                 : Promise.resolve(-1),
             ]),
           );
-          metadata = { type, size, memoryBytes, ttl };
+          metadata = { type, size, ttl };
           options.metadata?.set(key, metadata);
         }
-        const { type, size, memoryBytes, ttl } = metadata;
-        const stopped = () => options.stopWhenBudgetSpent && budgetSpent;
-        const estimatedBytes =
-          type === "string"
-            ? 4 * size + 2 * "RedisBinary(0x)".length
-            : (memoryBytes ?? maxValueBytes);
-        let omitted: RedisOversizedValueSnapshot | undefined =
-          this.exceedsRedisValueLimit(type, size)
-            ? redisOversizedValueSnapshot(type, size)
-            : memoryBytes !== null && memoryBytes > maxValueBytes
-              ? redisOversizedValueSnapshot(type, memoryBytes, "bytes")
-              : undefined;
-        if (!omitted) {
-          while (
-            !stopped() &&
-            spentBytes + estimatedBytes > maxTotalValueBytes &&
-            inFlightReads > 0
-          ) {
-            await new Promise<void>((resolve) => budgetWaiters.push(resolve));
-            throwIfQueryCancelled(context);
-          }
-          if (stopped() || spentBytes + estimatedBytes > maxTotalValueBytes) {
-            budgetSpent = true;
-            omitted = redisOversizedValueSnapshot(type, size, undefined, true);
-          }
+        const { type, size, ttl } = metadata;
+        const loadedRow = (
+          value: unknown,
+          currentTtl = ttl,
+        ): RedisSampleRow => ({
+          redisType: type,
+          row: { key, value, ttl: currentTtl >= 0 ? currentTtl : null, type },
+        });
+        if (type === "none") return loadedRow(null);
+        const isString = type === "string";
+        const canReadCompact = ["hash", "list", "set", "zset"].includes(type);
+        if (size !== undefined && this.exceedsRedisValueLimit(type, size)) {
+          return loadedRow(redisOversizedValueSnapshot(type, size));
         }
-        let value: unknown = null;
-        let binarySnapshot: unknown;
-        if (!omitted) {
-          spentBytes += estimatedBytes;
-          inFlightReads += 1;
-          try {
-            const currentSize = refreshSize
-              ? await read(() => this.readRedisValueSize(client, key, type))
-              : size;
-            ({ value, binarySnapshot, omitted } = this.exceedsRedisValueLimit(
+        if (!isString && !canReadCompact) {
+          return loadedRow(
+            redisUnavailableValueSnapshot(type, "no byte-bounded read"),
+          );
+        }
+        if (size === undefined || !Number.isSafeInteger(size) || size < 0) {
+          return loadedRow(
+            redisUnavailableValueSnapshot(
               type,
-              currentSize,
-            )
-              ? {
-                  value: null,
-                  binarySnapshot: undefined,
-                  omitted: redisOversizedValueSnapshot(type, currentSize),
-                }
-              : await this.readBoundedRedisValue(
-                  client,
-                  key,
-                  type,
-                  currentSize,
-                  read,
-                ));
-          } finally {
-            spentBytes -= estimatedBytes;
-            inFlightReads -= 1;
-            for (const resolve of budgetWaiters.splice(0)) resolve();
-          }
+              "bounded read denied or unsupported",
+            ),
+          );
         }
 
-        const row = flattenRootRecord({
-          key,
-          value: omitted ? null : value,
-          ttl: ttl >= 0 ? ttl : null,
-          type,
-        });
-        if (!omitted) {
-          const actualBytes =
-            typeof row.value === "string"
-              ? Buffer.byteLength(row.value) *
-                (isRedisBinaryValueSnapshot(binarySnapshot) ? 2 : 1)
-              : 0;
-          if (type !== "string" && actualBytes > maxValueBytes) {
-            omitted = redisOversizedValueSnapshot(type, actualBytes, "bytes");
-          } else if (spentBytes + actualBytes > maxTotalValueBytes) {
-            budgetSpent = true;
-            omitted = redisOversizedValueSnapshot(type, size, undefined, true);
-          } else {
-            spentBytes += actualBytes;
-          }
+        // GETRANGE's inclusive end allows exactly size+1 bytes, not a guess
+        // about the size when Redis runs the command. Reserve raw bytes and
+        // worst-case display + hex before dispatch; include any retained proof.
+        const reserved = isString
+          ? 5 * size + 2 * "RedisBinary(0x)".length + 1
+          : REDIS_COLLECTION_READ_RESERVATION;
+        const stopped = () => options.stopWhenBudgetSpent && budgetSpent;
+        while (
+          !stopped() &&
+          spentBytes + reserved > maxTotalValueBytes &&
+          inFlightReads > 0
+        ) {
+          await new Promise<void>((resolve) => budgetWaiters.push(resolve));
+          throwIfQueryCancelled(context);
         }
-        return {
-          redisType: type,
-          row: {
-            ...row,
-            ...(omitted
-              ? { value: omitted }
-              : binarySnapshot
-                ? { value: binarySnapshot }
-                : {}),
-          },
-        };
+        if (stopped() || spentBytes + reserved > maxTotalValueBytes) {
+          budgetSpent = true;
+          return loadedRow(
+            redisOversizedValueSnapshot(type, size, undefined, true),
+          );
+        }
+
+        spentBytes += reserved;
+        inFlightReads += 1;
+        try {
+          const {
+            value,
+            ttl: currentTtl,
+            deleteState,
+          } = await this.readBoundedRedisValue(
+            client,
+            key,
+            type,
+            size,
+            ttl,
+            options.deleteReadScope,
+            context,
+          );
+          throwIfQueryCancelled(context);
+          const result = loadedRow(value, currentTtl);
+          spentBytes += redisRowValueBytes(value);
+          if (deleteState && deleteState.client === this.client) {
+            const observation = { backend: "redis" } as const;
+            this.observedDeleteRows.set(result.row, observation);
+            this.deleteObservationStates.set(observation, deleteState);
+            spentBytes +=
+              deleteState.bytes.length + (deleteState.visibleHash?.length ?? 0);
+          }
+          return result;
+        } finally {
+          spentBytes -= reserved;
+          inFlightReads -= 1;
+          for (const resolve of budgetWaiters.splice(0)) resolve();
+        }
       },
       context?.signal,
     );
+  }
+
+  // Keep the slot until node-redis settles the command, not just until the
+  // caller stops waiting. An already sent reply can arrive after cancellation.
+  private tableValueCommands = 0;
+  private readonly tableValueWaiters = new Set<() => void>();
+
+  private async runTableValueCommand<T>(
+    operation: () => Promise<T>,
+    context?: QueryExecutionOptions,
+  ): Promise<T> {
+    while (this.tableValueCommands >= REDIS_TABLE_VALUE_COMMANDS) {
+      throwIfQueryCancelled(context);
+      let notify!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        notify = resolve;
+        this.tableValueWaiters.add(notify);
+      });
+      try {
+        await this.waitForResult(ready, context?.signal);
+      } finally {
+        this.tableValueWaiters.delete(notify);
+      }
+    }
+    throwIfQueryCancelled(context);
+    this.tableValueCommands += 1;
+    const pending = (async () => {
+      try {
+        return await operation();
+      } finally {
+        this.tableValueCommands -= 1;
+        for (const notify of this.tableValueWaiters) notify();
+        this.tableValueWaiters.clear();
+      }
+    })();
+    const result = await this.waitForResult(pending, context?.signal);
+    throwIfQueryCancelled(context);
+    return result;
+  }
+
+  private async readRedisCompactValue(
+    client: RedisClient,
+    key: string,
+    type: string,
+    size: number,
+    scope?: RedisDeleteReadScope,
+    context?: QueryExecutionOptions,
+  ): Promise<RedisLoadedValue | false | undefined> {
+    const reader = client.withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer });
+    if (typeof reader.sendCommand !== "function") return undefined;
+    let result: unknown;
+    try {
+      result = await this.runTableValueCommand(
+        () =>
+          reader.sendCommand([
+            "EVAL_RO",
+            REDIS_OBSERVE_DELETE,
+            "1",
+            key,
+            type,
+            scope ? "1" : "0",
+            String(size),
+          ]),
+        context,
+      );
+    } catch (error) {
+      // Redis < 7 or ACLs rejecting the observation must not prevent browsing.
+      if (error instanceof ErrorReply) return undefined;
+      throw error;
+    }
+    if (result === null || result === false) return false;
+    if (!Array.isArray(result) || result.length !== 6) return undefined;
+    const [rawType, expiry, ttl, dump, rawValue, visibleHash] = result;
+    if (
+      !Buffer.isBuffer(rawType) ||
+      rawType.toString("ascii") !== type ||
+      !Number.isSafeInteger(ttl) ||
+      ttl < -1
+    )
+      return undefined;
+    const bytes = type === "string" ? rawValue : dump;
+    const deleteState =
+      scope &&
+      Number.isSafeInteger(expiry) &&
+      expiry >= -1 &&
+      Buffer.isBuffer(bytes) &&
+      bytes.length <= REDIS_DELETE_EVIDENCE_BYTES &&
+      (type !== "hash" || Buffer.isBuffer(visibleHash))
+        ? {
+            ...scope,
+            key,
+            type,
+            expiry,
+            bytes,
+            ...(type === "hash" ? { visibleHash } : {}),
+          }
+        : undefined;
+    if (type === "string") {
+      if (!Buffer.isBuffer(rawValue) || rawValue.length > size)
+        return undefined;
+      return { deleteState, ttl, value: redisStringValue(rawValue) };
+    }
+    const value = formatRedisCollection(type, rawValue);
+    return value === undefined ? undefined : { deleteState, ttl, value };
+  }
+
+  // Reads a collection in pages without an atomic snapshot. The result is
+  // display data only and never carries delete evidence.
+  private async readPagedRedisCollection(
+    client: RedisClient,
+    key: string,
+    type: string,
+    context?: QueryExecutionOptions,
+  ): Promise<RedisLoadedValue> {
+    const unavailable = (
+      reason:
+        | "no byte-bounded read"
+        | "bounded read denied or unsupported"
+        | "value changed during read",
+    ) => ({ value: redisUnavailableValueSnapshot(type, reason) });
+    if (!["hash", "list", "set", "zset"].includes(type)) {
+      return unavailable("no byte-bounded read");
+    }
+    const reader = client.withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer });
+    if (typeof reader.sendCommand !== "function") {
+      return unavailable("bounded read denied or unsupported");
+    }
+    const send = (args: string[]) =>
+      this.runTableValueCommand(() => reader.sendCommand(args), context);
+    const text = (value: unknown) =>
+      Buffer.isBuffer(value) ? value.toString("latin1") : value;
+    try {
+      if (type === "list") {
+        // Compressed quicklist nodes make MEMORY USAGE smaller than the data.
+        const encoding = text(await send(["OBJECT", "ENCODING", key]));
+        if (encoding === null) return unavailable("value changed during read");
+        if (encoding === "quicklist") {
+          const config = await send(["CONFIG", "GET", "list-compress-depth"]);
+          if (
+            !Array.isArray(config) ||
+            config.length !== 2 ||
+            text(config[1]) !== "0"
+          ) {
+            return unavailable("no byte-bounded read");
+          }
+        } else if (
+          !["listpack", "ziplist", "linkedlist"].includes(String(encoding))
+        ) {
+          return unavailable("no byte-bounded read");
+        }
+      }
+      const usage: unknown = await send([
+        "MEMORY",
+        "USAGE",
+        key,
+        "SAMPLES",
+        "0",
+      ]);
+      if (usage === null) return unavailable("value changed during read");
+      if (!Number.isSafeInteger(usage) || (usage as number) < 0) {
+        return unavailable("bounded read denied or unsupported");
+      }
+      if ((usage as number) > REDIS_PAGED_PREFLIGHT_BYTES) {
+        return {
+          value: redisOversizedValueSnapshot(type, usage as number, "bytes"),
+        };
+      }
+      const { maxValueEntries } = REDIS_READ_BUDGET;
+      const paired = type === "hash" || type === "zset";
+      const collected: Buffer[] = [];
+      const seen = new Set<string>();
+      let bytes = 0;
+      const tooLarge = () => ({
+        value:
+          bytes > REDIS_PAGED_COLLECTION_BYTES
+            ? redisOversizedValueSnapshot(type, bytes, "bytes")
+            : redisOversizedValueSnapshot(
+                type,
+                collected.length / (paired ? 2 : 1),
+              ),
+      });
+      const accept = (reply: unknown[]): boolean => {
+        for (const item of reply) bytes += (item as Buffer).length;
+        if (type === "list") {
+          collected.push(...(reply as Buffer[]));
+        } else {
+          const step = paired ? 2 : 1;
+          for (let i = 0; i < reply.length; i += step) {
+            const member = (reply[i] as Buffer).toString("latin1");
+            if (seen.has(member)) continue;
+            seen.add(member);
+            collected.push(...(reply.slice(i, i + step) as Buffer[]));
+          }
+        }
+        return (
+          bytes <= REDIS_PAGED_COLLECTION_BYTES &&
+          collected.length <= maxValueEntries * (paired ? 2 : 1)
+        );
+      };
+      const isBuffers = (value: unknown): value is Buffer[] =>
+        Array.isArray(value) && value.every(Buffer.isBuffer);
+      if (type === "list") {
+        for (let start = 0, commands = 0; ; start += REDIS_PAGED_COUNT) {
+          if (++commands > REDIS_PAGED_MAX_COMMANDS) return tooLarge();
+          const reply = await send([
+            "LRANGE",
+            key,
+            String(start),
+            String(start + REDIS_PAGED_COUNT - 1),
+          ]);
+          if (!isBuffers(reply) || reply.length > REDIS_PAGED_COUNT) {
+            return unavailable("bounded read denied or unsupported");
+          }
+          if (!accept(reply)) return tooLarge();
+          if (reply.length < REDIS_PAGED_COUNT) break;
+        }
+      } else {
+        const command = { hash: "HSCAN", set: "SSCAN", zset: "ZSCAN" }[
+          type as "hash" | "set" | "zset"
+        ];
+        const cursors = new Set<string>();
+        let cursor = "0";
+        do {
+          if (cursors.size >= REDIS_PAGED_MAX_COMMANDS) return tooLarge();
+          cursors.add(cursor);
+          const reply = await send([
+            command,
+            key,
+            cursor,
+            "COUNT",
+            String(REDIS_PAGED_COUNT),
+          ]);
+          if (
+            !Array.isArray(reply) ||
+            reply.length !== 2 ||
+            !Buffer.isBuffer(reply[0]) ||
+            !isBuffers(reply[1]) ||
+            (paired && reply[1].length % 2 !== 0)
+          ) {
+            return unavailable("bounded read denied or unsupported");
+          }
+          if (!accept(reply[1])) return tooLarge();
+          cursor = reply[0].toString("latin1");
+          if (cursor !== "0" && cursors.has(cursor)) {
+            return unavailable("value changed during read");
+          }
+        } while (cursor !== "0");
+      }
+      if (type === "zset") sortRedisSortedSetPairs(collected);
+      const value = formatRedisCollection(type, collected);
+      return value === undefined
+        ? unavailable("bounded read denied or unsupported")
+        : { value };
+    } catch (error) {
+      if (!(error instanceof ErrorReply)) throw error;
+      return error.message.startsWith("WRONGTYPE")
+        ? unavailable("value changed during read")
+        : unavailable("bounded read denied or unsupported");
+    }
   }
 
   private async readBoundedRedisValue(
@@ -2466,100 +2981,57 @@ export class RedisDriver implements IDBDriver {
     key: string,
     type: string,
     size: number,
-    read: <T>(operation: () => Promise<T>) => Promise<T>,
-  ): Promise<{
-    value: unknown;
-    binarySnapshot?: unknown;
-    omitted?: RedisOversizedValueSnapshot;
-  }> {
-    const { maxValueEntries, maxValueBytes } = REDIS_READ_BUDGET;
-    let value: unknown = null;
-    let binarySnapshot: unknown;
-    const decoder = new RedisCollectionDecoder();
-    const members = redisMemberClient(client);
-    switch (type) {
-      case "string":
-        {
-          const bytes = await read(() =>
-            client
-              .withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer })
-              .getRange(key, 0, maxValueBytes),
-          );
-          if (Buffer.isBuffer(bytes) && bytes.length > maxValueBytes) {
-            return {
-              value: null,
-              omitted: redisOversizedValueSnapshot(
-                type,
-                Math.max(size, bytes.length),
-              ),
-            };
-          }
-          value = Buffer.isBuffer(bytes) ? formatRedisBlobString(bytes) : null;
-          if (Buffer.isBuffer(bytes) && !isDisplayableRedisText(bytes)) {
-            binarySnapshot = {
-              __rapidbRedisBinary: 1,
-              displayValue: value,
-              binaryHex: bytes.toString("hex"),
-            };
-          }
-        }
-        break;
-      case "hash":
-        value = decoder.record(await read(() => members.hGetAll(key)));
-        break;
-      case "list":
-        value = (await read(() => members.lRange(key, 0, maxValueEntries))).map(
-          (entry) => decoder.text(entry),
-        );
-        break;
-      case "set":
-        value = (await read(() => members.sMembers(key))).map((entry) =>
-          decoder.text(entry),
-        );
-        break;
-      case "zset":
-        value = (
-          await read(() => members.zRangeWithScores(key, 0, maxValueEntries))
-        ).map((entry) => ({
-          value: decoder.text(entry.value),
-          score: formatRedisSortedSetScore(entry.score),
-        }));
-        break;
-      case "stream": {
-        const entries = await read(() =>
-          this.readStreamEntries(members, key, maxValueEntries + 1),
-        );
-        value = Array.isArray(entries)
-          ? entries.map((entry) => {
-              const [id, message] = Array.isArray(entry)
-                ? entry
-                : [entry?.id, entry?.message];
-              return { id: decoder.text(id), message: decoder.record(message) };
-            })
-          : entries;
-        break;
+    ttl: number,
+    scope?: RedisDeleteReadScope,
+    context?: QueryExecutionOptions,
+  ): Promise<RedisLoadedValue> {
+    if (type !== "string" || (scope && size <= REDIS_DELETE_EVIDENCE_BYTES)) {
+      const checked = await this.readRedisCompactValue(
+        client,
+        key,
+        type,
+        size,
+        scope,
+        context,
+      );
+      if (checked) return checked;
+    }
+    // Never fall back to an unbounded collection read (even for one member):
+    // the paged reader requires a byte preflight and counts every reply.
+    if (type !== "string") {
+      return this.readPagedRedisCollection(client, key, type, context);
+    }
+    const unavailable = {
+      value: redisUnavailableValueSnapshot(
+        type,
+        "bounded read denied or unsupported",
+      ),
+    };
+    const reader = client.withTypeMapping({ [RESP_TYPES.BLOB_STRING]: Buffer });
+    if (typeof reader.getRange !== "function") return unavailable;
+    const changed = {
+      value: redisUnavailableValueSnapshot(type, "value changed during read"),
+    };
+    try {
+      const bytes = await this.runTableValueCommand(
+        () => reader.getRange(key, 0, size),
+        context,
+      );
+      if (!Buffer.isBuffer(bytes)) return unavailable;
+      if (bytes.length > REDIS_READ_BUDGET.maxValueBytes) {
+        return { value: redisOversizedValueSnapshot(type, bytes.length) };
       }
-      default:
-        value = null;
+      if (
+        bytes.length > size ||
+        (bytes.length === 0 && (size > 0 || ttl === -2))
+      ) {
+        return changed;
+      }
+      return { value: redisStringValue(bytes) };
+    } catch (error) {
+      if (!(error instanceof ErrorReply)) throw error;
+      return error.message.startsWith("WRONGTYPE") ? changed : unavailable;
     }
-    const entries = Array.isArray(value)
-      ? value.length
-      : type === "hash" && value
-        ? Object.keys(value).length
-        : 0;
-    if (type !== "string" && entries > maxValueEntries) {
-      return {
-        value: null,
-        omitted: redisOversizedValueSnapshot(type, Math.max(size, entries)),
-      };
-    }
-    if (decoder.binary) {
-      binarySnapshot = {
-        __rapidbRedisBinaryCollection: 1,
-        displayValue: JSON.stringify(value),
-      };
-    }
-    return { value, binarySnapshot };
   }
 
   private async readRowMetadata(
@@ -2902,49 +3374,10 @@ export class RedisDriver implements IDBDriver {
     }
   }
 
-  private async readRedisMemoryUsage(
-    client: RedisClient,
-    key: string,
-    type: string,
-  ): Promise<number | null> {
-    if (
-      !["hash", "list", "set", "zset", "stream"].includes(type) ||
-      typeof client.memoryUsage !== "function"
-    ) {
-      return null;
-    }
-    try {
-      return await client.memoryUsage(key, {
-        SAMPLES: REDIS_READ_BUDGET.maxValueEntries,
-      });
-    } catch (error) {
-      if (error instanceof ErrorReply) return null;
-      throw error;
-    }
-  }
-
   private exceedsRedisValueLimit(type: string, size: number): boolean {
     return type === "string"
       ? size > REDIS_READ_BUDGET.maxValueBytes
       : size > REDIS_READ_BUDGET.maxValueEntries;
-  }
-
-  private async readStreamEntries(
-    client: RedisMemberClient,
-    key: string,
-    count: number,
-  ): Promise<unknown> {
-    if (typeof client.xRange === "function") {
-      return client.xRange(key, "-", "+", { COUNT: count });
-    }
-    return client.sendCommand([
-      "XRANGE",
-      key,
-      "-",
-      "+",
-      "COUNT",
-      String(count),
-    ]);
   }
 
   private resolveStoredKey(rawKey: unknown): string | null {

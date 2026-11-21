@@ -70,6 +70,40 @@ const result: QueryResult = {
 };
 
 describe("QueryModeTableGrid result sets", () => {
+  it("shows the correct warning and rows for a compact, byte-limited PostgreSQL result", () => {
+    const first = {
+      id: "result-1",
+      columns: ["payload"],
+      rows: [{ __col_0: "retained" }],
+      rowCount: 2,
+      truncated: true,
+      truncatedAt: 1,
+      truncatedBySize: true,
+    };
+    render(
+      <QueryModeTableGrid
+        status="success"
+        result={{
+          columns: [],
+          columnMeta: [],
+          rows: [],
+          rowCount: 2,
+          rowCountKind: "returned",
+          executionTimeMs: 1,
+          resultSets: [first],
+        }}
+      />,
+    );
+    expect(
+      screen.getByText(/combined result exceeded the PostgreSQL/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/RapiDB: Query Row Limit/)).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("query-result-grid").textContent).toContain(
+      "retained",
+    );
+  });
+
   it("shows sets before and after an error, marking the failing set partial", () => {
     render(<QueryModeTableGrid status="success" result={result} />);
 

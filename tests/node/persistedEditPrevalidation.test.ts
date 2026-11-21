@@ -7,6 +7,7 @@ import {
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { buildUpdateRowSql } from "../../src/extension/table/updateSql";
 import type { ColumnTypeMeta } from "../../src/shared/tableTypes";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -41,6 +42,7 @@ function setup(hooks = false) {
     name: "prevalidation",
     type: "pg",
   });
+  mockPostgresTableScope(driver);
   const preview = vi.spyOn(driver, "materializePreviewSql");
   const query = vi.spyOn(driver, "query").mockResolvedValue({
     rows: [],

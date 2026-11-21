@@ -514,7 +514,12 @@ describe("ConnectionManager", () => {
     { type: "mongodb", connectionUri: "mongodb://db/app" },
     { type: "redis", connectionUri: "redis://db/0" },
     { type: "elasticsearch", connectionUri: "https://db:9200" },
-    { type: "dynamodb", awsRegion: "eu-west-1", awsEndpoint: "http://db:8000" },
+    {
+      type: "dynamodb",
+      awsRegion: "eu-west-1",
+      awsEndpoint: "http://db:8000",
+      awsCredentialMode: "default",
+    },
   ] as const)("preserves a $type session when saving legacy JSON presentation settings", async (legacy) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
@@ -2491,9 +2496,9 @@ describe("ConnectionManager", () => {
     expect(storedAmbiguous).toEqual(ambiguous);
     expect(storedGood).toMatchObject({ id: "good", useSecretStorage: true });
     expect(storedGood.password).toBeUndefined();
-    await expect(store.getSecret("good")).resolves.toBe(
-      JSON.stringify({ password: "pg-secret" }),
-    );
+    expect(JSON.parse((await store.getSecret("good")) ?? "{}")).toMatchObject({
+      password: "pg-secret",
+    });
     await expect(store.getSecret("ambiguous")).resolves.toBeUndefined();
   });
 
@@ -2715,7 +2720,7 @@ describe("ConnectionManager", () => {
     expect(deletes).not.toHaveBeenCalled();
   });
 
-  it("requires secret cleanup when an existing secret-backed connection becomes nonsecret", async () => {
+  it("retains credentials when an existing secret-backed connection becomes nonsecret", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -2750,8 +2755,8 @@ describe("ConnectionManager", () => {
     expect(deletes).not.toHaveBeenCalled();
 
     await manager.saveConnection(next);
-    expect(deletes).toHaveBeenCalledWith(config.id);
-    await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+    expect(deletes).not.toHaveBeenCalled();
+    await expect(store.getSecret(config.id)).resolves.toBe("old-secret");
     expect(store.getConnections()).toEqual([next]);
   });
 
@@ -2784,7 +2789,7 @@ describe("ConnectionManager", () => {
     await expect(store.getSecret("")).resolves.toBeUndefined();
   });
 
-  it("removes a connection and purges associated history, bookmarks, and secrets", async () => {
+  it("removes a connection and purges history and bookmarks without deleting secrets", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -2867,7 +2872,7 @@ describe("ConnectionManager", () => {
     expect(store.readBookmarks().map((entry) => entry.connectionId)).toEqual([
       "conn-2",
     ]);
-    await expect(store.getSecret("conn-1")).resolves.toBeUndefined();
+    await expect(store.getSecret("conn-1")).resolves.toBe("shh");
     expect(managerState._driverStaticMetadataCache.has("conn-1")).toBe(false);
     expect(managerState._schemaCacheMap.has("conn-1")).toBe(false);
     expect(managerState._schemaGenerationMap.has("conn-1")).toBe(false);
@@ -3119,7 +3124,12 @@ describe("ConnectionManager", () => {
         { signal: expect.any(AbortSignal) },
       );
     }
-    await expect(readSecret(config.id)).resolves.toBe(rawSecret);
+    // Credentials are unchanged; the legacy document is bound to its target
+    // on first successful use (trust on first use).
+    expect(JSON.parse((await readSecret(config.id)) as string)).toEqual({
+      ...JSON.parse(rawSecret),
+      rapidbSecretTargetV1: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
     await manager.dispose();
   });
 
@@ -3503,7 +3513,7 @@ describe("ConnectionManager", () => {
     name: string;
     config: Partial<ConnectionConfig>;
     expected: Partial<ConnectionConfig>;
-  }>)("moves $name between settings and Secret Storage when the storage flag is toggled", async ({
+  }>)("uses settings or Secret Storage according to the $name storage flag", async ({
     config: partial,
     expected,
   }) => {
@@ -3562,8 +3572,16 @@ describe("ConnectionManager", () => {
     await connectAndExpectSecrets();
 
     await manager.saveConnection(config);
-    expect(store.getConnections()).toEqual([config]);
-    await expect(store.getSecret(config.id)).resolves.toBeUndefined();
+    expect(store.getConnections()).toEqual([
+      config.type === "dynamodb"
+        ? {
+            ...config,
+            awsCredentialMode: "static",
+            awsSessionTokenRequired: true,
+          }
+        : config,
+    ]);
+    await expect(store.getSecret(config.id)).resolves.toBeDefined();
     await connectAndExpectSecrets();
     await manager.dispose();
   });
@@ -3764,7 +3782,9 @@ describe("ConnectionManager", () => {
     await manager.disconnectFrom(config.id);
 
     await manager.saveConnection({ ...config, useSecretStorage: true });
-    expect(JSON.parse((await store.getSecret(config.id)) ?? "{}")).toEqual({
+    expect(
+      JSON.parse((await store.getSecret(config.id)) ?? "{}"),
+    ).toMatchObject({
       password: "current-password",
     });
     await manager.dispose();
@@ -3773,7 +3793,7 @@ describe("ConnectionManager", () => {
   it.each([
     undefined,
     true,
-  ])("removes the Secret Storage entry only after settings switch to plaintext (previous flag %s)", async (previousFlag) => {
+  ])("retains the Secret Storage entry when settings switch to plaintext (previous flag %s)", async (previousFlag) => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -3817,12 +3837,12 @@ describe("ConnectionManager", () => {
 
     await manager.saveConnection(next);
     expect(store.getConnections()).toEqual([next]);
-    expect(deletes).toHaveBeenCalledOnce();
-    await expect(store.getSecret(previous.id)).resolves.toBeUndefined();
+    expect(deletes).not.toHaveBeenCalled();
+    await expect(store.getSecret(previous.id)).resolves.toBe(raw);
     await manager.dispose();
   });
 
-  it("keeps plaintext settings when removing the old Secret Storage entry fails", async () => {
+  it("uses saved plaintext settings without removing the old Secret Storage entry", async () => {
     const { ConnectionManager } = await import(
       "../../src/extension/connectionManager"
     );
@@ -3958,10 +3978,10 @@ describe("ConnectionManager", () => {
 
     expect(store.getConnections().slice(0, 2)).toEqual(handWritten);
     expect(writes).toHaveBeenCalledOnce();
-    expect(writes).toHaveBeenCalledWith(
-      "other",
-      JSON.stringify({ password: "other-password" }),
-    );
+    expect(writes).toHaveBeenCalledWith("other", expect.any(String));
+    expect(JSON.parse((await store.getSecret("other")) ?? "{}")).toMatchObject({
+      password: "other-password",
+    });
     await expect(store.getSecret("hand-tls")).resolves.toBeUndefined();
     await expect(store.getSecret("hand-ssh-key")).resolves.toBeUndefined();
     await manager.dispose();
@@ -4027,7 +4047,9 @@ describe("ConnectionManager", () => {
     expect(persisted.connectionUri).toBe("redis://host:6379/0");
     expect(persisted.useSecretStorage).toBe(true);
     await manager.saveConnection(persisted);
-    expect(JSON.parse((await store.getSecret("redis-uri"))!)).toEqual({
+    expect(
+      JSON.parse((await store.getSecret("redis-uri")) ?? "{}"),
+    ).toMatchObject({
       connectionUri,
     });
     await manager.connectTo("redis-uri");
@@ -4208,13 +4230,13 @@ describe("ConnectionManager", () => {
     expect(persisted?.ssh?.privateKey).toBeUndefined();
     expect(persisted?.ssh?.passphrase).toBeUndefined();
 
-    await expect(store.getSecret("conn-ssh-pg")).resolves.toBe(
-      JSON.stringify({
-        sshPrivateKey:
-          "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
-        sshPassphrase: "key-passphrase",
-      }),
-    );
+    expect(
+      JSON.parse((await store.getSecret("conn-ssh-pg")) ?? "{}"),
+    ).toMatchObject({
+      sshPrivateKey:
+        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----",
+      sshPassphrase: "key-passphrase",
+    });
 
     await manager.connectTo("conn-ssh-pg");
     expect(createSshRuntime).toHaveBeenCalledTimes(1);

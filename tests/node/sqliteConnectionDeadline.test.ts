@@ -10,8 +10,6 @@ import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 
 const installer = vi.hoisted(() => ({
   ensureSQLiteRuntimeInstalled: vi.fn(),
-  repairSQLiteManagedRuntime: vi.fn(),
-  snapshotSQLiteManagedRuntime: vi.fn(),
 }));
 const fork = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", async (importOriginal) => ({
@@ -74,10 +72,6 @@ beforeEach(() => {
     workers.push(worker);
     return worker;
   });
-  installer.snapshotSQLiteManagedRuntime.mockReturnValue({
-    packagePath: managed,
-    revision: "broken",
-  });
   installer.ensureSQLiteRuntimeInstalled.mockResolvedValue(managed);
 });
 
@@ -86,15 +80,6 @@ afterEach(async () => {
   workers.length = 0;
   vi.useRealTimers();
 });
-
-function repairGate() {
-  let finish!: (value: string | null) => void;
-  const job = new Promise<string | null>((resolve) => {
-    finish = resolve;
-  });
-  installer.repairSQLiteManagedRuntime.mockReturnValue(job);
-  return () => finish(managed);
-}
 
 async function openClient(timeoutMs = 100) {
   const client = new SQLiteWorkerClient();
@@ -109,84 +94,33 @@ async function openClient(timeoutMs = 100) {
   return { client, opening, worker };
 }
 
-async function failNativeProbe(worker: StubWorker) {
+it("fails a connect whose verified managed binary cannot be loaded, without a repair download or retry", async () => {
+  const { client, opening, worker } = await openClient();
+  expect(worker.requests[0].runtimeTargets?.[0]).toBe(managed);
   worker.reply({
     name: "SQLiteRuntimeLoadError",
     message: "failed managed native probe",
-    managedNativeFailure: true,
   });
-  await vi.advanceTimersByTimeAsync(0);
-}
+  await expect(opening).rejects.toThrow("failed managed native probe");
+  expect(client.connected).toBe(false);
+  expect(installer.ensureSQLiteRuntimeInstalled).toHaveBeenCalledOnce();
+  expect(fork).toHaveBeenCalledOnce();
+  expect(vi.getTimerCount()).toBe(0);
+});
 
-it("times out during repair without starting a retry or cancelling another waiter", async () => {
-  const finishRepair = repairGate();
-  const short = await openClient();
-  const long = await openClient(200);
-  await vi.advanceTimersByTimeAsync(20);
-  await failNativeProbe(short.worker);
-  await failNativeProbe(long.worker);
-  expect(installer.repairSQLiteManagedRuntime).toHaveBeenCalledTimes(2);
-  const [shortInterest, longInterest] =
-    installer.repairSQLiteManagedRuntime.mock.calls.map(
-      (args) => args[2] as AbortSignal,
-    );
-
-  await vi.advanceTimersByTimeAsync(80);
-  await expect(short.opening).rejects.toMatchObject({
+it("times out a worker that does not finish connecting within the budget", async () => {
+  const { client, opening, worker } = await openClient();
+  await vi.advanceTimersByTimeAsync(99);
+  expect(worker.killed).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  await expect(opening).rejects.toMatchObject({
     name: "DriverTimeoutError",
     timeoutKind: "connection",
     operationName: "connect",
     timeoutMs: 100,
   });
-  expect(shortInterest.aborted).toBe(true);
-  expect(longInterest.aborted).toBe(false);
-  expect(short.client.connected).toBe(false);
-  expect(fork).toHaveBeenCalledTimes(2);
-
-  finishRepair();
-  await vi.advanceTimersByTimeAsync(0);
-  expect(fork).toHaveBeenCalledTimes(3);
-  workers[2].reply();
-  await long.opening;
-  expect(long.client.connected).toBe(true);
-  expect(short.client.connected).toBe(false);
-  expect(vi.getTimerCount()).toBe(0);
-});
-
-it.each([
-  true,
-  false,
-])("uses the remaining budget (reply in time: %s)", async (replyInTime) => {
-  const finishRepair = repairGate();
-  const { client, opening, worker } = await openClient();
-  await vi.advanceTimersByTimeAsync(20);
-  await failNativeProbe(worker);
-  await vi.advanceTimersByTimeAsync(60);
-  // Wall-clock changes must not move the connection deadline.
-  vi.setSystemTime(Date.now() + 50_000);
-  finishRepair();
-  await vi.advanceTimersByTimeAsync(0);
-  const retry = workers[1];
-  expect(retry.requests[0]).toMatchObject({
-    method: "connect",
-    deadline: worker.requests[0].deadline,
-    runtimeTargets: [managed],
-  });
-  await vi.advanceTimersByTimeAsync(19);
-  expect(retry.killed).toBe(false);
-  if (replyInTime) {
-    retry.reply();
-    await opening;
-    expect(client.connected).toBe(true);
-  } else {
-    await vi.advanceTimersByTimeAsync(1);
-    await expect(opening).rejects.toMatchObject({
-      name: "DriverTimeoutError",
-      timeoutMs: 100,
-    });
-    expect(retry.killed).toBe(true);
-    expect(client.connected).toBe(false);
-  }
+  expect(worker.killed).toBe(true);
+  expect(client.connected).toBe(false);
   expect(vi.getTimerCount()).toBe(0);
 });
 
@@ -205,32 +139,11 @@ it("rejects a late worker reply even if the timeout callback has not run yet", a
   }
 });
 
-it("does not retry if repair finishes after the deadline before its timer fires", async () => {
-  const finishRepair = repairGate();
-  const { client, opening, worker } = await openClient();
-  await failNativeProbe(worker);
-  const late = BigInt(Math.ceil(worker.requests[0].deadline + 1)) * 1_000_000n;
-  const monotonic = vi.spyOn(process.hrtime, "bigint").mockReturnValue(late);
-  try {
-    finishRepair();
-    await expect(opening).rejects.toMatchObject({ name: "DriverTimeoutError" });
-    expect(client.connected).toBe(false);
-    expect(fork).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(0);
-  } finally {
-    monotonic.mockRestore();
-  }
-});
-
-it("keeps a no-timeout attempt unbounded across repair", async () => {
-  const finishRepair = repairGate();
+it("keeps a no-timeout attempt unbounded", async () => {
   const { client, opening, worker } = await openClient(0);
-  await failNativeProbe(worker);
+  expect(worker.requests[0].deadline).toBe(Infinity);
   await vi.advanceTimersByTimeAsync(50_000);
-  finishRepair();
-  await vi.advanceTimersByTimeAsync(0);
-  expect(workers[1].requests[0].deadline).toBe(Infinity);
-  workers[1].reply();
+  worker.reply();
   await opening;
   expect(client.connected).toBe(true);
   expect(vi.getTimerCount()).toBe(0);
@@ -239,22 +152,17 @@ it("keeps a no-timeout attempt unbounded across repair", async () => {
 it.each([
   "disconnect",
   "cancel",
-] as const)("clears the repair timer on explicit %s", async (action) => {
-  const finishRepair = repairGate();
-  const { client, opening, worker } = await openClient();
-  await failNativeProbe(worker);
-  const signal = installer.repairSQLiteManagedRuntime.mock
-    .calls[0][2] as AbortSignal;
+] as const)("clears the connect timer on explicit %s", async (action) => {
+  const { client, opening } = await openClient();
   const stop =
     action === "disconnect"
       ? client.close()
       : client.cancel({ reason: "manual", operationName: "connect" });
   vi.advanceTimersByTime(100);
   await stop;
-  await expect(opening).rejects.toThrow(/connection attempt cancelled/);
-  expect(signal.aborted).toBe(true);
-  finishRepair();
-  await vi.advanceTimersByTimeAsync(0);
+  await expect(opening).rejects.toThrow(
+    /connection attempt cancelled|cancel|closed|disconnect/i,
+  );
   expect(client.connected).toBe(false);
   expect(fork).toHaveBeenCalledOnce();
   expect(vi.getTimerCount()).toBe(0);

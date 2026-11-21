@@ -65,6 +65,17 @@ async function queryWireRow(
 }
 
 describe("PostgreSQL query results through formatting and JSON export", () => {
+  it("formats bytea once and preserves the typed binary export", async () => {
+    const { formatted, exported } = await queryWireRow(
+      [field("bytes", 17)],
+      ["\\x00ffaa"],
+    );
+    expect(formatted.rows).toBe(formatted.resultSets?.[0].rows);
+    expect(formatted.columnMeta).toBe(formatted.resultSets?.[0].columnMeta);
+    expect(formatted.rows).toEqual([{ __col_0: "0x00ffaa" }]);
+    expect(JSON.parse(exported)).toEqual({ bytes: "0x00ffaa" });
+  });
+
   it("exports array result columns as JSON arrays", async () => {
     const { formatted, exported } = await queryWireRow(
       [

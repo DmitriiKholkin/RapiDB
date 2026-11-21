@@ -626,6 +626,19 @@ describe("ConnectionFormPanel", () => {
       database: "app",
       username: "user",
       useSecretStorage: true,
+      ...(field === "apiKey"
+        ? { endpoint: "https://localhost" }
+        : field === "aws"
+          ? { awsRegion: "us-east-1" }
+          : field === "tls"
+            ? {
+                tls: {
+                  mode: "mutualTls",
+                  certFilePath: "/cert",
+                  keyFilePath: "/key",
+                },
+              }
+            : { connectionUri: "mongodb://localhost/app" }),
     };
     const connectionManager = {
       saveConnection: vi.fn(),
@@ -815,6 +828,9 @@ describe("ConnectionFormPanel", () => {
         id: "conn-tls",
         name: "Warehouse TLS",
         type: "pg",
+        host: "db.local",
+        database: "warehouse",
+        username: "reader",
         useSecretStorage: true,
         tls: {
           mode: "mutualTls",
@@ -832,6 +848,9 @@ describe("ConnectionFormPanel", () => {
         id: "conn-tls",
         name: "Warehouse TLS",
         type: "pg",
+        host: "db.local",
+        database: "warehouse",
+        username: "reader",
         useSecretStorage: true,
         tls: {
           mode: "mutualTls",
@@ -902,6 +921,9 @@ describe("ConnectionFormPanel", () => {
         id: "conn-1",
         name: "Warehouse",
         type: "pg",
+        host: "db.local",
+        database: "warehouse",
+        username: "reader",
         useSecretStorage: true,
       })),
       testConnection: vi.fn(),
@@ -914,8 +936,10 @@ describe("ConnectionFormPanel", () => {
         id: "conn-1",
         name: "Warehouse",
         type: "pg",
+        host: "db.local",
+        database: "warehouse",
+        username: "reader",
         useSecretStorage: true,
-        password: "ignored",
       },
     );
 
@@ -984,6 +1008,7 @@ describe("ConnectionFormPanel", () => {
         id: "conn-es-basic",
         name: "Elastic",
         type: "elasticsearch",
+        endpoint: "http://localhost:9200",
         useSecretStorage: true,
       })),
       testConnection: vi.fn(),
@@ -2102,7 +2127,7 @@ describe("MongoDB form credential lifecycle", () => {
     {
       method: "uri",
       keep: true,
-      expected: "mongodb://u:p%40ss@localhost/edited?authSource=admin",
+      expected: "mongodb://localhost/edited?authSource=admin",
     },
     {
       method: "uri",
@@ -2167,13 +2192,12 @@ describe("MongoDB form credential lifecycle", () => {
     await panel.webview.dispatchMessage({ type: "testConnection", payload });
     const tested = manager.testConnection.mock.calls[0]?.[0];
     expect(tested?.connectionUri).toBe(expected);
-    if (method === "fields")
-      expect(tested?.password).toBe("stored-fields-password");
+    if (method === "fields") expect(tested?.password).toBe("");
     else {
       expect(tested?.database).toBe("app");
       expect(tested?.authSource).toBeUndefined();
       expect(tested?.password).toBeUndefined();
-      expect(tested?.mongoUriHasCredentials).toBe(keep);
+      expect(tested?.mongoUriHasCredentials).toBe(false);
     }
     await panel.webview.dispatchMessage({ type: "saveConnection", payload });
     expect(manager.saveConnection.mock.calls[0]?.[0]).toEqual(tested);
@@ -2617,8 +2641,6 @@ describe("Redis and Elasticsearch URI credential editing", () => {
         connectionUri: "redis://cache.local:6380/5?socket_timeout=2",
       },
       expectedField: "connectionUri",
-      retained:
-        "redis://user:pass@cache.local:6380/5?socket_timeout=2&token=old-secret",
       safe: "redis://cache.local:6380/5?socket_timeout=2",
     },
     {
@@ -2636,17 +2658,14 @@ describe("Redis and Elasticsearch URI credential editing", () => {
       },
       payload: { endpoint: "https://elastic.local/edited" },
       expectedField: "endpoint",
-      retained:
-        "https://elastic-user:pass@elastic.local/edited?api_key=old-secret",
       safe: "https://elastic.local/edited",
     },
-  ] as const)("uses the same credential-aware config for Test and Save for $type (keep=$keep)", async ({
+  ] as const)("does not reuse $type URL credentials after an address change in either Test or Save", async ({
     type,
     existing,
     secrets,
     payload: uriPayload,
     expectedField,
-    retained,
     safe,
   }) => {
     for (const keep of [true, false]) {
@@ -2688,7 +2707,7 @@ describe("Redis and Elasticsearch URI credential editing", () => {
 
       await panel.webview.dispatchMessage({ type: "testConnection", payload });
       const tested = manager.testConnection.mock.calls[0]?.[0];
-      expect(tested?.[expectedField]).toBe(keep ? retained : safe);
+      expect(tested?.[expectedField]).toBe(safe);
       if (type === "elasticsearch")
         expect(tested?.connectionUri).toBeUndefined();
 

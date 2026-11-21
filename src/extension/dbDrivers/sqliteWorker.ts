@@ -1,6 +1,5 @@
 import { MutationNotExecutedError } from "./mutationExecutionState";
 import { SQLiteCoreDriver } from "./sqliteCore";
-import { SQLiteRuntimeLoadError } from "./sqliteRuntime";
 import {
   SQLITE_WORKER_METHODS,
   type SQLiteWorkerRequest,
@@ -63,11 +62,6 @@ process.on("message", (request: SQLiteWorkerRequest) => {
         response.error = {
           message: error instanceof Error ? error.message : String(error),
           name: error instanceof Error ? error.name : "Error",
-          ...(request.method === "connect" &&
-          error instanceof SQLiteRuntimeLoadError &&
-          error.managedNativeFailure
-            ? { managedNativeFailure: true }
-            : {}),
           ...(error instanceof TransactionVerificationError
             ? {
                 verificationFailure: error.verificationFailure,

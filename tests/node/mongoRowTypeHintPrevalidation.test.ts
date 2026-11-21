@@ -5,6 +5,7 @@ import {
   applyChangesTransactional,
   prepareApplyChangesPlan,
 } from "../../src/extension/table/tableMutationExecution";
+import { mockStandaloneMongoClient } from "../support/mockStandaloneMongoClient";
 
 const sampledBinaryColumn: ColumnTypeMeta = {
   name: "payload",
@@ -43,7 +44,7 @@ function setup() {
     .mockResolvedValue({ acknowledged: true, matchedCount: 1 });
   Object.assign(driver, {
     connected: true,
-    client: { db: () => ({ collection: () => ({ updateOne }) }) },
+    client: mockStandaloneMongoClient({ updateOne }),
   });
   const manager = {
     getDriver: () => driver,

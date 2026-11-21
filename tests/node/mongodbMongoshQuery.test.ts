@@ -9,6 +9,7 @@ import {
   Long,
   MaxKey,
   MinKey,
+  MongoServerError,
   ObjectId,
   Timestamp,
 } from "mongodb";
@@ -16,6 +17,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MongoDBDriver } from "../../src/extension/dbDrivers/mongodb";
 import type { ColumnTypeMeta } from "../../src/extension/dbDrivers/types";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 describe("MongoDB discoverable schema changes", () => {
   it.each([
@@ -63,6 +65,7 @@ function createMockDriver() {
     limit: vi.fn().mockReturnThis(),
     skip: vi.fn().mockReturnThis(),
     toArray: mockToArray,
+    [Symbol.asyncIterator]: mockMongoCursorIterator,
   });
   const mockInsertOne = vi
     .fn()
@@ -86,6 +89,14 @@ function createMockDriver() {
     .fn()
     .mockReturnValue({ toArray: mockAggregateToArray });
   const mockCommand = vi.fn().mockResolvedValue({ ok: 1 });
+  const mockHello = vi
+    .fn()
+    .mockResolvedValue({ ok: 1, isWritablePrimary: true, maxWireVersion: 21 });
+  const command = (request: Record<string, unknown>, options: unknown) =>
+    (request.hello || request.isMaster ? mockHello : mockCommand)(
+      request,
+      options,
+    );
   const mockCreateCollection = vi.fn().mockResolvedValue({});
   const mockCreateIndex = vi.fn().mockResolvedValue("users_by_email");
   const mockListCollections = vi.fn().mockReturnValue({
@@ -108,8 +119,9 @@ function createMockDriver() {
   };
 
   const mockDb = {
+    databaseName: "testdb",
     collection: vi.fn().mockReturnValue(mockCollection),
-    command: mockCommand,
+    command,
     createCollection: mockCreateCollection,
     listCollections: mockListCollections,
   };
@@ -137,7 +149,9 @@ function createMockDriver() {
     mockDeleteMany,
     mockCountDocuments,
     mockAggregate,
+    mockAggregateToArray,
     mockCommand,
+    mockHello,
     mockCreateCollection,
     mockCreateIndex,
     mockListCollections,
@@ -206,6 +220,7 @@ describe("MongoDBDriver — mongosh query()", () => {
 
     const findMock = vi.fn().mockReturnValue({
       limit: vi.fn().mockReturnThis(),
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
       toArray: vi.fn().mockResolvedValue([
         {
           _id: new ObjectId("64a1b2c3d4e5f67890abcdef"),
@@ -1013,6 +1028,7 @@ describe("MongoDBDriver — readTablePage()", () => {
         promoteValues: false,
         bsonRegExp: true,
         raw: true,
+        batchSize: 8,
       },
     );
     const readCursor = mockFind.mock.results.at(-1)?.value as {
@@ -1094,6 +1110,223 @@ describe("MongoDB table mutations", () => {
       { $set: { name: "Bob" } },
     );
     expect(mockDeleteOne).toHaveBeenCalledWith({ _id: { $eq: id } });
+  });
+
+  it.each([
+    ["mongos", { msg: "isdbgrid" }, false],
+    ["load-balanced", {}, true],
+    ["config server", { configsvr: 2, setName: "config" }, false],
+    // A modern shard member is recognized by $collStats, not by hello.
+    ["direct shard", { setName: "shard" }, false],
+  ] as const)("disables row identity and updates/deletes on %s even with one visible row", async (_name, hello, loadBalanced) => {
+    const {
+      driver,
+      mockClient,
+      mockHello,
+      mockUpdateOne,
+      mockDeleteOne,
+      mockInsertOne,
+      mockAggregateToArray,
+    } = createMockDriver();
+    mockAggregateToArray.mockImplementation(async () => [
+      { ns: "testdb.users", host: "member:27017", shard: "shard0" },
+    ]);
+    Object.assign(mockClient, { options: { loadBalanced } });
+    mockHello.mockResolvedValue({
+      ok: 1,
+      isWritablePrimary: true,
+      maxWireVersion: 21,
+      ...hello,
+    });
+    const target = { database: "testdb", schema: "", table: "users" };
+    const primaryKeys = { _id: "abc" };
+    const page = await driver.readTablePage({
+      ...target,
+      page: 1,
+      pageSize: 1,
+      filters: [],
+      sort: null,
+      skipCount: true,
+    });
+    expect(page.rows).toEqual([{ _id: "abc", name: "Alice" }]);
+    expect(page.mongoIdTypes).toBeUndefined();
+    expect(page.mongoRowMutationBlockReason).toContain("shard-key routing");
+    await expect(
+      driver.updateRows({
+        ...target,
+        updates: [{ primaryKeys, changes: { name: "Bob" } }],
+      }),
+    ).rejects.toMatchObject({
+      executionState: "not-executed",
+      message: page.mongoRowMutationBlockReason,
+    });
+    await expect(
+      driver.deleteRows({ ...target, primaryKeyValuesList: [primaryKeys] }),
+    ).rejects.toMatchObject({
+      message: page.mongoRowMutationBlockReason,
+      deleteResult: {
+        affectedRows: 0,
+        outcomeUnknown: false,
+        rowOutcomes: [{ status: "skipped" }],
+      },
+    });
+    expect(mockUpdateOne).not.toHaveBeenCalled();
+    expect(mockDeleteOne).not.toHaveBeenCalled();
+    if (loadBalanced) expect(mockHello).not.toHaveBeenCalled();
+    await driver.insertRow({ ...target, values: { name: "New document" } });
+    expect(mockInsertOne).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    17, 21, 25,
+  ])("checks a modern replica set (wire %s) with collection-scoped evidence, not hello fields", async (maxWireVersion) => {
+    const {
+      driver,
+      mockHello,
+      mockAggregate,
+      mockAggregateToArray,
+      mockUpdateOne,
+    } = createMockDriver();
+    mockHello.mockResolvedValue({
+      ok: 1,
+      setName: "ordinary",
+      isWritablePrimary: true,
+      maxWireVersion,
+      // Reported by ordinary replica sets as well; not a shard signal.
+      isImplicitDefaultMajorityWC: true,
+    });
+    mockAggregateToArray.mockResolvedValue([
+      { ns: "testdb.users", host: "member:27017" },
+    ]);
+    await driver.updateRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      updates: [{ primaryKeys: { _id: "abc" }, changes: { name: "Bob" } }],
+    });
+    expect(mockAggregate).toHaveBeenCalledWith(
+      [{ $collStats: {} }],
+      expect.objectContaining({ readPreference: "primary" }),
+    );
+    expect(mockUpdateOne).toHaveBeenCalledOnce();
+
+    // A shard member of the same version is refused, as is missing evidence.
+    for (const stats of [
+      [{ ns: "testdb.users", host: "member:27017", shard: "rs-shard" }],
+      [],
+    ]) {
+      mockAggregateToArray.mockResolvedValue(stats);
+      mockUpdateOne.mockClear();
+      await expect(
+        driver.updateRows({
+          database: "testdb",
+          schema: "",
+          table: "users",
+          updates: [{ primaryKeys: { _id: "abc" }, changes: { name: "Bob" } }],
+        }),
+      ).rejects.toMatchObject({ executionState: "not-executed" });
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+    }
+  });
+
+  it("does not probe a standalone server", async () => {
+    const { driver, mockAggregate, mockUpdateOne } = createMockDriver();
+    await driver.updateRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      updates: [{ primaryKeys: { _id: "abc" }, changes: { name: "Bob" } }],
+    });
+    expect(mockAggregate).not.toHaveBeenCalled();
+    expect(mockUpdateOne).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["ordinary", [{ ns: "testdb.users", host: "member:27017" }]],
+    ["shard", [{ ns: "testdb.users", host: "member:27017", shard: "shard0" }]],
+    ["unknown", []],
+    [
+      "unauthorized",
+      new MongoServerError({ code: 13, errmsg: "Unauthorized" }),
+    ],
+  ] as const)("uses collection-scoped topology evidence on legacy replica sets (%s)", async (mode, stats) => {
+    const {
+      driver,
+      mockHello,
+      mockAggregate,
+      mockAggregateToArray,
+      mockUpdateOne,
+    } = createMockDriver();
+    mockHello
+      .mockRejectedValueOnce(new MongoServerError({ code: 59 }))
+      .mockResolvedValue({
+        ok: 1,
+        setName: "legacy",
+        ismaster: true,
+        maxWireVersion: 8,
+      });
+    if (stats instanceof Error) mockAggregateToArray.mockRejectedValue(stats);
+    else mockAggregateToArray.mockResolvedValue(stats);
+    const update = driver.updateRows({
+      database: "testdb",
+      schema: "",
+      table: "users",
+      updates: [{ primaryKeys: { _id: "abc" }, changes: { name: "Bob" } }],
+    });
+    if (mode === "ordinary") {
+      await expect(update).resolves.toMatchObject({ affectedRows: 1 });
+      expect(mockUpdateOne).toHaveBeenCalledOnce();
+    } else {
+      await expect(update).rejects.toMatchObject({
+        executionState: "not-executed",
+        message: expect.stringContaining(
+          mode === "shard" ? "shard-key routing" : "could not verify",
+        ),
+      });
+      expect(mockUpdateOne).not.toHaveBeenCalled();
+    }
+    expect(mockHello).toHaveBeenNthCalledWith(
+      2,
+      { isMaster: 1 },
+      expect.anything(),
+    );
+    expect(mockAggregate).toHaveBeenCalledWith(
+      [{ $collStats: {} }],
+      expect.objectContaining({ readPreference: "primary" }),
+    );
+  });
+
+  it("refuses a delete preview without topology evidence and rechecks a prepared delete before executing", async () => {
+    const { driver, mockHello, mockDeleteOne } = createMockDriver();
+    const config = { id: "test", name: "MongoDB", type: "mongodb" } as const;
+    const columns = await driver.describeColumns("testdb", "", "users");
+    const service = new TableMutationService(
+      { getConnection: () => config, getDriver: () => driver } as never,
+      { getColumns: async () => columns },
+    );
+    const prepare = () =>
+      service.prepareDeleteRowsPlan("test", "testdb", "", "users", [
+        { _id: { $rapidbMongoId: { type: "string", value: "abc" } } },
+      ]);
+    const plan = await prepare();
+    expect(plan?.previewStatements[0]).toContain(".deleteOne");
+    if (!plan) throw new Error("Missing delete plan");
+
+    mockHello.mockRejectedValue(
+      new MongoServerError({ code: 13, errmsg: "Unauthorized" }),
+    );
+    await expect(prepare()).rejects.toThrow(/could not verify/);
+    await expect(service.executePreparedDeletePlan(plan)).rejects.toMatchObject(
+      {
+        deleteResult: {
+          changesPossible: false,
+          outcomeUnknown: false,
+          rowOutcomes: [{ status: "skipped" }],
+        },
+      },
+    );
+    expect(mockHello).toHaveBeenCalledTimes(3); // No legacy fallback on denial.
+    expect(mockDeleteOne).not.toHaveBeenCalled();
   });
 
   it("reports identities for completed updates when a later Mongo update conflicts", async () => {

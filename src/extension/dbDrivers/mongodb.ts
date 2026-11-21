@@ -35,6 +35,7 @@ import {
   stripMongoUriTlsOptions,
 } from "../../shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../../shared/mongoDatabase";
+import { noSqlDeleteObservationError } from "../../shared/noSqlDeleteObservation";
 import { compareNumericTokens } from "../../shared/numericNormalization";
 import { QUERY_LIMIT_POLICY } from "../../shared/safetyContracts";
 import type { ConnectionConfig } from "../connectionManager";
@@ -57,13 +58,25 @@ import {
 import { deleteRowsSequentially, prepareDeleteBatch } from "./deleteOutcomes";
 import { getMetadataSdkOptions } from "./metadataCancellation";
 import {
+  buildMongoObservedDeleteFilter,
+  type MongoDeleteState,
+  observeMongoDeleteState,
+} from "./mongodbDeleteObservation";
+import {
   decodeMongoExportCommand,
+  iterateMongoTableCursor,
   MONGO_EXPORT_BSON_OPTIONS,
-  MONGO_NATIVE_BSON_OPTIONS,
+  MONGO_TABLE_BSON_OPTIONS,
   mongoExportDbPointerNamespace,
+  mongoWireIsDbPointer,
   readMongoExportCursor,
 } from "./mongodbExportBson";
+import {
+  MONGO_TABLE_COLUMN_LIMIT,
+  MongoTableReadBudget,
+} from "./mongodbTableReadBudget";
 import { assertMongoshSupportedSyntax } from "./mongoshSyntax";
+import { MutationNotExecutedError } from "./mutationExecutionState";
 import {
   applyFilters,
   applySort,
@@ -98,7 +111,9 @@ import type {
   IDBDriver,
   IndexMeta,
   MongoValueTypeHint,
+  NoSqlDeleteObservation,
   PaginationResult,
+  PreparedObservedDelete,
   QueryColumnMeta,
   QueryExecutionOptions,
   QueryResult,
@@ -140,6 +155,12 @@ type MongoshChainOperation = {
 };
 
 type MongoSdkOptions = { signal?: AbortSignal; timeoutMS?: number };
+
+const MONGO_ROW_MUTATION_ROUTER =
+  "MongoDB Table Viewer cannot edit or delete rows through a router, load-balanced endpoint, or direct shard/config server. It does not support shard-key routing, and _id alone may not identify the selected document. Use the Query Editor with the full document key (including the shard key) on a sharded collection.";
+const MONGO_ROW_MUTATION_UNVERIFIED =
+  "MongoDB Table Viewer cannot edit or delete rows because it could not verify a standalone or non-sharded replica set. Check the connection topology and permissions (older replica sets require collStats), or use the Query Editor with an explicit, unique document key.";
+const MONGO_MIN_SUPPORTED_WIRE_VERSION = 8; // MongoDB 4.2 (Node driver 7.2)
 
 // MongoDB permits collection-scoped discovery only when both flags are set.
 const MONGO_AUTHORIZED_COLLECTION_NAMES = {
@@ -2447,32 +2468,28 @@ function mongoQueryColumnMetaFromCategories(
   };
 }
 
-function selectMongoSchemaSample(
-  documents: readonly Record<string, unknown>[],
-  fieldName: string,
-): unknown {
-  let fallbackSample: unknown;
-
-  for (const document of documents) {
-    if (!Object.hasOwn(document, fieldName)) {
-      continue;
-    }
-
-    const value = document[fieldName];
-    if (fallbackSample === undefined) {
-      fallbackSample = value;
-    }
-
-    if (value !== null && value !== undefined) {
-      return value;
-    }
-  }
-
-  return fallbackSample;
-}
-
 function isUnsupportedMongoTableField(name: string): boolean {
   return name.length === 0 || name.includes(".") || name.startsWith("$");
+}
+
+function isAmbiguousMongoDbRef(value: unknown): boolean {
+  return value instanceof DBRef && mongoWireIsDbPointer(value) === undefined;
+}
+
+function addMongoTableColumnNames(
+  names: Set<string>,
+  document: Record<string, unknown>,
+): void {
+  for (const name of Object.keys(document)) {
+    names.add(name);
+    if (names.size > MONGO_TABLE_COLUMN_LIMIT) throwMongoTableColumnLimit();
+  }
+}
+
+function throwMongoTableColumnLimit(): never {
+  throw new Error(
+    `MongoDB Table Viewer supports at most ${MONGO_TABLE_COLUMN_LIMIT} distinct fields in a read. No partial result was returned. Use a projected query or a database-native export.`,
+  );
 }
 
 function unsupportedMongoTableFieldMessage(name: string): string {
@@ -3517,6 +3534,58 @@ export class MongoDBDriver implements IDBDriver {
     request: DriverTablePageRequest,
   ): Promise<DriverTablePageResult> {
     const startTime = performance.now();
+    const client = this.client;
+    const mongoRowMutationBlockReason = request.omitRowIdentity
+      ? undefined
+      : client && this.connected
+        ? await this.getTableRowIdentityBlockReason(
+            client,
+            request.database,
+            request.table,
+            () => this.tablePageSdkOptions(request),
+          )
+        : MONGO_ROW_MUTATION_UNVERIFIED;
+    const rowIdentity = (rows: readonly Record<string, unknown>[]) => {
+      if (request.omitRowIdentity) return {};
+      const reason =
+        mongoRowMutationBlockReason ??
+        (client !== this.client ? MONGO_ROW_MUTATION_UNVERIFIED : undefined);
+      return reason
+        ? { mongoRowMutationBlockReason: reason }
+        : {
+            mongoIdTypes: rows.map(
+              (row) => this.tableRowIdTypes.get(row) ?? null,
+            ),
+          };
+    };
+    const deleteWires =
+      request.observeNoSqlDelete &&
+      !request.omitRowIdentity &&
+      !mongoRowMutationBlockReason
+        ? new WeakMap<Document, Uint8Array>()
+        : undefined;
+    const deleteObservations = (rows: readonly Record<string, unknown>[]) => {
+      if (!deleteWires || !client || client !== this.client) return {};
+      let remaining = 4 * 1024 * 1024;
+      return {
+        noSqlDeleteObservations: rows.map((row) => {
+          const document = this.tableRowRawDocuments.get(row);
+          const wire = document && deleteWires.get(document);
+          const state =
+            document && wire && observeMongoDeleteState(document, wire);
+          if (!state || state.retainedBytes > remaining) return null;
+          remaining -= state.retainedBytes;
+          const observation = { backend: "mongodb" } as const;
+          this.deleteObservationStates.set(observation, {
+            state,
+            client,
+            database: request.database || this.defaultDatabaseName(),
+            table: request.table,
+          });
+          return observation;
+        }),
+      };
+    };
     const schemaSampleLimit = Math.max(
       100,
       Math.min(500, request.pageSize * 2),
@@ -3560,22 +3629,36 @@ export class MongoDBDriver implements IDBDriver {
       const collection = this.requireDb(request.database).collection(
         request.table,
       );
-      const docs = await readMongoExportCursor(
+      const budget = new MongoTableReadBudget("page");
+      const rows: Record<string, unknown>[] = [];
+      const docs: Document[] = [];
+      const names = new Set(schemaColumns.map(({ name }) => name));
+      for await (const { document, wire } of iterateMongoTableCursor(
         collection
           .find(criteria, {
             ...this.tablePageSdkOptions(request),
-            ...MONGO_EXPORT_BSON_OPTIONS,
+            ...MONGO_TABLE_BSON_OPTIONS,
           })
           .sort(sort)
           .skip(offset)
           .limit(request.pageSize),
+        budget.acceptBson,
         collection.bsonOptions?.enableUtf8Validation,
         request.signal,
+      )) {
+        addMongoTableColumnNames(names, document);
+        if (wire) deleteWires?.set(document, wire);
+        docs.push(document);
+        const row = this.toRow(document);
+        budget.acceptDisplay(row);
+        rows.push(row);
+      }
+      // DBRef editor text is installed after the historical filter/sort view.
+      await this.prepareTableDbRefCells(
+        request,
+        rows,
+        new MongoTableReadBudget("page"),
       );
-      const rows = docs.map((doc) =>
-        this.toRow(doc as Record<string, unknown>),
-      );
-      await this.prepareTableDbRefCells(request, rows);
       const countOptions = this.tablePageSdkOptions(request);
       const rawCount = request.skipCount
         ? 0
@@ -3599,19 +3682,24 @@ export class MongoDBDriver implements IDBDriver {
                   : {}),
               })),
         rows,
-        mongoIdTypes: rows.map((row) => this.tableRowIdTypes.get(row) ?? null),
+        ...rowIdentity(rows),
+        ...deleteObservations(rows),
         mongoValueTypes: rows.map((row) => this.getTableRowValueTypes(row)),
         totalCount: toMongoTableTotalCount(rawCount),
         executionTimeMs: Math.round(performance.now() - startTime),
       };
     }
 
+    const sizes = new WeakMap<Record<string, unknown>, number>();
     const rows = await this.readRows(
       request.database,
       request.table,
       MONGODB_QUERY_HARD_CAP + 1,
       this.tablePageSdkOptions(request),
       criteria,
+      sizes,
+      deleteWires,
+      schemaColumns,
     );
     if (rows.length > MONGODB_QUERY_HARD_CAP) {
       throw new Error(
@@ -3685,11 +3773,17 @@ export class MongoDBDriver implements IDBDriver {
       this.rowValueCategory,
     );
     const paged = pageRows(sorted, request.page, request.pageSize);
-    await this.prepareTableDbRefCells(request, paged);
+    const budget = new MongoTableReadBudget("page");
+    for (const row of paged) {
+      const bytes = sizes.get(row);
+      if (bytes !== undefined) budget.acceptBson(bytes);
+    }
+    await this.prepareTableDbRefCells(request, paged, budget);
     return {
       columns: comparisonColumns,
       rows: paged,
-      mongoIdTypes: paged.map((row) => this.tableRowIdTypes.get(row) ?? null),
+      ...rowIdentity(paged),
+      ...deleteObservations(paged),
       mongoValueTypes: paged.map((row) => this.getTableRowValueTypes(row)),
       totalCount: request.skipCount ? 0 : sorted.length,
       executionTimeMs: Math.round(performance.now() - startTime),
@@ -4049,6 +4143,120 @@ export class MongoDBDriver implements IDBDriver {
     }
   }
 
+  private async getTableRowIdentityBlockReason(
+    client: MongoClient,
+    database: string,
+    table: string,
+    sdkOptions: () => MongoSdkOptions,
+  ): Promise<string | undefined> {
+    // Do not infer uniqueness from a sample of documents, shard count, or the
+    // collection's current state on mongos. A namespace can become sharded
+    // between preview/preflight and the write. Require a non-shard mongod.
+    if (client.options?.loadBalanced) return MONGO_ROW_MUTATION_ROUTER;
+    const probeOptions = () => {
+      const options = sdkOptions();
+      options.signal?.throwIfAborted();
+      return {
+        ...options,
+        timeoutMS: Math.min(options.timeoutMS ?? 2_000, 2_000),
+        readPreference: "primary" as const,
+        promoteValues: true,
+        promoteLongs: true,
+        useBigInt64: false,
+        raw: false,
+      };
+    };
+    try {
+      const admin = client.db("admin");
+      let hello: Document;
+      try {
+        hello = await admin.command({ hello: 1 }, probeOptions());
+      } catch (error) {
+        // MongoDB 4.2 and early 4.4 only support the legacy handshake name.
+        if (!(error instanceof MongoServerError) || error.code !== 59)
+          throw error;
+        hello = await admin.command({ isMaster: 1 }, probeOptions());
+      }
+      if (
+        hello.msg === "isdbgrid" ||
+        Object.hasOwn(hello, "serviceId") ||
+        Object.hasOwn(hello, "configsvr")
+      ) {
+        return MONGO_ROW_MUTATION_ROUTER;
+      }
+      if (
+        hello.ok !== 1 ||
+        (hello.isWritablePrimary ?? hello.ismaster) !== true ||
+        !Number.isInteger(hello.maxWireVersion) ||
+        hello.maxWireVersion < MONGO_MIN_SUPPORTED_WIRE_VERSION ||
+        Object.hasOwn(hello, "msg")
+      ) {
+        return MONGO_ROW_MUTATION_UNVERIFIED;
+      }
+      if (!Object.hasOwn(hello, "setName")) {
+        return hello.isreplicaset === true
+          ? MONGO_ROW_MUTATION_UNVERIFIED
+          : undefined;
+      }
+      if (typeof hello.setName !== "string" || !hello.setName) {
+        return MONGO_ROW_MUTATION_UNVERIFIED;
+      }
+      // hello has no documented field that identifies a shard member (shards
+      // are replica sets since 3.6; isImplicitDefaultMajorityWC is reported by
+      // ordinary replica sets too). On every version, $collStats on a shard
+      // member reports the local shard name, without config.collections access.
+      // Anything else than one local entry for this namespace is unverified.
+      const db = client.db(database || this.defaultDatabaseName());
+      const stats = await db
+        .collection(table)
+        .aggregate([{ $collStats: {} }], probeOptions())
+        .toArray();
+      if (stats.some((entry) => Object.hasOwn(entry, "shard"))) {
+        return MONGO_ROW_MUTATION_ROUTER;
+      }
+      if (
+        stats.length !== 1 ||
+        stats[0].ns !== `${db.databaseName}.${table}` ||
+        typeof stats[0].host !== "string" ||
+        !stats[0].host
+      ) {
+        return MONGO_ROW_MUTATION_UNVERIFIED;
+      }
+      return undefined;
+    } catch {
+      // No privilege, unsupported command/reply, or a probe timeout is never
+      // evidence of an unsharded target. Browsing can still proceed.
+      sdkOptions().signal?.throwIfAborted();
+      return MONGO_ROW_MUTATION_UNVERIFIED;
+    }
+  }
+
+  async assertTableRowMutationIdentity(
+    database: string,
+    _schema: string,
+    table: string,
+    context?: DriverOperationContext,
+  ): Promise<void> {
+    const client = this.requireClient();
+    const reason = await this.getTableRowIdentityBlockReason(
+      client,
+      database,
+      table,
+      () =>
+        context
+          ? {
+              ...this.getMutationTimeoutOptions(context),
+              signal: context.signal,
+            }
+          : getMetadataSdkOptions(),
+    );
+    if (reason || client !== this.client) {
+      throw new MutationNotExecutedError(
+        reason ?? MONGO_ROW_MUTATION_UNVERIFIED,
+      );
+    }
+  }
+
   async updateRows(
     request: DriverUpdateRowsRequest,
     context?: DriverOperationContext,
@@ -4068,6 +4276,22 @@ export class MongoDBDriver implements IDBDriver {
     const collection = this.requireDb(request.database).collection(
       request.table,
     );
+    if (request.updates.length > 0) {
+      try {
+        await this.assertTableRowMutationIdentity(
+          request.database,
+          request.schema,
+          request.table,
+          context,
+        );
+      } catch (error) {
+        if (error instanceof MutationNotExecutedError) throw error;
+        throw new MutationNotExecutedError(
+          error instanceof Error ? error.message : String(error),
+          error,
+        );
+      }
+    }
     let affectedRows = 0;
     const updateRowOutcomes: DriverUpdateRowOutcome[] = [];
     for (const [rowIndex, update] of request.updates.entries()) {
@@ -4142,7 +4366,7 @@ export class MongoDBDriver implements IDBDriver {
     const collection = await prepareDeleteBatch(
       request.primaryKeyValuesList,
       context,
-      () => {
+      async () => {
         if (
           request.primaryKeyValuesList.some(
             (entry) =>
@@ -4156,7 +4380,18 @@ export class MongoDBDriver implements IDBDriver {
             "MongoDB delete requires a complete _id for every row.",
           );
         }
-        return this.requireDb(request.database).collection(request.table);
+        const collection = this.requireDb(request.database).collection(
+          request.table,
+        );
+        if (request.primaryKeyValuesList.length > 0) {
+          await this.assertTableRowMutationIdentity(
+            request.database,
+            request.schema,
+            request.table,
+            context,
+          );
+        }
+        return collection;
       },
     );
     return deleteRowsSequentially(
@@ -4179,6 +4414,91 @@ export class MongoDBDriver implements IDBDriver {
         };
       },
     );
+  }
+
+  private readonly deleteObservationStates = new WeakMap<
+    NoSqlDeleteObservation,
+    {
+      state: MongoDeleteState;
+      client: MongoClient;
+      database: string;
+      table: string;
+    }
+  >();
+
+  prepareObservedDelete(
+    request: DriverDeleteRowsRequest,
+    observations: readonly NoSqlDeleteObservation[],
+  ): PreparedObservedDelete {
+    const client = this.requireClient();
+    const database = request.database || this.defaultDatabaseName();
+    const reject = () =>
+      new MutationNotExecutedError(noSqlDeleteObservationError.mongodb);
+    if (observations.length !== request.primaryKeyValuesList.length)
+      throw reject();
+    const filters = request.primaryKeyValuesList.map((keys, index) => {
+      const observed = this.deleteObservationStates.get(observations[index]);
+      const id = keys._id;
+      if (
+        !observed ||
+        observed.client !== client ||
+        observed.database !== database ||
+        observed.table !== request.table ||
+        Object.keys(keys).length !== 1 ||
+        !(observed.state.id instanceof ObjectId
+          ? id instanceof ObjectId && observed.state.id.equals(id)
+          : observed.state.id === id)
+      )
+        throw reject();
+      return buildMongoObservedDeleteFilter(observed.state);
+    });
+    const collation = { locale: "simple" };
+    return {
+      previewStatements: filters.map(
+        (filter) =>
+          `db.getSiblingDB(${JSON.stringify(database)}).runCommand(${this.serializeMongosh(
+            {
+              delete: request.table,
+              deletes: [{ q: filter, limit: 1, collation }],
+            },
+          )})`,
+      ),
+      execute: async (context) => {
+        const collection = await prepareDeleteBatch(
+          request.primaryKeyValuesList,
+          context,
+          async () => {
+            if (client !== this.client) throw reject();
+            await this.assertTableRowMutationIdentity(
+              request.database,
+              request.schema,
+              request.table,
+              context,
+            );
+            return client.db(database).collection(request.table);
+          },
+        );
+        return deleteRowsSequentially(
+          request.primaryKeyValuesList,
+          context,
+          (_identity, index) => {
+            if (client !== this.client) throw reject();
+            return async () => {
+              const result = await collection.deleteOne(filters[index], {
+                ...this.getMutationTimeoutOptions(context),
+                collation,
+              });
+              return result.acknowledged !== true ||
+                ![0, 1].includes(result.deletedCount)
+                ? "unknown"
+                : result.deletedCount === 1
+                  ? "deleted"
+                  : "conflict";
+            };
+          },
+        );
+      },
+    };
   }
 
   private getMutationTimeoutOptions(
@@ -4838,10 +5158,10 @@ export class MongoDBDriver implements IDBDriver {
     documents: readonly Record<string, unknown>[],
     names: readonly string[] = [],
   ): ColumnTypeMeta[] {
-    const extraNames = new Set([
-      ...names,
-      ...documents.flatMap((document) => Object.keys(document)),
-    ]);
+    const extraNames = new Set(names);
+    for (const document of documents) {
+      for (const name of Object.keys(document)) extraNames.add(name);
+    }
     for (const column of columns) extraNames.delete(column.name);
     return [
       ...columns,
@@ -4871,53 +5191,83 @@ export class MongoDBDriver implements IDBDriver {
     sdkOptions: () => MongoSdkOptions = getMetadataSdkOptions,
     writableSampleLimit = limit,
   ): Promise<ColumnTypeMeta[]> {
-    const documents = await this.readSchemaDocuments(
+    const pointersByName = new Set<string>();
+    const unknownPointers: Document[] = [];
+    const fields = new Map<
+      string,
+      {
+        first: MongoSchemaType;
+        firstNonNull?: MongoSchemaType;
+        categories: Set<TypeCategory>;
+        textNativeTypes: Set<string>;
+        writable: boolean;
+      }
+    >();
+    let index = 0;
+    for await (const document of await this.readSchemaDocuments(
       database,
       table,
       limit,
       sdkOptions,
-    );
+    )) {
+      let unknown = false;
+      for (const [name, value] of Object.entries(document)) {
+        const type = inferMongoSchemaType(value);
+        let field = fields.get(name);
+        if (!field) {
+          if (fields.size >= MONGO_TABLE_COLUMN_LIMIT) {
+            throwMongoTableColumnLimit();
+          }
+          field = {
+            first: type,
+            categories: new Set(),
+            textNativeTypes: new Set(),
+            writable: false,
+          };
+          fields.set(name, field);
+        } else if (field.first.nativeType === "undefined") {
+          field.first = type;
+        }
+        if (index < writableSampleLimit) field.writable = true;
+        if (value != null) {
+          field.firstNonNull ??= type;
+          field.categories.add(type.category);
+          if (type.category === "text")
+            field.textNativeTypes.add(type.nativeType);
+        }
+        if (value instanceof DBRef) {
+          const pointer = mongoWireIsDbPointer(value);
+          if (pointer) pointersByName.add(name);
+          else if (pointer === undefined) unknown = true;
+        }
+      }
+      if (unknown) unknownPointers.push(document);
+      index++;
+    }
     const isView = await this.isView(database, table, sdkOptions);
-    const dbPointers = await this.findDbPointerFields(
-      database,
-      table,
-      documents,
-      sdkOptions,
-    );
-    const writableNames = new Set(
-      documents.slice(0, writableSampleLimit).flatMap(Object.keys),
-    );
-    const inferredColumns = inferColumnsFromRows(documents, "_id", {
-      primaryKeyNames: isView ? [] : ["_id"],
-      nullableMode: "schemaLess",
-    });
-
-    return inferredColumns.map((inferredColumn) => {
-      const { name, isPrimaryKey, primaryKeyOrdinal } = inferredColumn;
-      const sample = selectMongoSchemaSample(documents, name);
-      const { category, nativeType, bsonSubtype } = documents.some((document) =>
-        dbPointers.get(document)?.has(name),
-      )
+    if (unknownPointers.length) {
+      const pointers = await this.findDbPointerFields(
+        database,
+        table,
+        unknownPointers,
+        sdkOptions,
+      );
+      for (const names of pointers.values()) {
+        for (const name of names) pointersByName.add(name);
+      }
+    }
+    const entries = [...fields];
+    const idIndex = entries.findIndex(([name]) => name === "_id");
+    if (!isView && idIndex > 0) entries.unshift(...entries.splice(idIndex, 1));
+    return entries.map(([name, field]) => {
+      const isPrimaryKey = !isView && name === "_id";
+      const { category, nativeType, bsonSubtype } = pointersByName.has(name)
         ? MONGO_DB_POINTER_TYPE
-        : inferMongoSchemaType(sample);
+        : (field.firstNonNull ?? field.first);
       const filterable = category !== "spatial";
       const nullable = !isPrimaryKey;
-      const observedTypes = documents
-        .filter(
-          (document) =>
-            Object.hasOwn(document, name) &&
-            document[name] !== null &&
-            document[name] !== undefined,
-        )
-        .map((document) => inferMongoSchemaType(document[name]));
-      const observedCategories = new Set(
-        observedTypes.map((observedType) => observedType.category),
-      );
-      const observedTextNativeTypes = new Set(
-        observedTypes
-          .filter((observedType) => observedType.category === "text")
-          .map((observedType) => observedType.nativeType),
-      );
+      const observedCategories = field.categories;
+      const observedTextNativeTypes = field.textNativeTypes;
       const filterOperators = new Set<FilterOperator>();
       if (filterable) {
         const categories =
@@ -4965,14 +5315,14 @@ export class MongoDBDriver implements IDBDriver {
         nullable,
         defaultValue: undefined,
         isPrimaryKey,
-        primaryKeyOrdinal,
+        primaryKeyOrdinal: isPrimaryKey ? 1 : undefined,
         isForeignKey: false,
         filterable,
         filterOperators: [...filterOperators],
         valueSemantics: "plain",
         ...(isUnsupportedMongoTableField(name) ||
         nativeType === "dbPointer" ||
-        !writableNames.has(name)
+        !field.writable
           ? { isReadOnly: true }
           : {}),
       } satisfies ColumnTypeMeta;
@@ -5012,7 +5362,7 @@ export class MongoDBDriver implements IDBDriver {
       const names = Object.keys(document).filter(
         (name) =>
           !isUnsupportedMongoTableField(name) &&
-          document[name] instanceof DBRef,
+          isAmbiguousMongoDbRef(document[name]),
       );
       if (names.length > 0) pointers.set(document, new Set(names));
     }
@@ -5024,36 +5374,39 @@ export class MongoDBDriver implements IDBDriver {
       ...new Set([...pointers.values()].flatMap((set) => [...set])),
     ];
     const options = sdkOptions();
-    let results: Record<string, unknown>[];
+    const typesById = new Map<string, Document>();
     try {
-      results = await this.requireDb(database)
-        .collection(table)
-        .aggregate(
-          [
-            {
-              $match: {
-                _id: { $in: candidates.map((document) => document._id) },
-              },
+      // The SDK's raw path supplies provenance directly. This fallback is
+      // only for decoded adapters which don't supply the original bytes.
+      const collection = this.requireDb(database).collection(table);
+      const budget = new MongoTableReadBudget("schema sample");
+      const cursor = collection.aggregate(
+        [
+          {
+            $match: {
+              _id: { $in: candidates.map((document) => document._id) },
             },
-            {
-              $project: Object.fromEntries(
-                names.map((name, index) => [
-                  `t${index}`,
-                  { $type: `$${name}` },
-                ]),
-              ),
-            },
-          ],
-          { ...options, ...MONGO_NATIVE_BSON_OPTIONS },
-        )
-        .toArray();
+          },
+          {
+            $project: Object.fromEntries(
+              names.map((name, index) => [`t${index}`, { $type: `$${name}` }]),
+            ),
+          },
+        ],
+        { ...options, ...MONGO_TABLE_BSON_OPTIONS },
+      );
+      for await (const { document } of iterateMongoTableCursor(
+        cursor,
+        budget.acceptBson,
+        collection.bsonOptions?.enableUtf8Validation,
+        options.signal,
+      )) {
+        typesById.set(mongoIdKey(document._id), document);
+      }
     } catch (error) {
       if (isMongoInterruption(error, options.signal)) throw error;
       return pointers;
     }
-    const typesById = new Map(
-      results.map((result) => [mongoIdKey(result._id), result]),
-    );
     for (const document of candidates) {
       const types = typesById.get(mongoIdKey(document._id));
       const fields = pointers.get(document);
@@ -5068,22 +5421,27 @@ export class MongoDBDriver implements IDBDriver {
   private async prepareTableDbRefCells(
     request: DriverTablePageRequest,
     rows: readonly Record<string, unknown>[],
+    budget: MongoTableReadBudget,
   ): Promise<void> {
     const documents = rows.flatMap((row) => {
       const document = this.tableRowRawDocuments.get(row);
-      return document ? [{ row, document }] : [];
+      return document ? [document] : [];
     });
     const pointers = await this.findDbPointerFields(
       request.database,
       request.table,
-      documents.map(({ document }) => document),
+      documents,
       () => this.tablePageSdkOptions(request),
     );
-    for (const { row, document } of documents) {
+    for (const row of rows) {
+      const document = this.tableRowRawDocuments.get(row);
       const schema = this.tableRowSchemas.get(row);
-      for (const [name, value] of Object.entries(document)) {
+      for (const [name, value] of Object.entries(document ?? {})) {
         if (!(value instanceof DBRef)) continue;
-        if (pointers.get(document)?.has(name)) {
+        if (
+          mongoWireIsDbPointer(value) ??
+          (document && pointers.get(document)?.has(name))
+        ) {
           schema?.set(name, MONGO_DB_POINTER_TYPE);
           continue;
         }
@@ -5101,27 +5459,29 @@ export class MongoDBDriver implements IDBDriver {
           });
         }
       }
+      budget.acceptDisplay(row);
     }
   }
 
-  private async readSchemaDocuments(
+  private async *readSchemaDocuments(
     database: string,
     table: string,
     limit: number,
     sdkOptions: () => MongoSdkOptions = getMetadataSdkOptions,
-  ): Promise<Record<string, unknown>[]> {
-    const docs = await this.requireDb(database)
-      .collection(table)
-      .find(
-        {},
-        {
-          ...sdkOptions(),
-          ...MONGO_NATIVE_BSON_OPTIONS,
-        },
-      )
-      .limit(limit)
-      .toArray();
-    return docs as Record<string, unknown>[];
+  ): AsyncGenerator<Document> {
+    const collection = this.requireDb(database).collection(table);
+    const options = sdkOptions();
+    const budget = new MongoTableReadBudget("schema sample");
+    for await (const { document } of iterateMongoTableCursor(
+      collection
+        .find({}, { ...options, ...MONGO_TABLE_BSON_OPTIONS })
+        .limit(limit),
+      budget.acceptBson,
+      collection.bsonOptions?.enableUtf8Validation,
+      options.signal,
+    )) {
+      yield document;
+    }
   }
 
   private async readRows(
@@ -5130,19 +5490,33 @@ export class MongoDBDriver implements IDBDriver {
     limit: number,
     sdkOptions: MongoSdkOptions = {},
     criteria: Record<string, unknown> = {},
+    sizes?: WeakMap<Record<string, unknown>, number>,
+    deleteWires?: WeakMap<Document, Uint8Array>,
+    schemaColumns: readonly ColumnTypeMeta[] = [],
   ): Promise<Record<string, unknown>[]> {
     const collection = this.requireDb(database).collection(table);
-    const docs = await readMongoExportCursor(
+    const budget = new MongoTableReadBudget("client-side filter or sort");
+    const rows: Record<string, unknown>[] = [];
+    const names = new Set(schemaColumns.map(({ name }) => name));
+    for await (const { document, bsonBytes, wire } of iterateMongoTableCursor(
       collection
         .find(criteria, {
           ...sdkOptions,
-          ...MONGO_EXPORT_BSON_OPTIONS,
+          ...MONGO_TABLE_BSON_OPTIONS,
         })
         .limit(limit),
+      budget.acceptBson,
       collection.bsonOptions?.enableUtf8Validation,
       sdkOptions.signal,
-    );
-    return docs.map((doc) => this.toRow(doc as Record<string, unknown>));
+    )) {
+      addMongoTableColumnNames(names, document);
+      const row = this.toRow(document);
+      budget.acceptDisplay(row);
+      sizes?.set(row, bsonBytes);
+      if (wire) deleteWires?.set(document, wire);
+      rows.push(row);
+    }
+    return rows;
   }
 
   private normalizeCriteria(

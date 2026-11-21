@@ -17,6 +17,7 @@ import {
 } from "./commands";
 import type { ExplorerSchemaScope } from "./connectionManager";
 import { ConnectionManager } from "./connectionManager";
+import { allowSQLiteDevelopmentRuntime } from "./dbDrivers/sqliteRuntime";
 import { maybeShowFeedbackPrompt } from "./feedbackPrompt";
 import { ErdPanel } from "./panels/erdPanel";
 import { QueryPanel } from "./panels/queryPanel";
@@ -27,8 +28,13 @@ import {
   type RapiDBNode,
 } from "./providers/connectionProvider";
 import { HistoryProvider } from "./providers/historyProvider";
+import { setUnverifiedTriggerVisibilityConfirmation } from "./table/lockedTableMutation";
 import { logger } from "./utils/logger";
-import { configureSQLiteInstaller } from "./utils/sqliteInstaller";
+import {
+  configureSQLiteInstaller,
+  formatSQLiteDownloadSize,
+  sqliteRuntimeDownloadSummary,
+} from "./utils/sqliteInstaller";
 
 function registerAllCommands(
   services: ActivationServices,
@@ -106,25 +112,84 @@ function activateOnce(context: vscode.ExtensionContext): void {
     logger.warn(`Feedback prompt failed: ${String(e)}`),
   );
 
+  // Only an extension launched for development or tests may fall back to a
+  // better-sqlite3 package resolved from node_modules; a production install
+  // loads nothing but the verified managed runtime.
+  if (
+    context.extensionMode === vscode.ExtensionMode.Development ||
+    context.extensionMode === vscode.ExtensionMode.Test
+  ) {
+    allowSQLiteDevelopmentRuntime(true);
+  }
   if (typeof context.globalStorageUri?.fsPath === "string") {
     configureSQLiteInstaller({
       storageRoot: context.globalStorageUri.fsPath,
-      workspaceRoots: () =>
-        vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath) ??
-        [],
       log: (message) => logger.info(message),
+      isTrusted: () => vscode.workspace.isTrusted,
+      withInstallProgress: (task) =>
+        Promise.resolve(
+          vscode.window.withProgress(
+            {
+              location: vscode.ProgressLocation.Notification,
+              title: "RapiDB: Downloading the SQLite runtime",
+              cancellable: true,
+            },
+            async (progress, token) => {
+              const controller = new AbortController();
+              const subscription = token.onCancellationRequested(() =>
+                controller.abort(),
+              );
+              let reportedPercent = 0;
+              try {
+                return await task({
+                  signal: controller.signal,
+                  report: (received, total) => {
+                    const percent = Math.min(
+                      100,
+                      Math.floor((received / total) * 100),
+                    );
+                    if (percent <= reportedPercent) return;
+                    progress.report({
+                      increment: percent - reportedPercent,
+                      message: `${formatSQLiteDownloadSize(received)} of ${formatSQLiteDownloadSize(total)} (${percent}%)`,
+                    });
+                    reportedPercent = percent;
+                  },
+                });
+              } finally {
+                subscription.dispose();
+              }
+            },
+          ),
+        ),
       allowInstall: async () => {
-        if (!vscode.workspace.isTrusted) return false;
         const install = "Install SQLite runtime";
         const choice = await vscode.window.showWarningMessage(
           "RapiDB needs to download and install the native better-sqlite3 runtime before opening SQLite databases.",
-          { modal: true },
+          {
+            modal: true,
+            detail: `Downloads ${sqliteRuntimeDownloadSummary()} once, verifies it against hashes pinned in RapiDB and stores it in the extension's global storage.`,
+          },
           install,
         );
         return choice === install;
       },
     });
   }
+
+  setUnverifiedTriggerVisibilityConfirmation(async (tables) => {
+    const apply = "Apply Without Trigger Check";
+    const choice = await vscode.window.showWarningMessage(
+      `RapiDB cannot prove that all triggers on ${tables.join(", ")} are visible to this database account.`,
+      {
+        modal: true,
+        detail:
+          "Without the TRIGGER privilege (directly or through an active role), triggers can be hidden from information_schema. A hidden trigger may have non-transactional side effects that a rollback does not undo, so RapiDB cannot guarantee that a failed or cancelled write is fully rolled back. Visible triggers still block the write. Nothing has been written yet. Apply this change once anyway?",
+      },
+      apply,
+    );
+    return choice === apply;
+  });
 
   const connectionManager = new ConnectionManager(context);
   const connectionProvider = new ConnectionProvider(

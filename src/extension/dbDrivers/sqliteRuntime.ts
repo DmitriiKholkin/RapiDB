@@ -1,13 +1,16 @@
 import { createHash } from "node:crypto";
 import type { QueryColumnMeta } from "../../shared/tableTypes";
+import { SQLITE_ARTIFACTS } from "../utils/sqliteArtifactPins";
 import {
   ensureSQLiteRuntimeInstalled,
   probeInstalledBetterSqlite3Runtime,
-  repairSQLiteManagedRuntime,
   type SQLiteInstalledRuntimeProbe,
-  snapshotSQLiteManagedRuntime,
   sqliteNativeBindingPath,
 } from "../utils/sqliteInstaller";
+import {
+  resolveSQLiteNativeTarget,
+  sqliteLinuxRuntimeRequirementHint,
+} from "../utils/sqliteNativeTarget";
 
 interface BetterSqlite3OpenOptions {
   readonly?: boolean;
@@ -91,38 +94,17 @@ export interface SQLiteRuntimeOpenConfig {
   readOnly?: boolean;
 }
 
-export type SQLiteRuntimeTargetId =
-  | "win32-x64"
-  | "win32-arm64"
-  | "linux-x64"
-  | "linux-arm64"
-  | "darwin-x64"
-  | "darwin-arm64";
-
-export function resolveSQLiteRuntimeTarget(
-  platform = process.platform,
-  arch = process.arch,
-): SQLiteRuntimeTargetId | null {
-  if (platform === "win32") {
-    if (arch === "x64") return "win32-x64";
-    if (arch === "arm64") return "win32-arm64";
-    return null;
+// The prebuild target RapiDB selects for this host (glibc and musl Linux
+// differ), or the raw platform when it is unsupported.
+function sqliteRuntimeTarget(
+  probe: SQLiteInstalledRuntimeProbe | null,
+): string {
+  if (probe?.target) return probe.target;
+  try {
+    return resolveSQLiteNativeTarget();
+  } catch {
+    return `${process.platform}-${process.arch}`;
   }
-  if (platform === "darwin") {
-    if (arch === "x64") return "darwin-x64";
-    if (arch === "arm64") return "darwin-arm64";
-    return null;
-  }
-  if (platform === "linux") {
-    if (arch === "x64") return "linux-x64";
-    if (arch === "arm64") return "linux-arm64";
-    return null;
-  }
-  return null;
-}
-
-function sqliteRuntimeTarget(): string {
-  return resolveSQLiteRuntimeTarget() ?? `${process.platform}-${process.arch}`;
 }
 
 function sqliteDateTimeKeyFromSeconds(
@@ -150,6 +132,16 @@ function sqliteTimeSortKey(value: unknown): string | null {
   const seconds = Number(whole) - 1_000_000_000_000;
   const timeOfDay = ((seconds % 86_400) + 86_400) % 86_400;
   return `${String(timeOfDay).padStart(5, "0")}.${fraction}`;
+}
+
+// Calendar day (UTC, after any offset) of RAPIDB_DATETIME_KEY as a sortable
+// day number, so hour 24 is the next day exactly as for datetime filters.
+function sqliteDateKey(value: unknown): string | null {
+  const key = sqliteDateTimeSortKey(value);
+  if (key === null) return null;
+  const seconds = Number(key.split(".")[0]) - 1_000_000_000_000;
+  const days = Math.floor(seconds / 86_400) + 10_000_000;
+  return String(days).padStart(8, "0");
 }
 
 function sqliteDateTimeSortKey(value: unknown): string | null {
@@ -232,12 +224,31 @@ function sqliteDateTimeSortKey(value: unknown): string | null {
   return sqliteDateTimeKeyFromSeconds(utcSeconds, match[7] ?? "");
 }
 
+// Set only by an extension running in ExtensionMode.Development/Test and by
+// the test setup. A global symbol survives module re-imports in tests.
+const DEVELOPMENT_RUNTIME_FLAG = Symbol.for(
+  "rapidb.sqlite.allowDevelopmentRuntime",
+);
+
+export function allowSQLiteDevelopmentRuntime(allowed: boolean): void {
+  (globalThis as Record<symbol, unknown>)[DEVELOPMENT_RUNTIME_FLAG] = allowed;
+}
+
+export function sqliteDevelopmentRuntimeAllowed(): boolean {
+  return (
+    (globalThis as Record<symbol, unknown>)[DEVELOPMENT_RUNTIME_FLAG] === true
+  );
+}
+
+// Production loads only the hash-verified managed runtime. Resolving the bare
+// "better-sqlite3" name could pick up an unverified copy from any parent
+// node_modules folder, so that fallback exists only for development and tests.
 export function resolveBetterSqlite3LoadTargets(
   validatedManagedPackage: string | null,
 ): string[] {
-  return validatedManagedPackage
-    ? [validatedManagedPackage, "better-sqlite3"]
-    : ["better-sqlite3"];
+  const targets = validatedManagedPackage ? [validatedManagedPackage] : [];
+  if (sqliteDevelopmentRuntimeAllowed()) targets.push("better-sqlite3");
+  return targets;
 }
 
 function errorMessage(error: unknown): string {
@@ -262,9 +273,7 @@ function installedProbeDetails(probe: SQLiteInstalledRuntimeProbe): string {
   return [
     `target=${probe.target}`,
     `runtime=${probe.runtime}`,
-    `packageRoot=${probe.packageRoot ?? "<not-found>"}`,
-    `bundledPackage=${probe.bundledPackagePath ?? "<unresolved>"}`,
-    `bundledPackageExists=${probe.bundledPackageExists}`,
+    `nodeApi=${probe.nodeApi}`,
     `installedPackage=${probe.installedPackagePath ?? "<unresolved>"}`,
     `installedPackageExists=${probe.installedPackageExists}`,
     `installedBinary=${probe.installedBinaryPath ?? "<unresolved>"}`,
@@ -282,15 +291,22 @@ export function formatSQLiteRuntimeLoadErrorMessage(
   const isModuleVersionError =
     errorMsg.includes("NODE_MODULE_VERSION") ||
     errorMsg.includes("MODULE_VERSION") ||
-    errorMsg.includes("different Node.js version");
+    errorMsg.includes("different Node.js version") ||
+    errorMsg.includes("Node-API version");
 
   const versionHint = isModuleVersionError
-    ? " The SQLite binary was compiled for a different Node.js version. " +
-      "Reconnect to check for a host-compatible SQLite runtime."
+    ? " The SQLite binary requires a newer Node.js/Node-API than this VS Code runtime provides. Update VS Code."
+    : "";
+  const isLibraryVersionError =
+    /\bGLIBC(?:XX)?_\d|\bCXXABI_\d|version [`'"]?[^\s`'"]+[`'"]? not found/i.test(
+      errorMsg,
+    );
+  const libraryHint = isLibraryVersionError
+    ? ` ${sqliteLinuxRuntimeRequirementHint(SQLITE_ARTIFACTS.prebuilds["linux-x64"] ?? {})}`
     : "";
 
   const managedHint =
-    " RapiDB stores the SQLite runtime in the extension cache and downloads a platform-matched prebuild on demand.";
+    " RapiDB stores the SQLite runtime in the extension cache and downloads the integrity-pinned better-sqlite3 package from registry.npmjs.org on demand.";
   const probeHint = probe
     ? ` Installed runtime probe: ${installedProbeDetails(probe)}.`
     : "";
@@ -300,7 +316,7 @@ export function formatSQLiteRuntimeLoadErrorMessage(
       : "";
   const runtimeHint = `Node.js ${process.version}, platform: ${process.platform}-${process.arch}`;
 
-  return `[RapiDB] SQLite runtime is unavailable because better-sqlite3 could not be loaded for ${sqliteRuntimeTarget()}.${versionHint}${managedHint}${attemptHint}${probeHint} Runtime: ${runtimeHint}. Error: ${errorMsg}`.trim();
+  return `[RapiDB] SQLite runtime is unavailable because better-sqlite3 could not be loaded for ${sqliteRuntimeTarget(probe)}.${versionHint}${libraryHint}${managedHint}${attemptHint}${probeHint} Runtime: ${runtimeHint}. Error: ${errorMsg}`.trim();
 }
 
 export class SQLiteRuntimeLoadError extends Error {
@@ -308,7 +324,6 @@ export class SQLiteRuntimeLoadError extends Error {
     cause: unknown,
     attemptedTargets: readonly string[],
     probe: SQLiteInstalledRuntimeProbe | null,
-    readonly managedNativeFailure: boolean,
   ) {
     super(formatSQLiteRuntimeLoadErrorMessage(cause, attemptedTargets, probe), {
       cause,
@@ -340,7 +355,7 @@ function loadBetterSqlite3(
   probe: SQLiteInstalledRuntimeProbe | null = null,
 ): LoadedSQLiteRuntime {
   let lastError: unknown;
-  let managedNativeError: unknown;
+  let managedError: unknown;
   for (const [index, target] of attemptedTargets.entries()) {
     const nativeBinding =
       index === 0 && managedPackage
@@ -356,18 +371,17 @@ function loadBetterSqlite3(
       }
 
       // require() only loads the JS wrapper. Force the addon to initialize
-      // before touching a user path, and pin managed loads to the exact binary
-      // selected by the installer rather than bindings' ambient search paths.
+      // before touching a user path, and pin managed loads to the exact
+      // hash-verified binary selected by the installer rather than any
+      // ambient prebuild search path.
       let smoke: BetterSqlite3Database;
       try {
-        smoke = new Database(":memory:", { nativeBinding });
+        smoke = new Database(
+          ":memory:",
+          nativeBinding ? { nativeBinding } : {},
+        );
       } catch (error) {
-        if (
-          nativeBinding &&
-          (error as NodeJS.ErrnoException)?.code === "ERR_DLOPEN_FAILED"
-        ) {
-          managedNativeError = error;
-        }
+        if (nativeBinding) managedError = error;
         throw error;
       }
       try {
@@ -385,57 +399,36 @@ function loadBetterSqlite3(
 
   throw new SQLiteRuntimeLoadError(
     installError ??
-      managedNativeError ??
+      managedError ??
       lastError ??
-      new Error("No better-sqlite3 load target is available."),
+      new Error(
+        "No verified SQLite runtime is available to load; RapiDB loads better-sqlite3 only from its managed, hash-verified runtime.",
+      ),
     attemptedTargets,
     probe,
-    managedNativeError !== undefined,
   );
 }
 
 async function selectSQLiteRuntime(): Promise<LoadedSQLiteRuntime> {
-  const snapshot = snapshotSQLiteManagedRuntime(__dirname);
   let managedPackage: string | null = null;
   let installError: unknown;
   let probe: SQLiteInstalledRuntimeProbe | null = null;
   try {
-    managedPackage = await ensureSQLiteRuntimeInstalled(__dirname);
+    managedPackage = await ensureSQLiteRuntimeInstalled();
   } catch (error) {
     installError = error;
   }
   try {
-    probe = probeInstalledBetterSqlite3Runtime(__dirname);
+    probe = probeInstalledBetterSqlite3Runtime();
   } catch {
     // Probe data is diagnostic only.
   }
-  try {
-    return loadBetterSqlite3(
-      resolveBetterSqlite3LoadTargets(managedPackage),
-      managedPackage,
-      installError,
-      probe,
-    );
-  } catch (error) {
-    if (
-      !(error instanceof SQLiteRuntimeLoadError) ||
-      !error.managedNativeFailure ||
-      !snapshot ||
-      snapshot.packagePath !== managedPackage
-    )
-      throw error;
-    try {
-      const repaired = await repairSQLiteManagedRuntime(__dirname, snapshot);
-      if (repaired)
-        return loadBetterSqlite3([repaired], repaired, undefined, probe);
-    } catch (repairError) {
-      throw withCause(
-        `${error.message} SQLite runtime repair failed: ${errorMessage(repairError)}`,
-        repairError,
-      );
-    }
-    throw error;
-  }
+  return loadBetterSqlite3(
+    resolveBetterSqlite3LoadTargets(managedPackage),
+    managedPackage,
+    installError,
+    probe,
+  );
 }
 
 function executeStatement<T>(
@@ -657,7 +650,7 @@ export async function openSQLiteDatabase(
     database = new Database(config.filePath, {
       readonly: readOnly,
       fileMustExist: readOnly,
-      nativeBinding,
+      ...(nativeBinding ? { nativeBinding } : {}),
     });
   } catch (error) {
     throw sqliteOpenError(config, error);
@@ -670,6 +663,11 @@ export async function openSQLiteDatabase(
       "RAPIDB_DATETIME_KEY",
       { deterministic: true },
       sqliteDateTimeSortKey,
+    );
+    database.function(
+      "RAPIDB_DATE_KEY",
+      { deterministic: true },
+      sqliteDateKey,
     );
     database.function(
       "RAPIDB_TIME_KEY",

@@ -9,6 +9,20 @@ export function elasticsearchIndexSettings(
   return { [index]: { settings: { index: { uuid } } } };
 }
 
+export function elasticsearchSourceMetadata(
+  index: string,
+  uuid = elasticsearchTestIndexUuid,
+  mappings: Record<string, unknown> = {},
+) {
+  return {
+    [index]: {
+      settings: { "index.uuid": uuid },
+      defaults: { "index.mode": "standard" },
+      mappings,
+    },
+  };
+}
+
 export function elasticsearchKeys(
   driver: ElasticsearchDriver,
   id: string,
@@ -24,6 +38,7 @@ export function elasticsearchKeys(
         table: string;
         epoch: number;
         indexUuids: Map<string, string>;
+        completeSourceIndexes: Set<string>;
       },
     ): Record<string, unknown>[];
   };
@@ -42,6 +57,7 @@ export function elasticsearchKeys(
       table,
       epoch: fixture.connectionEpoch,
       indexUuids: new Map([[index, elasticsearchTestIndexUuid]]),
+      completeSourceIndexes: new Set([index]),
     },
   )[0];
   return { _id: row._id, _identity: row._identity };

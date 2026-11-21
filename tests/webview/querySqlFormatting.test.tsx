@@ -145,6 +145,13 @@ describe("query panel formatting on open", () => {
       postgresDatabase: "app_db",
     },
     {
+      label: "SQL Server pinned bookmark",
+      source: "select DB_NAME();",
+      expected: "select DB_NAME();",
+      bookmark: true,
+      mssqlDatabase: "  Case]Δ  ",
+    },
+    {
       label: "ordinary pinned query",
       source: "select 1;",
       expected: "SELECT\n  1;",
@@ -161,18 +168,22 @@ describe("query panel formatting on open", () => {
     expected,
     bookmark,
     postgresDatabase,
+    mssqlDatabase,
     optIn,
   }) => {
+    const type = mssqlDatabase === undefined ? "pg" : "mssql";
+    const pinnedDatabase = postgresDatabase ?? mssqlDatabase;
     window.__RAPIDB_INITIAL_STATE__ = {
       view: "query",
       connectionId: "conn-1",
-      connectionType: "pg",
+      connectionType: type,
       targetBinding: { connectionId: "conn-1", sessionKey: targetSessionKey },
       postgresDatabase,
+      mssqlDatabase,
       queryText: source,
       formatOnOpen: bookmark ? false : optIn,
       isBookmarked: bookmark,
-      ...(bookmark && postgresDatabase
+      ...(bookmark && pinnedDatabase
         ? { editorPresentation: { formatOnOpen: false } }
         : {}),
     };
@@ -182,12 +193,12 @@ describe("query panel formatting on open", () => {
         {
           id: "conn-1",
           name: "Primary",
-          type: "pg",
+          type,
           targetSessionKey,
           editorPresentation: {
             formatOnOpen: !optIn,
             editorLanguage: "sql",
-            sqlDialect: "postgresql",
+            sqlDialect: type === "pg" ? "postgresql" : "transactsql",
           },
         },
       ]),
@@ -199,10 +210,18 @@ describe("query panel formatting on open", () => {
         }),
     );
 
-    if (postgresDatabase) {
+    if (pinnedDatabase !== undefined) {
       expect(
-        screen.getByText(`Pinned target: Primary / "${postgresDatabase}"`),
+        screen.getByText(
+          `Pinned target: Primary / ${JSON.stringify(pinnedDatabase)}`,
+          {
+            normalizer: (text) => text,
+          },
+        ),
       ).toBeTruthy();
+      expect(
+        screen.queryByRole("combobox", { name: "Active connection" }),
+      ).toBeNull();
     }
     if (bookmark) {
       expect(screen.getByRole("button", { name: "Bookmark" }).title).toBe(

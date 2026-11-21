@@ -406,6 +406,29 @@ describe("extension activation", () => {
     );
   });
 
+  it.each([
+    [1, false],
+    [2, true],
+    [3, true],
+    [undefined, false],
+  ])("allows the node_modules SQLite fallback only in development/test extension mode (%s)", async (extensionMode, allowed) => {
+    const flag = Symbol.for("rapidb.sqlite.allowDevelopmentRuntime");
+    const globals = globalThis as Record<symbol, unknown>;
+    const previous = globals[flag];
+    globals[flag] = false;
+    try {
+      const extension = await import("../../src/extension/extension");
+      extension.activate({
+        ...createExtensionContextStub(),
+        extensionMode,
+      } as never);
+      expect(globals[flag] === true).toBe(allowed);
+      await extension.deactivate();
+    } finally {
+      globals[flag] = previous;
+    }
+  });
+
   it("tracks explorer expand and collapse events with durable schema scopes", async () => {
     const extension = await import("../../src/extension/extension");
     const context = { subscriptions: [] as Array<{ dispose(): void }> };

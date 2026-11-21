@@ -94,8 +94,14 @@ class FakePool {
     if (this.serverVersionNum < 120000 && /\ba\.attgenerated\b/.test(sql)) {
       throw new Error("column a.attgenerated does not exist");
     }
-    if (sql.includes("FROM pg_attribute a")) {
-      return { rows: this.columnRows ?? [] };
+    if (sql.includes("AS relation_kind")) {
+      return {
+        rows: (this.columnRows ?? []).map((column) => ({
+          ...column,
+          relation_kind: "r",
+          is_partition: false,
+        })),
+      };
     }
     return { rows: [] };
   });

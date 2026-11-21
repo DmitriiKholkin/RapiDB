@@ -20,6 +20,7 @@ import { PersistedEditValidationError } from "../../src/extension/table/persiste
 import { applyChangesTransactional } from "../../src/extension/table/tableMutationExecution";
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { resolveMongoRemoteTarget } from "../../src/shared/mongoConnection";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 type MongoDocument = Record<string, unknown>;
 
@@ -62,6 +63,7 @@ function setup(
         return cursor;
       }),
       toArray: vi.fn(async () => documents.slice(0, limit)),
+      [Symbol.asyncIterator]: mockMongoCursorIterator,
     };
     return cursor;
   });
@@ -78,6 +80,7 @@ function setup(
       const ids = new Set(pipeline[0].$match._id.$in);
       const projection = Object.entries(pipeline[1].$project);
       return {
+        [Symbol.asyncIterator]: mockMongoCursorIterator,
         toArray: async () =>
           documents
             .filter((document) => ids.has(document._id))

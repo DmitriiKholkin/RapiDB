@@ -4,11 +4,17 @@ import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import * as vscode from "vscode";
 import {
+  hasAwsCredentialMaterial,
   isConnectionTlsEnabled,
+  resolveAwsCredentialMode,
   resolveConnectionTlsMode,
 } from "../shared/connectionConfig";
 import { resolveMongoRemoteTarget } from "../shared/mongoConnection";
 import { resolveMongoDatabaseName } from "../shared/mongoDatabase";
+import {
+  type QueryDatabaseScope,
+  queryDatabaseFields,
+} from "../shared/queryDatabaseTarget";
 import { getConfiguredRedisDatabaseName } from "../shared/redisDatabase";
 import { resolveUrlRemoteTarget } from "../shared/urlRemoteTarget";
 import {
@@ -46,16 +52,28 @@ import type {
   TestConnectionResult,
 } from "./connectionManagerModels";
 import {
-  type ConnectionIdsByScope,
+  bindDynamoDBSshTarget,
   type ConnectionManagerStore,
   canonicalizeOracleServiceName,
-  connectionIdsMatch,
   connectionSessionKey,
   connectionSessionSettings,
+  type DynamoDBTargetRecord,
+  dynamoDBSessionKey,
+  sanitizeConnectionSessionConfig,
   VSCodeConnectionManagerStore,
 } from "./connectionManagerStore";
 import {
+  assertConnectionSecretBinding,
+  bindConnectionSecret,
+  ConnectionSecretBindingError,
+  connectionSecretTarget,
+  credentialBearingUriChanged,
+  isUnboundLegacyConnectionSecret,
+  sameConnectionTofuPin,
+} from "./connectionSecretBinding";
+import {
   type ConnectionSecretClearOptions,
+  getAmbiguousCredentialBearingUriFields,
   hasPersistedConnectionConfigChanges,
   omitAmbiguousCredentialBearingUris,
   resolveStoredCredentialBearingUri,
@@ -72,7 +90,11 @@ import {
   withConnectionCredentialRevision,
 } from "./connectionSecretsData";
 import { DynamoDBDriver } from "./dbDrivers/dynamodb";
-import { resolveDynamoDBSshEndpoint } from "./dbDrivers/dynamodbConnection";
+import {
+  buildDynamoDBClientConfig,
+  resolveDynamoDBSshEndpoint,
+} from "./dbDrivers/dynamodbConnection";
+import { DynamoDBTargetChangedError } from "./dbDrivers/dynamodbTarget";
 import { ElasticsearchDriver } from "./dbDrivers/elasticsearch";
 import { MongoDBDriver } from "./dbDrivers/mongodb";
 import { MSSQLDriver } from "./dbDrivers/mssql";
@@ -158,15 +180,25 @@ function connectionSessionChanged(
   if (isDeepStrictEqual(before, after)) return false;
   if (next.useSecretStorage !== true) return true;
   try {
+    const sanitizedPrevious = sanitizeConnectionSessionConfig(previous);
     const sanitizedAfter = connectionSessionSettings(
-      sanitizeConnectionConfigForResponse(next),
+      sanitizeConnectionSessionConfig(next),
     );
+    if (
+      previous.useSecretStorage === true &&
+      hasPersistedConnectionConfigChanges(
+        sanitizePersistedConnectionConfig(previous),
+        previous,
+      )
+    ) {
+      // Moving credentials already present inline into Secret Storage may
+      // add a link without moving the connection or changing its auth.
+      sanitizedPrevious.secretStorageProfile = next.secretStorageProfile;
+    }
     return !(
       isDeepStrictEqual(after, sanitizedAfter) &&
       isDeepStrictEqual(
-        connectionSessionSettings(
-          sanitizeConnectionConfigForResponse(previous),
-        ),
+        connectionSessionSettings(sanitizedPrevious),
         sanitizedAfter,
       )
     );
@@ -751,7 +783,6 @@ function flattenSchemaSnapshot(snapshot: SchemaSnapshot): SchemaObjectEntry[] {
 
 const TEST_CONNECTION_ID = "__test__";
 const CONNECTION_CLEANUP_BUDGET_MS = 1_500;
-const ORPHANED_SECRET_CLEANUP_DELAY_MS = 5 * 60_000;
 
 async function awaitBoundedCleanup(
   label: string,
@@ -807,6 +838,7 @@ export class ConnectionManager
     IDBDriver,
     { key: string | null; generation: number }
   >();
+  private readonly dynamoDBTargets = new Map<string, DynamoDBTargetRecord>();
   private readonly automaticReconnectBlocks = new Map<string, string>();
   private readonly sshRuntimeMap = new Map<string, SshRuntime>();
   private readonly disposedSshRuntimes = new WeakSet<SshRuntime>();
@@ -877,15 +909,14 @@ export class ConnectionManager
   private _pendingSecretMigration: Promise<void> | null = null;
   private _disposed = false;
   private lastKnownConnections: ConnectionConfig[] = [];
+  private readonly pendingCredentialModeWrites = new Map<
+    string,
+    "profile" | "default"
+  >();
   private readonly pendingTrustedFingerprintWrites = new Map<
     string,
     ConnectionConfig
   >();
-  private readonly orphanedSecretTimers = new Map<
-    string,
-    ReturnType<typeof setTimeout>
-  >();
-  private lastKnownUserScopeIds = new Set<string>();
   constructor(
     context: vscode.ExtensionContext,
     store: ConnectionManagerStore = new VSCodeConnectionManagerStore(context),
@@ -914,10 +945,12 @@ export class ConnectionManager
         const current = new Map(
           this.getConnections().map((config) => [config.id, config]),
         );
-        this.reconcileOrphanedSecretCleanup(false);
         for (const before of previous) {
           const next = current.get(before.id);
-          if (!usesStoredCredentials(next)) {
+          if (
+            !usesStoredCredentials(next) ||
+            before.secretStorageProfile !== next?.secretStorageProfile
+          ) {
             this.credentialRevisions.delete(before.id);
           }
           const expected = this.pendingTrustedFingerprintWrites.get(before.id);
@@ -932,6 +965,17 @@ export class ConnectionManager
                   hostFingerprintSha256: expected.ssh?.hostFingerprintSha256,
                 },
               },
+              next,
+            )
+          )
+            continue;
+          const pendingMode = this.pendingCredentialModeWrites.get(before.id);
+          if (
+            next &&
+            pendingMode &&
+            before.awsCredentialMode === undefined &&
+            !connectionSessionChanged(
+              { ...before, awsCredentialMode: pendingMode },
               next,
             )
           )
@@ -969,10 +1013,6 @@ export class ConnectionManager
         });
       }
     });
-    void this.store.clearLegacyOrphanedSecretIds?.().catch((error) => {
-      logger.error("Could not clear legacy orphaned secret ids", error);
-    });
-    this.reconcileOrphanedSecretCleanup(true);
   }
 
   getConnectionSessionGeneration(id: string): number {
@@ -991,12 +1031,66 @@ export class ConnectionManager
   }
 
   getQueryTargetSessionKey(id: string): string | null {
-    return (
-      connectionSessionKey(
-        this.getConnection(id),
-        this.getConnectionSessionNonce(id),
-      ) ?? null
+    const config = this.getConnection(id);
+    const settingsKey = connectionSessionKey(
+      config,
+      this.getConnectionSessionNonce(id),
     );
+    if (!settingsKey || config?.type !== "dynamodb") return settingsKey ?? null;
+    const live = this.getDriver(id);
+    if (live?.getDynamoDBTargetFingerprint) {
+      const fingerprint = this.getDynamoDBTargetFingerprint(
+        live,
+        this.sshRuntimeMap.get(id),
+      );
+      const key = fingerprint && dynamoDBSessionKey(settingsKey, fingerprint);
+      const owner = this.driverTargetSessions.get(live);
+      return key &&
+        owner?.key === key &&
+        owner.generation === this.getConnectionSessionGeneration(id)
+        ? key
+        : null;
+    }
+    // Cold hint for restored panels only. getDriverForQuery must still connect
+    // and compare against an observed destination before an operation runs.
+    const local = this.dynamoDBTargets.get(id);
+    try {
+      const remembered =
+        local?.settingsKey === settingsKey
+          ? local
+          : this.store.readDynamoDBTarget?.(id);
+      return remembered?.settingsKey === settingsKey && remembered.fingerprint
+        ? dynamoDBSessionKey(settingsKey, remembered.fingerprint)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getDynamoDBTargetFingerprint(
+    driver: IDBDriver,
+    runtime?: SshRuntime,
+  ): string | undefined {
+    const fingerprint = driver.getDynamoDBTargetFingerprint?.();
+    if (!fingerprint || !runtime) return fingerprint;
+    return bindDynamoDBSshTarget(
+      fingerprint,
+      runtime.verifiedFingerprintSha256,
+    );
+  }
+
+  private rememberDynamoDBTarget(
+    id: string,
+    settingsKey: string,
+    fingerprint: string | null,
+  ): void {
+    const record = { settingsKey, fingerprint };
+    this.dynamoDBTargets.set(id, record);
+    void this.store
+      .writeDynamoDBTarget?.(id, record)
+      .catch((error) =>
+        logger.error("Could not remember the DynamoDB target", error),
+      );
   }
 
   // Return no promise on the hot path. A panel restored in a different host
@@ -1034,15 +1128,25 @@ export class ConnectionManager
       .then(async () => {
         if (this._disposed) return true;
         const config = this.getConnection(id);
-        if (!usesStoredCredentials(config)) return true;
+        if (!config || !usesStoredCredentials(config)) return true;
         const previous = this.credentialRevisions.get(id);
         const hadRevision = this.credentialRevisions.has(id);
         let revision: string | undefined;
+        let raw: string | undefined;
         try {
-          revision = readConnectionCredentialRevision(
-            await this.store.getSecret(id),
-          );
-        } catch {
+          raw = await this.store.getSecret(id);
+          assertConnectionSecretBinding(config, raw);
+          revision = readConnectionCredentialRevision(raw);
+        } catch (error) {
+          if (
+            error instanceof ConnectionSecretBindingError &&
+            raw !== undefined
+          ) {
+            // An unreferenced staged document is not a rotation of this
+            // target. Existing sessions keep their original credentials.
+            // Fresh connections cannot use it, even without a settings event.
+            return false;
+          }
           // An unreadable event cannot verify that a live session is still safe.
           // A cold read failure alone doesn't change the session key.
           if (
@@ -1055,13 +1159,21 @@ export class ConnectionManager
           }
           // Preserve the existing fallback for legacy profiles without an
           // explicit Secret Storage opt-in or an observed credential revision.
-          return !hadRevision && config?.useSecretStorage !== true;
+          return (
+            !hadRevision &&
+            config.secretStorageProfile === undefined &&
+            config.useSecretStorage !== true
+          );
         }
+        const current = this.getConnection(id);
         if (
           this._disposed ||
           previous !== this.credentialRevisions.get(id) ||
           hadRevision !== this.credentialRevisions.has(id) ||
-          !usesStoredCredentials(this.getConnection(id))
+          !current ||
+          !usesStoredCredentials(current) ||
+          current.secretStorageProfile !== config.secretStorageProfile ||
+          connectionSecretTarget(current) !== connectionSecretTarget(config)
         ) {
           return true;
         }
@@ -1132,206 +1244,6 @@ export class ConnectionManager
     this._onDidChangeConnectionSession.fire(id);
   }
 
-  private isOrphanedSecretCleanupDisabled(): boolean {
-    try {
-      return this.store.isRemoteWindow?.() === true;
-    } catch {
-      return true;
-    }
-  }
-
-  private reconcileOrphanedSecretCleanup(startup: boolean): void {
-    let scopes: ConnectionIdsByScope | undefined;
-    try {
-      scopes = this.store.getConnectionIdsByScope?.();
-    } catch (error) {
-      logger.error("Could not read connection settings scopes", error);
-    }
-    if (!scopes) return;
-    const cleanupDisabled = this.isOrphanedSecretCleanupDisabled();
-    const previousUserIds = this.lastKnownUserScopeIds;
-    this.lastKnownUserScopeIds = new Set(scopes.user);
-    void this._recordWorkspaceScopedConnectionIds(
-      cleanupDisabled
-        ? [...scopes.workspace, ...scopes.user]
-        : scopes.workspace,
-    );
-    for (const id of this.store.readOrphanedSecretIds?.() ?? []) {
-      if (this.isConnectionIdInUse(id)) {
-        this.cancelOrphanedSecretCleanup(id);
-      } else if (startup && !cleanupDisabled) {
-        this.armOrphanedSecretTimer(id);
-      }
-    }
-    if (cleanupDisabled) return;
-    for (const id of previousUserIds) {
-      if (!this.lastKnownUserScopeIds.has(id)) {
-        void this._scheduleOrphanedSecretCleanupIfStored(id);
-      }
-    }
-  }
-
-  private isConnectionIdInUse(
-    id: string,
-    connections: readonly { id?: unknown }[] = [],
-  ): boolean {
-    if (
-      !this.store.hasConnectionIdInAnyScope ||
-      !this.store.readWorkspaceScopedConnectionIds
-    )
-      return true;
-    try {
-      return (
-        connections.some(
-          (connection) =>
-            typeof connection.id === "string" &&
-            connectionIdsMatch(connection.id, id),
-        ) ||
-        this.store.hasConnectionIdInAnyScope(id) ||
-        this.store
-          .readWorkspaceScopedConnectionIds()
-          .some((candidate) => connectionIdsMatch(candidate, id))
-      );
-    } catch {
-      return true;
-    }
-  }
-
-  private isConnectionIdInOtherScope(id: string): boolean {
-    try {
-      return this.store.hasConnectionIdOutsideActiveScope?.(id) ?? false;
-    } catch {
-      return true;
-    }
-  }
-
-  private isOrphanedSecretCleanupPending(id: string): boolean {
-    return this.store.readOrphanedSecretIds?.().includes(id) ?? false;
-  }
-
-  private async _recordWorkspaceScopedConnectionIds(
-    ids: string[],
-  ): Promise<void> {
-    if (
-      !this.store.readWorkspaceScopedConnectionIds ||
-      !this.store.writeWorkspaceScopedConnectionIds
-    )
-      return;
-    try {
-      const current = this.store.readWorkspaceScopedConnectionIds();
-      const missing = ids.filter((id) => !current.includes(id));
-      if (missing.length === 0) return;
-      await this.store.writeWorkspaceScopedConnectionIds([
-        ...current,
-        ...missing,
-      ]);
-    } catch (error) {
-      logger.error("Could not record workspace connection ids", error);
-    }
-  }
-
-  private async _scheduleOrphanedSecretCleanupIfStored(
-    id: string,
-  ): Promise<void> {
-    if (this.isConnectionIdInUse(id)) return;
-    let stored: string | undefined;
-    try {
-      stored = await this.store.getSecret(id);
-    } catch {
-      return;
-    }
-    if (
-      stored === undefined ||
-      this._disposed ||
-      this.isOrphanedSecretCleanupDisabled() ||
-      this.lastKnownUserScopeIds.has(id) ||
-      this.isConnectionIdInUse(id)
-    )
-      return;
-    this.armOrphanedSecretTimer(id);
-    void this._updateOrphanedSecretIds((ids) =>
-      ids.includes(id) ? ids : [...ids, id],
-    );
-  }
-
-  private armOrphanedSecretTimer(id: string): void {
-    if (!id || this._disposed || this.isOrphanedSecretCleanupDisabled()) return;
-    const pending = this.orphanedSecretTimers.get(id);
-    if (pending) clearTimeout(pending);
-    const timer = setTimeout(() => {
-      if (this.orphanedSecretTimers.get(id) !== timer) return;
-      this.orphanedSecretTimers.delete(id);
-      void this._deleteOrphanedConnectionSecret(id);
-    }, ORPHANED_SECRET_CLEANUP_DELAY_MS);
-    timer.unref?.();
-    this.orphanedSecretTimers.set(id, timer);
-  }
-
-  private cancelOrphanedSecretCleanup(id: string): void {
-    const pending = this.orphanedSecretTimers.get(id);
-    if (pending) clearTimeout(pending);
-    this.orphanedSecretTimers.delete(id);
-    void this._updateOrphanedSecretIds((ids) => ids.filter((x) => x !== id));
-  }
-
-  private async _updateOrphanedSecretIds(
-    update: (ids: string[]) => string[],
-  ): Promise<void> {
-    if (!this.store.readOrphanedSecretIds || !this.store.writeOrphanedSecretIds)
-      return;
-    try {
-      const current = this.store.readOrphanedSecretIds();
-      const next = update(current);
-      if (isDeepStrictEqual(current, next)) return;
-      await this.store.writeOrphanedSecretIds(next);
-    } catch (error) {
-      logger.error("Could not record orphaned connection secrets", error);
-    }
-  }
-
-  private async _deleteOrphanedConnectionSecret(id: string): Promise<void> {
-    if (
-      this._disposed ||
-      this.isOrphanedSecretCleanupDisabled() ||
-      !this.isOrphanedSecretCleanupPending(id)
-    )
-      return;
-    try {
-      await this.store.mutateConnections(async (connections) => {
-        const stillOrphaned = () =>
-          !this._disposed &&
-          !this.orphanedSecretTimers.has(id) &&
-          this.isOrphanedSecretCleanupPending(id) &&
-          !this.isConnectionIdInUse(id, connections);
-        if (!stillOrphaned()) return { result: undefined };
-        const previousSecret = await this.store.getSecret(id);
-        await this.store.deleteSecret(id);
-        if (
-          previousSecret !== undefined &&
-          !stillOrphaned() &&
-          (await this.store.getSecret(id).catch(() => undefined)) === undefined
-        ) {
-          await this.store.storeSecret(id, previousSecret);
-        }
-        return { result: undefined };
-      });
-    } catch (error) {
-      logger.error(
-        `Could not remove Secret Storage entry of deleted connection "${id}"`,
-        error,
-      );
-      if (
-        !this._disposed &&
-        !this.orphanedSecretTimers.has(id) &&
-        this.isOrphanedSecretCleanupPending(id)
-      ) {
-        this.armOrphanedSecretTimer(id);
-      }
-      return;
-    }
-    if (this._disposed || this.orphanedSecretTimers.has(id)) return;
-    await this._updateOrphanedSecretIds((ids) => ids.filter((x) => x !== id));
-  }
   private getHistoryLimit(): number {
     return this.store.getHistoryLimit();
   }
@@ -1404,12 +1316,17 @@ export class ConnectionManager
   }
 
   private _scheduleSecretMigration(): void {
-    if (this._pendingSecretMigration) {
+    if (
+      this._pendingSecretMigration ||
+      this.store.canMutateConnections?.() === false
+    ) {
       return;
     }
 
     const pending = Promise.resolve()
-      .then(() => this._migrateAllStoredConnectionSecrets())
+      .then(() => {
+        if (!this._disposed) return this._migrateAllStoredConnectionSecrets();
+      })
       .catch(() => undefined)
       .finally(() => {
         this._pendingSecretMigration = null;
@@ -1419,53 +1336,39 @@ export class ConnectionManager
   }
 
   private async _persistConnectionSecretsIfNeeded(
-    config: ConnectionConfig,
-    clearOptions: ConnectionSecretClearOptions = {},
-    ignorePreviousSecrets = false,
-  ): Promise<(() => Promise<void>) | undefined> {
-    const previousSecretSnapshot = await this.store.getSecret(config.id);
-    const nextSecretSnapshot = shouldForceSecretStorage(config)
-      ? serializeConnectionSecretsForStoredConfig(
-          config,
-          ignorePreviousSecrets ? undefined : previousSecretSnapshot,
-          clearOptions,
-        )
-      : undefined;
-    if (nextSecretSnapshot === previousSecretSnapshot) {
+    id: string,
+    previous: string | undefined,
+    next: string | undefined,
+  ): Promise<
+    ((settingsWriteUnconfirmed?: boolean) => Promise<void>) | undefined
+  > {
+    if (next === previous || next === undefined) {
       return undefined;
     }
-
-    return this._stageConnectionSecret(
-      config.id,
-      previousSecretSnapshot,
-      nextSecretSnapshot,
-    );
+    return this._stageConnectionSecret(id, previous, next);
   }
 
   private async _stageConnectionSecret(
     id: string,
     previousSecret: string | undefined,
-    stagedSecret: string | undefined,
-  ): Promise<() => Promise<void>> {
-    const restore = async (): Promise<void> => {
+    stagedSecret: string,
+  ): Promise<(settingsWriteUnconfirmed?: boolean) => Promise<void>> {
+    const restore = async (settingsWriteUnconfirmed = false): Promise<void> => {
       // A different window may have committed a credential-only revision while
       // this settings write was pending. Do not undo its committed secret.
       if ((await this.store.getSecret(id)) !== stagedSecret) {
         return;
       }
       if (previousSecret === undefined) {
-        await this.store.deleteSecret(id);
+        // Only undo a new key when no settings write could have published it.
+        if (!settingsWriteUnconfirmed) await this.store.deleteSecret(id);
       } else {
         await this.store.storeSecret(id, previousSecret);
       }
     };
 
     try {
-      if (stagedSecret === undefined) {
-        await this.store.deleteSecret(id);
-      } else {
-        await this.store.storeSecret(id, stagedSecret);
-      }
+      await this.store.storeSecret(id, stagedSecret);
     } catch (writeError) {
       try {
         await restore();
@@ -1493,42 +1396,119 @@ export class ConnectionManager
     return hinted;
   }
 
-  private async _removeUnusedConnectionSecrets(id: string): Promise<void> {
-    try {
-      await this.store.mutateConnections(async (connections) => {
-        const current = connections.find((connection) => connection.id === id);
-        if (
-          current &&
-          (current.useSecretStorage === false || current.type === "sqlite") &&
-          (await this.store.getSecret(id)) !== undefined
-        ) {
-          await this.store.deleteSecret(id);
-        }
-        return { result: undefined };
-      });
-    } catch (error) {
-      logger.error(
-        `Could not remove unused Secret Storage entry for connection "${id}"`,
-        error,
-      );
-    }
-  }
-
   private async _hasUnflaggedStoredSecrets(
     config: ConnectionConfig,
   ): Promise<boolean> {
-    return (
-      typeof config.useSecretStorage !== "boolean" &&
-      config.type !== "sqlite" &&
-      !shouldKeepHandWrittenSecretsInSettings(config) &&
-      (await this.store.getSecret(config.id)) !== undefined
+    if (
+      typeof config.useSecretStorage === "boolean" ||
+      !usesStoredCredentials(config)
+    )
+      return false;
+    const raw = await this.store.getSecret(config.id);
+    assertConnectionSecretBinding(config, raw);
+    return raw !== undefined;
+  }
+
+  private async _prepareInlineSecretMigration(config: ConnectionConfig) {
+    const persisted = sanitizePersistedConnectionConfig(config);
+    const previous = await this.store.getSecret(config.id);
+    assertConnectionSecretBinding(config, previous);
+    const settingsChanged = hasPersistedConnectionConfigChanges(
+      persisted,
+      config,
     );
+    const next = serializeConnectionSecretsForStoredConfig(config, previous, {
+      retainCredentialBearingUris: true,
+    });
+    if (!settingsChanged && next === previous) return;
+    if (next !== previous && settingsChanged) {
+      persisted.secretStorageProfile = randomUUID();
+    }
+    const rollback = await this._persistConnectionSecretsIfNeeded(
+      config.id,
+      previous,
+      next !== previous ? bindConnectionSecret(persisted, next) : previous,
+    );
+    return { persisted: settingsChanged ? persisted : undefined, rollback };
+  }
+
+  // Older DynamoDB profiles have no explicit credential source. Two cases are
+  // unambiguous once Secret Storage has been read successfully and holds no
+  // AWS access keys for the profile (and no keys are in settings): a named
+  // AWS profile means "profile", no profile means the default chain. Persist
+  // the source so a later loss of Secret Storage cannot reclassify a profile.
+  // Anything else (keys next to a profile name, a read failure, a document
+  // already bound to its target) stays unresolved and Edit Connection asks.
+  private async _migrateLegacyDynamoDBCredentialMode(
+    config: ConnectionConfig,
+  ): Promise<void> {
+    if (
+      config.type !== "dynamodb" ||
+      config.awsCredentialMode !== undefined ||
+      resolveAwsCredentialMode(config) !== undefined ||
+      !usesStoredCredentials(config) ||
+      this.store.canMutateConnections?.() === false
+    ) {
+      return;
+    }
+    let raw: string | undefined;
+    try {
+      raw = await this.store.getSecret(config.id);
+    } catch {
+      return;
+    }
+    const unambiguous = (stored: ConnectionConfig, value?: string) =>
+      (value === undefined || isUnboundLegacyConnectionSecret(stored, value)) &&
+      !hasAwsCredentialMaterial(parseStoredConnectionSecrets(value));
+    if (!unambiguous(config, raw)) return;
+    const mode = config.awsProfile?.trim() ? "profile" : "default";
+    const target = connectionSecretTarget(config);
+    this.pendingCredentialModeWrites.set(config.id, mode);
+    try {
+      const changed = await this.store.mutateConnections(async (current) => {
+        const index = current.findIndex(({ id }) => id === config.id);
+        const stored = current[index];
+        if (
+          stored?.type !== "dynamodb" ||
+          stored.awsCredentialMode !== undefined ||
+          resolveAwsCredentialMode(stored) !== undefined ||
+          connectionSecretTarget(stored) !== target ||
+          (stored.awsProfile?.trim() ? "profile" : "default") !== mode
+        ) {
+          return { result: false };
+        }
+        const latest = await this.store.getSecret(config.id);
+        if (latest !== raw || !unambiguous(stored, latest)) {
+          return { result: false };
+        }
+        const next = [...current];
+        next[index] = { ...stored, awsCredentialMode: mode };
+        return { connections: next, result: true };
+      });
+      if (changed) {
+        this._connectionsCache = null;
+        this.getConnections();
+      }
+    } catch (error) {
+      logger.error(
+        `Could not record the DynamoDB credential source of connection "${config.id}"`,
+        error,
+      );
+    } finally {
+      if (this.pendingCredentialModeWrites.get(config.id) === mode) {
+        this.pendingCredentialModeWrites.delete(config.id);
+      }
+    }
   }
 
   private async _migrateSingleConnectionSecretsIfNeeded(
     config: ConnectionConfig,
   ): Promise<void> {
-    if (config.type === "sqlite" || !shouldForceSecretStorage(config)) {
+    if (
+      config.type === "sqlite" ||
+      !shouldForceSecretStorage(config) ||
+      this.store.canMutateConnections?.() === false
+    ) {
       return;
     }
     await this.store.mutateConnections(async (storedConnections) => {
@@ -1542,17 +1522,15 @@ export class ConnectionManager
       const liveConfig = canonicalizeOracleServiceName(
         storedConnections[index],
       );
-      const rollback = await this._persistConnectionSecretsIfNeeded(
-        liveConfig,
-        { retainCredentialBearingUris: true },
-      );
-      const persisted = sanitizePersistedConnectionConfig(liveConfig);
-      if (!hasPersistedConnectionConfigChanges(persisted, liveConfig)) {
-        return { result: undefined, rollback };
-      }
+      const migration = await this._prepareInlineSecretMigration(liveConfig);
+      if (!migration) return { result: undefined };
       const next = [...storedConnections];
-      next[index] = persisted;
-      return { connections: next, result: undefined, rollback };
+      if (migration.persisted) next[index] = migration.persisted;
+      return {
+        connections: migration.persisted ? next : undefined,
+        result: undefined,
+        rollback: migration.rollback,
+      };
     });
     this._connectionsCache = null;
   }
@@ -1560,8 +1538,9 @@ export class ConnectionManager
   private async _migrateAllStoredConnectionSecrets(): Promise<void> {
     const changed = await this.store.mutateConnections(
       async (storedConnections) => {
+        if (this._disposed) return { result: false };
         const next = [...storedConnections];
-        const rollbacks: Array<() => Promise<void>> = [];
+        const rollbacks: Array<(unconfirmed?: boolean) => Promise<void>> = [];
         let hasChanges = false;
         for (let index = 0; index < next.length; index += 1) {
           const connection = canonicalizeOracleServiceName(next[index]);
@@ -1577,16 +1556,11 @@ export class ConnectionManager
             ) {
               continue;
             }
-            const rollback = await this._persistConnectionSecretsIfNeeded(
-              connection,
-              { retainCredentialBearingUris: true },
-            );
-            if (rollback) {
-              rollbacks.push(rollback);
-            }
-            const persisted = sanitizePersistedConnectionConfig(connection);
-            if (hasPersistedConnectionConfigChanges(persisted, connection)) {
-              next[index] = persisted;
+            const migration =
+              await this._prepareInlineSecretMigration(connection);
+            if (migration?.rollback) rollbacks.push(migration.rollback);
+            if (migration?.persisted) {
+              next[index] = migration.persisted;
               hasChanges = true;
             }
           } catch (error) {
@@ -1597,11 +1571,11 @@ export class ConnectionManager
           }
         }
 
-        const rollback = async (): Promise<void> => {
+        const rollback = async (unconfirmed?: boolean): Promise<void> => {
           const rollbackErrors: unknown[] = [];
           for (const restore of rollbacks.reverse()) {
             try {
-              await restore();
+              await restore(unconfirmed);
             } catch (error) {
               rollbackErrors.push(error);
             }
@@ -1648,8 +1622,17 @@ export class ConnectionManager
   private invalidateDriverStaticMetadata(connectionId: string): void {
     this._driverStaticMetadataCache.delete(connectionId);
   }
-  getConnection(id: string): ConnectionConfig | undefined {
-    return this.getConnections().find((c) => c.id === id);
+  getConnection(id: string, fresh = false): ConnectionConfig | undefined {
+    if (!fresh) return this.getConnections().find((c) => c.id === id);
+    this._assertNotDisposed();
+    const config = this.store.getConnections().find((c) => c.id === id);
+    return (
+      config &&
+      canonicalizeOracleServiceName({
+        ...config,
+        username: config.username ?? config.user,
+      })
+    );
   }
   async saveConnection(
     config: ConnectionConfig,
@@ -1665,6 +1648,23 @@ export class ConnectionManager
           ? config.id
           : randomUUID(),
     });
+    if (canonicalConfig.type === "dynamodb") {
+      canonicalConfig.awsCredentialMode =
+        resolveAwsCredentialMode(canonicalConfig);
+      if (canonicalConfig.awsCredentialMode !== "profile") {
+        delete canonicalConfig.awsProfile;
+      }
+      if (canonicalConfig.awsCredentialMode !== "static") {
+        delete canonicalConfig.awsAccessKeyId;
+        delete canonicalConfig.awsSecretAccessKey;
+        delete canonicalConfig.awsSessionToken;
+        delete canonicalConfig.awsSessionTokenRequired;
+      } else if (canonicalConfig.awsSessionToken?.trim()) {
+        canonicalConfig.awsSessionTokenRequired = true;
+      }
+      // Validate the source before persisting/redacting any secrets.
+      buildDynamoDBClientConfig(canonicalConfig);
+    }
 
     const validation = this.validationService.validate(canonicalConfig);
     if (!validation.valid) {
@@ -1672,6 +1672,8 @@ export class ConnectionManager
     }
 
     let persistedConfig = sanitizePersistedConnectionConfig(canonicalConfig);
+    // An incoming form / caller never chooses a Secret Storage link.
+    delete persistedConfig.secretStorageProfile;
     let replacesSecretProfileWithSqlite = false;
     let credentialCommit: { revision: string; generation: number } | undefined;
     let credentialCommitError: Error | undefined;
@@ -1702,11 +1704,9 @@ export class ConnectionManager
               "Secret Storage was unavailable when the editor was opened. Reopen Edit Connection before saving.",
             );
           }
-          if (
-            previous.useSecretStorage !== false &&
-            previous.type !== "sqlite"
-          ) {
+          if (usesStoredCredentials(previous)) {
             editSecretSnapshot = await this.store.getSecret(previous.id);
+            assertConnectionSecretBinding(previous, editSecretSnapshot);
           }
           if (
             !connectionEditStatesMatch(
@@ -1714,6 +1714,7 @@ export class ConnectionManager
               connectionEditState(
                 previous,
                 parseStoredConnectionSecrets(editSecretSnapshot),
+                readConnectionCredentialRevision(editSecretSnapshot),
               ),
             )
           ) {
@@ -1729,6 +1730,7 @@ export class ConnectionManager
         }
         let sessionChanged = false;
         let previousSecret: string | undefined;
+        let previousEffectiveSecrets: string | undefined;
         if (previous) {
           const safePrevious = omitAmbiguousCredentialBearingUris(previous);
           const hydratedPrevious = await this._hydratePassword(
@@ -1737,22 +1739,67 @@ export class ConnectionManager
               previousSecret = stored;
             },
           );
-          const previousSecrets =
+          previousEffectiveSecrets =
             serializeConnectionSecretsForConfig(hydratedPrevious);
-          const nextSecrets = shouldForceSecretStorage(canonicalConfig)
-            ? serializeConnectionSecretsForStoredConfig(
-                canonicalConfig,
-                previousSecrets,
-                clearOptions,
-              )
-            : serializeConnectionSecretsForConfig(canonicalConfig);
+        }
+        const storesSecrets =
+          canonicalConfig.type !== "sqlite" &&
+          shouldForceSecretStorage(canonicalConfig);
+        if (storesSecrets && !usesStoredCredentials(previous)) {
+          // Read for rollback only. Never inherit an entry with no originating
+          // saved profile in this scope, or from a plaintext/SQLite profile.
+          previousSecret = await this.store.getSecret(canonicalConfig.id);
+        }
+        const sameTarget =
+          previous !== undefined &&
+          getAmbiguousCredentialBearingUriFields(previous).length === 0 &&
+          sameConnectionTofuPin(previous, persistedConfig) &&
+          connectionSecretTarget(previous) ===
+            connectionSecretTarget(persistedConfig);
+        const inheritSecrets = sameTarget && usesStoredCredentials(previous);
+        const nextSecrets = storesSecrets
+          ? serializeConnectionSecretsForStoredConfig(
+              canonicalConfig,
+              inheritSecrets ? previousSecret : undefined,
+              clearOptions,
+            )
+          : serializeConnectionSecretsForConfig(canonicalConfig);
+        if (storesSecrets) {
+          persistedConfig.secretStorageProfile = inheritSecrets
+            ? previous?.secretStorageProfile
+            : undefined;
+          if (
+            (!inheritSecrets &&
+              (previousSecret !== undefined || nextSecrets !== undefined)) ||
+            credentialBearingUriChanged(
+              parseStoredConnectionSecrets(
+                inheritSecrets ? previousSecret : undefined,
+              ),
+              parseStoredConnectionSecrets(nextSecrets),
+            )
+          ) {
+            persistedConfig.secretStorageProfile = randomUUID();
+          }
+        }
+        // A new link is published only in settings. Before that, old settings
+        // reject the staged document even if both URIs redact to the same URL.
+        const nextSecret =
+          storesSecrets &&
+          (nextSecrets !== previousSecret ||
+            persistedConfig.secretStorageProfile !==
+              previous?.secretStorageProfile)
+            ? bindConnectionSecret(persistedConfig, nextSecrets)
+            : nextSecrets;
+        if (previous) {
           sessionChanged =
             connectionSessionChanged(
-              sanitizeConnectionConfigForResponse(safePrevious),
+              sanitizeConnectionConfigForResponse(
+                omitAmbiguousCredentialBearingUris(previous),
+              ),
               sanitizeConnectionConfigForResponse(persistedConfig),
             ) ||
             !isDeepStrictEqual(
-              parseStoredConnectionSecrets(previousSecrets),
+              parseStoredConnectionSecrets(previousEffectiveSecrets),
               parseStoredConnectionSecrets(nextSecrets),
             );
         }
@@ -1772,11 +1819,6 @@ export class ConnectionManager
           const settingsChanged = !samePersistedConnection(
             previous,
             persistedConfig,
-          );
-          const nextSecret = serializeConnectionSecretsForStoredConfig(
-            canonicalConfig,
-            previousSecret,
-            clearOptions,
           );
           const assertCredentialsCurrent = async (
             expected: string | undefined,
@@ -1799,8 +1841,8 @@ export class ConnectionManager
               revision,
             );
             const commit = async (expected: string | undefined) => {
-              // The queue serializes this host. SecretStorage has no CAS, so
-              // across hosts this check cannot cover the gap before store().
+              // Participating writers in this settings scope are serialized.
+              // SecretStorage still has no CAS across different scopes.
               await assertCredentialsCurrent(expected);
               const generation = this.getConnectionSessionGeneration(id);
               try {
@@ -1825,7 +1867,7 @@ export class ConnectionManager
             const rollback = await this._stageConnectionSecret(
               id,
               previousSecret,
-              nextSecret,
+              nextSecret ?? bindConnectionSecret(persistedConfig, undefined),
             );
             const next = [...connections];
             next[idx] = persistedConfig;
@@ -1851,7 +1893,7 @@ export class ConnectionManager
                 } catch (error) {
                   let cause = error;
                   try {
-                    await rollback();
+                    await rollback(true); // Settings may already reference the staged key.
                   } catch (rollbackError) {
                     credentialRollbackFailed = true;
                     cause = new AggregateError([error, rollbackError]);
@@ -1871,16 +1913,26 @@ export class ConnectionManager
           }
           if (!settingsChanged) return { result: false };
         }
-        const rollback =
-          canonicalConfig.type !== "sqlite" &&
-          shouldForceSecretStorage(canonicalConfig)
-            ? await this._persistConnectionSecretsIfNeeded(
-                canonicalConfig,
-                clearOptions,
-                previous?.useSecretStorage === false ||
-                  previous?.type === "sqlite",
-              )
-            : undefined;
+        if (
+          storesSecrets &&
+          ((precondition?.kind === "edit" &&
+            usesStoredCredentials(previous) &&
+            editSecretSnapshot !== previousSecret) ||
+            (nextSecret !== previousSecret &&
+              (await this.store.getSecret(canonicalConfig.id)) !==
+                previousSecret))
+        ) {
+          throw new Error(
+            "Saved credentials changed during the operation. Please retry.",
+          );
+        }
+        const rollback = storesSecrets
+          ? await this._persistConnectionSecretsIfNeeded(
+              canonicalConfig.id,
+              previousSecret,
+              nextSecret,
+            )
+          : undefined;
         const next = [...connections];
         if (idx >= 0) {
           next[idx] = persistedConfig;
@@ -1932,13 +1984,15 @@ export class ConnectionManager
       this._onDidChangeConnections.fire();
       return sanitizeConnectionConfigForResponse(persistedConfig);
     }
-    if (sessionChanged) this.markConnectionSessionChanged(canonicalConfig.id);
+    if (sessionChanged) {
+      this.credentialRevisions.delete(canonicalConfig.id);
+      this.markConnectionSessionChanged(canonicalConfig.id);
+    }
     if (
       persistedConfig.useSecretStorage === false ||
       replacesSecretProfileWithSqlite
     ) {
       this.credentialRevisions.delete(canonicalConfig.id);
-      await this._removeUnusedConnectionSecrets(canonicalConfig.id);
     }
     this.invalidateDriverStaticMetadata(canonicalConfig.id);
     if (
@@ -1954,41 +2008,14 @@ export class ConnectionManager
   async removeConnection(id: string): Promise<boolean> {
     this._assertNotDisposed();
 
-    await this.disconnectFrom(id);
-    const removed = await this.store.mutateConnections(async (connections) => {
-      if (!connections.some((connection) => connection.id === id)) {
-        return { result: false };
-      }
+    const removed = await this.store.mutateConnections((connections) => {
       const remaining = connections.filter(
         (connection) => connection.id !== id,
       );
-      if (this.isConnectionIdInOtherScope(id)) {
-        return { connections: remaining, result: true };
-      }
-      const previousSecret = await this.store.getSecret(id);
-      try {
-        await this.store.deleteSecret(id);
-      } catch (deleteError) {
-        if (previousSecret !== undefined) {
-          try {
-            await this.store.storeSecret(id, previousSecret);
-          } catch (rollbackError) {
-            throw new AggregateError(
-              [deleteError, rollbackError],
-              `Secret deletion and rollback failed for connection "${id}".`,
-            );
-          }
-        }
-        throw deleteError;
-      }
-      return {
-        connections: remaining,
-        result: true,
-        rollback:
-          previousSecret === undefined
-            ? undefined
-            : () => this.store.storeSecret(id, previousSecret),
-      };
+      if (remaining.length === connections.length) return { result: false };
+      // SecretStorage may be shared with workspaces and profiles we cannot
+      // inspect. Removing a settings entry is not proof its secret is unused.
+      return { connections: remaining, result: true };
     });
     if (!removed) {
       return false;
@@ -1996,10 +2023,9 @@ export class ConnectionManager
     this._connectionsCache = null;
     this.credentialRevisions.delete(id);
     this.markConnectionSessionChanged(id);
-    // A query may have begun reconnecting while the removal was being saved.
-    if (this.driverMap.has(id) || this.isConnecting(id)) {
-      await this.disconnectFrom(id);
-    }
+    // Clear metadata even without an active driver. Do this after the settings
+    // commit, so a rejected removal does not disconnect a usable connection.
+    await this.disconnectFrom(id);
     this.automaticReconnectBlocks.delete(id);
     this.invalidateDriverStaticMetadata(id);
     await this._purgeHistoryForConnection(id);
@@ -2105,7 +2131,11 @@ export class ConnectionManager
       stored = await this.store.getSecret(config.id);
       this._secretReadFailures.delete(config.id);
     } catch (error) {
-      if (config.useSecretStorage === true) throw error;
+      if (
+        config.useSecretStorage === true ||
+        config.secretStorageProfile !== undefined
+      )
+        throw error;
       this._secretReadFailures.add(config.id);
       logger.error(
         `Could not read Secret Storage for connection "${config.id}"`,
@@ -2113,6 +2143,7 @@ export class ConnectionManager
       );
       return config;
     }
+    assertConnectionSecretBinding(config, stored);
     onSecretRead?.(stored);
     if (config.useSecretStorage !== true && stored === undefined) {
       return config;
@@ -2648,14 +2679,16 @@ export class ConnectionManager
     fallbackConfig: ConnectionConfig,
     connectEpoch: number,
   ): Promise<ConnectionConfig | null> {
-    await this._migrateSingleConnectionSecretsIfNeeded(fallbackConfig);
-
     if (this._isStaleConnectEpoch(id, connectEpoch)) {
       return null;
     }
 
     const liveConfig = this.getConnection(id) ?? fallbackConfig;
+    let legacySecret: string | undefined;
     const fullConfig = await this._hydratePassword(liveConfig, (stored) => {
+      if (isUnboundLegacyConnectionSecret(liveConfig, stored)) {
+        legacySecret = stored;
+      }
       if (
         !this.credentialChangeSubscription ||
         this._isStaleConnectEpoch(id, connectEpoch)
@@ -2682,8 +2715,59 @@ export class ConnectionManager
     if (!validation.valid) {
       throw new Error(validation.message ?? "Connection settings are invalid.");
     }
+    if (legacySecret !== undefined) {
+      await this.bindLegacySecretOnFirstUse(liveConfig, legacySecret);
+    }
 
     return fullConfig;
+  }
+
+  // Trust on first use for secrets saved before target binding existed: bind
+  // the document to the target it is being used with now, under the settings
+  // lock, only if neither the profile's target nor the document changed since
+  // they were read. Later target changes made outside Edit Connection are
+  // then refused. If the binding cannot be written (Secret Storage failure,
+  // read-only settings scope) the connection proceeds as before and the
+  // binding is retried on the next use.
+  private async bindLegacySecretOnFirstUse(
+    config: ConnectionConfig,
+    raw: string,
+  ): Promise<void> {
+    if (this.store.canMutateConnections?.() === false) {
+      logger.warn(
+        `Saved credentials of connection "${config.id}" are not yet bound to their target: this settings scope cannot be edited here.`,
+      );
+      return;
+    }
+    const target = connectionSecretTarget(config);
+    try {
+      await this.store.mutateConnections(async (current) => {
+        const stored = current.find(
+          (connection) => connection.id === config.id,
+        );
+        if (
+          !stored ||
+          connectionSecretTarget(stored) !== target ||
+          !isUnboundLegacyConnectionSecret(stored, raw) ||
+          (await this.store.getSecret(config.id)) !== raw
+        ) {
+          return { result: undefined };
+        }
+        return {
+          result: undefined,
+          commitSecretOnly: () =>
+            this.store.storeSecret(
+              config.id,
+              bindConnectionSecret(stored, raw),
+            ),
+        };
+      });
+    } catch (error) {
+      logger.error(
+        `Could not bind saved credentials of connection "${config.id}" to their target; retrying on next use`,
+        error,
+      );
+    }
   }
 
   private async connectPreparedDriver(
@@ -2899,10 +2983,32 @@ export class ConnectionManager
     void (async () => {
       this._secretReadFailures.delete(id);
       try {
+        const legacy = this.getConnection(id);
+        if (legacy) await this._migrateLegacyDynamoDBCredentialMode(legacy);
+        const beforeMigration = this.getConnection(id);
+        if (!beforeMigration) {
+          throw new Error(`[RapiDB] Connection "${id}" not found`);
+        }
+        // Migration can publish a profile link while retaining the same
+        // inline credentials. Capture the session key after that write.
+        await this._migrateSingleConnectionSecretsIfNeeded(beforeMigration);
+        const afterMigration = this.getConnection(id);
+        if (
+          this._isStaleConnectEpoch(id, connectEpoch) ||
+          !afterMigration ||
+          connectionSessionChanged(beforeMigration, afterMigration)
+        ) {
+          resolveAttempt();
+          return;
+        }
         const initializing = this.initializeConnectionCredentialRevision(id);
         if (initializing) await initializing;
         const targetSession = {
-          key: this.getQueryTargetSessionKey(id),
+          key:
+            connectionSessionKey(
+              this.getConnection(id),
+              this.getConnectionSessionNonce(id),
+            ) ?? null,
           generation: this.getConnectionSessionGeneration(id),
         };
         if (this.driverMap.has(id)) {
@@ -2922,12 +3028,17 @@ export class ConnectionManager
           config,
           connectEpoch,
         );
+        // Hydration can reveal a legacy DynamoDB static pair without adding
+        // a persisted mode. Check the settings snapshot here, then bind the
+        // driver to its independently verified target after connecting.
+        const currentSettings =
+          fullConfig?.type === "dynamodb" ? this.getConnection(id) : fullConfig;
         if (
           !fullConfig ||
           this._isStaleConnectEpoch(id, connectEpoch) ||
           targetSession.key !==
             (connectionSessionKey(
-              fullConfig,
+              currentSettings ?? undefined,
               this.getConnectionSessionNonce(id),
             ) ?? null) ||
           targetSession.generation !== this.getConnectionSessionGeneration(id)
@@ -2950,14 +3061,33 @@ export class ConnectionManager
           this._isStaleConnectEpoch(id, connectEpoch) ||
           targetSession.generation !==
             this.getConnectionSessionGeneration(id) ||
-          targetSession.key !== this.getQueryTargetSessionKey(id)
+          targetSession.key !==
+            (connectionSessionKey(
+              this.getConnection(id),
+              this.getConnectionSessionNonce(id),
+            ) ?? null)
         ) {
           await this.disposeUnboundConnectionResources(driver, runtime);
           resolveAttempt();
           return;
         }
 
-        this.driverTargetSessions.set(driver, targetSession);
+        const fingerprint = this.getDynamoDBTargetFingerprint(driver, runtime);
+        const oldTargetKey = this.getQueryTargetSessionKey(id);
+        let targetKey = targetSession.key;
+        if (fullConfig.type === "dynamodb") {
+          targetKey =
+            targetSession.key && fingerprint
+              ? dynamoDBSessionKey(targetSession.key, fingerprint)
+              : null;
+          if (targetSession.key && fingerprint) {
+            this.rememberDynamoDBTarget(id, targetSession.key, fingerprint);
+          }
+        }
+        this.driverTargetSessions.set(driver, {
+          ...targetSession,
+          key: targetKey,
+        });
         this.driverMap.set(id, driver);
         if (intent === "explicit") this.automaticReconnectBlocks.delete(id);
         if (runtime) {
@@ -2966,6 +3096,13 @@ export class ConnectionManager
         }
         this._invalidateSchemaState(id);
         this._onDidInvalidateConnectionMetadata.fire(id);
+        if (
+          fullConfig.type === "dynamodb" &&
+          oldTargetKey &&
+          oldTargetKey !== targetKey
+        ) {
+          this._onDidChangeConnectionSession.fire(id);
+        }
         this._onDidConnect.fire();
         resolveAttempt();
       } catch (err) {
@@ -2990,6 +3127,7 @@ export class ConnectionManager
     id: string,
     expectedKey: string,
   ): Promise<IDBDriver | undefined> {
+    if (!expectedKey) return;
     const initializing = this.initializeConnectionCredentialRevision(id);
     if (initializing && !(await initializing)) return undefined;
     if (this.getQueryTargetSessionKey(id) !== expectedKey) return undefined;
@@ -3005,13 +3143,65 @@ export class ConnectionManager
       }
     }
     const driver = this.getDriver(id);
-    const owner = driver && this.driverTargetSessions.get(driver);
-    return owner?.key === expectedKey &&
+    if (
+      !driver ||
+      this.getConnectedDriverSessionKey(id, driver) !== expectedKey
+    )
+      return;
+    await this.verifyLiveDynamoDBTarget(id, driver);
+    const owner = this.driverTargetSessions.get(driver);
+    return this.getDriver(id) === driver &&
+      owner?.key === expectedKey &&
       owner.generation === generation &&
       generation === this.getConnectionSessionGeneration(id) &&
       this.getQueryTargetSessionKey(id) === expectedKey
       ? driver
       : undefined;
+  }
+
+  async verifyLiveDynamoDBTarget(id: string, driver: IDBDriver): Promise<void> {
+    if (!driver.verifyDynamoDBTarget) return;
+    try {
+      const pinned = this.driverDiagnosticConfigs.get(driver)?.[0];
+      if (pinned && resolveAwsCredentialMode(pinned) === "static") {
+        const current = this.getConnection(id);
+        if (current?.type !== "dynamodb")
+          throw new DynamoDBTargetChangedError();
+        const hydrated = await this._hydratePassword(current).catch((error) => {
+          if (error instanceof ConnectionSecretBindingError) {
+            throw new DynamoDBTargetChangedError();
+          }
+          throw error;
+        });
+        if (
+          resolveAwsCredentialMode(hydrated) !== "static" ||
+          hydrated.awsAccessKeyId?.trim() !== pinned.awsAccessKeyId?.trim() ||
+          hydrated.awsSecretAccessKey?.trim() !==
+            pinned.awsSecretAccessKey?.trim() ||
+          hydrated.awsSessionToken?.trim() !== pinned.awsSessionToken?.trim()
+        )
+          throw new DynamoDBTargetChangedError();
+      }
+      if (
+        this.getDriver(id) !== driver ||
+        !this.getConnectedDriverSessionKey(id, driver)
+      )
+        throw new DynamoDBTargetChangedError();
+      await driver.verifyDynamoDBTarget();
+    } catch (error) {
+      if (
+        error instanceof DynamoDBTargetChangedError &&
+        this.getDriver(id) === driver
+      ) {
+        const settingsKey = connectionSessionKey(
+          this.getConnection(id),
+          this.getConnectionSessionNonce(id),
+        );
+        if (settingsKey) this.rememberDynamoDBTarget(id, settingsKey, null);
+        await this.invalidateCredentialSession(id, false);
+      }
+      throw error;
+    }
   }
   async connectTo(
     id: string,
@@ -4480,8 +4670,6 @@ export class ConnectionManager
     this.credentialChangeSubscription?.dispose();
     this.credentialRevisionReads.clear();
     this.credentialRevisions.clear();
-    for (const timer of this.orphanedSecretTimers.values()) clearTimeout(timer);
-    this.orphanedSecretTimers.clear();
 
     for (const connectionId of this._connectingMap.keys()) {
       this._nextConnectionEpoch(connectionId);
@@ -4533,7 +4721,7 @@ export class ConnectionManager
   async addToHistory(
     connectionId: string,
     sql: string,
-    postgresDatabase?: string,
+    databaseScope?: QueryDatabaseScope,
     targetSessionKey?: string,
   ): Promise<void> {
     const trimmed = sql.trim();
@@ -4543,13 +4731,15 @@ export class ConnectionManager
     if (this.getHistoryLimit() === 0) {
       return;
     }
+    const databaseFields = queryDatabaseFields(databaseScope);
     await this._enqueueHistoryMutation(async () => {
       const all = this.store.readHistory();
       const latest = all[0];
       if (
         latest?.sql === trimmed &&
         latest.connectionId === connectionId &&
-        latest.postgresDatabase === postgresDatabase &&
+        latest.postgresDatabase === databaseFields.postgresDatabase &&
+        latest.mssqlDatabase === databaseFields.mssqlDatabase &&
         latest.targetSessionKey === targetSessionKey
       )
         return;
@@ -4557,7 +4747,7 @@ export class ConnectionManager
         id: randomUUID(),
         sql: trimmed,
         connectionId,
-        ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
+        ...databaseFields,
         ...(targetSessionKey ? { targetSessionKey } : {}),
         executedAt: new Date().toISOString(),
       };
@@ -4585,7 +4775,7 @@ export class ConnectionManager
   async addBookmark(
     connectionId: string,
     sql: string,
-    postgresDatabase?: string,
+    databaseScope?: QueryDatabaseScope,
     targetSessionKey?: string,
   ): Promise<BookmarkEntry> {
     const trimmed = sql.trim();
@@ -4593,7 +4783,7 @@ export class ConnectionManager
       id: randomUUID(),
       sql: trimmed,
       connectionId,
-      ...(postgresDatabase !== undefined ? { postgresDatabase } : {}),
+      ...queryDatabaseFields(databaseScope),
       ...(targetSessionKey ? { targetSessionKey } : {}),
       savedAt: new Date().toISOString(),
     };

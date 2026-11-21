@@ -6,8 +6,12 @@ import {
   waitFor,
 } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
+import type {
+  QueryRunIdentity,
+  QueryRunStatusRequest,
+} from "../../src/shared/webviewContracts";
 
 const formatMock = vi.hoisted(() => vi.fn((_dialect?: string) => null));
 const selectionOverride = vi.hoisted(() => ({
@@ -176,6 +180,38 @@ import {
 } from "./testUtils";
 
 describe("QueryView", () => {
+  function mockDurableRunState() {
+    let persisted: Record<string, unknown> = {
+      initialState: { view: "query" },
+    };
+    const api = window.__vscode as NonNullable<Window["__vscode"]> & {
+      getState: ReturnType<typeof vi.fn>;
+      setState: ReturnType<typeof vi.fn>;
+      postMessage: ReturnType<typeof vi.fn>;
+    };
+    api.getState.mockImplementation(() => persisted);
+    api.setState.mockImplementation((state: typeof persisted) => {
+      persisted = state;
+      return state;
+    });
+    return api;
+  }
+
+  function resetDocumentState() {
+    useQueryStore.setState(useQueryStore.getInitialState());
+    useConnectionStore.setState(useConnectionStore.getInitialState());
+    useSchemaStore.setState(useSchemaStore.getInitialState());
+    clearPostedMessages();
+  }
+
+  function lastRunProbe(): QueryRunStatusRequest {
+    const probe = getPostedMessages()
+      .filter(({ type }) => type === "getQueryRunStatus")
+      .at(-1);
+    expect(probe).toBeDefined();
+    return probe?.payload as QueryRunStatusRequest;
+  }
+
   function receiveBookmark(payload: unknown) {
     act(() => dispatchIncomingMessage("bookmarkSaved", payload));
   }
@@ -191,6 +227,7 @@ describe("QueryView", () => {
     useConnectionStore.setState({ connections: [], activeConnectionId: "" });
     useSchemaStore.setState({ schemaByConnection: {} });
   });
+  afterEach(() => vi.useRealTimers());
 
   it("auto-formats on open for SQL editors", async () => {
     render(
@@ -656,7 +693,275 @@ describe("QueryView", () => {
     });
   });
 
-  it("uses a new operation ID after a reload and sends Stop only for the confirmed target", () => {
+  it("recovers a running pinned query after reload and reconciles a dropped result without replay", () => {
+    vi.useFakeTimers();
+    const api = mockDurableRunState();
+    const target = {
+      id: "pinned-connection",
+      name: "Pinned",
+      type: "mssql",
+      targetSessionKey: "c".repeat(64),
+    };
+    const view = (
+      <QueryView
+        panelId="relied-on-run"
+        connectionId={target.id}
+        mssqlDatabase="Original DB"
+        targetBinding={{
+          connectionId: target.id,
+          sessionKey: target.targetSessionKey,
+        }}
+        queryRunStatus
+        initialQueryText="select 1"
+      />
+    );
+    const sendConnections = () =>
+      act(() => dispatchIncomingMessage("connections", [target]));
+    const first = render(view);
+    sendConnections();
+    api.postMessage.mockImplementation((message) => {
+      if (message.type === "executeQuery") {
+        expect(api.getState()).toEqual({
+          initialState: { view: "query" },
+          queryRun: { phase: "pending", run: message.payload.run },
+        });
+      }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    const { run } = getLastPostedMessage()?.payload as {
+      run: QueryRunIdentity;
+    };
+    expect(run).toEqual({
+      panelId: "relied-on-run",
+      connectionId: target.id,
+      operationId: expect.any(String),
+      targetSessionKey: target.targetSessionKey,
+      mssqlDatabase: "Original DB",
+    });
+    expect(api.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "executeQuery" }),
+    );
+    first.unmount();
+    resetDocumentState();
+
+    render(view);
+    sendConnections();
+    const firstProbe = lastRunProbe();
+    expect(firstProbe.run).toEqual(run);
+    const receive = (payload: unknown) =>
+      act(() => dispatchIncomingMessage("queryRunStatus", payload));
+    receive({ ...firstProbe, status: "running" });
+    expect(useQueryStore.getState().status).toBe("running");
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(getLastPostedMessage()).toEqual({
+      type: "cancelQuery",
+      payload: {
+        connectionId: run.connectionId,
+        operationId: run.operationId,
+        run,
+      },
+    });
+    act(() => vi.advanceTimersByTime(2_000));
+    const nextProbe = lastRunProbe();
+    expect(nextProbe.requestId).not.toBe(firstProbe.requestId);
+    receive({ ...firstProbe, status: "completed" });
+    receive({
+      ...nextProbe,
+      run: { ...run, mssqlDatabase: "Other DB" },
+      status: "completed",
+    });
+    receive({
+      ...nextProbe,
+      run: { ...run, panelId: "other-panel" },
+      status: "completed",
+    });
+    expect(useQueryStore.getState().status).toBe("running");
+    receive({ ...nextProbe, status: "completed" });
+    expect(useQueryStore.getState().status).toBe("idle");
+    expect(
+      screen.getByText(
+        /previous query completed, but its result was not received/i,
+      ),
+    ).toBeTruthy();
+    expect(api.getState()).not.toHaveProperty("queryRun");
+    expect(
+      getPostedMessages().filter(({ type }) => type === "executeQuery"),
+    ).toEqual([]);
+  });
+
+  it.each([
+    true,
+    false,
+  ])("requires review after status replies stop (status support: %s)", (queryRunStatus) => {
+    vi.useFakeTimers();
+    const api = mockDurableRunState();
+    const view = (
+      <QueryView
+        panelId="no-reply"
+        connectionId="conn-1"
+        queryRunStatus={queryRunStatus}
+        initialQueryText="select 1"
+      />
+    );
+    const first = render(view);
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    const request = getLastPostedMessage()?.payload as { operationId: string };
+    act(() => vi.advanceTimersByTime(8_000));
+    if (queryRunStatus) {
+      act(() =>
+        dispatchIncomingMessage("queryRunStatus", {
+          ...lastRunProbe(),
+          status: "running",
+        }),
+      );
+      // An ACK confirms activity, not completion; continue probing after it.
+      act(() => vi.advanceTimersByTime(8_000));
+    }
+    expect(useQueryStore.getState().status).toBe("running");
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(useQueryStore.getState().status).toBe("idle");
+    expect(api.getState()).toMatchObject({
+      queryRun: { phase: "unknown", run: { operationId: request.operationId } },
+    });
+
+    first.unmount();
+    resetDocumentState();
+    render(view);
+    const run = screen.getByRole<HTMLButtonElement>("button", { name: "Run" });
+    expect(run.disabled).toBe(true);
+    expect(
+      screen.getByRole("alert", { name: "Previous query outcome" }).textContent,
+    ).toContain("outcome is unknown");
+    fireEvent.keyDown(screen.getByLabelText("SQL editor"), { key: "F5" });
+    fireEvent.click(run);
+    expect(
+      getPostedMessages().filter(({ type }) => type === "executeQuery"),
+    ).toHaveLength(0);
+    fireEvent.click(
+      screen.getByRole("button", { name: "I checked the previous query" }),
+    );
+    expect(api.getState()).not.toHaveProperty("queryRun");
+    expect(
+      getPostedMessages().filter(({ type }) => type === "executeQuery"),
+    ).toHaveLength(0);
+    fireEvent.click(run);
+    expect(getLastPostedMessage()?.type).toBe("executeQuery");
+    expect(getLastPostedMessage()?.payload).not.toMatchObject({
+      operationId: request.operationId,
+    });
+  });
+
+  it("does not send the query if the recovery marker cannot be saved", () => {
+    const api = mockDurableRunState();
+    api.setState.mockImplementation(() => {
+      throw new Error("state write failed");
+    });
+    render(<QueryView connectionId="conn-1" initialQueryText="select 1" />);
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(
+      getPostedMessages().filter(({ type }) => type === "executeQuery"),
+    ).toHaveLength(0);
+    expect(screen.getByTestId("results-panel").textContent).toContain(
+      "The query was not sent.",
+    );
+  });
+
+  it("recovers a live run from a lost rejection and does not retry it", () => {
+    vi.useFakeTimers();
+    const api = mockDurableRunState();
+    render(
+      <QueryView
+        connectionId="conn-1"
+        queryRunStatus
+        initialQueryText="SELECT 1"
+      />,
+    );
+    const runButton = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Run",
+    });
+    fireEvent.click(runButton);
+    const issued = getLastPostedMessage()?.payload as { run: QueryRunIdentity };
+    act(() =>
+      dispatchIncomingMessage("queryResult", {
+        ...issued.run,
+        run: issued.run,
+        runOutcome: "not-run",
+        // No result fields; the next probe can still resolve the marker.
+      }),
+    );
+    expect(runButton.disabled).toBe(true);
+    act(() => vi.advanceTimersByTime(2_000));
+    act(() =>
+      dispatchIncomingMessage("queryRunStatus", {
+        ...lastRunProbe(),
+        status: "not-run",
+      }),
+    );
+    expect(runButton.disabled).toBe(false);
+    expect(
+      screen.getByText(/previous query was not sent to the database/i),
+    ).toBeTruthy();
+    expect(api.getState()).not.toHaveProperty("queryRun");
+    expect(
+      getPostedMessages().filter(({ type }) => type === "executeQuery"),
+    ).toHaveLength(1);
+  });
+
+  it("recovers a run for the binding confirmed after the panel HTML was built", () => {
+    const api = mockDurableRunState();
+    const a = { connectionId: "conn-1", sessionKey: "a".repeat(64) };
+    const b = { connectionId: "conn-2", sessionKey: "b".repeat(64) };
+    const run = {
+      panelId: "old-html",
+      operationId: "on-b",
+      connectionId: b.connectionId,
+      targetSessionKey: b.sessionKey,
+    };
+    api.setState({ queryRun: { phase: "pending", run } });
+    render(
+      <QueryView
+        panelId={run.panelId}
+        connectionId={a.connectionId}
+        targetBinding={a}
+        queryRunStatus
+        initialQueryText="SELECT 1"
+      />,
+    );
+    expect(lastRunProbe().run).toEqual(run);
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(
+      getPostedMessages().find(({ type }) => type === "cancelQuery"),
+    ).toBeUndefined();
+    act(() => {
+      dispatchIncomingMessage("queryTargetBinding", b);
+      dispatchIncomingMessage("connections", [
+        {
+          id: b.connectionId,
+          name: "B",
+          type: "pg",
+          targetSessionKey: b.sessionKey,
+        },
+      ]);
+    });
+    expect(
+      screen.getByRole("combobox", { name: "Active connection" }),
+    ).toHaveProperty("value", b.connectionId);
+    expect(useQueryStore.getState().status).toBe("running");
+    act(() =>
+      dispatchIncomingMessage("queryRunStatus", {
+        ...lastRunProbe(),
+        status: "completed",
+      }),
+    );
+    expect(api.getState()).not.toHaveProperty("queryRun");
+    expect(useQueryStore.getState().status).toBe("idle");
+    expect(
+      getPostedMessages().find(({ type }) => type === "executeQuery"),
+    ).toBeUndefined();
+  });
+
+  it("uses a new operation ID only after review when a restored run has no host record", () => {
+    mockDurableRunState();
     const targets = [
       { id: "conn-1", name: "A", type: "pg", targetSessionKey: "a".repeat(64) },
       { id: "conn-2", name: "B", type: "pg", targetSessionKey: "b".repeat(64) },
@@ -670,6 +975,7 @@ describe("QueryView", () => {
           connectionId: targetA.id,
           sessionKey: targetA.targetSessionKey,
         }}
+        queryRunStatus
         initialQueryText="select 1"
       />
     );
@@ -686,28 +992,46 @@ describe("QueryView", () => {
     first.unmount();
 
     // A document reload resets the webview stores, unlike a React remount.
-    useQueryStore.setState(useQueryStore.getInitialState());
-    useConnectionStore.setState(useConnectionStore.getInitialState());
-    useSchemaStore.setState(useSchemaStore.getInitialState());
-    clearPostedMessages();
+    resetDocumentState();
     render(view);
     receiveConnections();
+    act(() =>
+      dispatchIncomingMessage("queryRunStatus", {
+        ...lastRunProbe(),
+        status: "unknown",
+      }),
+    );
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Run" }).disabled,
+    ).toBe(true);
     fireEvent.change(
       screen.getByRole("combobox", { name: "Active connection" }),
       { target: { value: targetB.id } },
     );
-    expect(getLastPostedMessage()).toEqual({
+    const change = getLastPostedMessage();
+    expect(change).toEqual({
       type: "activeConnectionChanged",
       payload: {
         connectionId: targetB.id,
         targetSessionKey: targetB.targetSessionKey,
+        requestId: expect.any(String),
       },
     });
     act(() =>
-      dispatchIncomingMessage("queryTargetBinding", {
-        connectionId: targetB.id,
-        sessionKey: targetB.targetSessionKey,
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId: (change?.payload as { requestId: string }).requestId,
+        accepted: true,
+        binding: {
+          connectionId: targetB.id,
+          sessionKey: targetB.targetSessionKey,
+        },
       }),
+    );
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Run" }).disabled,
+    ).toBe(true);
+    fireEvent.click(
+      screen.getByRole("button", { name: "I checked the previous query" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
     const newOperation = useQueryStore.getState().activeOperation;
@@ -722,8 +1046,15 @@ describe("QueryView", () => {
         ...newOperation,
         queryText: "select 1",
         targetSessionKey: targetB.targetSessionKey,
+        run: expect.objectContaining({
+          connectionId: targetB.id,
+          targetSessionKey: targetB.targetSessionKey,
+        }),
       },
     });
+    const { run: activeRun } = getLastPostedMessage()?.payload as {
+      run: QueryRunIdentity;
+    };
 
     const reply = {
       columns: [],
@@ -748,18 +1079,186 @@ describe("QueryView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(getLastPostedMessage()).toEqual({
       type: "cancelQuery",
-      payload: newOperation,
+      payload: { ...newOperation, run: activeRun },
     });
     act(() =>
       dispatchIncomingMessage("queryResult", {
         ...reply,
         ...newOperation,
         error: "Query B interrupted",
+        run: activeRun,
+        runOutcome: "unknown",
       }),
     );
     expect(useQueryStore.getState()).toMatchObject({
       status: "error",
       result: { error: "Query B interrupted" },
+    });
+  });
+
+  it("blocks Run (including F5) and Bookmark until the latest target selection is acknowledged", () => {
+    const targets = ["a", "b", "c"].map((id) => ({
+      id,
+      name: id,
+      type: "pg",
+      targetSessionKey: id.repeat(64),
+    }));
+    const binding = (id: string) => ({
+      connectionId: id,
+      sessionKey: id.repeat(64),
+    });
+    render(
+      <QueryView
+        connectionId="a"
+        targetBinding={binding("a")}
+        initialQueryText="select 1"
+      />,
+    );
+    act(() => dispatchIncomingMessage("connections", targets));
+    clearPostedMessages();
+    const select =
+      screen.getByLabelText<HTMLSelectElement>("Active connection");
+    const editor = screen.getByLabelText("SQL editor");
+    const run = screen.getByRole<HTMLButtonElement>("button", { name: "Run" });
+    const bookmark = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Bookmark",
+    });
+    const selectTarget = (id: string) => {
+      fireEvent.change(select, { target: { value: id } });
+      return (getLastPostedMessage()?.payload as { requestId: string })
+        .requestId;
+    };
+
+    let first!: string;
+    act(() => {
+      first = selectTarget("b");
+      fireEvent.keyDown(editor, { key: "F5" });
+      fireEvent.click(bookmark);
+    });
+    expect(select.value).toBe("b");
+    expect(useConnectionStore.getState().activeConnectionId).toBe("a");
+    expect(run.disabled).toBe(true);
+    expect(bookmark.disabled).toBe(true);
+    fireEvent.click(run);
+    fireEvent.click(bookmark);
+    const second = selectTarget("c");
+    const latest = selectTarget("b");
+    expect(new Set([first, second, latest]).size).toBe(3);
+
+    act(() => {
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId: first,
+        accepted: true,
+        binding: binding("b"),
+      });
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId: second,
+        accepted: false,
+        binding: binding("a"),
+      });
+      dispatchIncomingMessage("queryTargetBinding", binding("c"));
+      dispatchIncomingMessage("connections", targets);
+    });
+    fireEvent.keyDown(editor, { key: "F5" });
+    expect(getPostedMessages().map(({ type }) => type)).toEqual([
+      "activeConnectionChanged",
+      "activeConnectionChanged",
+      "activeConnectionChanged",
+    ]);
+    expect(run.disabled).toBe(true);
+    expect(bookmark.disabled).toBe(true);
+    expect(useConnectionStore.getState().activeConnectionId).toBe("a");
+
+    act(() =>
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId: latest,
+        accepted: true,
+        binding: binding("b"),
+      }),
+    );
+    act(() => dispatchIncomingMessage("queryTargetBinding", binding("c")));
+    expect(select.value).toBe("b");
+    expect(run.disabled).toBe(false);
+    expect(bookmark.disabled).toBe(false);
+    fireEvent.click(bookmark);
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "addBookmark",
+      payload: {
+        connectionId: "b",
+        targetSessionKey: "b".repeat(64),
+        queryText: "select 1",
+      },
+    });
+    fireEvent.keyDown(editor, { key: "F5" });
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "executeQuery",
+      payload: {
+        connectionId: "b",
+        targetSessionKey: "b".repeat(64),
+        queryText: "select 1",
+      },
+    });
+  });
+
+  it.each([
+    "a",
+    "b",
+  ])("restores the host's confirmed target %s and preserves the draft after a refusal", (confirmedId) => {
+    const targets = ["a", "b", "c"].map((id) => ({
+      id,
+      name: id,
+      type: "pg",
+      targetSessionKey: id.repeat(64),
+    }));
+    const initial = { connectionId: "a", sessionKey: "a".repeat(64) };
+    const confirmed = {
+      connectionId: confirmedId,
+      sessionKey: confirmedId.repeat(64),
+    };
+    render(
+      <QueryView
+        connectionId="a"
+        targetBinding={initial}
+        initialQueryText="select 1"
+      />,
+    );
+    act(() => dispatchIncomingMessage("connections", targets));
+    const editor = screen.getByLabelText("SQL editor");
+    fireEvent.change(editor, { target: { value: "select 2" } });
+    const select =
+      screen.getByLabelText<HTMLSelectElement>("Active connection");
+    fireEvent.change(select, { target: { value: "b" } });
+    if (confirmedId === "b") {
+      // The host committed B, but the user selected C before the reply arrived.
+      fireEvent.change(select, { target: { value: "c" } });
+    }
+    const { requestId } = getLastPostedMessage()?.payload as {
+      requestId: string;
+    };
+    act(() =>
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId,
+        accepted: false,
+        binding: confirmed,
+      }),
+    );
+    expect(
+      screen.getByRole("alert", { name: "Target change error" }),
+    ).toBeTruthy();
+    expect(select.value).toBe(confirmedId);
+    expect(editor).toHaveProperty("value", "select 2");
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Bookmark" })
+        .disabled,
+    ).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(getLastPostedMessage()).toMatchObject({
+      type: "executeQuery",
+      payload: {
+        connectionId: confirmedId,
+        targetSessionKey: confirmed.sessionKey,
+        queryText: "select 2",
+      },
     });
   });
 
@@ -809,9 +1308,7 @@ describe("QueryView", () => {
     const oldKey = "a".repeat(64);
     const nextKey = "b".repeat(64);
     const connection = { id: connectionId, name: "Same name", type: "pg" };
-    const api = window.__vscode as NonNullable<Window["__vscode"]> & {
-      setState: ReturnType<typeof vi.fn>;
-    };
+    const api = mockDurableRunState();
     render(
       <QueryView
         panelId="managed-draft"
@@ -841,9 +1338,12 @@ describe("QueryView", () => {
     });
     connections(nextKey);
     expect(run.disabled).toBe(true);
-    expect(screen.getByRole("alert").textContent).toContain(
-      "confirm the target",
-    );
+    expect(
+      screen.getByRole("alert", { name: "Query target review" }).textContent,
+    ).toContain("confirm the target");
+    expect(
+      screen.getByRole("alert", { name: "Previous query outcome" }).textContent,
+    ).toContain("outcome is unknown");
     expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     act(() =>
       dispatchIncomingMessage("queryResult", {
@@ -854,7 +1354,7 @@ describe("QueryView", () => {
         executionTimeMs: 1,
       }),
     );
-    expect(useQueryStore.getState().status).toBe("error");
+    expect(useQueryStore.getState().status).toBe("idle");
     fireEvent.keyDown(editor, { key: "F5" });
     expect(
       getPostedMessages().filter(({ type }) => type === "executeQuery"),
@@ -864,18 +1364,33 @@ describe("QueryView", () => {
     });
     expect(editor).toHaveProperty("value", "select current_database()");
     fireEvent.click(screen.getByRole("button", { name: "Use current target" }));
-    expect(getLastPostedMessage()).toEqual({
+    const change = getLastPostedMessage();
+    expect(change).toEqual({
       type: "activeConnectionChanged",
-      payload: { connectionId, targetSessionKey: nextKey },
+      payload: {
+        connectionId,
+        targetSessionKey: nextKey,
+        requestId: expect.any(String),
+      },
     });
     expect(run.disabled).toBe(true);
     act(() =>
-      dispatchIncomingMessage("queryTargetBinding", {
-        connectionId,
-        sessionKey: nextKey,
+      dispatchIncomingMessage("queryTargetChangeResult", {
+        requestId: (change?.payload as { requestId: string }).requestId,
+        accepted: true,
+        binding: { connectionId, sessionKey: nextKey },
       }),
     );
-    expect(screen.queryByRole("alert")).toBeNull();
+    expect(
+      screen.queryByRole("alert", { name: "Query target review" }),
+    ).toBeNull();
+    expect(run.disabled).toBe(true);
+    fireEvent.click(
+      screen.getByRole("button", { name: "I checked the previous query" }),
+    );
+    expect(
+      screen.queryByRole("alert", { name: "Previous query outcome" }),
+    ).toBeNull();
     expect(run.disabled).toBe(false);
     expect(api.setState.mock.lastCall?.[0]).toMatchObject({
       queryDraft: {
@@ -959,6 +1474,7 @@ describe("QueryView", () => {
       payload: {
         connectionId: other.id,
         targetSessionKey: other.targetSessionKey,
+        requestId: expect.any(String),
       },
     });
   });
@@ -1295,6 +1811,12 @@ describe("QueryView", () => {
       screen.getByLabelText("Active connection"),
       "conn-2",
     );
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Run" }).disabled,
+    ).toBe(true);
+    await user.click(
+      screen.getByRole("button", { name: "I checked the previous query" }),
+    );
     await user.click(screen.getByRole("button", { name: "Run" }));
     const newRequest = getLastPostedMessage()?.payload as {
       operationId: string;
@@ -1412,6 +1934,12 @@ describe("QueryView", () => {
     await user.selectOptions(
       screen.getByLabelText("Active connection"),
       "conn-2",
+    );
+    expect(
+      screen.getByRole<HTMLButtonElement>("button", { name: "Run" }).disabled,
+    ).toBe(true);
+    await user.click(
+      screen.getByRole("button", { name: "I checked the previous query" }),
     );
     await user.click(screen.getByRole("button", { name: "Run" }));
     const newRequest = getLastPostedMessage()?.payload as {

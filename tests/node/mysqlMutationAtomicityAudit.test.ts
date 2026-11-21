@@ -310,7 +310,7 @@ describe.runIf(Boolean(livePort))("MySQL atomicity (live MariaDB)", () => {
       });
     });
 
-    it(`${engine}: no persisted trigger-adjusted value after rejected verification`, async () => {
+    it(`${engine}: refuses a guarded write without running the trigger`, async () => {
       await live(engine, async ({ admin, manager, table }) => {
         await admin.query(
           `CREATE TRIGGER ${table}_bu BEFORE UPDATE ON ${table} FOR EACH ROW SET NEW.amount=NEW.amount+100`,
@@ -323,13 +323,12 @@ describe.runIf(Boolean(livePort))("MySQL atomicity (live MariaDB)", () => {
           `SELECT amount FROM ${table} WHERE id=1`,
         );
         expect({ result, rows }).toMatchObject({
-          result: { success: false },
+          result: { success: false, changesPossible: false },
           rows: [{ amount: 10 }],
         });
         expect(result.error).toMatch(
-          engine === "Aria" ? /rollback support.*ARIA/ : /verification failed/,
+          engine === "Aria" ? /rollback support.*ARIA/ : /UPDATE trigger/,
         );
-        if (engine === "Aria") expect(result.changesPossible).toBe(false);
       });
     });
   }
@@ -350,7 +349,7 @@ describe.runIf(Boolean(livePort))("MySQL atomicity (live MariaDB)", () => {
     });
   });
 
-  it("reads capabilities with table DML privileges only, without admin grants", async () => {
+  it("reads engine capabilities but refuses guarded writes without trigger visibility", async () => {
     await live("Aria", async ({ admin, table }) => {
       const username = `audit_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
       const driver = new MySQLDriver({
@@ -389,7 +388,11 @@ describe.runIf(Boolean(livePort))("MySQL atomicity (live MariaDB)", () => {
             manager,
             prepare(manager, table, [update(1)]),
           ),
-        ).toMatchObject({ success: true });
+        ).toMatchObject({
+          success: false,
+          changesPossible: false,
+          error: expect.stringContaining("full trigger visibility"),
+        });
       } finally {
         await driver.disconnect();
         await admin.query(`DROP USER IF EXISTS '${username}'@'%'`);

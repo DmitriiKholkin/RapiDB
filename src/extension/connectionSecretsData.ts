@@ -105,8 +105,12 @@ export function withConnectionCredentialRevision(
   value: string | undefined,
   revision: string,
 ): string {
-  const { record } = parseStoredConnectionSecretDocument(value);
-  return JSON.stringify({ ...record, [CREDENTIAL_REVISION_FIELD]: revision });
+  const { record, known, isLegacy } =
+    parseStoredConnectionSecretDocument(value);
+  return JSON.stringify({
+    ...(isLegacy ? known : record),
+    [CREDENTIAL_REVISION_FIELD]: revision,
+  });
 }
 
 export function readConnectionCredentialRevision(

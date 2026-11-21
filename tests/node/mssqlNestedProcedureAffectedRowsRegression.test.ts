@@ -26,6 +26,7 @@ const SELECT = 0xc1;
 const INSERT = 0xc3;
 const UPDATE = 0xc5;
 const EXEC = 0xe0;
+const mutationTarget = { profileDatabase: "profile_default", database: "db" };
 interface NativeRequest extends EventEmitter {
   rowCount: number;
   rst: unknown[];
@@ -93,12 +94,16 @@ function sdkHarness(
     }) => void
   >,
   bridgeAvailable = true,
+  target?: typeof mutationTarget,
 ) {
   const counts: number[] = [];
   const parsedCommands: number[] = [];
   const nativeEvents: Array<{ event: Completion; args: unknown[] }> = [];
   const nativeRequests: NativeRequest[] = [];
   const handlers: object[] = [];
+  const setup = target ? new MockMssqlRequest() : undefined;
+  const setupRequests = setup ? [setup] : [];
+  let currentDatabase = target?.profileDatabase;
   let index = 0;
   const connection = Object.assign(new EventEmitter(), {
     config: { options: { tdsVersion: "7_4" } },
@@ -110,7 +115,10 @@ function sdkHarness(
     createTokenStreamParser: Connection.prototype.createTokenStreamParser,
     inTransaction: false,
     closed: false,
-    reset: vi.fn((callback: () => void) => callback()),
+    reset: vi.fn((callback: () => void) => {
+      currentDatabase = target?.profileDatabase;
+      callback();
+    }),
     close: vi.fn(),
     cancel: vi.fn(() => {
       const native = nativeRequests.at(-1);
@@ -125,7 +133,25 @@ function sdkHarness(
   const originalParser = connection.createTokenStreamParser;
   if (!bridgeAvailable)
     Reflect.deleteProperty(connection, "createTokenStreamParser");
+  if (setup && target) {
+    setup.execute.mockImplementation(async (sql, physical) => {
+      expect(physical).toBe(connection);
+      expect(currentDatabase).toBe(target.profileDatabase);
+      expect(sql).toBe(
+        `USE [${target.database}]; SELECT DB_NAME() AS databaseName;`,
+      );
+      currentDatabase = target.database;
+      const recordset = [{ databaseName: currentDatabase }];
+      return {
+        recordsets: [recordset],
+        recordset,
+        rowsAffected: [1],
+        output: {},
+      };
+    });
+  }
   const execute = (native: NativeRequest) => {
+    if (target) expect(currentDatabase).toBe(target.database);
     native.rowCount = 0;
     native.rst = [];
     nativeRequests.push(native);
@@ -178,6 +204,10 @@ function sdkHarness(
     ),
     release: vi.fn(),
     request: () => {
+      // The catalog check is its own request, not part of the TDS mutation
+      // script or its affected-row evidence.
+      const setupRequest = setupRequests.shift();
+      if (setupRequest) return setupRequest;
       const request = new mssql.Request(pool as never);
       request.on("rowsaffected", (count: number) => counts.push(count));
       return request;
@@ -187,10 +217,12 @@ function sdkHarness(
     id: "nested-proc",
     name: "MSSQL",
     type: "mssql",
+    database: target?.profileDatabase,
   });
   Object.assign(driver, { pool });
   return {
     driver,
+    setup,
     counts,
     parsedCommands,
     nativeEvents,
@@ -673,7 +705,12 @@ describe("MSSQL query result consumers", () => {
       valueSemantics: "plain",
     },
   ];
-  const config = { id: "nested-proc", name: "MSSQL", type: "mssql" as const };
+  const config = {
+    id: "nested-proc",
+    name: "MSSQL",
+    type: "mssql" as const,
+    database: mutationTarget.profileDatabase,
+  };
   const settings = () => ({
     connectionTimeoutSeconds: 5,
     dbOperationTimeoutSeconds: 5,
@@ -682,13 +719,17 @@ describe("MSSQL query result consumers", () => {
   });
 
   it("does not report a successful DEFAULT VALUES INSERT as failed through the timeout wrapper", async () => {
-    const { driver, counts } = sdkHarness([
-      ({ token }) => {
-        token("doneInProc", 7);
-        token("doneProc");
-        token("done", 1, false, INSERT);
-      },
-    ]);
+    const { driver, counts, setup } = sdkHarness(
+      [
+        ({ token }) => {
+          token("doneInProc", 7);
+          token("doneProc");
+          token("done", 1, false, INSERT);
+        },
+      ],
+      true,
+      mutationTarget,
+    );
     const transaction = vi.spyOn(driver, "runTransaction");
     const wrapped = createTimeoutAwareDriver(driver, settings);
     const manager = {
@@ -700,7 +741,7 @@ describe("MSSQL query result consumers", () => {
     });
     const plan = await service.prepareInsertRow(
       config.id,
-      "db",
+      mutationTarget.database,
       "dbo",
       "audited",
       {},
@@ -708,18 +749,22 @@ describe("MSSQL query result consumers", () => {
     // DEFAULT VALUES supplies nothing to verify: this genuinely reaches the
     // query() consumer, not the guarded runTransaction() path.
     expect(plan.verification).toBeUndefined();
+    expect(plan.operation.sql).toContain("INSERT INTO [db].[dbo].[audited]");
     expect(plan.operation.sql).toContain("DEFAULT VALUES");
     await expect(
       service.executePreparedInsertPlan(plan),
     ).resolves.toBeUndefined();
+    expect(setup?.batch).toHaveBeenCalledOnce();
     expect(counts).toEqual([7, 1]);
     expect(transaction).not.toHaveBeenCalled();
   });
 
   it("still rejects a definite zero-row DEFAULT VALUES INSERT", async () => {
-    const { driver } = sdkHarness([
-      ({ token }) => token("done", 0, false, INSERT),
-    ]);
+    const { driver, counts, setup } = sdkHarness(
+      [({ token }) => token("done", 0, false, INSERT)],
+      true,
+      mutationTarget,
+    );
     const manager = {
       getConnection: () => config,
       getDriver: () => driver,
@@ -728,8 +773,16 @@ describe("MSSQL query result consumers", () => {
       getColumns: async () => columns,
     });
     await expect(
-      service.insertRow(config.id, "db", "dbo", "audited", {}),
+      service.insertRow(
+        config.id,
+        mutationTarget.database,
+        "dbo",
+        "audited",
+        {},
+      ),
     ).rejects.toThrow("Insert failed: the database reported 0 rows affected");
+    expect(setup?.batch).toHaveBeenCalledOnce();
+    expect(counts).toEqual([0]);
   });
 
   it("preserves uncertainty, rows, and partial errors through timeout and formatting across GO", async () => {

@@ -62,9 +62,11 @@ import {
   type PersistedTableViewState,
   registerMssqlSqlVariantRowIdentity,
   registerMySQLTimestampRowIdentity,
+  registerNoSqlDeleteObservationId,
   registerOracleTemporalRowIdentity,
   registerPostgresArrayRowIdentity,
   registerPostgresIntervalRowIdentity,
+  registerRowUpdateBlockReason,
   registerSQLiteRowIdentity,
   registerSqlDeleteObservation,
   type TableFetchOptions,
@@ -109,7 +111,9 @@ interface TableDataReply {
   extraColumns?: ColumnMeta[];
   pageScopedExtraColumns?: true;
   rows: Row[];
+  rowUpdateBlockReasons?: Array<string | null>;
   mongoIdTypes?: unknown;
+  mongoRowMutationBlockReason?: string;
   mongoValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   rowValueTypes?: Array<Record<string, MongoValueTypeHint>>;
   sqliteRowIdentities?: SQLiteRowIdentity[];
@@ -119,6 +123,7 @@ interface TableDataReply {
   mssqlSqlVariantRowIdentities?: MssqlSqlVariantRowIdentity[];
   oracleTemporalRowIdentities?: OracleTemporalRowIdentity[];
   sqlDeleteObservations?: Array<SqlDeleteObservation | null>;
+  noSqlDeleteObservationIds?: Array<string | null>;
   totalCount: number;
   executionTimeMs?: number;
 }
@@ -151,6 +156,17 @@ function isTableDataReply(
       Number.isFinite(payload.executionTimeMs)) &&
     (payload.pageScopedExtraColumns === undefined ||
       payload.pageScopedExtraColumns === true) &&
+    (payload.rowUpdateBlockReasons === undefined ||
+      (Array.isArray(payload.rowUpdateBlockReasons) &&
+        payload.rowUpdateBlockReasons.length === payload.rows.length &&
+        payload.rowUpdateBlockReasons.every(
+          (reason) =>
+            reason === null ||
+            (typeof reason === "string" && reason.trim().length > 0),
+        ))) &&
+    (payload.mongoRowMutationBlockReason === undefined ||
+      (typeof payload.mongoRowMutationBlockReason === "string" &&
+        payload.mongoRowMutationBlockReason.trim().length > 0)) &&
     (payload.extraColumns === undefined ||
       (isArrayOf(payload.extraColumns, isRecord) &&
         payload.extraColumns.every(
@@ -164,6 +180,12 @@ function isTableDataReply(
       isArrayOf(payload.mongoValueTypes, isValueTypeMap)) &&
     (payload.rowValueTypes === undefined ||
       isArrayOf(payload.rowValueTypes, isValueTypeMap)) &&
+    (payload.noSqlDeleteObservationIds === undefined ||
+      (Array.isArray(payload.noSqlDeleteObservationIds) &&
+        payload.noSqlDeleteObservationIds.length === payload.rows.length &&
+        [...payload.noSqlDeleteObservationIds].every(
+          (id) => id === null || isNoSqlDeleteObservationId(id),
+        ))) &&
     (payload.sqlDeleteObservations === undefined ||
       (Array.isArray(payload.sqlDeleteObservations) &&
         payload.sqlDeleteObservations.length === payload.rows.length &&
@@ -308,6 +330,8 @@ export function useTableDataController({
 }: UseTableDataControllerParams) {
   const [columns, setColumns] = useState<ColumnMeta[]>([]);
   const [pkCols, setPkCols] = useState<string[]>([]);
+  const [mongoRowMutationBlockReason, setMongoRowMutationBlockReason] =
+    useState<string | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -962,7 +986,9 @@ export function useTableDataController({
           extraColumns,
           pageScopedExtraColumns,
           rows: receivedRows,
+          rowUpdateBlockReasons,
           mongoIdTypes,
+          mongoRowMutationBlockReason,
           mongoValueTypes,
           rowValueTypes,
           sqliteRowIdentities,
@@ -972,6 +998,7 @@ export function useTableDataController({
           mssqlSqlVariantRowIdentities,
           oracleTemporalRowIdentities,
           sqlDeleteObservations,
+          noSqlDeleteObservationIds,
           totalCount: nextTotalCount,
           executionTimeMs: nextExecutionTimeMs,
         } = payload;
@@ -1002,6 +1029,9 @@ export function useTableDataController({
               )
             : [];
           const copy = missingUndefined.length > 0 ? { ...row } : row;
+          const updateBlockReason = rowUpdateBlockReasons?.[index];
+          if (updateBlockReason)
+            registerRowUpdateBlockReason(copy, updateBlockReason);
           for (const name of missingUndefined) {
             Object.defineProperty(copy, name, {
               value: undefined,
@@ -1016,6 +1046,10 @@ export function useTableDataController({
           const deleteObservation = sqlDeleteObservations?.[index];
           if (deleteObservation) {
             registerSqlDeleteObservation(copy, deleteObservation);
+          }
+          const noSqlObservationId = noSqlDeleteObservationIds?.[index];
+          if (noSqlObservationId) {
+            registerNoSqlDeleteObservationId(copy, noSqlObservationId);
           }
           if (postgresArrayKeyNames.length > 0) {
             const identity = postgresArrayRowIdentities?.[index];
@@ -1140,12 +1174,14 @@ export function useTableDataController({
         setReadOnlyTable(pendingReadOnlyTableRef.current);
         const previousMongoIdTypes = mongoIdTypesRef.current;
         const previousRowValueTypes = rowValueTypesRef.current;
+        setMongoRowMutationBlockReason(mongoRowMutationBlockReason ?? null);
         // Missing or unrecognized ID hints stay uneditable, but don't hide rows.
-        const nextMongoIdTypes = Array.isArray(mongoIdTypes)
-          ? mongoIdTypes.map((type) =>
-              type === "objectId" || type === "string" ? type : null,
-            )
-          : [];
+        const nextMongoIdTypes =
+          !mongoRowMutationBlockReason && Array.isArray(mongoIdTypes)
+            ? mongoIdTypes.map((type) =>
+                type === "objectId" || type === "string" ? type : null,
+              )
+            : [];
         pasteStructureEpochRef.current++;
         setRows(nextRows);
         mongoIdTypesRef.current = nextMongoIdTypes;
@@ -1445,6 +1481,7 @@ export function useTableDataController({
     page,
     pageSize,
     pkCols,
+    mongoRowMutationBlockReason,
     readError,
     readOnlyTable,
     requestedPage,
@@ -1462,3 +1499,5 @@ export function useTableDataController({
     updateFilterDraft,
   };
 }
+
+import { isNoSqlDeleteObservationId } from "../../../shared/noSqlDeleteObservation";

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { ElasticsearchDriver } from "../../src/extension/dbDrivers/elasticsearch";
-import { elasticsearchKeys } from "../support/elasticsearchIdentity";
+import {
+  elasticsearchKeys,
+  elasticsearchSourceMetadata,
+} from "../support/elasticsearchIdentity";
 
 const endpoint = process.env.RAPIDB_ES_SCRIPT_TEST_URL;
 
@@ -13,7 +16,13 @@ describe.skipIf(!endpoint)(
         name: "ES",
         type: "elasticsearch",
       });
-      const preview = driver.buildMutationPreviewStatement(
+      Object.assign(driver, {
+        connected: true,
+        client: {
+          indices: { get: async () => elasticsearchSourceMetadata("users") },
+        },
+      });
+      const [preview] = await driver.buildMutationPreviewStatements(
         "update",
         "default",
         "indices",

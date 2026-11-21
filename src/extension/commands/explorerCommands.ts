@@ -1,12 +1,16 @@
 import * as vscode from "vscode";
 import { RAPIDB_COMMANDS as CMD } from "../../shared/commandIds";
+import type { ConnectionConfig } from "../../shared/connectionConfig";
 import {
   isDataDbObjectKind,
   isDbObjectKind,
   isDdlOnlyDbObjectKind,
   isRoutineDbObjectKind,
 } from "../../shared/dbObjectKinds";
-import { isPostgresQueryDatabase } from "../../shared/postgresQueryDatabase";
+import {
+  type QueryDatabaseScope,
+  readQueryDatabaseScope,
+} from "../../shared/queryDatabaseTarget";
 import type {
   QueryEditorLanguage,
   QueryTargetBinding,
@@ -129,7 +133,7 @@ function openDefinitionInQueryPanel(
   connectionManager: ConnectionManager,
   targetBinding: QueryTargetBinding,
   definition: string,
-  postgresDatabase?: string,
+  databaseScope?: QueryDatabaseScope,
   presentation?: {
     formatOnOpen: boolean;
     editorLanguage?: QueryEditorLanguage;
@@ -144,17 +148,28 @@ function openDefinitionInQueryPanel(
     presentation?.formatOnOpen,
     false,
     presentation?.editorLanguage,
-    postgresDatabase,
+    databaseScope,
     targetBinding,
   );
 }
 
-function requirePostgresDefinitionDatabase(database: string): boolean {
-  if (isPostgresQueryDatabase(database)) return true;
-  vscode.window.showErrorMessage(
-    "[RapiDB] The selected PostgreSQL object's database is unknown. Refresh the Explorer and select the object again.",
+function definitionDatabaseScope(
+  type: ConnectionConfig["type"],
+  database: string,
+) {
+  if (type !== "pg" && type !== "mssql") return undefined;
+  const scope = readQueryDatabaseScope(
+    type === "pg"
+      ? { postgresDatabase: database }
+      : { mssqlDatabase: database },
   );
-  return false;
+  if (scope === null) {
+    const label = type === "pg" ? "PostgreSQL" : "SQL Server";
+    vscode.window.showErrorMessage(
+      `[RapiDB] The selected ${label} object's database is unknown. Refresh the Explorer and select the object again.`,
+    );
+  }
+  return scope;
 }
 
 export function registerExplorerCommands(
@@ -247,14 +262,11 @@ export function registerExplorerCommands(
     }
 
     const location = readNodeLocation(node);
-    const postgresDatabase =
-      connectionType === "pg" ? location.database : undefined;
-    if (
-      postgresDatabase !== undefined &&
-      !requirePostgresDefinitionDatabase(postgresDatabase)
-    ) {
-      return;
-    }
+    const databaseScope = definitionDatabaseScope(
+      connection.type,
+      location.database,
+    );
+    if (databaseScope === null) return;
 
     const objectKind = isDbObjectKind(node.kind) ? node.kind : undefined;
     const lookup = () => {
@@ -354,7 +366,7 @@ export function registerExplorerCommands(
             connectionManager,
             binding,
             ddl,
-            postgresDatabase,
+            databaseScope,
             objectKind && isRoutineDbObjectKind(objectKind)
               ? undefined
               : {
@@ -434,14 +446,11 @@ export function registerExplorerCommands(
     const location = readNodeLocation(node);
     const connection = connectionManager.getConnection(node.connectionId);
     if (!connection) return;
-    const postgresDatabase =
-      connection.type === "pg" ? location.database : undefined;
-    if (
-      postgresDatabase !== undefined &&
-      !requirePostgresDefinitionDatabase(postgresDatabase)
-    ) {
-      return;
-    }
+    const databaseScope = definitionDatabaseScope(
+      connection.type,
+      location.database,
+    );
+    if (databaseScope === null) return;
 
     const { connectionId, objectName, detailKey } = node;
     let driver = connectionManager.getDriver(connectionId);
@@ -519,7 +528,7 @@ export function registerExplorerCommands(
               connectionManager,
               binding,
               sql,
-              postgresDatabase,
+              databaseScope,
             );
           }
         },

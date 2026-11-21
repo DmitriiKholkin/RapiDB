@@ -1,5 +1,22 @@
 import { vi } from "vitest";
 
+export function redisCompactReply(
+  type: string,
+  fields: readonly (string | Buffer)[],
+  ttl = -1,
+) {
+  return [
+    Buffer.from(type),
+    null,
+    ttl,
+    null,
+    fields.map((field) =>
+      typeof field === "string" ? Buffer.from(field) : field,
+    ),
+    null,
+  ];
+}
+
 export function withRedisReplyMapping<T extends object>(client: T) {
   const commands = client as {
     scan?: (...args: unknown[]) => Promise<{
@@ -44,7 +61,7 @@ export function withRedisReplyMapping<T extends object>(client: T) {
       zRangeWithScores: (...args: unknown[]) =>
         commands.zRangeWithScores?.(...args),
       ...Object.fromEntries(
-        ["hGetAll", "lRange", "sMembers", "xRange", "sendCommand"]
+        ["getRange", "hGetAll", "lRange", "sMembers", "xRange", "sendCommand"]
           .filter((command) => command in client)
           .map((command) => [
             command,

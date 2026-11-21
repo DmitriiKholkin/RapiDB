@@ -1,14 +1,24 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StoredConnectionConfig } from "../../src/extension/connectionManagerModels";
 import { QUERY_LIMIT_POLICY } from "../../src/shared/safetyContracts";
+import { createProjectTempDir } from "../runtime/tempDirectories";
 
-async function createRepairStore() {
+let storagePath: string;
+beforeEach(async () => {
+  storagePath = await createProjectTempDir("unit-node", "connections-");
+});
+
+const storageUri = () => ({ scheme: "file", fsPath: storagePath });
+const workspaceFolders = () => [{ uri: storageUri() }];
+
+async function createRepairStore(generatedIds: string[] = []) {
   vi.resetModules();
   const state = {
     connections: [
-      { id: "duplicate", name: "First", type: "pg" },
-      { id: "duplicate", name: "Second", type: "pg" },
+      { id: "duplicate", name: "First", type: "pg", host: "first.invalid" },
+      { id: "duplicate", name: "Second", type: "pg", host: "second.invalid" },
     ] as StoredConnectionConfig[],
+    userConnections: [] as StoredConnectionConfig[],
     target: 1,
   };
   const raw = '{ "password": " secret ", "futureField": {"value":42} }';
@@ -27,28 +37,56 @@ async function createRepairStore() {
       state.connections = JSON.parse(JSON.stringify(value));
     },
   );
+  const showWarningMessage = vi.fn(async () => undefined);
   vi.doMock("vscode", () => ({
+    window: { showWarningMessage },
+    env: {},
     workspace: {
+      workspaceFolders: workspaceFolders(),
       getConfiguration: () => ({
         get: () => state.connections,
         inspect: () =>
           state.target === 1
             ? { globalValue: state.connections }
-            : { workspaceValue: state.connections },
+            : {
+                workspaceValue: state.connections,
+                globalValue: state.userConnections,
+              },
         update,
       }),
       onDidChangeConfiguration: vi.fn(),
     },
     ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
   }));
-  const { VSCodeConnectionManagerStore } = await import(
+  if (generatedIds.length > 0) {
+    vi.doMock("node:crypto", async (importOriginal) => {
+      const original = await importOriginal<typeof import("node:crypto")>();
+      return {
+        ...original,
+        randomUUID: () => generatedIds.shift() ?? original.randomUUID(),
+      };
+    });
+  }
+  const { readConnectionSecret, VSCodeConnectionManagerStore } = await import(
     "../../src/extension/connectionManagerStore"
   );
+  vi.doUnmock("node:crypto");
   const store = new VSCodeConnectionManagerStore({
+    globalStorageUri: storageUri(),
     globalState: { get: vi.fn(), update: vi.fn() },
     secrets,
   } as never);
-  return { store, state, documents, secrets, update, raw };
+  return {
+    store,
+    state,
+    documents,
+    secrets,
+    update,
+    raw,
+    showWarningMessage,
+    readConnectionSecret: (id: string) =>
+      readConnectionSecret(secrets as never, id),
+  };
 }
 
 describe("connection repair transactions", () => {
@@ -145,105 +183,54 @@ describe("connection repair transactions", () => {
   });
 
   it.each([
-    "",
-    " \t ",
-  ])("moves exact secret documents off orphan ID %j and preserves the first duplicate owner's key", async (id) => {
+    ["", ""],
+    [" \t ", " "],
+  ])("does not guess ownership of ambiguous blank IDs %j and %j", async (first, second) => {
     const { store, state, documents, secrets, raw } = await createRepairStore();
     state.connections.push(
-      { id, name: "Invalid first", type: "pg" },
-      { id, name: "Invalid second", type: "pg" },
+      { id: first, name: "Invalid first", type: "pg" },
+      { id: second, name: "Invalid second", type: "pg" },
     );
-    documents.set(id, raw);
+    documents.set(first, raw);
+    documents.set(second, raw);
     const repaired = store.getConnections();
     await store.mutateConnections(() => ({ result: undefined }));
     expect(state.connections).toEqual(repaired);
     expect(new Set(repaired.map((c) => c.id)).size).toBe(4);
-    for (const connection of repaired)
-      expect(documents.get(connection.id)).toBe(raw);
-    expect(documents.has(id)).toBe(false);
-    expect(secrets.delete).toHaveBeenCalledExactlyOnceWith(id);
-    expect(secrets.delete).not.toHaveBeenCalledWith("duplicate");
-    await store.mutateConnections(async (current) => {
-      for (const connection of current.slice(2))
-        await store.deleteSecret(connection.id);
-      return { connections: current.slice(0, 2), result: undefined };
-    });
-    expect(documents.size).toBe(2);
+    expect(documents.get("duplicate")).toBe(raw);
+    for (const connection of repaired.slice(1))
+      expect(documents.has(connection.id)).toBe(false);
+    expect(documents.get(first)).toBe(raw);
+    expect(documents.get(second)).toBe(raw);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
   });
 
   it.each([
-    "delete",
-    "settings",
-    "applied-settings",
-  ])("handles orphan cleanup %s failures transactionally", async (failure) => {
+    false,
+    true,
+  ])("retains the source and staged copy after a settings acknowledgement failure (applied=%s)", async (applied) => {
     const { store, state, documents, secrets, update, raw } =
       await createRepairStore();
-    state.connections = [
-      {
-        id: " ",
-        name: "Invalid",
-        type: "pg",
-        connectionUri: undefined,
-        tls: {
-          mode: "mutualTls",
-          certFilePath: "/cert",
-          keyFilePath: "/key",
-          keyPassphrase: undefined,
-        },
-      },
-    ];
-    documents.clear();
+    state.connections = [{ id: " ", name: "Invalid", type: "pg" }];
     documents.set(" ", raw);
-    if (failure === "delete")
-      secrets.delete.mockImplementationOnce(async (id) => {
-        documents.delete(id);
-        throw new Error("cleanup failed");
-      });
-    else
-      update.mockImplementationOnce(async (_key, value) => {
-        if (failure === "applied-settings")
-          state.connections = JSON.parse(JSON.stringify(value));
-        throw new Error("settings failed");
-      });
-    const repaired = store.getConnections();
-    if (failure !== "applied-settings") {
-      await vi.waitFor(() =>
-        expect(secrets.store).toHaveBeenCalledWith(" ", raw),
-      );
-      expect(state.connections[0].id).toBe(" ");
+    update.mockImplementationOnce(async (_key, value) => {
       expect(documents.get(" ")).toBe(raw);
-      expect(documents.has(repaired[0].id)).toBe(false);
+      if (applied) state.connections = JSON.parse(JSON.stringify(value));
+      throw new Error("settings failed");
+    });
+    const [repair] = store.getConnections();
+    const pending = store.mutateConnections(() => ({ result: undefined }));
+    if (applied) {
+      await expect(pending).resolves.toBeUndefined();
+      expect(state.connections).toEqual([repair]);
+    } else {
+      await expect(pending).rejects.toThrow("stale");
+      expect(state.connections[0].id).toBe(" ");
     }
-    await store.mutateConnections(() => ({ result: undefined }));
-    expect(state.connections).toEqual(repaired);
-    expect(documents.size).toBe(1);
-    expect(documents.get(repaired[0].id)).toBe(raw);
-    expect(documents.has(" ")).toBe(false);
-  });
-
-  it("restores an orphan's old key when settings change after cleanup but before commit", async () => {
-    const { store, state, documents, secrets, update, raw } =
-      await createRepairStore();
-    state.connections = [{ id: "", name: "Invalid", type: "pg" }];
-    documents.clear();
-    documents.set("", raw);
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    secrets.delete.mockImplementationOnce(async (id) => {
-      documents.delete(id);
-      await gate;
-    });
-    const repaired = store.getConnections();
-    await vi.waitFor(() => expect(documents.has("")).toBe(false));
-    state.connections = [{ id: "external", name: "External", type: "pg" }];
-    release();
-    await vi.waitFor(() => expect(documents.get("")).toBe(raw));
-    expect(update).not.toHaveBeenCalled();
-    expect(documents.has(repaired[0].id)).toBe(false);
-    await store.mutateConnections(() => ({ result: undefined }));
-    expect(state.connections[0].id).toBe("external");
+    expect(documents.get(repair.id)).toBe(raw);
+    expect(documents.get(" ")).toBe(raw);
+    expect(secrets.delete).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -341,79 +328,187 @@ describe("connection repair transactions", () => {
     else expect(state.connections).toBe(external);
   });
 
-  it("copies the exact duplicate secret before committing IDs and preserves the original", async () => {
-    const { store, documents, raw, update } = await createRepairStore();
-    update.mockImplementationOnce(async (_key, value) => {
-      expect(documents.get(value[1].id)).toBe(raw);
-    });
-    const repaired = store.getConnections()[1].id;
-    await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
-    expect(documents.get(repaired)).toBe(raw);
-    expect(documents.get("duplicate")).toBe(raw);
-  });
-
   it.each([
-    "read",
-    "save",
-    "delete",
-    "saveConnections",
-  ])("retries failed normalization with stable UI IDs on %s", async (action) => {
-    const { store, state, documents, raw, update, secrets } =
+    "exact",
+    "trim-equivalent",
+  ])("does not read either original key when repairing an %s duplicate", async (kind) => {
+    const { store, state, documents, raw, secrets, showWarningMessage } =
       await createRepairStore();
-    update.mockRejectedValueOnce(new Error("settings unavailable"));
-    const first = store.getConnections();
-    const id = first[1].id;
-    await vi.waitFor(() => expect(secrets.delete).toHaveBeenCalledWith(id));
-    expect(documents.has(id)).toBe(false);
-    expect(documents.get("duplicate")).toBe(raw);
-    if (action === "read") {
-      expect(store.getConnections()).toEqual(first);
-      await vi.waitFor(() => expect(state.connections[1].id).toBe(id));
-    } else if (action === "saveConnections") {
-      await store.saveConnections(
-        first.map((c) => (c.id === id ? { ...c, name: "Saved" } : c)),
-      );
-      expect(state.connections[1]).toMatchObject({ id, name: "Saved" });
-      expect(documents.get(id)).toBe(raw);
-    } else {
-      await store.mutateConnections(async (current) => {
-        expect(current.map((c) => c.id)).toEqual(first.map((c) => c.id));
-        expect(await store.getSecret(id)).toBe(raw);
-        if (action === "delete") await store.deleteSecret(id);
-        return {
-          connections:
-            action === "delete"
-              ? current.filter((c) => c.id !== id)
-              : current.map((c) => (c.id === id ? { ...c, name: "Saved" } : c)),
-          result: undefined,
-        };
-      });
-      expect(state.connections.find((c) => c.id === id)?.name).toBe(
-        action === "delete" ? undefined : "Saved",
-      );
+    const source = state.connections[1];
+    if (kind === "trim-equivalent") {
+      source.id = " duplicate ";
+      documents.set(source.id, raw);
     }
+    source.useSecretStorage = true;
+    source.secretStorageProfile = "copied-profile-link";
+    const repaired = store.getConnections();
+    expect(repaired[0]).toEqual(state.connections[0]);
+    expect(repaired[1]).toMatchObject({
+      host: source.host,
+      useSecretStorage: true,
+    });
+    expect(repaired[1]).not.toHaveProperty("secretStorageProfile");
+    expect(repaired[1].id).not.toBe(source.id);
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual(repaired);
+    expect(secrets.get).toHaveBeenCalledExactlyOnceWith(repaired[1].id);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(documents.has(repaired[1].id)).toBe(false);
     expect(documents.get("duplicate")).toBe(raw);
+    expect(documents.get(source.id)).toBe(raw);
+    expect(showWarningMessage).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("Edit Connection"),
+    );
   });
 
-  it("rolls back a secret copy that applies before rejecting and retries the same ID", async () => {
-    const { store, secrets, documents, update, raw } =
+  it("preserves hand-written secrets and repairs non-string IDs without reading an old key", async () => {
+    const { store, state, documents, raw, secrets, showWarningMessage } =
       await createRepairStore();
+    const handWritten = {
+      id: "duplicate",
+      name: "Hand written",
+      type: "pg",
+      password: "inline-password",
+      ssh: { password: "inline-ssh-password" },
+      extra: { untouched: true },
+    };
+    state.connections = [
+      state.connections[0],
+      handWritten,
+      { id: 42, name: "Numeric", type: "pg" },
+    ] as StoredConnectionConfig[];
+    documents.set("42", raw);
+    const repaired = store.getConnections();
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual(repaired);
+    expect(repaired[1]).toEqual({
+      ...handWritten,
+      id: repaired[1].id,
+      useSecretStorage: false,
+    });
+    expect(repaired[1].id).not.toBe(handWritten.id);
+    expect(repaired[2].id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(secrets.get.mock.calls).toEqual([
+      [repaired[1].id],
+      [repaired[2].id],
+    ]);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(documents.get("duplicate")).toBe(raw);
+    expect(documents.get("42")).toBe(raw);
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not move a blank ID's secret if a different settings scope also references it", async () => {
+    const { store, state, documents, secrets, raw } = await createRepairStore();
+    state.target = 2;
+    state.connections = [{ id: " ", name: "Workspace", type: "pg" }];
+    state.userConnections = [{ id: " ", name: "User", type: "pg" }];
+    documents.set(" ", raw);
+    const [repaired] = store.getConnections();
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual([repaired]);
+    expect(secrets.get).toHaveBeenCalledExactlyOnceWith(repaired.id);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(documents.get(" ")).toBe(raw);
+  });
+
+  it("reserves later IDs and other scopes, and never exposes or replaces an occupied generated key", async () => {
+    const later = "00000000-0000-4000-8000-000000000001";
+    const other = "00000000-0000-4000-8000-000000000002";
+    const occupied = "00000000-0000-4000-8000-000000000003";
+    const fresh = "00000000-0000-4000-8000-000000000004";
+    const {
+      store,
+      state,
+      documents,
+      secrets,
+      raw,
+      update,
+      showWarningMessage,
+      readConnectionSecret,
+    } = await createRepairStore([later, other, occupied, fresh]);
+    state.connections.push({ id: ` ${later} `, name: "Later", type: "pg" });
+    state.target = 2;
+    state.userConnections = [{ id: other, name: "User", type: "pg" }];
+    documents.set(occupied, raw);
+    const tentative = store.getConnections();
+    expect(tentative.map(({ id }) => id)).toEqual([
+      "duplicate",
+      occupied,
+      ` ${later} `,
+    ]);
+    await expect(readConnectionSecret(occupied)).resolves.toBeUndefined();
+    expect(update).not.toHaveBeenCalled();
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections.map(({ id }) => id)).toEqual([
+      "duplicate",
+      fresh,
+      ` ${later} `,
+    ]);
+    await expect(readConnectionSecret(occupied)).resolves.toBeUndefined();
+    expect(documents.get(occupied)).toBe(raw);
+    expect(documents.get("duplicate")).toBe(raw);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(showWarningMessage).toHaveBeenCalledOnce();
+  });
+
+  it("blocks a retry after an unconfirmed repair without copying duplicate credentials", async () => {
+    const {
+      store,
+      state,
+      documents,
+      raw,
+      update,
+      secrets,
+      showWarningMessage,
+    } = await createRepairStore();
+    update.mockRejectedValueOnce(new Error("settings unavailable"));
+    const [first, second] = store.getConnections();
+    await expect(
+      store.mutateConnections(() => ({ result: undefined })),
+    ).rejects.toThrow("stale");
+    expect(store.getConnections()).toEqual([first, second]);
+    expect(state.connections[1].id).toBe("duplicate");
+    expect(update).toHaveBeenCalledOnce();
+    expect(documents.get("duplicate")).toBe(raw);
+    expect(documents.has(second.id)).toBe(false);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(showWarningMessage).not.toHaveBeenCalled();
+  });
+
+  it("allocates a fresh repair ID after a secret copy applies before rejecting", async () => {
+    const { store, state, secrets, documents, update, raw } =
+      await createRepairStore();
+    state.connections = [{ id: "", name: "Invalid", type: "pg" }];
+    documents.set("", raw);
     secrets.store.mockImplementationOnce(async (id, value) => {
       documents.set(id, value);
       throw new Error("secret write failed");
     });
-    const id = store.getConnections()[1].id;
-    await vi.waitFor(() => expect(secrets.delete).toHaveBeenCalledWith(id));
+    await expect(
+      store.mutateConnections(() => ({ result: undefined })),
+    ).rejects.toThrow("secret write failed");
     expect(update).not.toHaveBeenCalled();
-    expect(documents.has(id)).toBe(false);
-    expect(store.getConnections()[1].id).toBe(id);
-    await vi.waitFor(() => expect(update).toHaveBeenCalledOnce());
+    const [id] = secrets.store.mock.calls[0];
     expect(documents.get(id)).toBe(raw);
+    expect(documents.get("")).toBe(raw);
+    expect(store.getConnections()[0].id).not.toBe(id);
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(documents.get(state.connections[0].id)).toBe(raw);
+    expect(secrets.delete).not.toHaveBeenCalled();
   });
 
-  it("rolls back copied secrets when settings change during normalization", async () => {
+  it("does not delete either secret when settings change during normalization", async () => {
     const { store, state, secrets, documents, update, raw } =
       await createRepairStore();
+    state.connections = [{ id: "", name: "Invalid", type: "pg" }];
+    documents.set("", raw);
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -422,19 +517,28 @@ describe("connection repair transactions", () => {
       documents.set(id, value);
       await gate;
     });
-    const id = store.getConnections()[1].id;
+    const id = store.getConnections()[0].id;
     await vi.waitFor(() => expect(documents.get(id)).toBe(raw));
     state.connections = [{ id: "external", name: "External", type: "sqlite" }];
     release();
-    await vi.waitFor(() => expect(secrets.delete).toHaveBeenCalledWith(id));
+    await store.mutateConnections(() => ({ result: undefined }));
     expect(update).not.toHaveBeenCalled();
-    expect(documents.get("duplicate")).toBe(raw);
+    expect(documents.get("")).toBe(raw);
+    expect(documents.get(id)).toBe(raw);
+    expect(secrets.delete).not.toHaveBeenCalled();
     expect(store.getConnections()).toEqual(state.connections);
   });
 
-  it("keeps copied secrets when normalization applies before rejecting", async () => {
-    const { store, state, documents, update, raw, secrets } =
-      await createRepairStore();
+  it("keeps a duplicate isolated when normalization applies before rejecting", async () => {
+    const {
+      store,
+      state,
+      documents,
+      update,
+      raw,
+      secrets,
+      showWarningMessage,
+    } = await createRepairStore();
     state.connections = state.connections.map((connection) => ({
       ...connection,
       connectionUri: undefined,
@@ -446,14 +550,30 @@ describe("connection repair transactions", () => {
     const first = store.getConnections();
     await store.mutateConnections(() => ({ result: undefined }));
     expect(store.getConnections()).toEqual(first);
-    expect(documents.get(first[1].id)).toBe(raw);
+    expect(documents.has(first[1].id)).toBe(false);
+    expect(documents.get("duplicate")).toBe(raw);
+    expect(secrets.store).not.toHaveBeenCalled();
     expect(secrets.delete).not.toHaveBeenCalled();
+    expect(showWarningMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not require credentials to repair a unique invalid ID", async () => {
+    const { store, state, documents, secrets, showWarningMessage } =
+      await createRepairStore();
+    state.connections = [{ id: "", name: "Invalid", type: "pg" }];
+    const [repaired] = store.getConnections();
+    await store.mutateConnections(() => ({ result: undefined }));
+    expect(state.connections).toEqual([repaired]);
+    expect(documents.has(repaired.id)).toBe(false);
+    expect(secrets.store).not.toHaveBeenCalled();
+    expect(secrets.delete).not.toHaveBeenCalled();
+    expect(showWarningMessage).not.toHaveBeenCalled();
   });
 
   it.each([
     "revision",
     "target",
-  ])("rolls back normalization secrets without clobbering an external %s update after JSON persistence", async (change) => {
+  ])("retains both normalization keys without clobbering an external %s update after JSON persistence", async (change) => {
     const { store, state, documents, secrets, update, raw } =
       await createRepairStore();
     state.connections = [
@@ -478,8 +598,8 @@ describe("connection repair transactions", () => {
     expect(state.connections).toBe(external);
     expect(update).toHaveBeenCalledOnce();
     expect(documents.get(" ")).toBe(raw);
-    expect(documents.has(repairedId)).toBe(false);
-    expect(secrets.delete).toHaveBeenCalledWith(repairedId);
+    expect(documents.get(repairedId)).toBe(raw);
+    expect(secrets.delete).not.toHaveBeenCalled();
   });
 });
 
@@ -502,7 +622,9 @@ describe("VSCodeConnectionManagerStore", () => {
     }));
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration,
         onDidChangeConfiguration: vi.fn(),
       },
@@ -516,6 +638,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -540,7 +663,9 @@ describe("VSCodeConnectionManagerStore", () => {
     vi.resetModules();
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn((section: string, fallback?: number) => {
             if (section === "queryRowLimit") {
@@ -562,6 +687,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -580,7 +706,9 @@ describe("VSCodeConnectionManagerStore", () => {
     vi.resetModules();
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn((section: string, fallback?: number) => {
             if (section === "queryRowLimit") {
@@ -602,6 +730,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -625,7 +754,9 @@ describe("VSCodeConnectionManagerStore", () => {
     vi.resetModules();
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn((section: string, fallback?: unknown) =>
             section === "queryHistoryLimit" || section === "queryRowLimit"
@@ -646,6 +777,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -665,7 +797,9 @@ describe("VSCodeConnectionManagerStore", () => {
     vi.resetModules();
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn((section: string, fallback?: boolean) => {
             if (section === "skipTableMutationPreview") {
@@ -687,6 +821,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -723,7 +858,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -740,6 +877,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -795,7 +933,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -812,6 +952,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -876,7 +1017,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -893,6 +1036,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -949,7 +1093,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -966,6 +1112,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -1013,7 +1160,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -1030,6 +1179,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -1075,7 +1225,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -1092,6 +1244,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -1137,7 +1290,9 @@ describe("VSCodeConnectionManagerStore", () => {
     });
 
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get,
           update,
@@ -1154,6 +1309,7 @@ describe("VSCodeConnectionManagerStore", () => {
     );
 
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: {
         get: vi.fn(),
         update: vi.fn(),
@@ -1186,7 +1342,9 @@ describe("VSCodeConnectionManagerStore", () => {
     ];
     const update = vi.fn(async () => undefined);
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn(() => workspaceConnections),
           inspect: vi.fn(() => ({ workspaceValue: workspaceConnections })),
@@ -1200,11 +1358,12 @@ describe("VSCodeConnectionManagerStore", () => {
       "../../src/extension/connectionManagerStore"
     );
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: { get: vi.fn(), update: vi.fn() },
       secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
     } as never);
 
-    await store.saveConnections([
+    await store.saveConnectionsIfRevision(store.getConnectionsRevision(), [
       { id: "conn-1", name: "Updated", type: "sqlite" },
     ]);
 
@@ -1294,9 +1453,10 @@ describe("VSCodeConnectionManagerStore", () => {
     for (const [scope, target] of [
       ["globalValue", 1],
       ["workspaceValue", 2],
-      ["workspaceFolderValue", 3],
+      ["workspaceFolderValue", 2],
     ] as const) {
       vi.resetModules();
+      storagePath = await createProjectTempDir("unit-node", "scope-");
       const handWritten = {
         id: "hand",
         name: "Hand",
@@ -1323,7 +1483,9 @@ describe("VSCodeConnectionManagerStore", () => {
         },
       );
       vi.doMock("vscode", () => ({
+        env: {},
         workspace: {
+          workspaceFolders: workspaceFolders(),
           getConfiguration: vi.fn(() => ({
             get: vi.fn(() => connections),
             inspect: vi.fn(() => ({ [scope]: connections })),
@@ -1338,6 +1500,7 @@ describe("VSCodeConnectionManagerStore", () => {
       );
       const secrets = { get: vi.fn(), store: vi.fn(), delete: vi.fn() };
       const store = new VSCodeConnectionManagerStore({
+        globalStorageUri: storageUri(),
         globalState: { get: vi.fn(), update: vi.fn() },
         secrets,
       } as never);
@@ -1372,7 +1535,9 @@ describe("VSCodeConnectionManagerStore", () => {
       connections = value;
     });
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn(() => connections),
           inspect: vi.fn(() => ({ globalValue: connections })),
@@ -1386,6 +1551,7 @@ describe("VSCodeConnectionManagerStore", () => {
       "../../src/extension/connectionManagerStore"
     );
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: { get: vi.fn(), update: vi.fn() },
       secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
     } as never);
@@ -1421,7 +1587,9 @@ describe("VSCodeConnectionManagerStore", () => {
       connections = value;
     });
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn(() => connections),
           update,
@@ -1434,6 +1602,7 @@ describe("VSCodeConnectionManagerStore", () => {
       "../../src/extension/connectionManagerStore"
     );
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: { get: vi.fn(), update: vi.fn() },
       secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
     } as never);
@@ -1458,7 +1627,9 @@ describe("VSCodeConnectionManagerStore", () => {
       throw new Error("acknowledgement failed");
     });
     vi.doMock("vscode", () => ({
+      env: {},
       workspace: {
+        workspaceFolders: workspaceFolders(),
         getConfiguration: vi.fn(() => ({
           get: vi.fn(() => connections),
           inspect: vi.fn(() => ({ globalValue: connections })),
@@ -1472,6 +1643,7 @@ describe("VSCodeConnectionManagerStore", () => {
       "../../src/extension/connectionManagerStore"
     );
     const store = new VSCodeConnectionManagerStore({
+      globalStorageUri: storageUri(),
       globalState: { get: vi.fn(), update: vi.fn() },
       secrets: { get: vi.fn(), store: vi.fn(), delete: vi.fn() },
     } as never);

@@ -24,6 +24,10 @@ import {
   oracleInsertIdentity,
 } from "./insertIdentitySql";
 import {
+  lockedTableMutationOptions,
+  runLockedTableTransaction,
+} from "./lockedTableMutation";
+import {
   applyRowTypeHints,
   buildPrevalidationFailedResult,
   validatePersistedEditRecord,
@@ -36,6 +40,7 @@ import type {
   RowUpdate,
   VerificationTarget,
 } from "./tableDataContracts";
+import { tableDataReference } from "./tableDataReference";
 import {
   appendPrimaryKeyComparison,
   buildUpdateRowSql,
@@ -180,28 +185,27 @@ export async function executeAtomicSqlApplyPlan(
       })),
       ...(apply?.operations ?? []),
     ];
-    await assertMutationRollbackSupport(
-      driver,
-      [
-        ...(apply && apply.operations.length > 0
-          ? [
-              {
-                database: apply.database,
-                schema: apply.schema,
-                table: apply.table,
-                verification: "UPDATE" as const,
-              },
-            ]
-          : []),
-        ...inserts.map((plan) => ({
-          database: plan.database,
-          schema: plan.schema,
-          table: plan.table,
-          ...(plan.verification ? { verification: "INSERT" as const } : {}),
-        })),
-      ],
-      operations.length,
-    );
+    const targets = [
+      ...(apply && apply.operations.length > 0
+        ? [
+            {
+              database: apply.database,
+              schema: apply.schema,
+              table: apply.table,
+              event: "UPDATE" as const,
+              verification: "UPDATE" as const,
+            },
+          ]
+        : []),
+      ...inserts.map((plan) => ({
+        database: plan.database,
+        schema: plan.schema,
+        table: plan.table,
+        event: "INSERT" as const,
+        ...(plan.verification ? { verification: "INSERT" as const } : {}),
+      })),
+    ];
+    await assertMutationRollbackSupport(driver, targets, operations.length);
     assertConnectionWritable(connectionManager, connectionId, "apply changes");
     if (connectionManager.getDriver(connectionId) !== driver) {
       throw new Error(
@@ -209,11 +213,22 @@ export async function executeAtomicSqlApplyPlan(
       );
     }
     executionStarted = true;
-    await driver.runTransaction(operations, undefined, {
-      ...options,
-      ...(sqliteAttachmentTarget ? { sqliteAttachmentTarget } : {}),
-      ...(verifications.length ? { verifications } : {}),
-    });
+    await runLockedTableTransaction(
+      lockedTableMutationOptions(
+        connectionManager,
+        driver,
+        connectionId,
+        "apply changes",
+        targets,
+      ),
+      (locked) =>
+        driver.runTransaction(operations, undefined, {
+          ...options,
+          ...locked,
+          ...(sqliteAttachmentTarget ? { sqliteAttachmentTarget } : {}),
+          ...(verifications.length ? { verifications } : {}),
+        }),
+    );
     return {
       ...(apply
         ? appliedPlanResult(apply)
@@ -395,23 +410,29 @@ export function prepareApplyChangesPlan(
         cols: columns,
         updates: coercedUpdates,
         operations: [],
-        previewStatements: executableUpdates.map(
-          ({ primaryKeys, changes, originalValues, originalTypes }) =>
-            driver.buildMutationPreviewStatement
-              ? driver.buildMutationPreviewStatement(
-                  "update",
-                  database,
-                  schema,
-                  table,
-                  {
-                    primaryKeys,
-                    changes,
-                    originalValues,
-                    originalTypes,
-                  },
-                )
-              : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes, originalValues })}`,
-        ),
+        // The panel awaits async builders before presenting a preview. Do not
+        // produce a fallback command that bypasses an async preflight.
+        previewStatements:
+          driver.buildMutationPreviewStatements &&
+          !driver.buildMutationPreviewStatement
+            ? []
+            : executableUpdates.map(
+                ({ primaryKeys, changes, originalValues, originalTypes }) =>
+                  driver.buildMutationPreviewStatement
+                    ? driver.buildMutationPreviewStatement(
+                        "update",
+                        database,
+                        schema,
+                        table,
+                        {
+                          primaryKeys,
+                          changes,
+                          originalValues,
+                          originalTypes,
+                        },
+                      )
+                    : `UPDATE ${driver.qualifiedTableName(database, schema, table)} ${JSON.stringify({ primaryKeys, changes, originalValues })}`,
+              ),
         skippedRows: [...skippedRows],
         verificationTargets: [],
       },
@@ -710,16 +731,16 @@ export async function executePreparedApplyPlan(
   let executionStarted = false;
   try {
     const options = buildTransactionOptions(driver, plan);
+    const target = {
+      database: plan.database,
+      schema: plan.schema,
+      table: plan.table,
+      event: "UPDATE" as const,
+      verification: "UPDATE" as const,
+    };
     await assertMutationRollbackSupport(
       driver,
-      [
-        {
-          database: plan.database,
-          schema: plan.schema,
-          table: plan.table,
-          verification: "UPDATE" as const,
-        },
-      ],
+      [target],
       plan.operations.length,
     );
     assertConnectionWritable(
@@ -733,7 +754,20 @@ export async function executePreparedApplyPlan(
       );
     }
     executionStarted = true;
-    await driver.runTransaction(plan.operations, undefined, options);
+    await runLockedTableTransaction(
+      lockedTableMutationOptions(
+        connectionManager,
+        driver,
+        plan.connectionId,
+        "apply changes",
+        [target],
+      ),
+      (locked) =>
+        driver.runTransaction(plan.operations, undefined, {
+          ...options,
+          ...locked,
+        }),
+    );
     return appliedPlanResult(plan);
   } catch (error: unknown) {
     if (error instanceof TransactionVerificationError) {
@@ -1006,7 +1040,6 @@ function buildTransactionOptions(
     cols: columns,
     verificationTargets: targets,
   } = plan;
-  const qualifiedTableName = driver.qualifiedTableName(database, schema, table);
   const columnMetaByName = new Map(
     columns.map((column) => [column.name, column]),
   );
@@ -1051,7 +1084,8 @@ function buildTransactionOptions(
           `${driver.buildVerificationValueExpr?.(column) ?? driver.quoteIdentifier(column.name)} AS ${driver.quoteIdentifier(`__col_${index}`)}`,
       )
       .join(", ");
-    const sql = `SELECT ${projection || "1"} FROM ${qualifiedTableName}${captured?.sqlite ? "" : ` WHERE ${whereParts.join(" AND ")}`}`;
+    const from = tableDataReference(driver, database, schema, table, columns);
+    const sql = `SELECT ${projection || "1"} FROM ${from}${captured?.sqlite ? "" : ` WHERE ${whereParts.join(" AND ")}`}`;
     const parameterIndexes = sqliteNullKeyColumns
       ? [0]
       : (captured?.columns.map((_, index) => index) ?? []);

@@ -36,13 +36,24 @@ export type {
   QueryResultCounts,
   QueryResultExportPayload,
   QueryResultSet,
+  QueryRunIdentity,
+  QueryRunOutcome,
+  QueryRunStatus,
+  QueryRunStatusReply,
+  QueryRunStatusRequest,
   QuerySchemaPayload,
   QueryTargetBinding,
+  QueryTargetChangeResult,
 } from "./query";
 export {
   parseBookmarkSavedPayload,
   parseQueryPanelMessage,
+  parseQueryRunIdentity,
+  parseQueryRunOutcome,
+  parseQueryRunStatusReply,
   parseQueryTargetBinding,
+  parseQueryTargetChangeResult,
+  sameQueryRun,
 } from "./query";
 export type {
   PanelRetentionMode,

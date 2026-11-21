@@ -25,11 +25,23 @@ export interface ConnectionSshSettings {
       };
 }
 
+export interface SshForwardTarget {
+  remoteHost: string;
+  remotePort: number;
+}
+
+export interface SshLocalForward extends SshForwardTarget {
+  localHost: "127.0.0.1";
+  localPort: number;
+}
+
 export type SshRuntimeRequest =
   | {
       kind: "tcpForward";
       remoteHost: string;
       remotePort: number;
+      /** Further fixed targets reached through the same SSH session. */
+      extraForwards?: readonly SshForwardTarget[];
     }
   | {
       kind: "httpAgent";
@@ -42,6 +54,7 @@ export type SshRuntimeTransport =
       localPort: number;
       remoteHost: string;
       remotePort: number;
+      extraForwards?: readonly SshLocalForward[];
     }
   | {
       kind: "httpAgent";
@@ -569,20 +582,14 @@ async function createVerifiedClient(
   };
 }
 
-async function createTcpForwardRuntime(
+function createForwardServer(
   lifetime: SshTransportLifetime,
-  verifiedFingerprintSha256: string,
-  request: Extract<SshRuntimeRequest, { kind: "tcpForward" }>,
-): Promise<SshRuntime> {
-  lifetime.signal.throwIfAborted();
-  const server = net.createServer((socket) => {
+  target: SshForwardTarget,
+): net.Server {
+  return net.createServer((socket) => {
     lifetime.track(socket);
     if (socket.destroyed) return;
-    void createForwardOutPromise(
-      lifetime,
-      request.remoteHost,
-      request.remotePort,
-    )
+    void createForwardOutPromise(lifetime, target.remoteHost, target.remotePort)
       .then((upstream) => {
         if (socket.destroyed || lifetime.signal.aborted) {
           upstream.destroy();
@@ -607,30 +614,59 @@ async function createTcpForwardRuntime(
         socket.destroy();
       });
   });
+}
+
+async function createTcpForwardRuntime(
+  lifetime: SshTransportLifetime,
+  verifiedFingerprintSha256: string,
+  request: Extract<SshRuntimeRequest, { kind: "tcpForward" }>,
+): Promise<SshRuntime> {
+  lifetime.signal.throwIfAborted();
+  const targets: SshForwardTarget[] = [
+    { remoteHost: request.remoteHost, remotePort: request.remotePort },
+    ...(request.extraForwards ?? []),
+  ];
+  const servers = targets.map((target) =>
+    createForwardServer(lifetime, target),
+  );
 
   let closing: Promise<void> | undefined;
   const close = () => {
-    if (!server.listening && !closing) return Promise.resolve();
-    closing ??= closeServer(server);
+    if (!servers.some((server) => server.listening) && !closing)
+      return Promise.resolve();
+    closing ??= Promise.all(servers.map(closeServer)).then(() => undefined);
     return closing;
   };
-  server.on("error", (error) => lifetime.stop(error));
+  for (const server of servers) {
+    server.on("error", (error) => lifetime.stop(error));
+  }
   const onAbort = () => {
     void close();
   };
   lifetime.signal.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const address = await waitForServerListening(server);
+    const addresses = await Promise.all(servers.map(waitForServerListening));
     lifetime.signal.throwIfAborted();
     let disposal: Promise<void> | undefined;
+    const [main, ...extra] = addresses;
     return {
       transport: {
         kind: "tcpForward",
         localHost: "127.0.0.1",
-        localPort: address.port,
+        localPort: main.port,
         remoteHost: request.remoteHost,
         remotePort: request.remotePort,
+        ...(extra.length > 0
+          ? {
+              extraForwards: extra.map((address, index) => ({
+                localHost: "127.0.0.1" as const,
+                localPort: address.port,
+                remoteHost: targets[index + 1].remoteHost,
+                remotePort: targets[index + 1].remotePort,
+              })),
+            }
+          : {}),
       },
       verifiedFingerprintSha256,
       onDidClose: (listener) => lifetime.onDidClose(listener),

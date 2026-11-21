@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ConnectionManager } from "../../src/extension/connectionManager";
 import { VSCodeConnectionManagerStore } from "../../src/extension/connectionManagerStore";
+import { bindConnectionSecret } from "../../src/extension/connectionSecretBinding";
 import { parseStoredConnectionSecrets } from "../../src/extension/connectionSecretsData";
 import { ConnectionFormPanel } from "../../src/extension/panels/connectionFormPanel";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
 import type { ConnectionFormExistingState } from "../../src/shared/webviewContracts";
-import { createExtensionContextStub } from "../support/fakeConnectionManagerStore";
+import { registerConnectionStorageFixture } from "../support/connectionStorageContext";
 import type { MockWebviewPanel } from "../support/mockVscode";
 import { SSH_HOST_FINGERPRINT_SHA256 } from "../support/sshFingerprints";
 
@@ -19,6 +20,8 @@ vi.mock("../../src/extension/panels/webviewShell", () => ({
 
 import * as vscode from "vscode";
 import { createWebviewShell } from "../../src/extension/panels/webviewShell";
+
+const createExtensionContextStub = registerConnectionStorageFixture();
 
 function fixture(configs: ConnectionConfig[]) {
   let connections = structuredClone(configs);
@@ -93,6 +96,63 @@ const tofuSsh = {
 
 describe("edit precondition ignores extension-managed background writes", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it.each([
+    "legacy",
+    "bound",
+  ])("repairs a duplicate without inheriting %s credentials and lets the new profile save its own", async (kind) => {
+    const owner =
+      kind === "bound"
+        ? {
+            ...pg,
+            useSecretStorage: true,
+            secretStorageProfile: "original-link",
+          }
+        : pg;
+    const duplicate = {
+      ...owner,
+      name: "Other profile",
+      host: "other.invalid",
+    };
+    const f = fixture([owner, duplicate]);
+    const original =
+      kind === "bound"
+        ? bindConnectionSecret(
+            owner,
+            JSON.stringify({ password: "owner-password" }),
+          )
+        : "owner-password";
+    await f.context.secrets.store(owner.id, original);
+    await f.drainMigration();
+    const [retained, repaired] = f.manager.getConnections();
+    expect(retained.id).toBe(owner.id);
+    expect(repaired.id).not.toBe(owner.id);
+    expect(repaired.secretStorageProfile).toBeUndefined();
+    expect((await f.manager._hydratePassword(retained)).password).toBe(
+      "owner-password",
+    );
+    expect((await f.manager._hydratePassword(repaired)).password ?? "").toBe(
+      "",
+    );
+    expect(await f.context.secrets.get(repaired.id)).toBeUndefined();
+    const edit = await f.open(repaired);
+    await edit.panel.webview.dispatchMessage({
+      type: "saveConnection",
+      payload: {
+        ...repaired,
+        password: "new-password",
+        useSecretStorage: true,
+      },
+    });
+    await edit.result;
+    const saved = f.manager.getConnection(repaired.id, true);
+    expect(saved?.host).toBe(duplicate.host);
+    expect(
+      parseStoredConnectionSecrets(await f.context.secrets.get(repaired.id)),
+    ).toEqual({ password: "new-password" });
+    expect(await f.context.secrets.get(owner.id)).toBe(original);
+    await f.manager.dispose();
+  });
 
   it("saves a rename after legacy secret migration flags useSecretStorage", async () => {
     const f = fixture([pg]);
@@ -209,9 +269,37 @@ describe("edit precondition ignores extension-managed background writes", () => 
 
   it("does not attach the stored fingerprint when the SSH host is edited", async () => {
     const { f, edit, payload } = await openTofu();
+    const testConnection = vi
+      .spyOn(f.manager, "testConnection")
+      .mockResolvedValue({ success: true });
+    await edit.panel.webview.dispatchMessage({
+      type: "testConnection",
+      payload: {
+        ...payload,
+        requestId: "changed-ssh",
+        ssh: { ...payload.ssh, host: "other.local" },
+      },
+    });
+    expect(testConnection).not.toHaveBeenCalled();
+    expect(edit.panel.webview.postMessage).toHaveBeenCalledWith({
+      type: "testResult",
+      payload: expect.objectContaining({
+        requestId: "changed-ssh",
+        success: false,
+        error: expect.stringContaining("ssh.password"),
+      }),
+    });
     await edit.panel.webview.dispatchMessage({
       type: "saveConnection",
-      payload: { ...payload, ssh: { ...payload.ssh, host: "other.local" } },
+      payload: {
+        ...payload,
+        password: "new-db-secret",
+        ssh: {
+          ...payload.ssh,
+          host: "other.local",
+          password: "new-ssh-secret",
+        },
+      },
     });
     await edit.result;
     expect(f.connections()[0].ssh).toMatchObject({ host: "other.local" });
@@ -222,7 +310,11 @@ describe("edit precondition ignores extension-managed background writes", () => 
     const { f, edit, payload } = await openTofu();
     await edit.panel.webview.dispatchMessage({
       type: "saveConnection",
-      payload: { ...payload, ssh: { ...payload.ssh, username: "other" } },
+      payload: {
+        ...payload,
+        password: "new-db-secret",
+        ssh: { ...payload.ssh, username: "other", password: "new-ssh-secret" },
+      },
     });
     await edit.result;
     expect(saveResults(edit.panel)).toEqual([]);
@@ -363,7 +455,7 @@ describe("signed Elasticsearch endpoint", () => {
     expect(persisted.endpoint).toBe(safeEndpoint);
     expect(
       JSON.parse((await f.context.secrets.get(config.id)) ?? "null"),
-    ).toEqual({
+    ).toMatchObject({
       endpoint,
     });
     const edit = await f.open(persisted);
@@ -429,21 +521,14 @@ describe("SQLite never touches Secret Storage", () => {
 describe("type switches through SQLite", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it.each([
-    false,
-    true,
-  ])("does not resurrect the old PostgreSQL secrets after pg -> sqlite -> pg (deleteFails=%s)", async (deleteFails) => {
+  it("retains but does not resurrect the old PostgreSQL secrets after pg -> sqlite -> pg", async () => {
     const original = { ...pg, useSecretStorage: true };
     const f = fixture([original]);
     await f.context.secrets.store(
       "a",
       JSON.stringify({ password: "old-pg-secret" }),
     );
-    if (deleteFails) {
-      vi.spyOn(f.context.secrets, "delete").mockRejectedValueOnce(
-        new Error("keychain locked"),
-      );
-    }
+    const deletes = vi.spyOn(f.context.secrets, "delete");
     const toSqlite = await f.open(original);
     await toSqlite.panel.webview.dispatchMessage({
       type: "saveConnection",
@@ -459,8 +544,9 @@ describe("type switches through SQLite", () => {
     expect(saveResults(toSqlite.panel)).toEqual([]);
     expect(f.connections()[0].type).toBe("sqlite");
     expect(await f.context.secrets.get("a")).toBe(
-      deleteFails ? JSON.stringify({ password: "old-pg-secret" }) : undefined,
+      JSON.stringify({ password: "old-pg-secret" }),
     );
+    expect(deletes).not.toHaveBeenCalled();
 
     const testConnection = vi
       .spyOn(f.manager, "testConnection")
@@ -480,7 +566,9 @@ describe("type switches through SQLite", () => {
     expect(saveResults(toPg.panel)).toEqual([]);
     expect(f.connections()[0]).toMatchObject({ type: "pg" });
     expect(f.connections()[0].password).toBeUndefined();
-    expect(await f.context.secrets.get("a")).toBeUndefined();
+    expect(
+      parseStoredConnectionSecrets(await f.context.secrets.get("a")),
+    ).toEqual({});
     expect(
       (await f.manager._hydratePassword(f.connections()[0])).password,
     ).toBe("");

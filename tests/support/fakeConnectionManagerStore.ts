@@ -8,6 +8,7 @@ import type {
 import type {
   ConnectionManagerStore,
   ConnectionStoreMutation,
+  DynamoDBTargetRecord,
 } from "../../src/extension/connectionManagerStore";
 import {
   createDriverTimeoutSettingsSnapshot,
@@ -47,6 +48,7 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
   private history: HistoryEntry[] = [];
   private bookmarks: BookmarkEntry[] = [];
   private readonly secrets = new Map<string, string>();
+  private readonly dynamoDBTargets = new Map<string, DynamoDBTargetRecord>();
   private readonly listeners: ConfigurationListener[] = [];
   private historyLimit = 100;
   private defaultPageSize = 25;
@@ -156,6 +158,17 @@ export class FakeConnectionManagerStore implements ConnectionManagerStore {
 
   async deleteSecret(id: string): Promise<void> {
     this.secrets.delete(id);
+  }
+
+  readDynamoDBTarget(id: string): DynamoDBTargetRecord | undefined {
+    return this.dynamoDBTargets.get(id);
+  }
+
+  async writeDynamoDBTarget(
+    id: string,
+    target: DynamoDBTargetRecord,
+  ): Promise<void> {
+    this.dynamoDBTargets.set(id, target);
   }
 
   getHistoryLimit(): number {

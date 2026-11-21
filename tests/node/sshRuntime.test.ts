@@ -88,6 +88,7 @@ async function createRuntime(
         kind: "tcpForward";
         remoteHost: string;
         remotePort: number;
+        extraForwards?: Array<{ remoteHost: string; remotePort: number }>;
       }
     | {
         kind: "httpAgent";
@@ -556,6 +557,60 @@ describe("sshRuntime", () => {
     });
 
     await runtime.dispose();
+  });
+
+  it("opens fixed extra forwards over the same SSH session and closes them on dispose", async () => {
+    const runtime = await createRuntime(sshSettings, {
+      kind: "tcpForward",
+      remoteHost: "dynamodb.us-east-1.amazonaws.com",
+      remotePort: 443,
+      extraForwards: [
+        { remoteHost: "sts.us-east-1.amazonaws.com", remotePort: 443 },
+      ],
+    });
+    expect(createdClients).toHaveLength(1);
+    const client = createdClients[0];
+    if (runtime.transport.kind !== "tcpForward") {
+      throw new Error("Expected tcpForward runtime");
+    }
+    const [sts] = runtime.transport.extraForwards ?? [];
+    expect(sts).toMatchObject({
+      localHost: "127.0.0.1",
+      remoteHost: "sts.us-east-1.amazonaws.com",
+      remotePort: 443,
+    });
+    expect(sts.localPort).not.toBe(runtime.transport.localPort);
+    await new Promise<void>((resolve, reject) => {
+      const socket = net.createConnection({
+        host: sts.localHost,
+        port: sts.localPort,
+      });
+      socket.once("connect", () => socket.end());
+      socket.once("close", () => resolve());
+      socket.once("error", reject);
+    });
+    expect(client?.forwardOutCalls).toEqual([
+      {
+        srcIP: "127.0.0.1",
+        srcPort: 0,
+        dstIP: "sts.us-east-1.amazonaws.com",
+        dstPort: 443,
+      },
+    ]);
+    await runtime.dispose();
+    await expect(
+      new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection({
+          host: sts.localHost,
+          port: sts.localPort,
+        });
+        socket.once("connect", () => {
+          socket.destroy();
+          reject(new Error("extra forward still listening"));
+        });
+        socket.once("error", () => resolve());
+      }),
+    ).resolves.toBeUndefined();
   });
 
   it("forwards HTTP-agent requests to the resolved remote host and port", async () => {

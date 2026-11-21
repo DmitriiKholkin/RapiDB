@@ -25,6 +25,16 @@ export const MONGO_EXPORT_BSON_OPTIONS = {
   raw: true,
 } as const;
 
+export const MONGO_TABLE_BSON_OPTIONS = {
+  ...MONGO_EXPORT_BSON_OPTIONS,
+  batchSize: 8,
+} as const;
+
+export function mongoWireIsDbPointer(ref: DBRef): boolean | undefined {
+  const type = wireDbRefTypes.get(ref);
+  return type === undefined ? undefined : typeof type === "string";
+}
+
 function couldBeDbPointer(ref: DBRef): boolean {
   return ref.oid instanceof ObjectId && Object.keys(ref.fields).length === 0;
 }
@@ -108,13 +118,51 @@ export function readMongoExportCursor(
   // Decode while consuming each batch; do not collect or retain raw row views.
   const decoded = cursor.map?.((value: Document) => {
     signal?.throwIfAborted();
-    return types.isUint8Array(value)
-      ? deserializeMongoExportDocument(value, validateUtf8)
-      : value;
+    if (!types.isUint8Array(value)) return value;
+    return deserializeMongoExportDocument(value, validateUtf8);
   });
   // A cursor adapter may already return decoded documents. If so, the JSON
   // serializer still refuses any ambiguous DBRef without wire provenance.
   return (decoded ?? cursor).toArray();
+}
+
+export async function* iterateMongoTableCursor(
+  cursor: AsyncIterable<Document>,
+  acceptBytes: (bytes: number) => void,
+  validateUtf8 = true,
+  signal?: AbortSignal,
+): AsyncGenerator<{
+  document: Document;
+  bsonBytes: number;
+  wire?: Uint8Array;
+}> {
+  signal?.throwIfAborted();
+  // Returning or throwing closes the SDK iterator, including a live server
+  // cursor. The SDK exposes raw document views, not decoded objects.
+  for await (const value of cursor) {
+    signal?.throwIfAborted();
+    if (types.isUint8Array(value)) {
+      const bsonBytes = value.byteLength;
+      acceptBytes(bsonBytes);
+      // BSON Binary and other decoded values may hold views into these bytes.
+      // Copy the accepted document, so they can't pin the entire SDK reply.
+      const wire = Buffer.from(value);
+      yield {
+        document: deserializeMongoExportDocument(wire, validateUtf8),
+        bsonBytes,
+        wire,
+      };
+    } else {
+      // For adapters that already decoded a document, compute size without
+      // serializing or manufacturing wire evidence.
+      const bsonBytes = BSON.calculateObjectSize(value, {
+        ignoreUndefined: false,
+      });
+      acceptBytes(bsonBytes);
+      yield { document: value, bsonBytes };
+    }
+  }
+  signal?.throwIfAborted();
 }
 
 export function decodeMongoExportCommand(document: Document): Document {

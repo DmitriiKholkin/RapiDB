@@ -22,8 +22,8 @@ vi.mock("../../src/extension/utils/sqliteInstaller", async (importOriginal) => {
     >();
   return {
     ...actual,
-    ensureSQLiteRuntimeInstalled: (baseDir: string) =>
-      installerOverride.install ?? actual.ensureSQLiteRuntimeInstalled(baseDir),
+    ensureSQLiteRuntimeInstalled: () =>
+      installerOverride.install ?? actual.ensureSQLiteRuntimeInstalled(),
   };
 });
 
@@ -138,7 +138,7 @@ describe("SQLite worker request queue failures", () => {
     ]);
   });
 
-  it("surfaces repair denial for an unvalidated cache before spawning a worker", async () => {
+  it("surfaces install denial for an unverified cache before spawning a worker", async () => {
     const directory = await createProjectTempDir(
       "sqlite-worker-install-denied",
     );
@@ -147,7 +147,7 @@ describe("SQLite worker request queue failures", () => {
       allowInstall: () => false,
     });
     const { installedPackagePath, installedBinaryPath } =
-      probeInstalledBetterSqlite3Runtime(__dirname);
+      probeInstalledBetterSqlite3Runtime();
     if (!installedPackagePath || !installedBinaryPath) {
       throw new Error("Could not resolve managed SQLite fixture paths");
     }

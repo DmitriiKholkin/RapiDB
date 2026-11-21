@@ -23,6 +23,117 @@ function harness(requests = [new MockMssqlRequest()]) {
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("MSSQL query session isolation", () => {
+  const pinnedDatabase = "  Source]Δ  ";
+  const profileDatabase = "profile_default";
+
+  it("verifies the exact pinned database on the GO lease and resets before an ordinary query", async () => {
+    const [setup, first, second, ordinary] = Array.from(
+      { length: 4 },
+      () => new MockMssqlRequest(),
+    );
+    const { driver, pool, connection } = harness([
+      setup,
+      first,
+      second,
+      ordinary,
+    ]);
+    let currentDatabase = profileDatabase;
+    setup.execute.mockImplementation(async (_sql, physical) => {
+      expect(physical).toBe(connection);
+      expect(currentDatabase).toBe(profileDatabase);
+      currentDatabase = pinnedDatabase;
+      const recordset = [{ databaseName: currentDatabase }];
+      return {
+        recordsets: [recordset],
+        recordset,
+        rowsAffected: [1],
+        output: {},
+      };
+    });
+    connection.reset.mockImplementation((callback) => {
+      currentDatabase = profileDatabase;
+      callback();
+    });
+    for (const request of [first, second, ordinary]) {
+      request.execute.mockImplementation(async (_sql, physical) => {
+        expect(physical).toBe(connection);
+        request.emit("recordset", [{ name: "current_database" }]);
+        request.emit("row", [currentDatabase]);
+        return { recordsets: [], recordset: [], rowsAffected: [], output: {} };
+      });
+    }
+
+    const result = await driver.query("SELECT DB_NAME()\nGO 2", undefined, {
+      database: pinnedDatabase,
+    });
+    expect(setup.batch).toHaveBeenCalledExactlyOnceWith(
+      "USE [  Source]]Δ  ]; SELECT DB_NAME() AS databaseName;",
+    );
+    expect(setup.query).not.toHaveBeenCalled();
+    expect(result.resultSets?.map((set) => set.rows)).toEqual([
+      [{ __col_0: pinnedDatabase }],
+      [{ __col_0: pinnedDatabase }],
+    ]);
+    expect(pool.acquire).toHaveBeenCalledOnce();
+    expect(connection.reset).toHaveBeenCalledBefore(pool.release);
+    await expect(driver.query("SELECT DB_NAME()")).resolves.toMatchObject({
+      rows: [{ __col_0: profileDatabase }],
+    });
+  });
+
+  it.each([
+    "unavailable",
+    "different case",
+    "no result",
+  ] as const)("never sends user SQL when the pinned database is %s", async (outcome) => {
+    const setup = new MockMssqlRequest();
+    const user = new MockMssqlRequest();
+    const { driver, pool, connection } = harness([setup, user]);
+    if (outcome === "unavailable") {
+      setup.execute.mockRejectedValue(new Error("Database unavailable"));
+    } else {
+      const recordset =
+        outcome === "no result"
+          ? []
+          : [{ databaseName: pinnedDatabase.toLowerCase() }];
+      setup.execute.mockResolvedValue({
+        recordsets: [recordset],
+        recordset,
+        rowsAffected: [],
+        output: {},
+      });
+    }
+    await expect(
+      driver.query("SELECT 1", undefined, { database: pinnedDatabase }),
+    ).rejects.toThrow(
+      outcome === "unavailable" ? "Database unavailable" : "not executed",
+    );
+    expect(user.execute).not.toHaveBeenCalled();
+    expect(pool.request).toHaveBeenCalledOnce();
+    expect(connection.reset).toHaveBeenCalledBefore(pool.release);
+  });
+
+  it("applies the query deadline to target setup and discards the cancelled lease", async () => {
+    vi.useFakeTimers();
+    const setup = new MockMssqlRequest();
+    const user = new MockMssqlRequest();
+    const { driver, pool, connection } = harness([setup, user]);
+    setup.execute.mockImplementation(() => new Promise(() => {}));
+    const pending = driver.query("SELECT 1", undefined, {
+      database: pinnedDatabase,
+      deadline: Date.now() + 125,
+    });
+    const rejected = expect(pending).rejects.toThrow("deadline exceeded");
+    await vi.advanceTimersByTimeAsync(20);
+    expect(setup.execute).toHaveBeenCalledOnce();
+    expect(setup.overrides).toMatchObject({ requestTimeout: 125 });
+    await vi.advanceTimersByTimeAsync(125);
+    await rejected;
+    expect(setup.cancel).toHaveBeenCalledOnce();
+    expect(user.execute).not.toHaveBeenCalled();
+    expect(connection.close).toHaveBeenCalledBefore(pool.release);
+  });
+
   it("preserves prior all-omitted metadata when a later GO batch fails", async () => {
     const requests = Array.from({ length: 3 }, () => new MockMssqlRequest());
     const { driver, pool } = harness(requests);

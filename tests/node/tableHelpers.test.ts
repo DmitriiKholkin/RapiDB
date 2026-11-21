@@ -19,6 +19,7 @@ import {
 import { TableMutationService } from "../../src/extension/table/tableMutationService";
 import { TableReadService } from "../../src/extension/table/tableReadService";
 import type { ConnectionConfig } from "../../src/shared/connectionConfig";
+import { mockPostgresTableScope } from "../support/mockPostgresTableScope";
 
 const columns: ColumnTypeMeta[] = [
   {
@@ -819,6 +820,7 @@ describe("table helpers", () => {
       name: "pg-preview-test",
     };
     const postgresDriver = new PostgresDriver(connection);
+    mockPostgresTableScope(postgresDriver);
 
     const postgresColumns: ColumnTypeMeta[] = [
       {

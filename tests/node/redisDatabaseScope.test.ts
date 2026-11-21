@@ -7,6 +7,8 @@ import type {
 import { RedisDriver } from "../../src/extension/dbDrivers/redis";
 import { loadConnectionRootCatalog } from "../../src/extension/schema/schemaLoaders";
 import { getConfiguredRedisDatabaseName } from "../../src/shared/redisDatabase";
+import { redisUnavailableValueSnapshot } from "../../src/shared/redisValueSnapshot";
+import { redisCompactReply } from "../support/redisReplyMapping";
 
 it.each([
   [{ connectionUri: "redis://localhost/1" }, "db1"],
@@ -138,26 +140,23 @@ class FakeRedis {
           ? value
           : Buffer.from(String(value));
     },
-    getRange: async (key: string) => {
+    getRange: async (key: string, start: number, end: number) => {
       const value = await this.get(key);
-      return value == null
-        ? null
-        : Buffer.isBuffer(value)
-          ? value
-          : Buffer.from(String(value));
+      return (
+        Buffer.isBuffer(value) ? value : Buffer.from(String(value ?? ""))
+      ).subarray(start, end + 1);
     },
-    lRange: (key: string) => this.lRange(key),
-    xRange: (key: string) => this.xRange(key),
+    sendCommand: (args: string[]) => this.sendCommand(args),
   }));
   ttl = vi.fn(async (key: string) => this.store().get(key)?.ttl ?? -2);
-  lRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
-  xRange = vi.fn(async (key: string) => this.store().get(key)?.value ?? []);
   strLen = vi.fn(async (key: string) => this.valueSize(key));
   lLen = vi.fn(async (key: string) => this.valueSize(key));
   xLen = vi.fn(async (key: string) => this.valueSize(key));
   private valueSize(key: string) {
     const value = this.store().get(key)?.value;
-    return Array.isArray(value) ? value.length : String(value ?? "").length;
+    return Array.isArray(value)
+      ? value.length
+      : Buffer.byteLength(String(value ?? ""));
   }
   set = vi.fn(
     async (
@@ -180,6 +179,12 @@ class FakeRedis {
       return "OK";
     }
     if (args[0] === "GET") return this.get(args[1]);
+    if (args[0] === "EVAL_RO") {
+      const entry = store.get(args[3]);
+      return entry?.type === "list" && Array.isArray(entry.value)
+        ? redisCompactReply("list", entry.value, entry.ttl)
+        : null;
+    }
     if (args[0] === "SET") {
       const exIndex = args.indexOf("EX", 3);
       return this.set(args[1], args[2], {
@@ -224,10 +229,9 @@ class FakeRedis {
         scan: (cursor: string, options: { MATCH: string }) =>
           run(() => this.withTypeMapping().scan(cursor, options)),
         get: (key: string) => run(() => this.withTypeMapping().get(key)),
-        getRange: (key: string) =>
-          run(() => this.withTypeMapping().getRange(key)),
-        lRange: (key: string) => run(() => this.withTypeMapping().lRange(key)),
-        xRange: (key: string) => run(() => this.withTypeMapping().xRange(key)),
+        getRange: (key: string, start: number, end: number) =>
+          run(() => this.withTypeMapping().getRange(key, start, end)),
+        sendCommand: (args: string[]) => run(() => this.sendCommand(args)),
       }),
       type: (key: string) => run(() => this.type(key)),
       strLen: (key: string) => run(() => this.strLen(key)),
@@ -702,7 +706,7 @@ describe("B09 Redis reserved default prefix", () => {
 });
 
 describe("B02 Redis logical database isolation", () => {
-  it("scopes discovery, metadata, both page paths, stream reads and export", async () => {
+  it("scopes discovery, metadata, both page paths, stream metadata and export", async () => {
     const driver = driverWith();
     await driver.connect();
     expect((await driver.listDatabases()).map((db) => db.name)).toEqual([
@@ -755,8 +759,11 @@ describe("B02 Redis logical database isolation", () => {
       { key: "users:shared", value: "value-1", ttl: 11, type: "string" },
     ]);
     expect(
-      (await driver.readTablePage(page("db1", "events"))).rows[0]?.value,
-    ).toContain('"db":"1"');
+      (await driver.readTablePage(page("db1", "events"))).rows[0],
+    ).toMatchObject({
+      type: "stream",
+      value: redisUnavailableValueSnapshot("stream", "no byte-bounded read"),
+    });
     const service = new TableReadService({
       getConnection: () => config,
       getDriver: () => driver,

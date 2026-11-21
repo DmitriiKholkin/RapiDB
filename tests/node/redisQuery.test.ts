@@ -1,5 +1,8 @@
 import { type createClient, ErrorReply, RESP_TYPES } from "redis";
-import { withRedisReplyMapping } from "../support/redisReplyMapping";
+import {
+  redisCompactReply,
+  withRedisReplyMapping,
+} from "../support/redisReplyMapping";
 
 const queryReplyOptions = {
   typeMapping: {
@@ -20,6 +23,7 @@ import {
   REDIS_UNPREFIXED_KEYS_TABLE,
 } from "../../src/extension/dbDrivers/redisKeyspace";
 import { logger } from "../../src/extension/utils/logger";
+import { redisUnavailableValueSnapshot } from "../../src/shared/redisValueSnapshot";
 import { REDIS_READ_BUDGET } from "../../src/shared/safetyContracts";
 import {
   defaultFilterOperator,
@@ -885,23 +889,27 @@ describe("RedisDriver — metadata and pages", () => {
         return "none";
       }),
       get: vi.fn(async (key: string) => (key === "users:1" ? "Alice" : null)),
-      hGetAll: vi.fn(async (key: string) =>
-        key === "users:2" ? { first: "Bob", last: "Builder" } : {},
-      ),
-      lRange: vi.fn(async (key: string) =>
-        key === "users:3" ? ["draft", "published"] : [],
-      ),
-      sMembers: vi.fn(async (key: string) =>
-        key === "users:4" ? ["alpha", "beta"] : [],
-      ),
-      zRangeWithScores: vi.fn(async (key: string) =>
-        key === "users:5"
-          ? [
-              { value: "gold", score: 10 },
-              { value: "silver", score: 5 },
-            ]
-          : [],
-      ),
+      strLen: vi.fn(async () => 5),
+      sendCommand: vi.fn(async ([command, , , key]: string[]) => {
+        expect(command).toBe("EVAL_RO");
+        switch (key) {
+          case "users:2":
+            return redisCompactReply("hash", [
+              "first",
+              "Bob",
+              "last",
+              "Builder",
+            ]);
+          case "users:3":
+            return redisCompactReply("list", ["draft", "published"]);
+          case "users:4":
+            return redisCompactReply("set", ["alpha", "beta"]);
+          case "users:5":
+            return redisCompactReply("zset", ["gold", "10", "silver", "5"]);
+          default:
+            return null;
+        }
+      }),
     };
 
     (
@@ -1097,15 +1105,12 @@ describe("RedisDriver — metadata and pages", () => {
     expect(page.rows).toEqual([
       {
         key: "events:1",
-        value:
-          '[{"id":"1716115200000-0","message":{"event":"created","userId":"42"}}]',
+        value: redisUnavailableValueSnapshot("stream", "no byte-bounded read"),
         ttl: null,
         type: "stream",
       },
     ]);
-    expect(client.xRange).toHaveBeenCalledWith("events:1", "-", "+", {
-      COUNT: REDIS_READ_BUDGET.maxValueEntries + 1,
-    });
+    expect(client.xRange).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1120,6 +1125,9 @@ describe("RedisDriver — metadata and pages", () => {
       }),
       type: vi.fn().mockResolvedValue("string"),
       get: vi.fn(async (key: string) => (key === "labels:1" ? first : second)),
+      strLen: vi.fn(async (key: string) =>
+        Buffer.byteLength(key === "labels:1" ? first : second),
+      ),
     };
     Object.assign(driver, { client: withRedisReplyMapping(client) });
 
@@ -1162,6 +1170,7 @@ describe("RedisDriver — metadata and pages", () => {
       }),
       type: vi.fn().mockResolvedValue("string"),
       get: vi.fn(async (key: string) => key),
+      strLen: vi.fn(async (key: string) => Buffer.byteLength(key)),
       ttl: vi.fn(async (key: string) => {
         if (key === "users:1") {
           return -1;

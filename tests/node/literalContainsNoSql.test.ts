@@ -9,6 +9,7 @@ import type {
   DriverTablePageRequest,
 } from "../../src/extension/dbDrivers/types";
 import { resolveFilterOperators } from "../../src/extension/dbDrivers/types";
+import { mockMongoCursorIterator } from "../support/mockMongoCursorIterator";
 
 const needles = ["%", "_", "\\", "!", String.raw`!%_\!`, "ordinary", ".*[x]"];
 const samples = [
@@ -80,6 +81,7 @@ describe("H1 NoSQL active Contains routes", () => {
           skip: () => cursor,
           limit: () => cursor,
           toArray: async () => rows.filter((row) => regex.test(row.value)),
+          [Symbol.asyncIterator]: mockMongoCursorIterator,
         };
         return cursor;
       },

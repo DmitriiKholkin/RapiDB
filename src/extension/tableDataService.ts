@@ -6,6 +6,7 @@ import type {
   DriverTableExportChunk,
   DriverTableExportFormat,
   FilterExpression,
+  NoSqlDeleteObservation,
 } from "./dbDrivers/types";
 import type {
   PreparedDeletePlan,
@@ -167,6 +168,7 @@ export class TableDataService {
     table: string,
     primaryKeyValuesList: Record<string, unknown>[],
     observations?: readonly (SqlDeleteObservation | null)[],
+    noSqlObservations?: readonly (NoSqlDeleteObservation | null)[],
   ): Promise<PreparedDeletePlan | null> {
     return this.mutationService.prepareDeleteRowsPlan(
       connectionId,
@@ -175,6 +177,7 @@ export class TableDataService {
       table,
       primaryKeyValuesList,
       observations,
+      noSqlObservations,
     );
   }
   executePreparedDeletePlan(plan: PreparedDeletePlan): Promise<void> {

@@ -59,7 +59,16 @@ function setup(column = binaryColumn) {
   const insertOne = vi.fn().mockResolvedValue({ acknowledged: true });
   Object.assign(driver, {
     connected: true,
-    client: { db: () => ({ collection: () => ({ updateOne, insertOne }) }) },
+    client: {
+      db: () => ({
+        command: async () => ({
+          ok: 1,
+          isWritablePrimary: true,
+          maxWireVersion: 21,
+        }),
+        collection: () => ({ updateOne, insertOne }),
+      }),
+    },
   });
   const columns = [idColumn, column];
   const manager = {

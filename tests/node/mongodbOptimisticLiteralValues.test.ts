@@ -26,7 +26,16 @@ describe("MongoDB optimistic literal values", () => {
     });
     Object.assign(driver, {
       connected: true,
-      client: { db: () => ({ collection: () => ({ updateOne }) }) },
+      client: {
+        db: () => ({
+          command: async () => ({
+            ok: 1,
+            isWritablePrimary: true,
+            maxWireVersion: 21,
+          }),
+          collection: () => ({ updateOne }),
+        }),
+      },
     });
     const update = {
       primaryKeys: { _id: "one" },
