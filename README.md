@@ -60,19 +60,11 @@ PostgreSQL, SQL Server, MySQL, MariaDB, SQLite, Oracle, Redis, MongoDB, Elastics
 
 > **Read-only mode** blocks table edits and restricts query execution. For SQL Server and Oracle, it allows browsing only; query execution is disabled. Use database-enforced read-only permissions for reliable protection.
 
-> **SQLite runtime.** SQLite uses the native [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) module, which is not bundled with the extension. The first time you open a SQLite database, RapiDB asks before downloading it once (about 11.6 MB) from `registry.npmjs.org`, verifies it against hashes pinned in the extension, and reuses it offline afterwards. No compiler is needed. Supported: macOS, Windows and Linux on x64 or arm64, VS Code 1.101 or later. On Linux, glibc-based systems need glibc 2.34 or newer and libstdc++ from GCC 11 or newer (for example RHEL 9, Ubuntu 22.04, Debian 12 or newer); RHEL 8 and its rebuilds, Ubuntu 20.04, Debian 10/11 and SUSE Linux Enterprise / openSUSE Leap 15 releases with glibc 2.31 are not supported. musl systems (Alpine) need the `libstdc++` package. See [usage notes](docs/usage-notes.md#sqlite-runtime).
-
 <br/>
 
 ## 🔐 Credentials, TLS & SSH
 
 Store credentials with **VS Code Secret Storage**, configure encryption, or connect through an **SSH bastion** - all from the same form.
-
-**DynamoDB:** Connections save an explicit credential source: access keys, a named AWS profile, or the SDK default chain. Missing saved static keys never fall back to AWS profile or environment credentials. If an older profile's source cannot be determined safely, open **Edit Connection**, choose the intended source, and save.
-
-For recognized AWS DynamoDB endpoints, RapiDB verifies the signing credentials' AWS account and partition through regional STS and binds query tabs, history, bookmarks, and Table Viewer to the verified destination. Without SSH, the extension host must be able to reach regional STS (`sts.<region>.amazonaws.com`). With SSH, the STS request uses the same SSH session as DynamoDB (a second fixed forward to `sts.<region>.<suffix>:443`, with TLS server name, certificate check and signed `Host` for the STS hostname), so the SSH host must reach regional STS — in a private subnet, add an STS interface VPC endpoint with private DNS. If that endpoint has no private DNS, set **STS endpoint** (`awsStsEndpoint`) in Edit Connection to its HTTPS DNS name (for example `https://vpce-….sts.<region>.vpce.amazonaws.com`). It accepts only AWS STS host names for the connection's region (regional, FIPS, dual-stack or interface VPC endpoint), without port, path, query or credentials; the request is still SigV4-signed for `sts` in the connection's region, and TLS server name, certificate check and signed `Host` use that host name (with SSH, through a forward to it on port 443). The STS endpoint is part of the verified target and of the saved-credential binding, so changing it requires reconnecting and re-entering saved secrets. Account verification cannot be turned off; environment and shared-config STS endpoint overrides are deliberately ignored. After an account or endpoint change, reconnect and review the target before running older queries. Older saved queries without a verified binding still open as text; reopen older Table Viewers from the current connection. This check does not restrict explicitly addressed cross-account table ARNs; AWS permissions still apply.
-
-For DynamoDB Local and custom endpoints (including AWS aliases that RapiDB cannot recognize), the binding checks endpoint, signing region and — for long-term keys — the access key ID, not the identity of the backend behind that address. Temporary credentials (with a session token) get a new access key ID on every refresh, so for them only endpoint and signing region are bound; a different account reached through the same custom endpoint with temporary credentials is not detected. RapiDB does not probe STS for these endpoints; a selected AWS credential provider may still use its usual authentication services.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/connection-security.png" alt="Secret Storage, password management, encryption, and SSH tunnel settings" width="620" />
@@ -146,8 +138,6 @@ Open a table to work with your data in a **virtualized grid**. Sort and resize c
 <img src="https://raw.githubusercontent.com/DmitriiKholkin/RapiDB/main/media/screenshots/table-data.png" alt="Invoice table with primary and foreign key indicators, per-column filters, typed values, CSV and JSON exports, and pagination" width="100%" />
 
 Editing support depends on the database engine and column types. Review important changes and keep backups.
-
-**MongoDB:** Table Viewer can edit and delete existing documents only on a verified standalone or non-sharded replica set. It does not route by shard key, so these actions and their previews are disabled on `mongos` (including unsharded collections behind it), load-balanced endpoints, direct shard/config servers, and when topology cannot be verified. On replica sets of every MongoDB version, verification runs `$collStats` on the collection (a shard member reports its shard name there) and requires the `collStats` privilege; standalone servers are not probed. Browsing, export, and inserts remain available subject to connection permissions. To edit or delete a document in a sharded collection, use the Query Editor with the full document key (including the shard key).
 
 <br/>
 
